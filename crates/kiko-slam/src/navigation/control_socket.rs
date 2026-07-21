@@ -30,6 +30,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{
     self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
 };
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::{
@@ -386,6 +391,52 @@ pub fn agent_control_runtime_queue(
         AgentControlRuntimeSender { inner: sender },
         AgentControlRuntimeReceiver { inner: receiver },
     )
+}
+
+#[cfg(all(test, feature = "agent-runtime", feature = "actuation"))]
+pub(crate) fn enqueue_agent_control_test_request(
+    sender: &AgentControlRuntimeSender,
+    request: AgentControlRequestV1,
+    received_at: HostMonotonicTimestamp,
+) -> JoinHandle<Option<AgentControlResponseV1>> {
+    let (claim_sender, claim_receiver) = mpsc::sync_channel(0);
+    let (response_sender, response_receiver) = mpsc::sync_channel(0);
+    sender
+        .inner
+        .try_send(AgentControlDispatch {
+            request,
+            received_at,
+            claim: claim_sender,
+            response: response_sender,
+        })
+        .expect("test runtime queue has capacity");
+    thread::spawn(move || {
+        claim_receiver.recv().ok()?;
+        response_receiver.recv().ok()
+    })
+}
+
+#[cfg(all(test, feature = "agent-runtime", feature = "actuation"))]
+pub(crate) fn enqueue_agent_control_test_request_with_expired_response(
+    sender: &AgentControlRuntimeSender,
+    request: AgentControlRequestV1,
+    received_at: HostMonotonicTimestamp,
+) -> JoinHandle<()> {
+    let (claim_sender, claim_receiver) = mpsc::sync_channel(0);
+    let (response_sender, response_receiver) = mpsc::sync_channel(0);
+    sender
+        .inner
+        .try_send(AgentControlDispatch {
+            request,
+            received_at,
+            claim: claim_sender,
+            response: response_sender,
+        })
+        .expect("test runtime queue has capacity");
+    thread::spawn(move || {
+        claim_receiver.recv().expect("dispatcher claims request");
+        drop(response_receiver);
+    })
 }
 
 impl AgentControlRuntimeReceiver {
@@ -877,6 +928,81 @@ impl Drop for AgentControlSocketServer {
         let _ = self.path_guard.cleanup();
     }
 }
+
+/// Dedicated sequential socket owner used by the live agent.
+///
+/// The runtime receiver remains in the navigation owner. If this task exits,
+/// its sole sender is dropped and the receiver observes disconnection as a
+/// fail-closed runtime fault.
+#[must_use = "the live owner must join the control socket task and inspect cleanup"]
+pub struct AgentControlSocketTask {
+    handle: JoinHandle<AgentControlSocketTaskExit>,
+}
+
+impl AgentControlSocketTask {
+    /// Bind before spawning, so startup cannot report readiness until the
+    /// private path and permissions have been established.
+    pub fn bind_and_spawn(
+        config: AgentControlSocketConfig,
+        clock: AgentControlMonotonicOrigin,
+        capacity: AgentControlRuntimeQueueCapacity,
+        running: Arc<AtomicBool>,
+    ) -> Result<(Self, AgentControlRuntimeReceiver), AgentControlSocketBindError> {
+        let (sender, receiver) = agent_control_runtime_queue(capacity);
+        let mut server = AgentControlSocketServer::bind(config, clock, sender)?;
+        let handle = thread::spawn(move || {
+            while running.load(Ordering::Acquire) {
+                match server.poll_one() {
+                    Ok(AgentControlServeOutcome::Idle) => {
+                        thread::park_timeout(Duration::from_millis(1));
+                    }
+                    Ok(AgentControlServeOutcome::Responded { .. }) => {}
+                    Err(source) => {
+                        running.store(false, Ordering::Release);
+                        return AgentControlSocketTaskExit::ServeFailed {
+                            source,
+                            cleanup: server.shutdown(),
+                        };
+                    }
+                }
+            }
+            AgentControlSocketTaskExit::Shutdown {
+                cleanup: server.shutdown(),
+            }
+        });
+        Ok((Self { handle }, receiver))
+    }
+
+    pub fn join(self) -> Result<AgentControlSocketTaskExit, AgentControlSocketTaskJoinError> {
+        self.handle
+            .join()
+            .map_err(|_| AgentControlSocketTaskJoinError::Panicked)
+    }
+}
+
+#[derive(Debug)]
+pub enum AgentControlSocketTaskExit {
+    Shutdown {
+        cleanup: AgentControlSocketCleanupOutcome,
+    },
+    ServeFailed {
+        source: AgentControlServeError,
+        cleanup: AgentControlSocketCleanupOutcome,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentControlSocketTaskJoinError {
+    Panicked,
+}
+
+impl fmt::Display for AgentControlSocketTaskJoinError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("agent-control socket task panicked")
+    }
+}
+
+impl std::error::Error for AgentControlSocketTaskJoinError {}
 
 /// Successful completion of one client connection.
 #[derive(Debug)]

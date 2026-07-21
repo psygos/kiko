@@ -53,7 +53,7 @@ use kiko_slam::dataset::{
 #[cfg(any(feature = "record", test))]
 use kiko_slam::navigation::NavigationGoalArg;
 #[cfg(all(feature = "record", feature = "actuation"))]
-use kiko_slam::navigation::actuation::{LiveActuationError, PhysicalActuationSession};
+use kiko_slam::navigation::actuation::LiveActuationError;
 #[cfg(any(feature = "record", test))]
 use kiko_slam::navigation::mpc::HostMonotonicClockReadError;
 #[cfg(feature = "record")]
@@ -72,7 +72,8 @@ use kiko_slam::navigation::{
 };
 #[cfg(all(feature = "record", feature = "actuation"))]
 use kiko_slam::navigation::{
-    MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES, NavigationActuationConfigV1,
+    LiveMpcControlDriver, LiveMpcControlError, MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES,
+    NavigationActuationConfigV1,
 };
 #[cfg(feature = "record")]
 use kiko_slam::{
@@ -4466,6 +4467,10 @@ enum LiveNavigationWorkerError {
         source: LiveActuationError,
     },
     #[cfg(feature = "actuation")]
+    MpcControl {
+        source: LiveMpcControlError,
+    },
+    #[cfg(feature = "actuation")]
     OperationAndDisarm {
         operation: Box<Self>,
         disarm: LiveActuationError,
@@ -4512,6 +4517,8 @@ impl std::fmt::Display for LiveNavigationWorkerError {
                 )
             }
             #[cfg(feature = "actuation")]
+            Self::MpcControl { source } => write!(formatter, "{source}"),
+            #[cfg(feature = "actuation")]
             Self::OperationAndDisarm { operation, disarm } => write!(
                 formatter,
                 "navigation failed ({operation}); shutdown also could not prove controller stop ({disarm})"
@@ -4544,6 +4551,8 @@ impl std::error::Error for LiveNavigationWorkerError {
             #[cfg(feature = "actuation")]
             Self::Actuation { source, .. } => Some(source),
             #[cfg(feature = "actuation")]
+            Self::MpcControl { source } => Some(source),
+            #[cfg(feature = "actuation")]
             Self::OperationAndDisarm { operation, .. } => Some(operation.as_ref()),
             Self::TickSequenceExhausted => None,
         }
@@ -4574,13 +4583,11 @@ fn run_live_navigation_worker(
     #[cfg(feature = "actuation")]
     let mut physical_actuation = match actuation_config.as_ref() {
         Some(config) => {
-            let (session, initial_zero) = PhysicalActuationSession::acquire(config, clock_origin)
-                .map_err(|source| {
-                LiveNavigationWorkerError::Actuation {
+            let (driver, initial_zero) = LiveMpcControlDriver::acquire(config, clock_origin)
+                .map_err(|source| LiveNavigationWorkerError::Actuation {
                     phase: "zero acquisition",
                     source,
-                }
-            })?;
+                })?;
             eprintln!(
                 "physical actuation acquired: robot_id={} boot_id={} epoch={} sequence={} applied_pwm=[{},{}] known_active_through_host_ns={}",
                 config.robot_id(),
@@ -4593,7 +4600,7 @@ fn run_live_navigation_worker(
                     .known_active_through_exclusive()
                     .nanos_since_clock_start(),
             );
-            Some(session)
+            Some(driver)
         }
         None => None,
     };
@@ -4703,34 +4710,27 @@ fn run_live_navigation_worker(
                     if !running.load(Ordering::SeqCst) {
                         break;
                     }
-                    #[cfg(feature = "actuation")]
-                    if let Some(session) = physical_actuation.as_mut() {
-                        session.require_current_before_solve().map_err(|source| {
-                            LiveNavigationWorkerError::Actuation {
-                                phase: "pre-solve applied-evidence gate",
-                                source,
-                            }
-                        })?;
-                    }
                     let tick = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
+                    #[cfg(feature = "actuation")]
+                    let (outcome, applied_actuation) = if let Some(driver) = physical_actuation.as_mut() {
+                        let applied = driver
+                            .tick_point_goal(&mut coordinator, tick, &mut clock)
+                            .map_err(|source| LiveNavigationWorkerError::MpcControl { source })?;
+                        let (outcome, receipt) = applied.into_parts();
+                        (outcome, Some(live_applied_actuation_viz(&receipt)))
+                    } else {
+                        let outcome = coordinator
+                            .tick(tick, &mut clock)
+                            .map_err(|source| LiveNavigationWorkerError::Tick { source })?;
+                        (outcome, None)
+                    };
+                    #[cfg(not(feature = "actuation"))]
                     let outcome = coordinator
                         .tick(tick, &mut clock)
                         .map_err(|source| LiveNavigationWorkerError::Tick { source })?;
                     tick_sequence = tick_sequence
                         .checked_add(1)
                         .ok_or(LiveNavigationWorkerError::TickSequenceExhausted)?;
-                    #[cfg(feature = "actuation")]
-                    let applied_actuation = if let Some(session) = physical_actuation.as_mut() {
-                        let receipt = session.apply(outcome.decision()).map_err(|source| {
-                            LiveNavigationWorkerError::Actuation {
-                                phase: "synchronous command application",
-                                source,
-                            }
-                        })?;
-                        Some(live_applied_actuation_viz(&receipt))
-                    } else {
-                        None
-                    };
                     #[cfg(not(feature = "actuation"))]
                     let applied_actuation = None;
                     // Diagnostic copies happen only after the authoritative decision and never

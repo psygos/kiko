@@ -375,9 +375,10 @@ mod tests {
             "robot_id": "kiko-production-01",
             "oak": {
                 "mxid": "A1B2C3D4E5F60708",
-                "runtime_provenance": "depthai-runtime@2.29.0",
-                "sdk_build_provenance": "depthai-core@2.29.0+abc123",
-                "adapter_build_provenance": "kiko-oak-adapter@abc123"
+                "linked_depthai_sdk_version": "3.6.1",
+                "linked_depthai_sdk_commit": "abc123",
+                "linked_depthai_embedded_device_artifact_version": "device-1",
+                "linked_depthai_embedded_bootloader_artifact_version": "bootloader-1"
             },
             "stm32": {
                 "serial_by_id_path": "/dev/serial/by-id/usb-Kiko_STM32_A1-if00",

@@ -198,6 +198,90 @@ pub struct ManualDriveCommandDto<LeaseId> {
     pub command: ManualDriveCommandKindDto,
 }
 
+/// Component named by the one finite-value boundary parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManualVelocityComponentV1 {
+    ForwardVelocityMps,
+    YawRateRadS,
+}
+
+/// A finite body-frame velocity intent before envelope admission.
+///
+/// The private fields make non-finite states unrepresentable after
+/// [`Self::parse`]. Limits, ambiguous zero, authority, ordering, and freshness
+/// remain session-dependent and are enforced once by [`ManualDriveCore`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FiniteManualVelocityV1 {
+    forward_velocity_mps: f64,
+    yaw_rate_rad_s: f64,
+}
+
+impl FiniteManualVelocityV1 {
+    pub fn parse(
+        forward_velocity_mps: f64,
+        yaw_rate_rad_s: f64,
+    ) -> Result<Self, FiniteManualVelocityParseError> {
+        for (component, value) in [
+            (
+                ManualVelocityComponentV1::ForwardVelocityMps,
+                forward_velocity_mps,
+            ),
+            (ManualVelocityComponentV1::YawRateRadS, yaw_rate_rad_s),
+        ] {
+            if !value.is_finite() {
+                return Err(FiniteManualVelocityParseError { component, value });
+            }
+        }
+        Ok(Self {
+            forward_velocity_mps,
+            yaw_rate_rad_s,
+        })
+    }
+
+    pub const fn forward_velocity_mps(self) -> f64 {
+        self.forward_velocity_mps
+    }
+
+    pub const fn yaw_rate_rad_s(self) -> f64 {
+        self.yaw_rate_rad_s
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FiniteManualVelocityParseError {
+    component: ManualVelocityComponentV1,
+    value: f64,
+}
+
+impl FiniteManualVelocityParseError {
+    pub const fn component(self) -> ManualVelocityComponentV1 {
+        self.component
+    }
+
+    pub const fn value(self) -> f64 {
+        self.value
+    }
+
+    const fn field(self) -> &'static str {
+        match self.component {
+            ManualVelocityComponentV1::ForwardVelocityMps => "forward_velocity_mps",
+            ManualVelocityComponentV1::YawRateRadS => "yaw_rate_rad_s",
+        }
+    }
+}
+
+impl fmt::Display for FiniteManualVelocityParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "manual velocity component {:?} must be finite, got {}",
+            self.component, self.value
+        )
+    }
+}
+
+impl std::error::Error for FiniteManualVelocityParseError {}
+
 /// Strictly ordered command identity within one authority lease.
 ///
 /// Zero is valid. The core admits only strictly increasing values and never
@@ -213,6 +297,70 @@ impl ManualDriveSequence {
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ManualDriveParsedCommandKind {
+    Velocity(FiniteManualVelocityV1),
+    Stop,
+}
+
+/// Current-schema manual command whose numeric boundary proof is retained.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ManualDriveParsedCommand<LeaseId> {
+    authority_lease_id: LeaseId,
+    sequence: ManualDriveSequence,
+    command: ManualDriveParsedCommandKind,
+}
+
+impl<LeaseId> ManualDriveParsedCommand<LeaseId> {
+    pub const fn velocity(
+        authority_lease_id: LeaseId,
+        sequence: ManualDriveSequence,
+        velocity: FiniteManualVelocityV1,
+    ) -> Self {
+        Self {
+            authority_lease_id,
+            sequence,
+            command: ManualDriveParsedCommandKind::Velocity(velocity),
+        }
+    }
+
+    pub const fn stop(authority_lease_id: LeaseId, sequence: ManualDriveSequence) -> Self {
+        Self {
+            authority_lease_id,
+            sequence,
+            command: ManualDriveParsedCommandKind::Stop,
+        }
+    }
+
+    pub fn authority_lease_id(&self) -> LeaseId
+    where
+        LeaseId: Copy,
+    {
+        self.authority_lease_id
+    }
+
+    pub const fn sequence(&self) -> ManualDriveSequence {
+        self.sequence
+    }
+
+    pub const fn finite_velocity(&self) -> Option<FiniteManualVelocityV1> {
+        match self.command {
+            ManualDriveParsedCommandKind::Velocity(velocity) => Some(velocity),
+            ManualDriveParsedCommandKind::Stop => None,
+        }
+    }
+
+    pub const fn is_explicit_stop(&self) -> bool {
+        matches!(self.command, ManualDriveParsedCommandKind::Stop)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ManualDriveIngressCommand<LeaseId> {
+    Weak(ManualDriveCommandDto<LeaseId>),
+    Parsed(ManualDriveParsedCommand<LeaseId>),
 }
 
 /// Supervisor state projected into this dependency-neutral navigation core.
@@ -325,7 +473,62 @@ impl<LeaseId: Copy> ManualDriveAcceptedTarget<LeaseId> {
     pub fn target(self) -> BodyVelocityTargetV1 {
         self.target
     }
+
+    /// Narrow an accepted target to the explicit-stop domain exactly once.
+    pub fn into_explicit_stop(
+        self,
+    ) -> Result<ManualDriveAcceptedStop<LeaseId>, ManualDriveAcceptedTargetKindError> {
+        if self.intent != ManualDriveAcceptedIntent::ExplicitStop || !self.target.is_stop() {
+            return Err(ManualDriveAcceptedTargetKindError::NotExplicitStop);
+        }
+        Ok(ManualDriveAcceptedStop {
+            authority_lease_id: self.authority_lease_id,
+            sequence: self.sequence,
+            received_at: self.received_at,
+            valid_through_exclusive: self.valid_through_exclusive,
+        })
+    }
 }
+
+/// An already-admitted, ordered explicit stop bound to one exact lease.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ManualDriveAcceptedStop<LeaseId> {
+    authority_lease_id: LeaseId,
+    sequence: ManualDriveSequence,
+    received_at: HostMonotonicTimestamp,
+    valid_through_exclusive: HostMonotonicTimestamp,
+}
+
+impl<LeaseId: Copy> ManualDriveAcceptedStop<LeaseId> {
+    pub fn authority_lease_id(self) -> LeaseId {
+        self.authority_lease_id
+    }
+
+    pub fn sequence(self) -> ManualDriveSequence {
+        self.sequence
+    }
+
+    pub fn received_at(self) -> HostMonotonicTimestamp {
+        self.received_at
+    }
+
+    pub fn valid_through_exclusive(self) -> HostMonotonicTimestamp {
+        self.valid_through_exclusive
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManualDriveAcceptedTargetKindError {
+    NotExplicitStop,
+}
+
+impl fmt::Display for ManualDriveAcceptedTargetKindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("accepted manual target is not an explicit stop")
+    }
+}
+
+impl std::error::Error for ManualDriveAcceptedTargetKindError {}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ManualDriveStopCause<LeaseId> {
@@ -363,6 +566,10 @@ pub enum ManualDriveStopCause<LeaseId> {
         previous: HostMonotonicTimestamp,
         current: HostMonotonicTimestamp,
     },
+    ReceiptBeforeManualSession {
+        session_started_at: HostMonotonicTimestamp,
+        received_at: HostMonotonicTimestamp,
+    },
     ReceiptAfterObservation {
         received_at: HostMonotonicTimestamp,
         observed_at: HostMonotonicTimestamp,
@@ -391,6 +598,107 @@ pub enum ManualDriveStopCause<LeaseId> {
         deadline_exclusive: HostMonotonicTimestamp,
         observed_at: HostMonotonicTimestamp,
     },
+}
+
+impl<LeaseId: Copy> ManualDriveStopCause<LeaseId> {
+    /// Project only lease identities while preserving the exact typed stop
+    /// cause and all timing/numeric evidence.
+    pub fn map_authority_lease<Other: Copy>(
+        self,
+        map: impl Fn(LeaseId) -> Other,
+    ) -> ManualDriveStopCause<Other> {
+        match self {
+            Self::NoCommand => ManualDriveStopCause::NoCommand,
+            Self::ClockRegression { previous, current } => {
+                ManualDriveStopCause::ClockRegression { previous, current }
+            }
+            Self::ClockFaultLatched => ManualDriveStopCause::ClockFaultLatched,
+            Self::AuthorityNotActiveManual => ManualDriveStopCause::AuthorityNotActiveManual,
+            Self::ActiveAuthorityLeaseMismatch { bound, active } => {
+                ManualDriveStopCause::ActiveAuthorityLeaseMismatch {
+                    bound: map(bound),
+                    active: map(active),
+                }
+            }
+            Self::AuthorityLeaseExpired {
+                expires_at_exclusive,
+                observed_at,
+            } => ManualDriveStopCause::AuthorityLeaseExpired {
+                expires_at_exclusive,
+                observed_at,
+            },
+            Self::CommandAuthorityLeaseMismatch { bound, command } => {
+                ManualDriveStopCause::CommandAuthorityLeaseMismatch {
+                    bound: map(bound),
+                    command: map(command),
+                }
+            }
+            Self::UnsupportedCommandSchema { actual, supported } => {
+                ManualDriveStopCause::UnsupportedCommandSchema { actual, supported }
+            }
+            Self::DuplicateSequence { sequence } => {
+                ManualDriveStopCause::DuplicateSequence { sequence }
+            }
+            Self::SequenceRegression { previous, current } => {
+                ManualDriveStopCause::SequenceRegression { previous, current }
+            }
+            Self::ReceiptTimeRegression { previous, current } => {
+                ManualDriveStopCause::ReceiptTimeRegression { previous, current }
+            }
+            Self::ReceiptBeforeManualSession {
+                session_started_at,
+                received_at,
+            } => ManualDriveStopCause::ReceiptBeforeManualSession {
+                session_started_at,
+                received_at,
+            },
+            Self::ReceiptAfterObservation {
+                received_at,
+                observed_at,
+            } => ManualDriveStopCause::ReceiptAfterObservation {
+                received_at,
+                observed_at,
+            },
+            Self::NonFiniteVelocity { field, value } => {
+                ManualDriveStopCause::NonFiniteVelocity { field, value }
+            }
+            Self::VelocityOutsideEnvelope {
+                field,
+                value,
+                maximum_abs,
+            } => ManualDriveStopCause::VelocityOutsideEnvelope {
+                field,
+                value,
+                maximum_abs,
+            },
+            Self::AmbiguousZeroVelocity => ManualDriveStopCause::AmbiguousZeroVelocity,
+            Self::CommandStale {
+                received_at,
+                observed_at,
+                maximum_age_ns,
+            } => ManualDriveStopCause::CommandStale {
+                received_at,
+                observed_at,
+                maximum_age_ns,
+            },
+            Self::DeadmanDeadlineOverflow {
+                received_at,
+                deadman_timeout_ns,
+            } => ManualDriveStopCause::DeadmanDeadlineOverflow {
+                received_at,
+                deadman_timeout_ns,
+            },
+            Self::DeadmanExpired {
+                sequence,
+                deadline_exclusive,
+                observed_at,
+            } => ManualDriveStopCause::DeadmanExpired {
+                sequence,
+                deadline_exclusive,
+                observed_at,
+            },
+        }
+    }
 }
 
 /// Fail-closed output. Its target is always the canonical zero body velocity.
@@ -441,6 +749,7 @@ pub struct ManualDriveCore<LeaseId> {
     last_sequence: Option<ManualDriveSequence>,
     last_received_at: Option<HostMonotonicTimestamp>,
     last_observed_at: HostMonotonicTimestamp,
+    session_started_at: HostMonotonicTimestamp,
     clock_fault_latched: bool,
     current: Option<ManualDriveAcceptedTarget<LeaseId>>,
 }
@@ -460,6 +769,7 @@ where
             last_sequence: None,
             last_received_at: None,
             last_observed_at: created_at,
+            session_started_at: created_at,
             clock_fault_latched: false,
             current: None,
         }
@@ -471,6 +781,10 @@ where
 
     pub fn bound_authority_lease_id(&self) -> LeaseId {
         self.bound_authority_lease_id
+    }
+
+    pub fn session_started_at(&self) -> HostMonotonicTimestamp {
+        self.session_started_at
     }
 
     pub fn last_sequence(&self) -> Option<ManualDriveSequence> {
@@ -492,6 +806,44 @@ where
         observed_at: HostMonotonicTimestamp,
         authority: ManualAuthoritySnapshot<LeaseId>,
     ) -> ManualDriveOutput<LeaseId> {
+        self.ingest_inner(
+            ManualDriveIngressCommand::Weak(dto),
+            received_at,
+            observed_at,
+            authority,
+        )
+    }
+
+    /// Admit a command whose wire-schema and finite-value proof has already
+    /// been established by the control boundary.
+    ///
+    /// This is the production agent path. It deliberately retains the
+    /// session-dependent checks here: exact authority, receipt time, strict
+    /// ordering, configured envelope, ambiguous zero, and deadman deadline.
+    /// It never rechecks `is_finite()` because the parsed command cannot carry
+    /// a non-finite velocity.
+    pub fn ingest_parsed(
+        &mut self,
+        command: ManualDriveParsedCommand<LeaseId>,
+        received_at: HostMonotonicTimestamp,
+        observed_at: HostMonotonicTimestamp,
+        authority: ManualAuthoritySnapshot<LeaseId>,
+    ) -> ManualDriveOutput<LeaseId> {
+        self.ingest_inner(
+            ManualDriveIngressCommand::Parsed(command),
+            received_at,
+            observed_at,
+            authority,
+        )
+    }
+
+    fn ingest_inner(
+        &mut self,
+        ingress: ManualDriveIngressCommand<LeaseId>,
+        received_at: HostMonotonicTimestamp,
+        observed_at: HostMonotonicTimestamp,
+        authority: ManualAuthoritySnapshot<LeaseId>,
+    ) -> ManualDriveOutput<LeaseId> {
         if let Some(cause) = self.observe_time(observed_at) {
             return self.stop(observed_at, cause);
         }
@@ -507,26 +859,70 @@ where
                 unreachable!("non-manual authority returned a stop cause")
             }
         };
-        if dto.authority_lease_id != self.bound_authority_lease_id {
+        let (authority_lease_id, sequence, command, weak_schema_version) = match ingress {
+            ManualDriveIngressCommand::Weak(dto) => (
+                dto.authority_lease_id,
+                ManualDriveSequence::from_raw(dto.sequence),
+                ManualDriveIngressKind::Weak(dto.command),
+                Some(dto.schema_version),
+            ),
+            ManualDriveIngressCommand::Parsed(command) => (
+                command.authority_lease_id,
+                command.sequence,
+                ManualDriveIngressKind::Parsed(command.command),
+                None,
+            ),
+        };
+        if authority_lease_id != self.bound_authority_lease_id {
             return self.stop(
                 observed_at,
                 ManualDriveStopCause::CommandAuthorityLeaseMismatch {
                     bound: self.bound_authority_lease_id,
-                    command: dto.authority_lease_id,
+                    command: authority_lease_id,
                 },
             );
         }
-        if dto.schema_version != MANUAL_DRIVE_COMMAND_V1 {
+        if let Some(actual) = weak_schema_version
+            && actual != MANUAL_DRIVE_COMMAND_V1
+        {
             return self.stop(
                 observed_at,
                 ManualDriveStopCause::UnsupportedCommandSchema {
-                    actual: dto.schema_version,
+                    actual,
                     supported: MANUAL_DRIVE_COMMAND_V1,
                 },
             );
         }
 
-        let sequence = ManualDriveSequence::from_raw(dto.sequence);
+        if let Some(previous) = self.last_received_at
+            && received_at < previous
+        {
+            return self.stop(
+                observed_at,
+                ManualDriveStopCause::ReceiptTimeRegression {
+                    previous,
+                    current: received_at,
+                },
+            );
+        }
+        if received_at < self.session_started_at {
+            return self.stop(
+                observed_at,
+                ManualDriveStopCause::ReceiptBeforeManualSession {
+                    session_started_at: self.session_started_at,
+                    received_at,
+                },
+            );
+        }
+        if received_at > observed_at {
+            return self.stop(
+                observed_at,
+                ManualDriveStopCause::ReceiptAfterObservation {
+                    received_at,
+                    observed_at,
+                },
+            );
+        }
         if let Some(previous) = self.last_sequence {
             if sequence == previous {
                 return self.stop(
@@ -545,30 +941,9 @@ where
             }
         }
         self.last_sequence = Some(sequence);
-
-        if let Some(previous) = self.last_received_at
-            && received_at < previous
-        {
-            return self.stop(
-                observed_at,
-                ManualDriveStopCause::ReceiptTimeRegression {
-                    previous,
-                    current: received_at,
-                },
-            );
-        }
-        if received_at > observed_at {
-            return self.stop(
-                observed_at,
-                ManualDriveStopCause::ReceiptAfterObservation {
-                    received_at,
-                    observed_at,
-                },
-            );
-        }
         self.last_received_at = Some(received_at);
 
-        let (intent, target) = match self.parse_target(dto.command) {
+        let (intent, target) = match self.parse_target(command) {
             Ok(parsed) => parsed,
             Err(cause) => return self.stop(observed_at, cause),
         };
@@ -636,6 +1011,62 @@ where
         ManualDriveOutput::Accepted(current)
     }
 
+    /// Extend only the authority half of the current target deadline after
+    /// the supervisor has renewed the same exact manual lease.
+    ///
+    /// This cannot refresh receipt age or deadman time. Rejected, duplicate,
+    /// or silent traffic therefore cannot extend motion, while a successfully
+    /// admitted fresh command may keep one finite supervisor lease alive.
+    pub fn admit_authority_renewal(
+        &mut self,
+        observed_at: HostMonotonicTimestamp,
+        authority: ManualAuthoritySnapshot<LeaseId>,
+    ) -> ManualDriveOutput<LeaseId> {
+        if let Some(cause) = self.observe_time(observed_at) {
+            return self.stop(observed_at, cause);
+        }
+        if let Some(cause) = self.authority_stop_cause(authority, observed_at) {
+            return self.stop(observed_at, cause);
+        }
+        let ManualAuthoritySnapshot::ActiveManual {
+            expires_at_exclusive,
+            ..
+        } = authority
+        else {
+            unreachable!("non-manual authority returned a stop cause")
+        };
+        let Some(mut current) = self.current else {
+            return self.stop(observed_at, ManualDriveStopCause::NoCommand);
+        };
+        let Some(deadman_ns) = current
+            .received_at
+            .as_nanos()
+            .checked_add(self.config.deadman_timeout_ns())
+        else {
+            return self.stop(
+                observed_at,
+                ManualDriveStopCause::DeadmanDeadlineOverflow {
+                    received_at: current.received_at,
+                    deadman_timeout_ns: self.config.deadman_timeout_ns(),
+                },
+            );
+        };
+        let deadman_deadline = HostMonotonicTimestamp::from_nanos(deadman_ns);
+        if observed_at >= deadman_deadline {
+            return self.stop(
+                observed_at,
+                ManualDriveStopCause::DeadmanExpired {
+                    sequence: current.sequence,
+                    deadline_exclusive: deadman_deadline,
+                    observed_at,
+                },
+            );
+        }
+        current.valid_through_exclusive = deadman_deadline.min(expires_at_exclusive);
+        self.current = Some(current);
+        ManualDriveOutput::Accepted(current)
+    }
+
     fn observe_time(
         &mut self,
         observed_at: HostMonotonicTimestamp,
@@ -688,19 +1119,32 @@ where
 
     fn parse_target(
         &self,
-        command: ManualDriveCommandKindDto,
+        command: ManualDriveIngressKind,
     ) -> Result<(ManualDriveAcceptedIntent, BodyVelocityTargetV1), ManualDriveStopCause<LeaseId>>
     {
-        let ManualDriveCommandKindDto::Velocity {
-            forward_velocity_mps,
-            yaw_rate_rad_s,
-        } = command
-        else {
-            return Ok((
-                ManualDriveAcceptedIntent::ExplicitStop,
-                BodyVelocityTargetV1::STOP,
-            ));
+        let velocity = match command {
+            ManualDriveIngressKind::Weak(ManualDriveCommandKindDto::Velocity {
+                forward_velocity_mps,
+                yaw_rate_rad_s,
+            }) => FiniteManualVelocityV1::parse(forward_velocity_mps, yaw_rate_rad_s).map_err(
+                |source| ManualDriveStopCause::NonFiniteVelocity {
+                    field: source.field(),
+                    value: source.value(),
+                },
+            )?,
+            ManualDriveIngressKind::Parsed(ManualDriveParsedCommandKind::Velocity(velocity)) => {
+                velocity
+            }
+            ManualDriveIngressKind::Weak(ManualDriveCommandKindDto::Stop)
+            | ManualDriveIngressKind::Parsed(ManualDriveParsedCommandKind::Stop) => {
+                return Ok((
+                    ManualDriveAcceptedIntent::ExplicitStop,
+                    BodyVelocityTargetV1::STOP,
+                ));
+            }
         };
+        let forward_velocity_mps = velocity.forward_velocity_mps();
+        let yaw_rate_rad_s = velocity.yaw_rate_rad_s();
         for (field, value, maximum_abs) in [
             (
                 "forward_velocity_mps",
@@ -713,9 +1157,6 @@ where
                 self.config.maximum_abs_yaw_rate_rad_s(),
             ),
         ] {
-            if !value.is_finite() {
-                return Err(ManualDriveStopCause::NonFiniteVelocity { field, value });
-            }
             if value.abs() > maximum_abs {
                 return Err(ManualDriveStopCause::VelocityOutsideEnvelope {
                     field,
@@ -743,6 +1184,12 @@ where
             cause,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ManualDriveIngressKind {
+    Weak(ManualDriveCommandKindDto),
+    Parsed(ManualDriveParsedCommandKind),
 }
 
 fn canonical_zero(value: f64) -> f64 {
@@ -1024,6 +1471,55 @@ mod tests {
             }
         );
         assert!(handover.target().is_stop());
+    }
+
+    #[test]
+    fn same_lease_renewal_extends_only_authority_and_never_the_deadman() {
+        let lease = LeaseId(9);
+        let mut core = ManualDriveCore::new(config(), lease, at(0));
+        let initial = accepted(core.ingest(
+            velocity(lease, 1, 0.2, 0.1),
+            at(1),
+            at(1),
+            authority(lease, 8),
+        ));
+        assert_eq!(initial.valid_through_exclusive(), at(8));
+
+        let renewed = accepted(core.admit_authority_renewal(at(2), authority(lease, 100)));
+        assert_eq!(renewed.sequence().get(), 1);
+        assert_eq!(renewed.received_at(), at(1));
+        assert_eq!(renewed.valid_through_exclusive(), at(21));
+
+        let stopped = stopped(core.admit_authority_renewal(at(21), authority(lease, 200)));
+        assert!(matches!(
+            stopped.cause(),
+            ManualDriveStopCause::DeadmanExpired {
+                sequence,
+                deadline_exclusive,
+                observed_at,
+            } if sequence.get() == 1 && deadline_exclusive == at(21) && observed_at == at(21)
+        ));
+    }
+
+    #[test]
+    fn queued_receipt_before_session_start_cannot_be_rebound_to_new_lease() {
+        let lease = LeaseId(10);
+        let mut core = ManualDriveCore::new(config(), lease, at(50));
+        let stopped = stopped(core.ingest(
+            velocity(lease, 1, 0.2, 0.0),
+            at(49),
+            at(50),
+            authority(lease, 100),
+        ));
+        assert!(matches!(
+            stopped.cause(),
+            ManualDriveStopCause::ReceiptBeforeManualSession {
+                session_started_at,
+                received_at,
+            } if session_started_at == at(50) && received_at == at(49)
+        ));
+        assert_eq!(core.current(), None);
+        assert_eq!(core.last_sequence(), None);
     }
 
     #[test]

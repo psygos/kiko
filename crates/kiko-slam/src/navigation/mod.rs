@@ -6,6 +6,10 @@ pub mod actuation;
 mod actuation_config;
 #[cfg(all(feature = "agent-runtime", unix))]
 mod agent_config;
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
+mod agent_dispatch;
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
+mod agent_manual;
 #[cfg(feature = "agent-runtime")]
 mod authority;
 mod cell_inflation;
@@ -20,6 +24,8 @@ mod frontier;
 mod global_planner;
 mod goal_input;
 mod ingress;
+#[cfg(feature = "actuation")]
+mod live_mpc_control;
 mod local_costmap;
 mod manual_drive;
 mod manual_reference;
@@ -44,6 +50,17 @@ pub use actuation_config::{
 };
 #[cfg(all(feature = "agent-runtime", unix))]
 pub use agent_config::*;
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
+pub use agent_dispatch::{
+    AgentControlDispatcher, AgentControlDispatcherError, AgentDispatchOutcome,
+};
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
+pub use agent_manual::{
+    AgentControllerStopKnowledge, AgentLiveActuationDisposition, AgentLiveActuationFault,
+    AgentLiveActuationFaultKind, AgentManualControlCore, AgentManualControlError,
+    AgentManualGlobalStopRequirement, AgentManualRuntimePolicy, BeginManualTransition,
+    ManualControlTick, classify_live_actuation_error,
+};
 #[cfg(feature = "agent-runtime")]
 pub use authority::{AgentAuthorityError, AgentAuthoritySupervisor};
 pub use control_api::{
@@ -53,7 +70,7 @@ pub use control_api::{
     AgentControlRequestV1, AgentControlResponseKindV1, AgentControlResponseV1,
     AgentControlStatusV1, AgentLocalizationStateV1, AgentManualStopV1, AgentManualVelocityV1,
     AgentMapStateV1, AgentOperatingModeV1, AgentRuntimeStateV1,
-    MAX_AGENT_CONTROL_REQUEST_JSON_BYTES, ManualVelocityComponentV1,
+    MAX_AGENT_CONTROL_REQUEST_JSON_BYTES,
 };
 #[cfg(unix)]
 pub use control_socket::{
@@ -64,7 +81,8 @@ pub use control_socket::{
     AgentControlRuntimeReceiver, AgentControlRuntimeSender, AgentControlServeError,
     AgentControlServeOutcome, AgentControlSocketBindError, AgentControlSocketCleanupOutcome,
     AgentControlSocketConfig, AgentControlSocketPath, AgentControlSocketPathError,
-    AgentControlSocketServer, AgentControlSocketTimeoutError, AgentControlSocketTimeouts,
+    AgentControlSocketServer, AgentControlSocketTask, AgentControlSocketTaskExit,
+    AgentControlSocketTaskJoinError, AgentControlSocketTimeoutError, AgentControlSocketTimeouts,
     AgentControlTimeoutKind, MAX_AGENT_CONTROL_RESPONSE_JSON_BYTES,
     MAX_AGENT_CONTROL_RUNTIME_QUEUE_CAPACITY, MAX_AGENT_CONTROL_SOCKET_PATH_BYTES,
     agent_control_runtime_queue,
@@ -120,6 +138,8 @@ pub use ingress::{
     RecordedImuReport, RecordedMapEpochId, RecordedMapEpochIdError, ReplayMapEpochBinding,
     VisualAttemptIngress, VisualAttemptOutcome,
 };
+#[cfg(feature = "actuation")]
+pub use live_mpc_control::{LiveAppliedMpcTick, LiveMpcControlDriver, LiveMpcControlError};
 pub use local_costmap::{
     DepthFrameKey, LocalCostmap, LocalCostmapCell, LocalCostmapClockRegression, LocalCostmapConfig,
     LocalCostmapConfigError, LocalCostmapCoordinateError, LocalCostmapError, LocalCostmapFreshness,
@@ -127,11 +147,13 @@ pub use local_costmap::{
     LocalDepthObservation, LocalDepthObservationError, TrackingCameraToBase,
 };
 pub use manual_drive::{
-    BODY_VELOCITY_TARGET_V1, BodyVelocityTargetV1, MANUAL_DRIVE_COMMAND_V1, MANUAL_DRIVE_CONFIG_V1,
-    ManualAuthoritySnapshot, ManualDriveAcceptedIntent, ManualDriveAcceptedTarget,
-    ManualDriveCommandDto, ManualDriveCommandKindDto, ManualDriveConfigParseError,
-    ManualDriveConfigV1, ManualDriveConfigV1Dto, ManualDriveCore, ManualDriveOutput,
-    ManualDriveSequence, ManualDriveStopCause, ManualDriveStopped,
+    BODY_VELOCITY_TARGET_V1, BodyVelocityTargetV1, FiniteManualVelocityParseError,
+    FiniteManualVelocityV1, MANUAL_DRIVE_COMMAND_V1, MANUAL_DRIVE_CONFIG_V1,
+    ManualAuthoritySnapshot, ManualDriveAcceptedIntent, ManualDriveAcceptedStop,
+    ManualDriveAcceptedTarget, ManualDriveAcceptedTargetKindError, ManualDriveCommandDto,
+    ManualDriveCommandKindDto, ManualDriveConfigParseError, ManualDriveConfigV1,
+    ManualDriveConfigV1Dto, ManualDriveCore, ManualDriveOutput, ManualDriveParsedCommand,
+    ManualDriveSequence, ManualDriveStopCause, ManualDriveStopped, ManualVelocityComponentV1,
 };
 pub use manual_reference::{
     FrontierYawReferenceBuildError, FrontierYawScanBudgetError, FrontierYawScanBudgetV1,

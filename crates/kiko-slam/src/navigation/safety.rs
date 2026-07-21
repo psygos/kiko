@@ -81,6 +81,7 @@ pub enum SafetyNotReadyReason {
     NavigationEpochUnavailable,
     NavigationEpochTransition,
     MotionStateUnavailable,
+    ManualDriveStopped,
 }
 
 impl fmt::Display for SafetyNotReadyReason {
@@ -1606,6 +1607,7 @@ mod tests {
             SafetyNotReadyReason::NavigationEpochUnavailable,
             SafetyNotReadyReason::NavigationEpochTransition,
             SafetyNotReadyReason::MotionStateUnavailable,
+            SafetyNotReadyReason::ManualDriveStopped,
         ];
         let fixture = runtime_fixture();
         let mut supervisor = supervisor_with_capacity(&fixture, 2);
@@ -1629,13 +1631,14 @@ mod tests {
                 (index + 1).min(2)
             );
         }
+        let final_id = u64::try_from(reasons.len()).expect("bounded fixture");
         assert_eq!(
             supervisor
                 .shadow_session()
                 .retained()
                 .map(|record| record.decision_id().as_u64())
                 .collect::<Vec<_>>(),
-            vec![14, 15]
+            vec![final_id - 1, final_id]
         );
     }
 

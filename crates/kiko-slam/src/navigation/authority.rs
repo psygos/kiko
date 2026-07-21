@@ -268,6 +268,19 @@ impl AgentAuthoritySupervisor {
         self.finish(result)
     }
 
+    /// Cancel the sole authority lease waiting behind a zero gate.
+    ///
+    /// The core preserves the zero obligation, replaces activation with a
+    /// return to `ReadyStopped`, and moves the evidence barrier to `now`.
+    pub fn cancel_pending_authority(
+        &mut self,
+        now: HostMonotonicTimestamp,
+    ) -> Result<SupervisorAction, AgentAuthorityError> {
+        let now = self.observe_time(now)?;
+        let result = self.supervisor.cancel_pending_authority(now);
+        self.finish(result)
+    }
+
     /// Disarm through the core's explicit post-stop zero gate.
     pub fn disarm(
         &mut self,

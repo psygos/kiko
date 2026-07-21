@@ -69,6 +69,7 @@ pub enum StopReason {
     AuthorityHandover,
     AuthorityReleased,
     AuthorityLeaseExpired,
+    PendingAuthorityCancelled,
     ExplicitDisarm,
     ZeroEvidenceStale,
 }
@@ -363,6 +364,32 @@ impl RobotSupervisor {
         ))
     }
 
+    /// Cancel an authority lease which is waiting behind a zero gate.
+    ///
+    /// Cancellation never reuses the zero which preceded the request and never
+    /// transitions through `Active`. It replaces only an `Activate` continuation
+    /// with `Ready`, moves the zero-evidence barrier to `now`, and therefore
+    /// still requires a newly applied zero observed strictly after cancellation.
+    pub fn cancel_pending_authority(
+        &mut self,
+        now: MonotonicInstant,
+    ) -> Result<SupervisorAction, SupervisorError> {
+        self.require_time(now)?;
+        let SupervisorState::AwaitingZero { readiness, .. } = self.state else {
+            return Err(self.invalid_transition("cancel pending authority"));
+        };
+        if !matches!(self.after_zero, Some(AfterZero::Activate(_))) {
+            return Err(SupervisorError::NoPendingAuthorityToCancel);
+        }
+        self.commit_time(now);
+        Ok(self.await_zero(
+            readiness,
+            StopReason::PendingAuthorityCancelled,
+            AfterZero::Ready,
+            now,
+        ))
+    }
+
     pub fn disarm(&mut self, now: MonotonicInstant) -> Result<SupervisorAction, SupervisorError> {
         self.require_time(now)?;
         match self.state {
@@ -596,6 +623,7 @@ pub enum SupervisorError {
         expected: AuthorityLeaseId,
         actual: AuthorityLeaseId,
     },
+    NoPendingAuthorityToCancel,
     ZeroControllerIdentityMismatch,
     ZeroControlEpochMismatch {
         expected: robot_protocol::v2::ControlEpoch,
@@ -796,6 +824,55 @@ mod tests {
             supervisor.state(),
             SupervisorState::ReadyStopped { .. }
         ));
+    }
+
+    #[test]
+    fn cancelling_pending_authority_moves_the_zero_barrier_and_never_activates() {
+        let mut supervisor = ready();
+        let lease = AuthorityLeaseId::try_new(1).unwrap();
+        assert_eq!(
+            supervisor.request_authority(lease, AuthorityMode::Manual, duration(50), at(25)),
+            Ok(SupervisorAction::BaseZeroRequired {
+                reason: StopReason::ZeroEvidenceStale,
+            })
+        );
+        assert_eq!(
+            supervisor.cancel_pending_authority(at(26)),
+            Ok(SupervisorAction::BaseZeroRequired {
+                reason: StopReason::PendingAuthorityCancelled,
+            })
+        );
+        assert_eq!(
+            supervisor.admit_confirmed_zero(zero(26), at(26)),
+            Err(SupervisorError::ZeroEvidencePredatesStopRequest {
+                observed_at_ns: 26,
+                required_after_ns: 26,
+            })
+        );
+        assert_eq!(
+            supervisor.admit_confirmed_zero(zero(27), at(27)),
+            Ok(SupervisorAction::ReadyStopped)
+        );
+        assert!(matches!(
+            supervisor.state(),
+            SupervisorState::ReadyStopped { .. }
+        ));
+    }
+
+    #[test]
+    fn a_non_authority_zero_gate_cannot_be_relabeled_as_cancellation() {
+        let mut supervisor = supervisor();
+        supervisor.begin_inventory(at(1)).unwrap();
+        supervisor.admit_readiness(readiness(1), at(2)).unwrap();
+        supervisor.arm(at(3)).unwrap();
+        assert_eq!(
+            supervisor.cancel_pending_authority(at(4)),
+            Err(SupervisorError::NoPendingAuthorityToCancel)
+        );
+        assert_eq!(
+            supervisor.admit_confirmed_zero(zero(5), at(5)),
+            Ok(SupervisorAction::ReadyStopped)
+        );
     }
 
     #[test]

@@ -34,9 +34,11 @@ use super::local_costmap::{
     DepthFrameKey, LocalCostmap, LocalCostmapClockRegression, LocalCostmapError,
     LocalCostmapUpdateOutcome, LocalDepthObservation, LocalDepthObservationError,
 };
+use super::manual_drive::{ManualDriveAcceptedStop, ManualDriveStopCause, ManualDriveStopped};
 use super::manual_reference::{
     FrontierYawReferenceBuildError, FrontierYawReferenceBuilderV1, FrontierYawScanCommandV1,
     ManualMpcCommandV1, ManualReferenceBuildError, ManualReferenceBuilderV1,
+    NumericAuthorityLeaseId,
 };
 use super::mpc::{
     HostMonotonicClock, MotionValueError, MpcConfigV1, NavigationEpochError, NavigationEpochV1,
@@ -555,6 +557,14 @@ pub enum CoordinatorTickBlocker {
     ManualCommandIdentityConflict {
         sequence: u64,
     },
+    ManualExplicitStop {
+        authority_lease_id: NonZeroU64,
+        sequence: u64,
+    },
+    ManualDriveStopped {
+        authority_lease_id: NonZeroU64,
+        cause: ManualDriveStopCause<NonZeroU64>,
+    },
     FrontierCommandSequenceRegression {
         previous: u64,
         command: u64,
@@ -597,6 +607,9 @@ impl CoordinatorTickBlocker {
             }
             Self::Reference(_) | Self::ManualReference(_) | Self::FrontierYawReference(_) => {
                 SafetyNotReadyReason::ReferenceUnavailable
+            }
+            Self::ManualExplicitStop { .. } | Self::ManualDriveStopped { .. } => {
+                SafetyNotReadyReason::ManualDriveStopped
             }
             Self::MotionModeMismatch { .. }
             | Self::DirectAuthorityLeaseMismatch { .. }
@@ -661,6 +674,28 @@ impl std::error::Error for CoordinatorTickError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ManualCommandEvidence {
+    Velocity(ManualMpcCommandV1),
+    ExplicitStop {
+        authority_lease_id: NonZeroU64,
+        sequence: u64,
+    },
+}
+
+impl ManualCommandEvidence {
+    fn sequence(self) -> u64 {
+        match self {
+            Self::Velocity(command) => command.sequence().get(),
+            Self::ExplicitStop { sequence, .. } => sequence,
+        }
+    }
+}
+
+fn numeric_authority_lease<LeaseId: NumericAuthorityLeaseId>(lease: LeaseId) -> NonZeroU64 {
+    NonZeroU64::new(lease.get()).expect("numeric authority lease IDs are sealed nonzero domains")
+}
+
 /// Pure host navigation owner.  It contains no transport handle, packet
 /// encoder, callback, Rerun dependency, or encoder-derived state.
 pub struct ShadowNavigationCoordinator<J: NavigationIngressSink> {
@@ -683,7 +718,7 @@ pub struct ShadowNavigationCoordinator<J: NavigationIngressSink> {
     frontier_yaw_reference_builder: FrontierYawReferenceBuilderV1,
     motion_mode: CoordinatorMotionModeV1,
     direct_localization_binding: Option<DirectLocalizationBinding>,
-    last_manual_command: Option<ManualMpcCommandV1>,
+    last_manual_command: Option<ManualCommandEvidence>,
     last_frontier_yaw_command: Option<FrontierYawScanCommandV1>,
     mpc_config: MpcConfigV1,
     solver_budget: SolverBudgetNs,
@@ -1424,7 +1459,9 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
                 clock,
             );
         }
-        if let Some(blocker) = self.admit_manual_command_order(command) {
+        if let Some(blocker) =
+            self.admit_manual_command_order(ManualCommandEvidence::Velocity(command))
+        {
             return self.stop_tick(tick, blocker, control_tick_journaled, None, clock);
         }
         if let Some(blocker) = self.direct_preflight_blocker() {
@@ -1516,9 +1553,9 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         };
         let freshness_blocker = if !local_view.freshness().is_current() {
             Some(CoordinatorTickBlocker::LocalCostmapExpired)
-        } else if !local_view
+        } else if local_view
             .provenance()
-            .is_some_and(|provenance| provenance.frame() == expected_depth)
+            .is_none_or(|provenance| provenance.frame() != expected_depth)
         {
             Some(CoordinatorTickBlocker::DepthUnaligned)
         } else {
@@ -1544,6 +1581,126 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
             control_tick_journaled,
             journal_error: None,
         })
+    }
+
+    /// Record and decide one already-admitted ordered manual stop.
+    ///
+    /// This deliberately bypasses reference/MPC construction: a stop cannot
+    /// be represented as a zero-valued velocity reference. It still journals
+    /// the control tick and produces the same typed zero safety decision later
+    /// consumed by the receipt-gated physical session.
+    pub fn tick_manual_explicit_stop<C, LeaseId>(
+        &mut self,
+        tick: HostMonotonicTimestamp,
+        stop: ManualDriveAcceptedStop<LeaseId>,
+        clock: &mut C,
+    ) -> Result<CoordinatorTickOutcome<J::Error>, CoordinatorTickError>
+    where
+        C: HostMonotonicClock,
+        LeaseId: NumericAuthorityLeaseId,
+    {
+        let (control_tick_journaled, journal_error, journal_blocker) =
+            self.journal_control_tick(tick);
+        if let Some(blocker) = journal_blocker {
+            return self.stop_tick(tick, blocker, control_tick_journaled, journal_error, clock);
+        }
+        let authority_lease_id = numeric_authority_lease(stop.authority_lease_id());
+        let bound_lease = match self.motion_mode {
+            CoordinatorMotionModeV1::Manual { authority_lease_id } => authority_lease_id,
+            actual => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::MotionModeMismatch {
+                        expected: CoordinatorMotionModeV1::Manual { authority_lease_id },
+                        actual,
+                    },
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        if bound_lease != authority_lease_id {
+            return self.stop_tick(
+                tick,
+                CoordinatorTickBlocker::DirectAuthorityLeaseMismatch {
+                    bound: bound_lease,
+                    command: authority_lease_id,
+                },
+                control_tick_journaled,
+                None,
+                clock,
+            );
+        }
+        let evidence = ManualCommandEvidence::ExplicitStop {
+            authority_lease_id,
+            sequence: stop.sequence().get(),
+        };
+        if let Some(blocker) = self.admit_manual_command_order(evidence) {
+            return self.stop_tick(tick, blocker, control_tick_journaled, None, clock);
+        }
+        self.stop_tick(
+            tick,
+            CoordinatorTickBlocker::ManualExplicitStop {
+                authority_lease_id,
+                sequence: stop.sequence().get(),
+            },
+            control_tick_journaled,
+            None,
+            clock,
+        )
+    }
+
+    /// Record the exact fail-closed output of `ManualDriveCore` without
+    /// relabelling it as a point-goal or motion-mode failure.
+    pub fn tick_manual_stopped<C, LeaseId>(
+        &mut self,
+        tick: HostMonotonicTimestamp,
+        stopped: ManualDriveStopped<LeaseId>,
+        clock: &mut C,
+    ) -> Result<CoordinatorTickOutcome<J::Error>, CoordinatorTickError>
+    where
+        C: HostMonotonicClock,
+        LeaseId: NumericAuthorityLeaseId,
+    {
+        let (control_tick_journaled, journal_error, journal_blocker) =
+            self.journal_control_tick(tick);
+        if let Some(blocker) = journal_blocker {
+            return self.stop_tick(tick, blocker, control_tick_journaled, journal_error, clock);
+        }
+        let authority_lease_id = numeric_authority_lease(stopped.bound_authority_lease_id());
+        let bound_lease = match self.motion_mode {
+            CoordinatorMotionModeV1::Manual { authority_lease_id } => authority_lease_id,
+            actual => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::MotionModeMismatch {
+                        expected: CoordinatorMotionModeV1::Manual { authority_lease_id },
+                        actual,
+                    },
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        if bound_lease != authority_lease_id {
+            return self.stop_tick(
+                tick,
+                CoordinatorTickBlocker::DirectAuthorityLeaseMismatch {
+                    bound: bound_lease,
+                    command: authority_lease_id,
+                },
+                control_tick_journaled,
+                None,
+                clock,
+            );
+        }
+        let blocker = CoordinatorTickBlocker::ManualDriveStopped {
+            authority_lease_id,
+            cause: stopped.cause().map_authority_lease(numeric_authority_lease),
+        };
+        self.stop_tick(tick, blocker, control_tick_journaled, None, clock)
     }
 
     /// Run a map-revision-bound frontier yaw target without fabricating a
@@ -1733,9 +1890,9 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         };
         let freshness_blocker = if !local_view.freshness().is_current() {
             Some(CoordinatorTickBlocker::LocalCostmapExpired)
-        } else if !local_view
+        } else if local_view
             .provenance()
-            .is_some_and(|provenance| provenance.frame() == expected_depth)
+            .is_none_or(|provenance| provenance.frame() != expected_depth)
         {
             Some(CoordinatorTickBlocker::DepthUnaligned)
         } else {
@@ -2047,7 +2204,7 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
 
     fn admit_manual_command_order(
         &mut self,
-        command: ManualMpcCommandV1,
+        command: ManualCommandEvidence,
     ) -> Option<CoordinatorTickBlocker> {
         let Some(previous) = self.last_manual_command else {
             self.last_manual_command = Some(command);
@@ -2056,8 +2213,8 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         if command == previous {
             return None;
         }
-        let previous_sequence = previous.sequence().get();
-        let command_sequence = command.sequence().get();
+        let previous_sequence = previous.sequence();
+        let command_sequence = command.sequence();
         if command_sequence < previous_sequence {
             return Some(CoordinatorTickBlocker::ManualCommandSequenceRegression {
                 previous: previous_sequence,
@@ -2802,6 +2959,22 @@ mod tests {
         ManualMpcCommandV1::try_from_accepted(accepted).expect("typed manual MPC command")
     }
 
+    fn manual_core(
+        lease: NonZeroU64,
+        created_at_ns: u64,
+        deadman_timeout_ns: u64,
+    ) -> ManualDriveCore<NonZeroU64> {
+        let config = ManualDriveConfigV1::parse(ManualDriveConfigV1Dto {
+            schema_version: 1,
+            maximum_abs_forward_velocity_mps: 1.0,
+            maximum_abs_yaw_rate_rad_s: 2.0,
+            maximum_command_age_ns: deadman_timeout_ns,
+            deadman_timeout_ns,
+        })
+        .expect("manual fixture limits");
+        ManualDriveCore::new(config, lease, host(created_at_ns))
+    }
+
     #[test]
     fn manual_mode_is_exclusive_and_uses_the_full_safety_pipeline() {
         let mut coordinator = ready_fixture(1_000, 10, 2.0);
@@ -2958,6 +3131,96 @@ mod tests {
             coordinator.motion_mode(),
             CoordinatorMotionModeV1::MappingOnly
         );
+    }
+
+    #[test]
+    fn explicit_stop_and_deadman_keep_the_real_manual_reason_on_the_zero_decision() {
+        let lease = NonZeroU64::new(35).unwrap();
+        let mut coordinator = ready_fixture(1_000, 10, 2.0);
+        coordinator.clear_goal();
+        coordinator.enter_manual_mode(lease).unwrap();
+        let mut core = manual_core(lease, 1_110, 100);
+        let authority = ManualAuthoritySnapshot::active_manual(lease, host(10_000));
+
+        let velocity = core.ingest(
+            ManualDriveCommandDto {
+                schema_version: MANUAL_DRIVE_COMMAND_V1,
+                authority_lease_id: lease,
+                sequence: 5,
+                command: ManualDriveCommandKindDto::Velocity {
+                    forward_velocity_mps: 0.2,
+                    yaw_rate_rad_s: 0.0,
+                },
+            },
+            host(1_110),
+            host(1_110),
+            authority,
+        );
+        let ManualDriveOutput::Accepted(velocity) = velocity else {
+            panic!("velocity fixture")
+        };
+        let command = ManualMpcCommandV1::try_from_accepted(velocity).unwrap();
+        let tick = host(1_120);
+        assert!(
+            coordinator
+                .tick_manual(tick, command, &mut FixedClock(tick))
+                .unwrap()
+                .blocker()
+                .is_none()
+        );
+
+        let stop = core.ingest(
+            ManualDriveCommandDto {
+                schema_version: MANUAL_DRIVE_COMMAND_V1,
+                authority_lease_id: lease,
+                sequence: 6,
+                command: ManualDriveCommandKindDto::Stop,
+            },
+            host(1_130),
+            host(1_130),
+            authority,
+        );
+        let ManualDriveOutput::Accepted(stop) = stop else {
+            panic!("stop fixture")
+        };
+        let stop = stop.into_explicit_stop().expect("explicit-stop domain");
+        let tick = host(1_130);
+        let outcome = coordinator
+            .tick_manual_explicit_stop(tick, stop, &mut FixedClock(tick))
+            .unwrap();
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::ManualExplicitStop {
+                authority_lease_id,
+                sequence: 6,
+            }) if *authority_lease_id == lease
+        ));
+        assert!(outcome.decision().record().pwm().is_stop());
+        assert!(matches!(
+            outcome.decision().outcome(),
+            SafetyDecisionOutcome::Stopped(stopped)
+                if matches!(
+                    stopped.cause(),
+                    SafetyStopCause::NotReady(SafetyNotReadyReason::ManualDriveStopped)
+                )
+        ));
+
+        let stopped = core.tick(host(1_230), authority);
+        let ManualDriveOutput::Stopped(stopped) = stopped else {
+            panic!("deadman equality must stop")
+        };
+        let tick = host(1_230);
+        let outcome = coordinator
+            .tick_manual_stopped(tick, stopped, &mut FixedClock(tick))
+            .unwrap();
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::ManualDriveStopped {
+                authority_lease_id,
+                cause: ManualDriveStopCause::DeadmanExpired { sequence, .. },
+            }) if *authority_lease_id == lease && sequence.get() == 6
+        ));
+        assert!(outcome.decision().record().pwm().is_stop());
     }
 
     #[test]

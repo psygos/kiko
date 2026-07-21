@@ -46,10 +46,12 @@ use kiko_supervisor_core::{
 };
 use serde::Deserialize;
 
+use super::mpc::{BoundedId, PlantModelV1};
 use super::{
     AgentControlRuntimeQueueCapacity, AgentControlRuntimeQueueCapacityError,
     AgentControlSocketConfig, AgentControlSocketPath, AgentControlSocketPathError,
-    AgentControlSocketTimeoutError, AgentControlSocketTimeouts,
+    AgentControlSocketTimeoutError, AgentControlSocketTimeouts, MANUAL_DRIVE_CONFIG_V1,
+    ManualDriveConfigParseError, ManualDriveConfigV1, ManualDriveConfigV1Dto,
 };
 
 /// The only supported Nano-agent policy-component schema.
@@ -67,6 +69,13 @@ pub const MAX_NANO_AGENT_DATA_PATH_BYTES: usize = 1_024;
 
 /// Maximum supervisor or per-mode authority lease admitted by this boundary.
 pub const MAX_NANO_AGENT_AUTHORITY_LEASE_MS: u64 = 60_000;
+
+/// Maximum admitted manual command/deadman window.
+///
+/// The live owner ticks this independently of the controller's shorter motion
+/// lease. A finite upper bound also prevents a policy typo from turning the
+/// manual stream into an effectively unbounded command hold.
+pub const MAX_NANO_AGENT_MANUAL_WINDOW_MS: u64 = 60_000;
 
 /// Maximum freshness window for one RGB observation.
 pub const MAX_NANO_AGENT_RGB_FRAME_FRESHNESS_MS: u64 = 5_000;
@@ -706,6 +715,147 @@ pub enum NanoMotionModePolicy {
     ControlApi { authority_lease: AuthorityDuration },
 }
 
+/// Manual authority and the only envelope accepted by the manual ingress
+/// core. Values are already SI/timing domain types; the live owner must not
+/// reparse or reinterpret them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NanoManualControlApiConfig {
+    authority_lease: AuthorityDuration,
+    drive: ManualDriveConfigV1,
+}
+
+impl NanoManualControlApiConfig {
+    pub const fn authority_lease(self) -> AuthorityDuration {
+        self.authority_lease
+    }
+
+    pub const fn drive(self) -> ManualDriveConfigV1 {
+        self.drive
+    }
+
+    /// Bind the policy envelope to the exact calibrated plant used by MPC.
+    pub fn bind_to_plant(
+        self,
+        plant: PlantModelV1,
+    ) -> Result<PlantBoundNanoManualControlApiConfig, NanoManualPlantBindingError> {
+        let supported_forward = plant.maximum_symmetric_abs_forward_velocity_mps();
+        if self.drive.maximum_abs_forward_velocity_mps() > supported_forward {
+            return Err(
+                NanoManualPlantBindingError::ForwardVelocityOutsidePlantEnvelope {
+                    configured_mps: self.drive.maximum_abs_forward_velocity_mps(),
+                    supported_mps: supported_forward,
+                },
+            );
+        }
+        let supported_yaw = plant.maximum_abs_yaw_rate_rad_s();
+        if self.drive.maximum_abs_yaw_rate_rad_s() > supported_yaw {
+            return Err(NanoManualPlantBindingError::YawRateOutsidePlantEnvelope {
+                configured_rad_s: self.drive.maximum_abs_yaw_rate_rad_s(),
+                supported_rad_s: supported_yaw,
+            });
+        }
+        if !plant.supports_symmetric_body_velocity_box(
+            self.drive.maximum_abs_forward_velocity_mps(),
+            self.drive.maximum_abs_yaw_rate_rad_s(),
+        ) {
+            let half_wheelbase_m = 0.5 * plant.wheelbase_m();
+            let required_abs_wheel_velocity_mps = half_wheelbase_m.mul_add(
+                self.drive.maximum_abs_yaw_rate_rad_s(),
+                self.drive.maximum_abs_forward_velocity_mps(),
+            );
+            return Err(
+                NanoManualPlantBindingError::CombinedBodyVelocityOutsidePlantEnvelope {
+                    configured_forward_mps: self.drive.maximum_abs_forward_velocity_mps(),
+                    configured_yaw_rate_rad_s: self.drive.maximum_abs_yaw_rate_rad_s(),
+                    wheelbase_m: plant.wheelbase_m(),
+                    required_abs_wheel_velocity_mps,
+                    supported_abs_wheel_velocity_mps: plant
+                        .maximum_symmetric_abs_wheel_velocity_mps(),
+                },
+            );
+        }
+        Ok(PlantBoundNanoManualControlApiConfig {
+            authority_lease: self.authority_lease,
+            drive: self.drive,
+            plant_model_id: plant.model_id(),
+            plant_model_version: plant.model_version(),
+        })
+    }
+}
+
+/// Manual policy proven compatible with one exact MPC plant identity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlantBoundNanoManualControlApiConfig {
+    authority_lease: AuthorityDuration,
+    drive: ManualDriveConfigV1,
+    plant_model_id: BoundedId,
+    plant_model_version: std::num::NonZeroU32,
+}
+
+impl PlantBoundNanoManualControlApiConfig {
+    pub const fn authority_lease(self) -> AuthorityDuration {
+        self.authority_lease
+    }
+
+    pub const fn drive(self) -> ManualDriveConfigV1 {
+        self.drive
+    }
+
+    pub const fn plant_model_id(self) -> BoundedId {
+        self.plant_model_id
+    }
+
+    pub const fn plant_model_version(self) -> std::num::NonZeroU32 {
+        self.plant_model_version
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NanoManualPlantBindingError {
+    ForwardVelocityOutsidePlantEnvelope {
+        configured_mps: f64,
+        supported_mps: f64,
+    },
+    YawRateOutsidePlantEnvelope {
+        configured_rad_s: f64,
+        supported_rad_s: f64,
+    },
+    CombinedBodyVelocityOutsidePlantEnvelope {
+        configured_forward_mps: f64,
+        configured_yaw_rate_rad_s: f64,
+        wheelbase_m: f64,
+        required_abs_wheel_velocity_mps: f64,
+        supported_abs_wheel_velocity_mps: f64,
+    },
+}
+
+impl fmt::Display for NanoManualPlantBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "manual policy does not match MPC plant: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for NanoManualPlantBindingError {}
+
+/// Manual motion is disabled or explicitly bounded and control-API-owned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NanoManualModePolicy {
+    Disabled,
+    ControlApi(NanoManualControlApiConfig),
+}
+
+impl NanoManualModePolicy {
+    pub const fn config(self) -> Option<NanoManualControlApiConfig> {
+        match self {
+            Self::Disabled => None,
+            Self::ControlApi(config) => Some(config),
+        }
+    }
+}
+
 impl NanoMotionModePolicy {
     pub const fn authority_lease(self) -> Option<AuthorityDuration> {
         match self {
@@ -789,7 +939,7 @@ impl NanoFrontierExplorePolicy {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NanoLiveModePolicy {
     startup: NanoAgentStartupMode,
-    manual: NanoMotionModePolicy,
+    manual: NanoManualModePolicy,
     point_goal: NanoMotionModePolicy,
     frontier_explore: NanoFrontierExplorePolicy,
 }
@@ -799,7 +949,7 @@ impl NanoLiveModePolicy {
         self.startup
     }
 
-    pub const fn manual(self) -> NanoMotionModePolicy {
+    pub const fn manual(self) -> NanoManualModePolicy {
         self.manual
     }
 
@@ -881,6 +1031,13 @@ pub enum NanoAgentPolicyConfigParseError {
         lease_ms: u64,
         supervisor_maximum_ms: u64,
     },
+    ManualCommandAge {
+        source: NanoBoundedMillisecondsError,
+    },
+    ManualDeadman {
+        source: NanoBoundedMillisecondsError,
+    },
+    ManualDrive(ManualDriveConfigParseError),
     MotionPolicyRequiresActuationFeature {
         mode: NanoConfiguredMotionMode,
     },
@@ -924,11 +1081,14 @@ impl std::error::Error for NanoAgentPolicyConfigParseError {
             Self::RgbFrameFreshness { source }
             | Self::SupervisorDuration { source, .. }
             | Self::ModeAuthorityLease { source, .. }
+            | Self::ManualCommandAge { source }
+            | Self::ManualDeadman { source }
             | Self::ExploreRuntime { source } => Some(source),
             Self::RgbFrameFreshnessDomain(source) => Some(source),
             Self::SupervisorTimeDomain { source, .. }
             | Self::ModeAuthorityLeaseTimeDomain { source, .. } => Some(source),
             Self::SupervisorConfig(source) => Some(source),
+            Self::ManualDrive(source) => Some(source),
             Self::ExploreBoundary { source } => Some(source),
             Self::InputTooLarge { .. }
             | Self::UnsupportedSchemaVersion { .. }
@@ -1329,8 +1489,7 @@ fn parse_live_mode_policy(
     supervisor: SupervisorConfig,
 ) -> Result<NanoLiveModePolicy, NanoAgentPolicyConfigParseError> {
     let NanoAgentStartupModeDto::DisarmedMapOnly = dto.startup;
-    let manual =
-        parse_motion_mode_policy(NanoConfiguredMotionMode::Manual, dto.manual, supervisor)?;
+    let manual = parse_manual_mode_policy(dto.manual, supervisor)?;
     let point_goal = parse_motion_mode_policy(
         NanoConfiguredMotionMode::PointGoal,
         dto.point_goal,
@@ -1393,6 +1552,54 @@ fn parse_live_mode_policy(
         point_goal,
         frontier_explore,
     })
+}
+
+fn parse_manual_mode_policy(
+    dto: NanoManualModePolicyDto,
+    supervisor: SupervisorConfig,
+) -> Result<NanoManualModePolicy, NanoAgentPolicyConfigParseError> {
+    let NanoManualModePolicyDto::ControlApi {
+        authority_lease_ms,
+        maximum_abs_forward_velocity_mps,
+        maximum_abs_yaw_rate_rad_s,
+        maximum_command_age_ms,
+        deadman_timeout_ms,
+    } = dto
+    else {
+        return Ok(NanoManualModePolicy::Disabled);
+    };
+    if !cfg!(feature = "actuation") {
+        return Err(
+            NanoAgentPolicyConfigParseError::MotionPolicyRequiresActuationFeature {
+                mode: NanoConfiguredMotionMode::Manual,
+            },
+        );
+    }
+    let authority_lease = parse_mode_authority_lease(
+        NanoConfiguredMotionMode::Manual,
+        authority_lease_ms,
+        supervisor,
+    )?;
+    let maximum_command_age_ns =
+        parse_bounded_milliseconds(maximum_command_age_ms, MAX_NANO_AGENT_MANUAL_WINDOW_MS)
+            .map_err(|source| NanoAgentPolicyConfigParseError::ManualCommandAge { source })?;
+    let deadman_timeout_ns =
+        parse_bounded_milliseconds(deadman_timeout_ms, MAX_NANO_AGENT_MANUAL_WINDOW_MS)
+            .map_err(|source| NanoAgentPolicyConfigParseError::ManualDeadman { source })?;
+    let drive = ManualDriveConfigV1::parse(ManualDriveConfigV1Dto {
+        schema_version: MANUAL_DRIVE_CONFIG_V1,
+        maximum_abs_forward_velocity_mps,
+        maximum_abs_yaw_rate_rad_s,
+        maximum_command_age_ns,
+        deadman_timeout_ns,
+    })
+    .map_err(NanoAgentPolicyConfigParseError::ManualDrive)?;
+    Ok(NanoManualModePolicy::ControlApi(
+        NanoManualControlApiConfig {
+            authority_lease,
+            drive,
+        },
+    ))
 }
 
 fn parse_motion_mode_policy(
@@ -1703,9 +1910,22 @@ struct NanoSupervisorConfigDto {
 #[serde(deny_unknown_fields)]
 struct NanoLiveModePolicyDto {
     startup: NanoAgentStartupModeDto,
-    manual: NanoMotionModePolicyDto,
+    manual: NanoManualModePolicyDto,
     point_goal: NanoMotionModePolicyDto,
     frontier_explore: NanoFrontierExplorePolicyDto,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "permission", rename_all = "snake_case", deny_unknown_fields)]
+enum NanoManualModePolicyDto {
+    Disabled,
+    ControlApi {
+        authority_lease_ms: u64,
+        maximum_abs_forward_velocity_mps: f64,
+        maximum_abs_yaw_rate_rad_s: f64,
+        maximum_command_age_ms: u64,
+        deadman_timeout_ms: u64,
+    },
 }
 
 #[derive(Deserialize)]
@@ -1741,7 +1961,48 @@ mod tests {
     use kiko_expression_runtime::REQUIRED_EYE_CAPABILITIES;
     use serde_json::{Value, json};
 
+    #[cfg(feature = "actuation")]
+    use super::super::mpc::{
+        PLANT_MODEL_V1, PlantEvidenceV1Dto, PlantModelV1Dto, PlantValidityEnvelopeV1Dto,
+        WheelPlantV1Dto,
+    };
     use super::*;
+
+    #[cfg(feature = "actuation")]
+    fn bounded_manual_plant() -> PlantModelV1 {
+        PlantModelV1::parse(PlantModelV1Dto {
+            schema_version: PLANT_MODEL_V1,
+            model_id: "manual-binding-fixture".to_owned(),
+            model_version: 1,
+            sample_period_s: 0.1,
+            wheelbase_m: 0.4,
+            left: WheelPlantV1Dto {
+                velocity_gain_mps_per_pwm_percent: 0.01,
+                time_constant_s: 0.2,
+            },
+            right: WheelPlantV1Dto {
+                velocity_gain_mps_per_pwm_percent: 0.01,
+                time_constant_s: 0.2,
+            },
+            validity: PlantValidityEnvelopeV1Dto {
+                left_pwm_min_percent: -50,
+                left_pwm_max_percent: 50,
+                right_pwm_min_percent: -50,
+                right_pwm_max_percent: 50,
+                left_velocity_min_mps: -0.5,
+                left_velocity_max_mps: 0.5,
+                right_velocity_min_mps: -0.5,
+                right_velocity_max_mps: 0.5,
+                max_abs_yaw_rate_rad_s: 2.0,
+                max_abs_lateral_velocity_mps: 0.0,
+            },
+            evidence: PlantEvidenceV1Dto::SyntheticFixture {
+                fixture_id: "manual-binding".to_owned(),
+                generator_id: "unit-test".to_owned(),
+            },
+        })
+        .expect("bounded manual plant")
+    }
 
     fn valid_value() -> Value {
         let value = json!({
@@ -1828,7 +2089,11 @@ mod tests {
                 "startup": "disarmed_map_only",
                 "manual": {
                     "permission": "control_api",
-                    "authority_lease_ms": 500
+                    "authority_lease_ms": 500,
+                    "maximum_abs_forward_velocity_mps": 0.35,
+                    "maximum_abs_yaw_rate_rad_s": 1.0,
+                    "maximum_command_age_ms": 100,
+                    "deadman_timeout_ms": 250
                 },
                 "point_goal": {
                     "permission": "control_api",
@@ -1867,9 +2132,10 @@ mod tests {
             "robot_id": "kiko-production-01",
             "oak": {
                 "mxid": "ABCDEF1234567890",
-                "runtime_provenance": "depthai-runtime-v1",
-                "sdk_build_provenance": "depthai-sdk-v1",
-                "adapter_build_provenance": "oak-adapter-v1"
+                "compiled_depthai_header_sdk_version": "depthai-sdk-v1",
+                "compiled_depthai_header_sdk_commit": "depthai-sdk-commit-v1",
+                "compiled_depthai_header_embedded_device_artifact_version": "depthai-device-v1",
+                "compiled_depthai_header_embedded_bootloader_artifact_version": "depthai-bootloader-v1"
             },
             "stm32": {
                 "serial_by_id_path": "/dev/serial/by-id/usb-kiko-stm32-if00",
@@ -1950,6 +2216,19 @@ mod tests {
             parsed.live_mode_policy().startup(),
             NanoAgentStartupMode::DisarmedMapOnly
         );
+        #[cfg(feature = "actuation")]
+        {
+            let manual = parsed
+                .live_mode_policy()
+                .manual()
+                .config()
+                .expect("manual control API policy");
+            assert_eq!(manual.authority_lease().as_nanos(), 500_000_000);
+            assert_eq!(manual.drive().maximum_abs_forward_velocity_mps(), 0.35);
+            assert_eq!(manual.drive().maximum_abs_yaw_rate_rad_s(), 1.0);
+            assert_eq!(manual.drive().maximum_command_age_ns(), 100_000_000);
+            assert_eq!(manual.drive().deadman_timeout_ns(), 250_000_000);
+        }
     }
 
     #[test]
@@ -2397,6 +2676,119 @@ mod tests {
 
     #[cfg(feature = "actuation")]
     #[test]
+    fn manual_envelope_age_and_deadman_are_explicit_and_fail_closed() {
+        let mut value = valid_value();
+        value["live_mode_policy"]["manual"]["maximum_abs_forward_velocity_mps"] = json!(0.0);
+        assert!(matches!(
+            parse(&value),
+            Err(NanoAgentPolicyConfigParseError::ManualDrive(
+                ManualDriveConfigParseError::NonPositiveLimit {
+                    field: "maximum_abs_forward_velocity_mps",
+                    ..
+                }
+            ))
+        ));
+
+        let mut value = valid_value();
+        value["live_mode_policy"]["manual"]["maximum_abs_yaw_rate_rad_s"] =
+            json!(super::super::reference::MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S * 2.0);
+        assert!(matches!(
+            parse(&value),
+            Err(NanoAgentPolicyConfigParseError::ManualDrive(
+                ManualDriveConfigParseError::AboveSupportedLimit {
+                    field: "maximum_abs_yaw_rate_rad_s",
+                    ..
+                }
+            ))
+        ));
+
+        let mut value = valid_value();
+        value["live_mode_policy"]["manual"]["maximum_command_age_ms"] = json!(251);
+        value["live_mode_policy"]["manual"]["deadman_timeout_ms"] = json!(250);
+        assert!(matches!(
+            parse(&value),
+            Err(NanoAgentPolicyConfigParseError::ManualDrive(
+                ManualDriveConfigParseError::CommandAgeExceedsDeadman { .. }
+            ))
+        ));
+
+        for field in ["maximum_command_age_ms", "deadman_timeout_ms"] {
+            let mut zero = valid_value();
+            zero["live_mode_policy"]["manual"][field] = json!(0);
+            assert!(matches!(
+                parse(&zero),
+                Err(NanoAgentPolicyConfigParseError::ManualCommandAge {
+                    source: NanoBoundedMillisecondsError::Zero
+                }) | Err(NanoAgentPolicyConfigParseError::ManualDeadman {
+                    source: NanoBoundedMillisecondsError::Zero
+                })
+            ));
+
+            let mut unbounded = valid_value();
+            unbounded["live_mode_policy"]["manual"][field] =
+                json!(MAX_NANO_AGENT_MANUAL_WINDOW_MS + 1);
+            assert!(matches!(
+                parse(&unbounded),
+                Err(NanoAgentPolicyConfigParseError::ManualCommandAge {
+                    source: NanoBoundedMillisecondsError::TooLarge { .. }
+                }) | Err(NanoAgentPolicyConfigParseError::ManualDeadman {
+                    source: NanoBoundedMillisecondsError::TooLarge { .. }
+                })
+            ));
+        }
+
+        let disabled = json!({"permission": "disabled"});
+        let mut value = valid_value();
+        value["live_mode_policy"]["manual"] = disabled;
+        assert!(matches!(
+            parse(&value)
+                .expect("disabled manual policy needs no dormant limits")
+                .live_mode_policy()
+                .manual(),
+            NanoManualModePolicy::Disabled
+        ));
+    }
+
+    #[cfg(feature = "actuation")]
+    #[test]
+    fn manual_policy_binds_the_whole_body_twist_box_to_wheel_limits() {
+        let value = valid_value();
+        let manual = parse(&value)
+            .expect("manual policy")
+            .live_mode_policy()
+            .manual()
+            .config()
+            .expect("manual enabled");
+        assert!(matches!(
+            manual.bind_to_plant(bounded_manual_plant()),
+            Err(
+                NanoManualPlantBindingError::CombinedBodyVelocityOutsidePlantEnvelope {
+                    configured_forward_mps,
+                    configured_yaw_rate_rad_s,
+                    wheelbase_m,
+                    required_abs_wheel_velocity_mps,
+                    supported_abs_wheel_velocity_mps,
+                }
+            ) if configured_forward_mps == 0.35
+                && configured_yaw_rate_rad_s == 1.0
+                && wheelbase_m == 0.4
+                && required_abs_wheel_velocity_mps > 0.5
+                && supported_abs_wheel_velocity_mps == 0.5
+        ));
+
+        let mut value = valid_value();
+        value["live_mode_policy"]["manual"]["maximum_abs_forward_velocity_mps"] = json!(0.25);
+        let manual = parse(&value)
+            .expect("reduced manual policy")
+            .live_mode_policy()
+            .manual()
+            .config()
+            .expect("manual enabled");
+        assert!(manual.bind_to_plant(bounded_manual_plant()).is_ok());
+    }
+
+    #[cfg(feature = "actuation")]
+    #[test]
     fn exploration_requires_finite_ordered_bounds_and_finite_resources() {
         let mut reversed = valid_value();
         reversed["live_mode_policy"]["frontier_explore"]["boundary_minimum_x_m"] = json!(20.0);
@@ -2426,10 +2818,7 @@ mod tests {
     #[cfg(not(feature = "actuation"))]
     #[test]
     fn motion_policies_require_an_actuation_capable_build() {
-        for (field, mode) in [
-            ("manual", NanoConfiguredMotionMode::Manual),
-            ("point_goal", NanoConfiguredMotionMode::PointGoal),
-        ] {
+        for (field, mode) in [("point_goal", NanoConfiguredMotionMode::PointGoal)] {
             let mut value = valid_value();
             value["live_mode_policy"][field] = json!({
                 "permission": "control_api",
@@ -2444,6 +2833,24 @@ mod tests {
                 ) if actual == mode
             ));
         }
+
+        let mut value = valid_value();
+        value["live_mode_policy"]["manual"] = json!({
+            "permission": "control_api",
+            "authority_lease_ms": 500,
+            "maximum_abs_forward_velocity_mps": 0.35,
+            "maximum_abs_yaw_rate_rad_s": 1.0,
+            "maximum_command_age_ms": 100,
+            "deadman_timeout_ms": 250
+        });
+        assert!(matches!(
+            parse(&value),
+            Err(
+                NanoAgentPolicyConfigParseError::MotionPolicyRequiresActuationFeature {
+                    mode: NanoConfiguredMotionMode::Manual
+                }
+            )
+        ));
 
         let mut value = valid_value();
         value["live_mode_policy"]["frontier_explore"] = json!({

@@ -25,9 +25,9 @@ use std::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    MANUAL_DRIVE_COMMAND_V1, ManualDriveCommandDto, ManualDriveCommandKindDto, ManualDriveSequence,
-    MapPointGoalSelection, MapPointGoalSelectionDto, MapPointGoalSelectionParseError,
-    RecordedMapEpochId,
+    FiniteManualVelocityParseError, FiniteManualVelocityV1, ManualDriveParsedCommand,
+    ManualDriveSequence, MapPointGoalSelection, MapPointGoalSelectionDto,
+    MapPointGoalSelectionParseError, RecordedMapEpochId,
 };
 
 /// Wire schema supported by this request and response API.
@@ -85,6 +85,7 @@ pub enum AgentControlCommandKindV1 {
     QueryStatus,
     MapOnly,
     Stop,
+    BeginManual,
     ManualVelocity,
     ManualStop,
     FrontierExplore,
@@ -95,16 +96,18 @@ pub enum AgentControlCommandKindV1 {
 
 /// Parsed command intents accepted by the protocol boundary.
 ///
-/// `Stop` is the global explicit stop/release intent. `ManualStop` is an
-/// ordered manual-drive command and retains its manual sequence. `SaveMap`
-/// deliberately carries no path: the runtime must use its preconfigured,
-/// bounded persistence destination rather than accepting filesystem authority
-/// through this protocol.
+/// `Stop` is the global explicit stop/release intent. `BeginManual` is the
+/// only request which may acquire manual authority; velocity traffic can never
+/// acquire it implicitly. `ManualStop` is an ordered manual-drive command and
+/// retains its manual sequence. `SaveMap` deliberately carries no path: the
+/// runtime must use its preconfigured, bounded persistence destination rather
+/// than accepting filesystem authority through this protocol.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AgentControlCommandV1 {
     QueryStatus,
     MapOnly,
     Stop,
+    BeginManual,
     ManualVelocity(AgentManualVelocityV1),
     ManualStop(AgentManualStopV1),
     FrontierExplore,
@@ -120,6 +123,7 @@ impl AgentControlCommandV1 {
             Self::QueryStatus => AgentControlCommandKindV1::QueryStatus,
             Self::MapOnly => AgentControlCommandKindV1::MapOnly,
             Self::Stop => AgentControlCommandKindV1::Stop,
+            Self::BeginManual => AgentControlCommandKindV1::BeginManual,
             Self::ManualVelocity(_) => AgentControlCommandKindV1::ManualVelocity,
             Self::ManualStop(_) => AgentControlCommandKindV1::ManualStop,
             Self::FrontierExplore => AgentControlCommandKindV1::FrontierExplore,
@@ -132,19 +136,17 @@ impl AgentControlCommandV1 {
 
 /// A finite body-frame manual velocity intent in SI units.
 ///
-/// This is intentionally still weak relative to [`super::ManualDriveCore`].
-/// The control boundary proves only finite values and preserves the existing
-/// [`ManualDriveSequence`]. It does not know the active authority lease or the
-/// configured velocity envelope, and it does not reinterpret `(0, 0)` as a
-/// stop. [`into_weak_manual_drive_dto`](Self::into_weak_manual_drive_dto)
-/// explicitly crosses back into the weak DTO consumed by `ManualDriveCore`,
-/// whose single admission step remains responsible for authority, ordering,
-/// freshness, limits, ambiguous zero, and deadman semantics.
+/// This is intentionally still unadmitted relative to
+/// [`super::ManualDriveCore`]. The control boundary proves finite values once
+/// and preserves the existing [`ManualDriveSequence`]. It does not know the
+/// active authority lease or configured velocity envelope, and it does not
+/// reinterpret `(0, 0)` as a stop. Binding retains the finite-value proof;
+/// the core remains responsible for authority, ordering, freshness, limits,
+/// ambiguous zero, and deadman semantics.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AgentManualVelocityV1 {
     sequence: ManualDriveSequence,
-    forward_velocity_mps: f64,
-    yaw_rate_rad_s: f64,
+    velocity: FiniteManualVelocityV1,
 }
 
 impl AgentManualVelocityV1 {
@@ -155,32 +157,25 @@ impl AgentManualVelocityV1 {
 
     /// Requested body-frame forward velocity in metres per second.
     pub const fn forward_velocity_mps(self) -> f64 {
-        self.forward_velocity_mps
+        self.velocity.forward_velocity_mps()
     }
 
     /// Requested body-frame yaw rate in radians per second.
     pub const fn yaw_rate_rad_s(self) -> f64 {
-        self.yaw_rate_rad_s
+        self.velocity.yaw_rate_rad_s()
     }
 
     /// Bind this finite intent to the supervisor adapter's exact lease type.
     ///
-    /// The result is deliberately named weak: `ManualDriveCore::ingest` must
-    /// still perform its configured and authority-dependent admission. No
-    /// successful result from this method means that motion is authorized.
-    pub const fn into_weak_manual_drive_dto<LeaseId>(
+    /// The result retains the finite-value proof. `ManualDriveCore` must still
+    /// perform configured-envelope, authority, ordering, receipt-freshness,
+    /// ambiguous-zero, and deadman admission; binding alone is not motion
+    /// authorization.
+    pub const fn bind_to_manual_lease<LeaseId>(
         self,
         authority_lease_id: LeaseId,
-    ) -> ManualDriveCommandDto<LeaseId> {
-        ManualDriveCommandDto {
-            schema_version: MANUAL_DRIVE_COMMAND_V1,
-            authority_lease_id,
-            sequence: self.sequence.get(),
-            command: ManualDriveCommandKindDto::Velocity {
-                forward_velocity_mps: self.forward_velocity_mps,
-                yaw_rate_rad_s: self.yaw_rate_rad_s,
-            },
-        }
+    ) -> ManualDriveParsedCommand<LeaseId> {
+        ManualDriveParsedCommand::velocity(authority_lease_id, self.sequence, self.velocity)
     }
 
     fn parse(
@@ -189,24 +184,16 @@ impl AgentManualVelocityV1 {
         forward_velocity_mps: f64,
         yaw_rate_rad_s: f64,
     ) -> Result<Self, AgentControlRequestParseError> {
-        if !forward_velocity_mps.is_finite() {
-            return Err(AgentControlRequestParseError::NonFiniteManualVelocity {
-                request_id,
-                component: ManualVelocityComponentV1::ForwardVelocityMps,
-                value: forward_velocity_mps,
-            });
-        }
-        if !yaw_rate_rad_s.is_finite() {
-            return Err(AgentControlRequestParseError::NonFiniteManualVelocity {
-                request_id,
-                component: ManualVelocityComponentV1::YawRateRadS,
-                value: yaw_rate_rad_s,
-            });
-        }
+        let velocity = FiniteManualVelocityV1::parse(forward_velocity_mps, yaw_rate_rad_s)
+            .map_err(
+                |source| AgentControlRequestParseError::NonFiniteManualVelocity {
+                    request_id,
+                    source,
+                },
+            )?;
         Ok(Self {
             sequence: ManualDriveSequence::from_raw(sequence),
-            forward_velocity_mps,
-            yaw_rate_rad_s,
+            velocity,
         })
     }
 }
@@ -225,27 +212,15 @@ impl AgentManualStopV1 {
 
     /// Bind this explicit stop to the supervisor adapter's exact lease type.
     ///
-    /// The returned DTO still requires normal `ManualDriveCore` admission; in
-    /// particular, parsing this request alone does not prove a stop was sent or
-    /// applied by the base controller.
-    pub const fn into_weak_manual_drive_dto<LeaseId>(
+    /// The returned command still requires normal `ManualDriveCore` admission;
+    /// in particular, parsing this request alone does not prove a stop was sent
+    /// or applied by the base controller.
+    pub const fn bind_to_manual_lease<LeaseId>(
         self,
         authority_lease_id: LeaseId,
-    ) -> ManualDriveCommandDto<LeaseId> {
-        ManualDriveCommandDto {
-            schema_version: MANUAL_DRIVE_COMMAND_V1,
-            authority_lease_id,
-            sequence: self.sequence.get(),
-            command: ManualDriveCommandKindDto::Stop,
-        }
+    ) -> ManualDriveParsedCommand<LeaseId> {
+        ManualDriveParsedCommand::stop(authority_lease_id, self.sequence)
     }
-}
-
-/// Manual velocity component named by a domain error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ManualVelocityComponentV1 {
-    ForwardVelocityMps,
-    YawRateRadS,
 }
 
 /// Stateful parser for one ordered control request stream.
@@ -369,8 +344,7 @@ pub enum AgentControlRequestParseError {
     },
     NonFiniteManualVelocity {
         request_id: AgentControlRequestId,
-        component: ManualVelocityComponentV1,
-        value: f64,
+        source: FiniteManualVelocityParseError,
     },
     MapPoint {
         request_id: AgentControlRequestId,
@@ -445,12 +419,9 @@ impl fmt::Display for AgentControlRequestParseError {
                 previous.get(),
                 current.get()
             ),
-            Self::NonFiniteManualVelocity {
-                component, value, ..
-            } => write!(
-                formatter,
-                "manual velocity component {component:?} must be finite SI data, got {value}"
-            ),
+            Self::NonFiniteManualVelocity { source, .. } => {
+                write!(formatter, "invalid manual velocity: {source}")
+            }
             Self::MapPoint { source, .. } => {
                 write!(formatter, "invalid map-point command: {source}")
             }
@@ -462,6 +433,7 @@ impl std::error::Error for AgentControlRequestParseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Json(source) => Some(source),
+            Self::NonFiniteManualVelocity { source, .. } => Some(source),
             Self::MapPoint { source, .. } => Some(source),
             _ => None,
         }
@@ -482,6 +454,7 @@ enum AgentControlCommandV1Dto {
     QueryStatus {},
     MapOnly {},
     Stop {},
+    BeginManual {},
     ManualVelocity {
         sequence: u64,
         forward_velocity_mps: f64,
@@ -510,6 +483,7 @@ impl AgentControlCommandV1Dto {
             Self::QueryStatus {} => Ok(AgentControlCommandV1::QueryStatus),
             Self::MapOnly {} => Ok(AgentControlCommandV1::MapOnly),
             Self::Stop {} => Ok(AgentControlCommandV1::Stop),
+            Self::BeginManual {} => Ok(AgentControlCommandV1::BeginManual),
             Self::ManualVelocity {
                 sequence,
                 forward_velocity_mps,
@@ -801,6 +775,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::navigation::ManualVelocityComponentV1;
 
     fn request(id: u64, command: Value) -> Vec<u8> {
         serde_json::to_vec(&json!({
@@ -817,6 +792,7 @@ mod tests {
             json!({"kind": "query_status"}),
             json!({"kind": "map_only"}),
             json!({"kind": "stop"}),
+            json!({"kind": "begin_manual"}),
             json!({
                 "kind": "manual_velocity",
                 "sequence": 0,
@@ -839,6 +815,7 @@ mod tests {
             AgentControlCommandKindV1::QueryStatus,
             AgentControlCommandKindV1::MapOnly,
             AgentControlCommandKindV1::Stop,
+            AgentControlCommandKindV1::BeginManual,
             AgentControlCommandKindV1::ManualVelocity,
             AgentControlCommandKindV1::ManualStop,
             AgentControlCommandKindV1::FrontierExplore,
@@ -858,7 +835,7 @@ mod tests {
 
         let selected = parser
             .parse_next(&request(
-                10,
+                11,
                 json!({
                     "kind": "select_map_point",
                     "map_epoch_id": 11,
@@ -877,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_commands_convert_explicitly_to_the_existing_weak_envelope() {
+    fn manual_commands_bind_once_parsed_values_to_the_exact_manual_lease() {
         let mut parser = AgentControlRequestParser::new();
         let velocity = parser
             .parse_next(&request(
@@ -889,21 +866,19 @@ mod tests {
                     "yaw_rate_rad_s": -2.0e100
                 }),
             ))
-            .expect("finite values remain weak until configured admission");
+            .expect("finite values remain unadmitted until configured admission");
         let AgentControlCommandV1::ManualVelocity(velocity) = velocity.command() else {
             panic!("expected velocity");
         };
-        let weak = velocity.into_weak_manual_drive_dto(NonZeroU64::new(7).expect("lease"));
-        assert_eq!(weak.schema_version, MANUAL_DRIVE_COMMAND_V1);
-        assert_eq!(weak.sequence, 17);
-        assert_eq!(weak.authority_lease_id.get(), 7);
-        assert!(matches!(
-            weak.command,
-            ManualDriveCommandKindDto::Velocity {
-                forward_velocity_mps,
-                yaw_rate_rad_s,
-            } if forward_velocity_mps == 1.0e100 && yaw_rate_rad_s == -2.0e100
-        ));
+        let parsed =
+            velocity.bind_to_manual_lease(NonZeroU64::new(7).expect("nonzero lease identity"));
+        assert_eq!(parsed.sequence().get(), 17);
+        assert_eq!(parsed.authority_lease_id().get(), 7);
+        let finite = parsed
+            .finite_velocity()
+            .expect("velocity command retains finite proof");
+        assert_eq!(finite.forward_velocity_mps(), 1.0e100);
+        assert_eq!(finite.yaw_rate_rad_s(), -2.0e100);
 
         let stop = parser
             .parse_next(&request(2, json!({"kind": "manual_stop", "sequence": 18})))
@@ -911,9 +886,9 @@ mod tests {
         let AgentControlCommandV1::ManualStop(stop) = stop.command() else {
             panic!("expected stop");
         };
-        let weak = stop.into_weak_manual_drive_dto(7_u64);
-        assert_eq!(weak.sequence, 18);
-        assert_eq!(weak.command, ManualDriveCommandKindDto::Stop);
+        let parsed = stop.bind_to_manual_lease(7_u64);
+        assert_eq!(parsed.sequence().get(), 18);
+        assert!(parsed.is_explicit_stop());
     }
 
     #[test]
@@ -929,17 +904,19 @@ mod tests {
                     "yaw_rate_rad_s": -0.0
                 }),
             ))
-            .expect("finite weak velocity boundary");
+            .expect("finite velocity boundary");
         let AgentControlCommandV1::ManualVelocity(velocity) = parsed.command() else {
             panic!("zero-valued velocity must remain a velocity intent");
         };
         assert_eq!(velocity.sequence(), ManualDriveSequence::from_raw(0));
         assert_eq!(velocity.forward_velocity_mps(), 0.0);
         assert_eq!(velocity.yaw_rate_rad_s(), 0.0);
-        assert!(matches!(
-            velocity.into_weak_manual_drive_dto(1_u64).command,
-            ManualDriveCommandKindDto::Velocity { .. }
-        ));
+        assert!(
+            velocity
+                .bind_to_manual_lease(1_u64)
+                .finite_velocity()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1107,17 +1084,19 @@ mod tests {
             AgentManualVelocityV1::parse(request_id, 0, f64::INFINITY, 0.0),
             Err(AgentControlRequestParseError::NonFiniteManualVelocity {
                 request_id: actual,
-                component: ManualVelocityComponentV1::ForwardVelocityMps,
-                ..
+                source,
             }) if actual == request_id
+                && source.component() == ManualVelocityComponentV1::ForwardVelocityMps
+                && source.value() == f64::INFINITY
         ));
         assert!(matches!(
             AgentManualVelocityV1::parse(request_id, 0, 0.0, f64::NAN),
             Err(AgentControlRequestParseError::NonFiniteManualVelocity {
                 request_id: actual,
-                component: ManualVelocityComponentV1::YawRateRadS,
-                ..
+                source,
             }) if actual == request_id
+                && source.component() == ManualVelocityComponentV1::YawRateRadS
+                && source.value().is_nan()
         ));
     }
 

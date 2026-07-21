@@ -22,6 +22,13 @@ navigation tick follows this order:
    `AppliedResult` relayed by the robot server; and
 5. only after exact, timely agreement may another MPC tick begin.
 
+The live worker enforces this as one `LiveMpcControlDriver` call whose success
+contains both the coordinator outcome and the matching applied receipt. Point
+goals and admitted manual body-twist commands use this same owner. Manual input
+is converted only to an expiring body-frame MPC reference; it has no direct
+PWM API. Explicit manual stop and deadman expiry still create a journaled zero
+safety decision and require an exact zero receipt.
+
 This makes the existing shadow record a valid previous-PWM input during an
 armed run: the process continues only after the same PWM was confirmed at the
 controller timer boundary. A timeout, malformed or mismatched result,

@@ -48,7 +48,7 @@ pub struct BoundedId {
 }
 
 impl BoundedId {
-    fn parse(field: &'static str, value: String) -> Result<Self, IdentifierError> {
+    pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, IdentifierError> {
         if value.is_empty()
             || value.len() > MAX_ID_BYTES
             || !value.bytes().all(|byte| {
@@ -310,6 +310,57 @@ impl PlantModelV1 {
     }
     pub fn wheelbase_m(self) -> f64 {
         self.wheelbase_m
+    }
+    /// Largest symmetric straight-line body speed covered by both calibrated
+    /// wheel velocity ranges.
+    pub fn maximum_symmetric_abs_forward_velocity_mps(self) -> f64 {
+        self.maximum_symmetric_abs_wheel_velocity_mps()
+    }
+    /// Largest wheel-speed magnitude supported in both directions by both
+    /// calibrated wheel envelopes.
+    pub(crate) fn maximum_symmetric_abs_wheel_velocity_mps(self) -> f64 {
+        self.left_velocity
+            .max
+            .min(-self.left_velocity.min)
+            .min(self.right_velocity.max)
+            .min(-self.right_velocity.min)
+            .max(0.0)
+    }
+    /// Whether every corner of a symmetric `(forward, yaw-rate)` command box
+    /// lies inside both calibrated wheel-velocity envelopes.
+    #[cfg(feature = "agent-runtime")]
+    pub(crate) fn supports_symmetric_body_velocity_box(
+        self,
+        maximum_abs_forward_velocity_mps: f64,
+        maximum_abs_yaw_rate_rad_s: f64,
+    ) -> bool {
+        if !maximum_abs_forward_velocity_mps.is_finite()
+            || maximum_abs_forward_velocity_mps < 0.0
+            || !maximum_abs_yaw_rate_rad_s.is_finite()
+            || maximum_abs_yaw_rate_rad_s < 0.0
+            || maximum_abs_yaw_rate_rad_s > self.max_abs_yaw_rate_rad_s
+        {
+            return false;
+        }
+        for forward_velocity_mps in [
+            -maximum_abs_forward_velocity_mps,
+            maximum_abs_forward_velocity_mps,
+        ] {
+            for yaw_rate_rad_s in [-maximum_abs_yaw_rate_rad_s, maximum_abs_yaw_rate_rad_s] {
+                let half_turn = 0.5 * self.wheelbase_m * yaw_rate_rad_s;
+                let left_velocity_mps = forward_velocity_mps - half_turn;
+                let right_velocity_mps = forward_velocity_mps + half_turn;
+                if !self.left_velocity.contains(left_velocity_mps)
+                    || !self.right_velocity.contains(right_velocity_mps)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    pub fn maximum_abs_yaw_rate_rad_s(self) -> f64 {
+        self.max_abs_yaw_rate_rad_s
     }
     pub fn evidence(self) -> PlantEvidenceV1 {
         self.evidence
