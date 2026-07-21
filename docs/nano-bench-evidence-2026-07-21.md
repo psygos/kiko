@@ -138,6 +138,92 @@ pose as the calibrated neutral. These runs prove bounded host ownership,
 window enforcement, and cleanup—not an unbounded or independently supervised
 production head controller.
 
+A later return-to-target qualification exposed an important failure mode. The
+first attempt started from the redundantly admitted raw pose
+`[2337, 2938, 2748, 2748]` in bow/curl/yaw/roll order. It used a 10-tick
+waypoint lead, goal speed 50 ticks/s, torque limits `[600, 400, 400, 400]`
+permille, a 100 ms control period, and a 2 s no-progress deadline. The head
+moved, but Curl made only two ticks of admitted progress and the controller
+returned `NoProgress` with 391 ticks still remaining. The then-running actor
+performed its four torque-disable cleanup writes. The operator reported that
+the gravity-loaded neck then fell. This was a failed return and demonstrated
+that torque-off cleanup alone is not a benign physical fallback for this
+assembly; it did not qualify the 10-tick policy.
+
+The waypoint lead was changed from 10 to 50 ticks while retaining the same
+50 ticks/s speed, torque limits, 100 ms control period, 2 s no-progress bound,
+and 20 s total motion bound. Recoverable kinematic errors were also given a
+narrow fallback: after a complete status-zero telemetry set, the actor writes
+all four exact present positions and reports completed writes with retained
+serial ownership only if every host write completes. The current source
+does not permit that fallback for clock regression, telemetry identity/order,
+device-status, read, or write faults, and it validates the complete telemetry
+set before using any position from it. A recovery write is still not a servo
+acknowledgement, proof that torque remains enabled, or a stopped-position
+readback, so it remains a failed return and is never relabelled as return
+success.
+
+The second physical attempt started from `[2211, 2576, 2858, 2906]` and reached
+the reviewed target `[2155, 2545, 2943, 2876]` in 18 four-joint waypoint write
+cycles. Completion required two consecutive stopped full-telemetry samples.
+The final evidence was:
+
+| Joint | First position | Second position | Both stopped | Load raw | Voltage raw | Temperature raw | Current raw | Device status raw |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| bow | 2160 | 2160 | yes | 48 | 120 | 32 | 1 | 0 |
+| curl | 2548 | 2548 | yes | 32 | 119 | 32 | 1 | 0 |
+| yaw | 2941 | 2941 | yes | 1048 | 119 | 37 | 0 | 0 |
+| roll | 2874 | 2874 | yes | 1048 | 119 | 37 | 0 | 0 |
+
+This proves one bounded raw-encoder return with stable stopped final samples;
+the final positions are within the configured target tolerance and are not
+misreported as exact equality to every requested target tick. The subsequent
+900,000 ms hold reached its configured limit and completed torque-disable
+writes for all four joints. At the frozen handoff point the commissioning
+process was no longer running, torque was disabled, and the neck was free to
+move rather than actively held. Continuous supervised hold, restart recovery,
+and cold-boot production ownership therefore remain unqualified.
+
+### Post-run head hardening (software evidence only)
+
+The source was hardened after the physical qualification above. These changes
+were not used by that physical run and must not be retroactively promoted into
+hardware evidence:
+
+- A motion-capable actor can now be created only by consuming one complete
+  parsed `ReturnToTargetConfig` and both physical-consent tokens. The public
+  return command takes no plan, target, bounds, device, or tuning arguments, so
+  values parsed for different owners cannot be cross-paired.
+- Return motion starts from two new command-time telemetry sets, not the older
+  startup-hold pose. Both sets must be stopped, status zero, canonical-ID
+  ordered, mutually agreeing, no more than 100 ms old, and individually span
+  no more than 100 ms across all four serial observations. The fresh pose is
+  re-admitted against the reviewed windows and per-joint travel limits.
+- Target completion, path-corridor, direction-regression, and startup-hold
+  readback tolerances now have distinct configuration meanings and enforced
+  ordering/travel invariants. A return cannot report success until the exact
+  four-joint target has itself completed one full host write batch, followed by
+  two stopped final telemetry sets.
+- The 20 s total motion and 2 s no-progress bounds now cap each serial request,
+  response, retry, and waypoint write rather than being checked only between
+  control cycles. An elapsed deadline before response I/O begins is recorded as
+  such and is not fabricated into an attempted-read error.
+- All four joints must pass the complete path corridor before a recovery-pose
+  capability exists. Partial waypoint/recovery batches preserve the precise
+  completed-write prefix, positions, original kinematic fault, and interrupted
+  I/O evidence.
+- Startup verification now rejects nonzero full-telemetry device status before
+  it can claim a natural hold. SIGINT/SIGTERM race startup and return work; the
+  commissioning CLI requests bounded cleanup immediately. Every return fault
+  now ends the commissioning lease rather than entering an unsupervised hold
+  for the configured 900 s maximum.
+
+Software-only aarch64 verification on the Nano passed 17
+`kiko-head-protocol` unit tests, 41 `kiko-head-runtime` library tests, and 8
+commissioning-binary tests. This proves the typed/simulated behavior above; no
+head process or physical servo command was run for this verification. A
+production continuously supervised natural-head owner remains open work.
+
 ## Controller firmware findings
 
 The Nano built and tested the checked-out `robot-server` and
@@ -355,6 +441,35 @@ parallel: OAK-frame translation `[0,-0.25,-0.20]` m. The host parses that
 geometry into bounded domain types and computes right-positive yaw and
 down-positive pitch, but this remains declared geometry rather than a measured
 extrinsic or servo-angle calibration.
+
+## Host live MPC control-driver verification
+
+The live `kiko-slam` navigation worker now owns physical actuation through one
+`LiveMpcControlDriver`. A successful physical tick is a single typed result
+containing both the coordinator safety decision and its exact KRP2 applied
+receipt. Its fixed ordering is previous-receipt preflight, coordinator/MPC and
+safety, then synchronous exact application. Preflight failure prevents the
+solve and send; coordinator failure prevents the send; application failure
+cannot be returned as a successful tick. The same owner exposes manual
+body-twist, explicit-stop, and deadman-stop inputs through the coordinator's
+ordinary local-costmap, MPC, safety, journal, and exact-receipt path. It does
+not expose a direct manual-to-PWM conversion.
+
+Host evidence for this slice:
+
+- three focused ordering/failure tests passed;
+- the complete `kiko-slam` library suite with `agent-runtime,actuation` passed:
+  1,047 tests, 0 failures;
+- strict Clippy passed for the library and live binary both with
+  `record,actuation` and with `record,actuation,agent-runtime`; and
+- the live binary compiled in `OAK_SYS_CHECK_ONLY=1` mode on macOS. That mode
+  validates the Rust integration surface but deliberately does not link or run
+  the native DepthAI bridge.
+
+No runtime or throughput improvement is claimed; no benchmark was run. The
+Nano was not reachable at `192.168.50.2` during this host verification, so this
+section is not deployment, camera, STM32, or physical-motion evidence. The
+temporary direct-PWM dashboard is not part of this production control path.
 
 ## Claims that remain open
 
