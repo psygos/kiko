@@ -27,8 +27,9 @@
 //! little-endian CRC-32/ISO-HDLC checksum over the header and class bytes.
 //!
 //! [`crate::map::MapInstanceId`] is deliberately absent. It is a process-local
-//! freshness token, so a loaded snapshot has no map instance ID and must be
-//! explicitly rebound by the live mapping/navigation coordinator.
+//! freshness token, so a loaded snapshot has no map instance ID. It can be
+//! rebound only after exact comparison with the final occupancy output of a
+//! retained dataset replay; that comparison is not live visual relocalization.
 
 use std::collections::TryReserveError;
 use std::ffi::OsString;
@@ -43,6 +44,7 @@ use super::occupancy::{
     HeightRangeError, HeightRangeMeters, OccupancyGridGeometry, OccupancyGridGeometryError,
     OccupancyGridSnapshot, WorldToOccupancy, WorldToOccupancyError,
 };
+use crate::map::{MapInstanceId, MapSnapshot};
 
 const MAGIC: [u8; 8] = *b"KIKO2DM\0";
 pub const OCCUPANCY_MAP_FORMAT_VERSION: u16 = 1;
@@ -568,6 +570,212 @@ struct ParsedHeader {
     revision: u64,
 }
 
+/// Capability proving that persisted and replay occupancy are exactly equal
+/// for every serialized domain field and cell.
+///
+/// The type must be visible to the sibling occupancy module, but its private
+/// field means only this verifier can construct it. This prevents another
+/// dense sibling from attaching a live identity without performing the exact
+/// comparison.
+pub(super) struct ExactReplayMatchProof(());
+
+/// A decoded occupancy artifact that deliberately has no process-local map
+/// identity.
+///
+/// This type is the warm-start boundary: it cannot be passed to navigation as
+/// a live map until [`Self::verify_replay_and_bind`] proves an exact match to
+/// final evidence from a retained sparse-map replay.
+#[derive(Debug)]
+pub struct PersistedOccupancyMap {
+    snapshot: OccupancyGridSnapshot,
+}
+
+impl PersistedOccupancyMap {
+    fn from_decoded(snapshot: OccupancyGridSnapshot) -> Self {
+        debug_assert_eq!(snapshot.map_instance_id(), None);
+        Self { snapshot }
+    }
+
+    /// Inspect the unbound artifact without granting it a live map identity.
+    pub fn snapshot(&self) -> &OccupancyGridSnapshot {
+        &self.snapshot
+    }
+
+    /// Verify every persisted field and cell against the final occupancy
+    /// output of a dataset replay, then attach that replay's process-local map
+    /// identity without copying the persisted cell buffer.
+    ///
+    /// A successful result proves that this occupancy artifact exactly matches
+    /// the supplied replay occupancy output. It does **not** prove that a
+    /// current live camera frame has relocalized in that map; motion admission
+    /// must still require fresh tracker localization evidence.
+    pub fn verify_replay_and_bind(
+        self,
+        replay: ReplayOccupancyEvidence,
+    ) -> Result<ReplayMatchedOccupancyMap, OccupancyReplayBindError> {
+        let proof = verify_exact_replay(&self.snapshot, &replay.occupancy_snapshot)?;
+        let snapshot = self
+            .snapshot
+            .bind_to_exact_replay(&replay.occupancy_snapshot, proof);
+        let sparse_map_snapshot = replay.sparse_map_snapshot;
+        Ok(ReplayMatchedOccupancyMap {
+            snapshot,
+            sparse_map_snapshot,
+        })
+    }
+}
+
+/// Sparse and occupancy outputs captured from one dataset replay.
+///
+/// Construction parses the weak `Option<MapInstanceId>` carried by a generic
+/// occupancy snapshot into a value whose sparse/occupancy identity cannot
+/// disagree. That identity check cannot itself prove replay quiescence or
+/// synchronization of the two revisions: the integration must capture both
+/// outputs behind the replay runtime's successful drain barrier.
+#[derive(Debug)]
+pub struct ReplayOccupancyEvidence {
+    sparse_map_snapshot: MapSnapshot,
+    occupancy_snapshot: OccupancyGridSnapshot,
+}
+
+impl ReplayOccupancyEvidence {
+    pub fn try_new(
+        sparse_map_snapshot: MapSnapshot,
+        occupancy_snapshot: OccupancyGridSnapshot,
+    ) -> Result<Self, ReplayOccupancyEvidenceError> {
+        let expected = sparse_map_snapshot.instance_id();
+        let actual = occupancy_snapshot
+            .map_instance_id()
+            .ok_or(ReplayOccupancyEvidenceError::UnboundOccupancySnapshot)?;
+        if actual != expected {
+            return Err(ReplayOccupancyEvidenceError::MapInstanceMismatch { expected, actual });
+        }
+        Ok(Self {
+            sparse_map_snapshot,
+            occupancy_snapshot,
+        })
+    }
+
+    pub fn sparse_map_snapshot(&self) -> MapSnapshot {
+        self.sparse_map_snapshot
+    }
+
+    pub fn occupancy_snapshot(&self) -> &OccupancyGridSnapshot {
+        &self.occupancy_snapshot
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayOccupancyEvidenceError {
+    UnboundOccupancySnapshot,
+    MapInstanceMismatch {
+        expected: MapInstanceId,
+        actual: MapInstanceId,
+    },
+}
+
+impl fmt::Display for ReplayOccupancyEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnboundOccupancySnapshot => formatter.write_str(
+                "dataset replay occupancy has no live map identity; persisted occupancy cannot establish one",
+            ),
+            Self::MapInstanceMismatch { expected, actual } => write!(
+                formatter,
+                "dataset replay occupancy belongs to map {}, but the retained sparse replay is map {}",
+                actual.as_u64(),
+                expected.as_u64()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplayOccupancyEvidenceError {}
+
+/// A loaded artifact proven byte-for-domain-field equivalent to final replay
+/// output and rebound to that replay's process-local map identity.
+///
+/// The name intentionally says `ReplayMatched`, not `Relocalized`: live visual
+/// relocalization is a separate tracker result.
+#[derive(Debug)]
+pub struct ReplayMatchedOccupancyMap {
+    snapshot: OccupancyGridSnapshot,
+    sparse_map_snapshot: MapSnapshot,
+}
+
+impl ReplayMatchedOccupancyMap {
+    pub fn sparse_map_snapshot(&self) -> MapSnapshot {
+        self.sparse_map_snapshot
+    }
+
+    pub fn map_instance_id(&self) -> MapInstanceId {
+        self.sparse_map_snapshot.instance_id()
+    }
+
+    pub fn snapshot(&self) -> &OccupancyGridSnapshot {
+        &self.snapshot
+    }
+
+    pub fn into_snapshot(self) -> OccupancyGridSnapshot {
+        self.snapshot
+    }
+}
+
+/// Exact persisted/replay field names. Floating-point values are compared by
+/// representation so a successful match means the artifact can be substituted
+/// without silently changing a transform or metric boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OccupancyReplayField {
+    GridWidthCells,
+    GridHeightCells,
+    ResolutionMetersPerCell,
+    LowerBoundMeters { axis: usize },
+    WorldToOccupancyRotation { row: usize, column: usize },
+    WorldToOccupancyTranslationMeters { axis: usize },
+    MinimumHeightMeters,
+    MaximumHeightMeters,
+    Revision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OccupancyReplayBindError {
+    FieldMismatch {
+        field: OccupancyReplayField,
+        persisted_bits: u64,
+        replayed_bits: u64,
+    },
+    CellClassMismatch {
+        index: usize,
+        persisted: u8,
+        replayed: u8,
+    },
+}
+
+impl fmt::Display for OccupancyReplayBindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FieldMismatch {
+                field,
+                persisted_bits,
+                replayed_bits,
+            } => write!(
+                formatter,
+                "persisted occupancy field {field:?} does not exactly match dataset replay (persisted={persisted_bits:#018x}, replayed={replayed_bits:#018x})"
+            ),
+            Self::CellClassMismatch {
+                index,
+                persisted,
+                replayed,
+            } => write!(
+                formatter,
+                "persisted occupancy cell {index} has class {persisted} but dataset replay has class {replayed}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OccupancyReplayBindError {}
+
 /// Encodes one snapshot without platform-dependent padding or byte order.
 pub fn encode_occupancy_map(
     snapshot: &OccupancyGridSnapshot,
@@ -609,6 +817,16 @@ pub fn decode_occupancy_map(
         })?;
     owned_cells.extend_from_slice(cells);
     Ok(snapshot_from_parsed(parsed, owned_cells))
+}
+
+/// Decode an untrusted in-memory artifact directly into the explicit unbound
+/// warm-start type. This performs the same single parse as
+/// [`decode_occupancy_map`]; no second validation pass or cell copy is added.
+pub fn decode_persisted_occupancy_map(
+    bytes: &[u8],
+    limits: OccupancyMapLimits,
+) -> Result<PersistedOccupancyMap, OccupancyMapDecodeError> {
+    decode_occupancy_map(bytes, limits).map(PersistedOccupancyMap::from_decoded)
 }
 
 /// Writes a map through a same-directory temporary file, synchronizes its
@@ -778,6 +996,118 @@ pub fn load_occupancy_map(
     }
     validate_payload(&header, &cells, stored_checksum)?;
     Ok(snapshot_from_parsed(parsed, cells))
+}
+
+/// Load an untrusted file directly into the explicit unbound warm-start type.
+/// The file is opened, bounded, parsed, and checksummed exactly once.
+pub fn load_persisted_occupancy_map(
+    path: impl AsRef<Path>,
+    limits: OccupancyMapLimits,
+) -> Result<PersistedOccupancyMap, OccupancyMapLoadError> {
+    load_occupancy_map(path, limits).map(PersistedOccupancyMap::from_decoded)
+}
+
+fn verify_exact_replay(
+    persisted: &OccupancyGridSnapshot,
+    replayed: &OccupancyGridSnapshot,
+) -> Result<ExactReplayMatchProof, OccupancyReplayBindError> {
+    fn require_exact(
+        field: OccupancyReplayField,
+        persisted_bits: u64,
+        replayed_bits: u64,
+    ) -> Result<(), OccupancyReplayBindError> {
+        if persisted_bits == replayed_bits {
+            Ok(())
+        } else {
+            Err(OccupancyReplayBindError::FieldMismatch {
+                field,
+                persisted_bits,
+                replayed_bits,
+            })
+        }
+    }
+
+    require_exact(
+        OccupancyReplayField::GridWidthCells,
+        u64::from(persisted.width()),
+        u64::from(replayed.width()),
+    )?;
+    require_exact(
+        OccupancyReplayField::GridHeightCells,
+        u64::from(persisted.height()),
+        u64::from(replayed.height()),
+    )?;
+    require_exact(
+        OccupancyReplayField::ResolutionMetersPerCell,
+        persisted.resolution_m().to_bits(),
+        replayed.resolution_m().to_bits(),
+    )?;
+    for axis in 0..2 {
+        require_exact(
+            OccupancyReplayField::LowerBoundMeters { axis },
+            persisted.lower_bound_m()[axis].to_bits(),
+            replayed.lower_bound_m()[axis].to_bits(),
+        )?;
+    }
+
+    let persisted_transform = persisted.world_to_occupancy();
+    let replayed_transform = replayed.world_to_occupancy();
+    let persisted_rotation = persisted_transform.rotation();
+    let replayed_rotation = replayed_transform.rotation();
+    for row in 0..3 {
+        for column in 0..3 {
+            require_exact(
+                OccupancyReplayField::WorldToOccupancyRotation { row, column },
+                persisted_rotation[row][column].to_bits(),
+                replayed_rotation[row][column].to_bits(),
+            )?;
+        }
+    }
+    let persisted_translation = persisted_transform.translation_m();
+    let replayed_translation = replayed_transform.translation_m();
+    for axis in 0..3 {
+        require_exact(
+            OccupancyReplayField::WorldToOccupancyTranslationMeters { axis },
+            persisted_translation[axis].to_bits(),
+            replayed_translation[axis].to_bits(),
+        )?;
+    }
+
+    require_exact(
+        OccupancyReplayField::MinimumHeightMeters,
+        persisted.height_range().minimum_m().to_bits(),
+        replayed.height_range().minimum_m().to_bits(),
+    )?;
+    require_exact(
+        OccupancyReplayField::MaximumHeightMeters,
+        persisted.height_range().maximum_m().to_bits(),
+        replayed.height_range().maximum_m().to_bits(),
+    )?;
+    require_exact(
+        OccupancyReplayField::Revision,
+        persisted.revision(),
+        replayed.revision(),
+    )?;
+
+    let persisted_cells = persisted.class_ids();
+    let replayed_cells = replayed.class_ids();
+    // Valid snapshots contain exactly width * height cells, and those exact
+    // dimensions were compared above. A separate runtime length error would
+    // therefore describe an unrepresentable state.
+    debug_assert_eq!(persisted_cells.len(), replayed_cells.len());
+    if let Some((index, (&persisted, &replayed))) = persisted_cells
+        .iter()
+        .zip(replayed_cells)
+        .enumerate()
+        .find(|(_, (persisted, replayed))| persisted != replayed)
+    {
+        return Err(OccupancyReplayBindError::CellClassMismatch {
+            index,
+            persisted,
+            replayed,
+        });
+    }
+    Ok(ExactReplayMatchProof(()))
 }
 
 fn encoded_parts(
@@ -1299,6 +1629,45 @@ mod tests {
         }
     }
 
+    fn replay_evidence(snapshot: &OccupancyGridSnapshot) -> ReplayOccupancyEvidence {
+        let sparse_map_snapshot = SlamMap::new().snapshot();
+        let occupancy_snapshot = snapshot
+            .try_duplicate()
+            .expect("duplicate small replay fixture")
+            .with_test_map_instance_id(sparse_map_snapshot.instance_id());
+        ReplayOccupancyEvidence::try_new(sparse_map_snapshot, occupancy_snapshot)
+            .expect("matching replay evidence")
+    }
+
+    fn assert_replay_field_mismatch(
+        persisted_encoding: &[u8],
+        maximum_cells: usize,
+        mutate_replay: impl FnOnce(&mut [u8]),
+        expected_field: OccupancyReplayField,
+    ) {
+        let mut replay_encoding = persisted_encoding.to_vec();
+        mutate_replay(&mut replay_encoding);
+        rewrite_checksum(&mut replay_encoding);
+        let replayed = decode_occupancy_map(&replay_encoding, limits(maximum_cells))
+            .expect("mutated replay fixture remains a valid occupancy snapshot");
+        let persisted = decode_persisted_occupancy_map(persisted_encoding, limits(maximum_cells))
+            .expect("decode typed persisted fixture");
+        match persisted
+            .verify_replay_and_bind(replay_evidence(&replayed))
+            .expect_err("changed replay field must reject persisted occupancy")
+        {
+            OccupancyReplayBindError::FieldMismatch {
+                field,
+                persisted_bits,
+                replayed_bits,
+            } => {
+                assert_eq!(field, expected_field);
+                assert_ne!(persisted_bits, replayed_bits);
+            }
+            other => panic!("unexpected replay bind error: {other}"),
+        }
+    }
+
     #[test]
     fn crc32_matches_standard_check_vector_across_updates() {
         let mut checksum = Crc32::new();
@@ -1380,6 +1749,172 @@ mod tests {
         let decoded = decode_occupancy_map(&encoded, limits(4)).expect("decode persisted map");
         assert_eq!(decoded.map_instance_id(), None);
         assert_exact_snapshot(&original, &decoded);
+    }
+
+    #[test]
+    fn replay_evidence_requires_a_bound_snapshot_from_the_retained_sparse_map() {
+        let sparse_map_snapshot = SlamMap::new().snapshot();
+        assert!(matches!(
+            ReplayOccupancyEvidence::try_new(sparse_map_snapshot, fixture(2, 2, 1)),
+            Err(ReplayOccupancyEvidenceError::UnboundOccupancySnapshot)
+        ));
+
+        let other_map_snapshot = SlamMap::new().snapshot();
+        let wrong_map_occupancy =
+            fixture(2, 2, 1).with_test_map_instance_id(other_map_snapshot.instance_id());
+        assert!(matches!(
+            ReplayOccupancyEvidence::try_new(sparse_map_snapshot, wrong_map_occupancy),
+            Err(ReplayOccupancyEvidenceError::MapInstanceMismatch {
+                expected,
+                actual,
+            }) if expected == sparse_map_snapshot.instance_id()
+                && actual == other_map_snapshot.instance_id()
+        ));
+    }
+
+    #[test]
+    fn exact_replay_match_rebinds_the_loaded_buffer_without_copying_it() {
+        let original = fixture(8, 6, 0x9a);
+        let encoded = encode_occupancy_map(&original).expect("encode persisted fixture");
+        let persisted = decode_persisted_occupancy_map(&encoded, limits(48))
+            .expect("decode typed persisted fixture");
+        assert_eq!(persisted.snapshot().map_instance_id(), None);
+        assert_eq!(persisted.snapshot().geometry().max_cells(), 48);
+        let persisted_cells = persisted.snapshot().class_ids().as_ptr();
+
+        let sparse_map_snapshot = SlamMap::new().snapshot();
+        let replayed = decode_occupancy_map(&encoded, limits(96))
+            .expect("decode replay fixture with its runtime bound")
+            .with_test_map_instance_id(sparse_map_snapshot.instance_id());
+        assert_eq!(replayed.geometry().max_cells(), 96);
+        let replay = ReplayOccupancyEvidence::try_new(sparse_map_snapshot, replayed)
+            .expect("matching replay evidence");
+        let expected_sparse_snapshot = replay.sparse_map_snapshot();
+        let matched = persisted
+            .verify_replay_and_bind(replay)
+            .expect("exact final replay must bind");
+
+        assert_eq!(matched.sparse_map_snapshot(), expected_sparse_snapshot);
+        assert_eq!(
+            matched.map_instance_id(),
+            expected_sparse_snapshot.instance_id()
+        );
+        assert_eq!(
+            matched.snapshot().map_instance_id(),
+            Some(expected_sparse_snapshot.instance_id())
+        );
+        assert_eq!(matched.snapshot().geometry().max_cells(), 96);
+        assert_eq!(matched.snapshot().class_ids().as_ptr(), persisted_cells);
+        assert_exact_snapshot(&original, matched.snapshot());
+    }
+
+    #[test]
+    fn replay_binding_rejects_dimension_and_cell_differences() {
+        let original = fixture(4, 3, 0x42);
+        let encoded = encode_occupancy_map(&original).expect("encode persisted fixture");
+
+        let different_geometry = fixture(3, 4, 0x42);
+        let persisted = decode_persisted_occupancy_map(&encoded, limits(12))
+            .expect("decode typed persisted fixture");
+        assert!(matches!(
+            persisted.verify_replay_and_bind(replay_evidence(&different_geometry)),
+            Err(OccupancyReplayBindError::FieldMismatch {
+                field: OccupancyReplayField::GridWidthCells,
+                ..
+            })
+        ));
+
+        let different_height = fixture(4, 4, 0x42);
+        let persisted = decode_persisted_occupancy_map(&encoded, limits(12))
+            .expect("decode typed persisted fixture");
+        assert!(matches!(
+            persisted.verify_replay_and_bind(replay_evidence(&different_height)),
+            Err(OccupancyReplayBindError::FieldMismatch {
+                field: OccupancyReplayField::GridHeightCells,
+                ..
+            })
+        ));
+
+        let mut different_cell_bytes = encoded.clone();
+        let cell_offset = OCCUPANCY_MAP_HEADER_BYTES + 5;
+        different_cell_bytes[cell_offset] = (different_cell_bytes[cell_offset] + 1) % 3;
+        rewrite_checksum(&mut different_cell_bytes);
+        let different_cell = decode_occupancy_map(&different_cell_bytes, limits(12))
+            .expect("decode valid different cell");
+        let persisted = decode_persisted_occupancy_map(&encoded, limits(12))
+            .expect("decode typed persisted fixture");
+        assert!(matches!(
+            persisted.verify_replay_and_bind(replay_evidence(&different_cell)),
+            Err(OccupancyReplayBindError::CellClassMismatch { index: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn replay_binding_compares_every_persisted_metadata_category_by_bits() {
+        let original = fixture(4, 3, 0x42);
+        let encoded = encode_occupancy_map(&original).expect("encode persisted fixture");
+
+        assert_replay_field_mismatch(
+            &encoded,
+            12,
+            |bytes| put_f64(bytes, 48, original.resolution_m() * 2.0),
+            OccupancyReplayField::ResolutionMetersPerCell,
+        );
+        for axis in 0..2 {
+            assert_replay_field_mismatch(
+                &encoded,
+                12,
+                |bytes| {
+                    put_f64(bytes, 56 + axis * 8, original.lower_bound_m()[axis] + 0.25);
+                },
+                OccupancyReplayField::LowerBoundMeters { axis },
+            );
+        }
+
+        assert_replay_field_mismatch(
+            &encoded,
+            12,
+            |bytes| {
+                let rotation = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+                for (index, value) in rotation.into_iter().flatten().enumerate() {
+                    put_f64(bytes, 72 + index * 8, value);
+                }
+            },
+            OccupancyReplayField::WorldToOccupancyRotation { row: 0, column: 0 },
+        );
+        for axis in 0..3 {
+            assert_replay_field_mismatch(
+                &encoded,
+                12,
+                |bytes| {
+                    put_f64(
+                        bytes,
+                        144 + axis * 8,
+                        original.world_to_occupancy().translation_m()[axis] + 0.25,
+                    );
+                },
+                OccupancyReplayField::WorldToOccupancyTranslationMeters { axis },
+            );
+        }
+
+        assert_replay_field_mismatch(
+            &encoded,
+            12,
+            |bytes| put_f64(bytes, 168, original.height_range().minimum_m() - 0.25),
+            OccupancyReplayField::MinimumHeightMeters,
+        );
+        assert_replay_field_mismatch(
+            &encoded,
+            12,
+            |bytes| put_f64(bytes, 176, original.height_range().maximum_m() + 0.25),
+            OccupancyReplayField::MaximumHeightMeters,
+        );
+        assert_replay_field_mismatch(
+            &encoded,
+            12,
+            |bytes| put_u64(bytes, 184, original.revision().wrapping_add(1)),
+            OccupancyReplayField::Revision,
+        );
     }
 
     #[test]
@@ -1606,8 +2141,10 @@ mod tests {
             fs::read(&destination).expect("read published map"),
             encode_occupancy_map(&first).expect("encode expected first map")
         );
-        let loaded = load_occupancy_map(&destination, limits(48)).expect("load published map");
-        assert_exact_snapshot(&first, &loaded);
+        let loaded = load_persisted_occupancy_map(&destination, limits(48))
+            .expect("load typed published map");
+        assert_eq!(loaded.snapshot().map_instance_id(), None);
+        assert_exact_snapshot(&first, loaded.snapshot());
         assert_no_temporary_files(directory.path());
 
         let replacement = fixture(4, 3, 12);

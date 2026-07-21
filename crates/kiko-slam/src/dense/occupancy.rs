@@ -1045,6 +1045,33 @@ impl OccupancyGridSnapshot {
         }
     }
 
+    /// Replace persistence-only context with the exact live context from a
+    /// replay snapshot after the persistence verifier has proven every stored
+    /// field and cell equivalent.
+    ///
+    /// The proof's private constructor makes this mutation unavailable to
+    /// other dense siblings even though Rust requires sibling-facing
+    /// visibility on this method. Copying the replay metadata and geometry
+    /// also preserves its process-local identity and runtime allocation bound;
+    /// the persisted cell buffer remains in place.
+    pub(super) fn bind_to_exact_replay(
+        mut self,
+        replayed: &Self,
+        _proof: super::occupancy_persistence::ExactReplayMatchProof,
+    ) -> Self {
+        debug_assert!(self.metadata.map_instance_id.is_none());
+        debug_assert!(replayed.metadata.map_instance_id.is_some());
+        self.metadata = replayed.metadata;
+        self.geometry = replayed.geometry;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_map_instance_id(mut self, map_instance_id: MapInstanceId) -> Self {
+        self.metadata.map_instance_id = Some(map_instance_id);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_cells(
         geometry: OccupancyGridGeometry,
