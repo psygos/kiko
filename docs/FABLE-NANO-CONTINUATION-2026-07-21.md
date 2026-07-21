@@ -228,6 +228,32 @@ and do not reset, clean, bulk-copy, or commit the aggregate tree.
 - native Rust SLAM remains blocked by the missing pinned native DepthAI
   headers/library, and old binaries also lacked `libonnxruntime.so.1`.
 
+### Concurrent Nano-only motor draft discovered during handoff
+
+After the continuation was first copied, a new modification appeared only in
+the Nano integration worktree:
+
+- path: `embedded/src/motor_commission.rs`;
+- observed mtime: `2026-07-21T07:22:05.756626643+05:30`;
+- file SHA-256:
+  `dae860f9ca8a712832f48c8417dd58d0b580ad29a5c2020114fd14e804c73657`;
+- binary-diff SHA-256:
+  `3b8a81c953b760d52624bfa5a28e01082a3c18a40ac2181976c78f23c6c7e678`;
+- diff size: 260 insertions and 28 deletions.
+
+It adds an uncommitted `BothRamp50Pct20S` KMC3 commissioning recipe: both
+protocol-positive motor outputs, a 500 ms zero dwell, then a nominal 20-second
+triangle from 1% to 50% and back to 1%, with a new command byte and watchdog
+configuration. This materially increases the physical test envelope beyond the
+documented 30% / 500 ms single-channel pulses.
+
+The author and intent were not established. The file was not present in the
+earlier Nano status snapshot and is absent from the Mac dirty tree. There is no
+evidence in this handoff that it was built, flashed, or executed. Preserve it as
+possible concurrent/unrelated work, identify its owner, and review it
+independently. **Do not build, flash, trigger, copy, merge, or infer operator
+approval for this recipe.** Wheel state is unknown and Nano work is paused.
+
 Do not run `git pull`, `git reset`, `git clean`, or a bulk rsync on either
 worktree. Their committed bases and dirty slices differ intentionally.
 
