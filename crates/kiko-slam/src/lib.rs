@@ -3,8 +3,9 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 pub use inference::{
-    EigenPlaces, InferenceBackend, InferenceError, LightGlue, PlaceDescriptorExtractor, SuperPoint,
-    WatchdogConfigError,
+    EigenPlaces, InferenceBackend, InferenceError, LightGlue, OrtRuntimePinError,
+    OrtRuntimePinOperation, PinnedOrtRuntime, PlaceDescriptorExtractor, SuperPoint,
+    WatchdogConfigError, pin_ort_runtime_from_memory,
 };
 mod channel;
 pub mod dataset;

@@ -3,8 +3,16 @@ use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use std::cell::Cell;
 use std::ffi::CStr;
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::future::Future;
+#[cfg(target_os = "linux")]
+use std::io::Write;
 use std::num::NonZeroUsize;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -37,10 +45,15 @@ pub enum InferenceError {
         path: PathBuf,
         source: OrtError,
     },
+    MemoryLoadFailed {
+        model: &'static str,
+        source: OrtError,
+    },
     ModelFileUnavailable {
         path: PathBuf,
         source: std::io::Error,
     },
+    RuntimePin(OrtRuntimePinError),
 
     Execution(OrtError),
 
@@ -122,9 +135,11 @@ impl std::error::Error for InferenceError {
         match self {
             Self::RuntimeLoadFailed { source, .. }
             | Self::LoadFailed { source, .. }
+            | Self::MemoryLoadFailed { source, .. }
             | Self::Execution(source)
             | Self::SessionConfiguration { source }
             | Self::OutputDecode { source, .. } => Some(source),
+            Self::RuntimePin(source) => Some(source),
             Self::Environment(source) => Some(source),
             Self::InvalidWatchdog(source) => Some(source),
             Self::HostParallelism { source } => Some(source),
@@ -203,11 +218,20 @@ impl std::fmt::Display for InferenceError {
             InferenceError::LoadFailed { path, source } => {
                 write!(f, "failed to load model at {}: {source}", path.display())
             }
+            InferenceError::MemoryLoadFailed { model, source } => {
+                write!(
+                    f,
+                    "failed to load {model} model from retained bytes: {source}"
+                )
+            }
             InferenceError::ModelFileUnavailable { path, source } => write!(
                 f,
                 "model file is unavailable at {}: {source}",
                 path.display()
             ),
+            InferenceError::RuntimePin(source) => {
+                write!(f, "failed to pin retained ONNX Runtime bytes: {source}")
+            }
             InferenceError::Execution(e) => write!(f, "execution error: {e}"),
             InferenceError::SessionConfiguration { source } => {
                 write!(f, "session configuration error: {source}")
@@ -319,6 +343,114 @@ impl std::fmt::Display for InferenceError {
     }
 }
 
+/// Failure to turn retained ONNX Runtime bytes into the process runtime.
+#[derive(Debug)]
+pub enum OrtRuntimePinError {
+    UnsupportedPlatform {
+        target_os: &'static str,
+    },
+    InitializationStatePoisoned,
+    AlreadyInitializedFromPath {
+        path: PathBuf,
+    },
+    RuntimeIdentityMismatch {
+        pinned_bytes: usize,
+        supplied_bytes: usize,
+    },
+    MemfdIo {
+        operation: OrtRuntimePinOperation,
+        source: std::io::Error,
+    },
+    MissingMemfdSeals {
+        required: i32,
+        observed: i32,
+    },
+    EnvironmentAlreadyInitialized,
+    InitializationIndeterminate,
+}
+
+impl std::fmt::Display for OrtRuntimePinError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedPlatform { target_os } => write!(
+                formatter,
+                "retained shared-library loading is unsupported on {target_os}"
+            ),
+            Self::InitializationStatePoisoned => {
+                formatter.write_str("the ONNX Runtime initialization state is poisoned")
+            }
+            Self::AlreadyInitializedFromPath { path } => write!(
+                formatter,
+                "ONNX Runtime was already initialized from {}",
+                path.display()
+            ),
+            Self::RuntimeIdentityMismatch {
+                pinned_bytes,
+                supplied_bytes,
+            } => write!(
+                formatter,
+                "a different ONNX Runtime is already pinned (pinned_bytes={pinned_bytes}, supplied_bytes={supplied_bytes})"
+            ),
+            Self::MemfdIo { operation, source } => {
+                write!(formatter, "Linux memfd {operation} failed: {source}")
+            }
+            Self::MissingMemfdSeals { required, observed } => write!(
+                formatter,
+                "Linux memfd seal verification failed (required={required:#x}, observed={observed:#x})"
+            ),
+            Self::EnvironmentAlreadyInitialized => formatter.write_str(
+                "the ORT environment was already initialized outside the retained-runtime boundary",
+            ),
+            Self::InitializationIndeterminate => formatter.write_str(
+                "an earlier retained-runtime initialization reached ORT but could not prove which library ORT retained",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OrtRuntimePinError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MemfdIo { source, .. } => Some(source),
+            Self::UnsupportedPlatform { .. }
+            | Self::InitializationStatePoisoned
+            | Self::AlreadyInitializedFromPath { .. }
+            | Self::RuntimeIdentityMismatch { .. }
+            | Self::MissingMemfdSeals { .. }
+            | Self::EnvironmentAlreadyInitialized
+            | Self::InitializationIndeterminate => None,
+        }
+    }
+}
+
+impl From<OrtRuntimePinError> for InferenceError {
+    fn from(error: OrtRuntimePinError) -> Self {
+        Self::RuntimePin(error)
+    }
+}
+
+/// Fallible Linux operation used while pinning retained runtime bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrtRuntimePinOperation {
+    Create,
+    Write,
+    AddSeals,
+    InspectSeals,
+    Compare,
+}
+
+impl std::fmt::Display for OrtRuntimePinOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Create => "creation",
+            Self::Write => "write",
+            Self::AddSeals => "sealing",
+            Self::InspectSeals => "seal inspection",
+            Self::Compare => "identity comparison",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchdogConfigError {
     ZeroTimeout {
@@ -368,6 +500,81 @@ impl From<WatchdogConfigError> for InferenceError {
 }
 pub use lightglue::LightGlue;
 pub use superpoint::SuperPoint;
+
+/// Proof that this process initialized ORT from one exact retained byte image.
+///
+/// The token is intentionally not constructible by callers. On Linux it is
+/// issued only after the bytes have been copied into a sealed memfd, ORT has
+/// loaded that descriptor path, and the descriptor has been retained for the
+/// rest of the process. Passing the token to an in-memory model constructor
+/// prevents that constructor from consulting `ORT_DYLIB_PATH`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnedOrtRuntime {
+    _private: (),
+}
+
+/// Initialize ONNX Runtime from exact retained shared-library bytes.
+///
+/// This must be the first ORT initialization in the process. Repeating the
+/// call with byte-for-byte identical input is idempotent; a pathname-backed
+/// runtime, different bytes, or an already configured external ORT
+/// environment is a typed failure.
+#[cfg(target_os = "linux")]
+pub fn pin_ort_runtime_from_memory(
+    runtime_bytes: &[u8],
+) -> Result<PinnedOrtRuntime, InferenceError> {
+    let mut state = lock_ort_runtime_state()?;
+    match state.as_mut() {
+        Some(OrtRuntimeState::Retained(runtime)) => {
+            if runtime.matches(runtime_bytes)? {
+                return Ok(PinnedOrtRuntime { _private: () });
+            }
+            return Err(OrtRuntimePinError::RuntimeIdentityMismatch {
+                pinned_bytes: runtime.byte_len,
+                supplied_bytes: runtime_bytes.len(),
+            }
+            .into());
+        }
+        Some(OrtRuntimeState::Path(path)) => {
+            return Err(
+                OrtRuntimePinError::AlreadyInitializedFromPath { path: path.clone() }.into(),
+            );
+        }
+        Some(OrtRuntimeState::Indeterminate) => {
+            return Err(OrtRuntimePinError::InitializationIndeterminate.into());
+        }
+        None => {}
+    }
+
+    let runtime = RetainedLinuxOrtRuntime::try_new(runtime_bytes)?;
+    let runtime_path = runtime.descriptor_path();
+    let preflight = preflight_ort_runtime(&runtime_path)?;
+    let environment =
+        ort::init_from(&runtime_path).map_err(|source| InferenceError::RuntimeLoadFailed {
+            path: runtime_path.clone(),
+            source,
+        })?;
+    if !environment.commit() {
+        *state = Some(OrtRuntimeState::Indeterminate);
+        return Err(OrtRuntimePinError::EnvironmentAlreadyInitialized.into());
+    }
+    drop(preflight);
+    *state = Some(OrtRuntimeState::Retained(runtime));
+
+    Ok(PinnedOrtRuntime { _private: () })
+}
+
+/// Non-Linux hosts keep compiling, but cannot truthfully provide the sealed
+/// descriptor guarantee used by the production Nano boundary.
+#[cfg(not(target_os = "linux"))]
+pub fn pin_ort_runtime_from_memory(
+    _runtime_bytes: &[u8],
+) -> Result<PinnedOrtRuntime, InferenceError> {
+    Err(OrtRuntimePinError::UnsupportedPlatform {
+        target_os: std::env::consts::OS,
+    }
+    .into())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WatchdogDuration(u64);
@@ -807,19 +1014,175 @@ fn cpu_provider_may_be_configured(requested_backend: InferenceBackend) -> bool {
     )
 }
 
+enum OrtRuntimeState {
+    Path(PathBuf),
+    #[cfg(target_os = "linux")]
+    Retained(RetainedLinuxOrtRuntime),
+    Indeterminate,
+}
+
+static ORT_RUNTIME_STATE: Mutex<Option<OrtRuntimeState>> = Mutex::new(None);
+
+fn lock_ort_runtime_state()
+-> Result<std::sync::MutexGuard<'static, Option<OrtRuntimeState>>, InferenceError> {
+    ORT_RUNTIME_STATE
+        .lock()
+        .map_err(|_| OrtRuntimePinError::InitializationStatePoisoned.into())
+}
+
+#[cfg(target_os = "linux")]
+struct RetainedLinuxOrtRuntime {
+    file: File,
+    byte_len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl RetainedLinuxOrtRuntime {
+    const MEMFD_NAME: &[u8] = b"kiko-onnxruntime\0";
+    const REQUIRED_SEALS: i32 =
+        libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+
+    #[allow(unsafe_code)]
+    fn try_new(bytes: &[u8]) -> Result<Self, InferenceError> {
+        // SAFETY: MEMFD_NAME is a static NUL-terminated byte string and the
+        // flag bits are the documented Linux memfd_create flags.
+        let descriptor = unsafe {
+            libc::memfd_create(
+                Self::MEMFD_NAME.as_ptr().cast(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        if descriptor < 0 {
+            return Err(memfd_io_error(
+                OrtRuntimePinOperation::Create,
+                std::io::Error::last_os_error(),
+            ));
+        }
+
+        // SAFETY: memfd_create returned a new owned descriptor and this is its
+        // single transfer into File.
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        file.write_all(bytes)
+            .map_err(|source| memfd_io_error(OrtRuntimePinOperation::Write, source))?;
+
+        // SAFETY: file owns a valid memfd descriptor. F_ADD_SEALS accepts the
+        // documented integer seal mask passed as its variadic third argument.
+        let seal_result =
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, Self::REQUIRED_SEALS) };
+        if seal_result < 0 {
+            return Err(memfd_io_error(
+                OrtRuntimePinOperation::AddSeals,
+                std::io::Error::last_os_error(),
+            ));
+        }
+
+        // SAFETY: file remains open and F_GET_SEALS takes no variadic argument.
+        let observed_seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+        if observed_seals < 0 {
+            return Err(memfd_io_error(
+                OrtRuntimePinOperation::InspectSeals,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if observed_seals & Self::REQUIRED_SEALS != Self::REQUIRED_SEALS {
+            return Err(OrtRuntimePinError::MissingMemfdSeals {
+                required: Self::REQUIRED_SEALS,
+                observed: observed_seals,
+            }
+            .into());
+        }
+
+        Ok(Self {
+            file,
+            byte_len: bytes.len(),
+        })
+    }
+
+    fn descriptor_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    fn matches(&self, expected: &[u8]) -> Result<bool, InferenceError> {
+        if self.byte_len != expected.len() {
+            return Ok(false);
+        }
+
+        let mut offset = 0_usize;
+        let mut buffer = [0_u8; 8 * 1_024];
+        while offset < expected.len() {
+            let count = buffer.len().min(expected.len() - offset);
+            let file_offset = u64::try_from(offset).map_err(|_| {
+                memfd_io_error(
+                    OrtRuntimePinOperation::Compare,
+                    std::io::Error::other("runtime byte offset is not representable as u64"),
+                )
+            })?;
+            self.file
+                .read_exact_at(&mut buffer[..count], file_offset)
+                .map_err(|source| memfd_io_error(OrtRuntimePinOperation::Compare, source))?;
+            if buffer[..count] != expected[offset..offset + count] {
+                return Ok(false);
+            }
+            offset += count;
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn memfd_io_error(operation: OrtRuntimePinOperation, source: std::io::Error) -> InferenceError {
+    OrtRuntimePinError::MemfdIo { operation, source }.into()
+}
+
 fn build_session(
     path: &std::path::Path,
     backend: InferenceBackend,
 ) -> Result<(ManagedSession, InferenceBackend), InferenceError> {
     let settings = SessionSettings::from_environment(backend)?;
     ensure_ort_runtime()?;
-    let mut builder = Session::builder().map_err(|e| InferenceError::LoadFailed {
+    let builder = Session::builder().map_err(|e| InferenceError::LoadFailed {
         path: path.to_path_buf(),
         source: e,
     })?;
 
+    let (mut builder, selected) = configure_session_builder(builder, backend, &settings)?;
+
+    let session = builder
+        .commit_from_file(path)
+        .map_err(|e| InferenceError::LoadFailed {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+    Ok((ManagedSession::new(session, settings.watchdog), selected))
+}
+
+fn build_session_from_memory(
+    model: &'static str,
+    model_bytes: &[u8],
+    backend: InferenceBackend,
+    _runtime: PinnedOrtRuntime,
+) -> Result<(ManagedSession, InferenceBackend), InferenceError> {
+    let settings = SessionSettings::from_environment(backend)?;
+    let builder =
+        Session::builder().map_err(|source| InferenceError::MemoryLoadFailed { model, source })?;
+
+    let (mut builder, selected) = configure_session_builder(builder, backend, &settings)?;
+
+    let session = builder
+        .commit_from_memory(model_bytes)
+        .map_err(|source| InferenceError::MemoryLoadFailed { model, source })?;
+
+    Ok((ManagedSession::new(session, settings.watchdog), selected))
+}
+
+fn configure_session_builder(
+    mut builder: ort::session::builder::SessionBuilder,
+    backend: InferenceBackend,
+    settings: &SessionSettings,
+) -> Result<(ort::session::builder::SessionBuilder, InferenceBackend), InferenceError> {
     let selection = backend::select_backend(backend, settings.cpu_arena)?;
-    builder = apply_session_config(builder, selection.selected(), &settings)?;
+    builder = apply_session_config(builder, selection.selected(), settings)?;
     if selection.strict_accelerator() {
         builder = builder
             .with_disable_cpu_fallback()
@@ -831,17 +1194,7 @@ fn build_session(
             .map_err(session_configuration_error)?;
     }
 
-    let session = builder
-        .commit_from_file(path)
-        .map_err(|e| InferenceError::LoadFailed {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-
-    Ok((
-        ManagedSession::new(session, settings.watchdog),
-        selection.selected(),
-    ))
+    Ok((builder, selection.selected()))
 }
 
 fn session_configuration_error(
@@ -853,6 +1206,20 @@ fn session_configuration_error(
 }
 
 fn ensure_ort_runtime() -> Result<(), InferenceError> {
+    let mut state = lock_ort_runtime_state()?;
+    match state.as_ref() {
+        Some(OrtRuntimeState::Indeterminate) => {
+            return Err(OrtRuntimePinError::InitializationIndeterminate.into());
+        }
+        Some(OrtRuntimeState::Path(path)) => {
+            let _initialized_path = path;
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        Some(OrtRuntimeState::Retained(_)) => return Ok(()),
+        None => {}
+    }
+
     let path = std::env::var_os("ORT_DYLIB_PATH")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -864,8 +1231,12 @@ fn ensure_ort_runtime() -> Result<(), InferenceError> {
             path: resolved_path.clone(),
             source,
         })?;
-    let _ = environment.commit();
+    if !environment.commit() {
+        *state = Some(OrtRuntimeState::Indeterminate);
+        return Err(OrtRuntimePinError::EnvironmentAlreadyInitialized.into());
+    }
     drop(preflight);
+    *state = Some(OrtRuntimeState::Path(resolved_path));
     Ok(())
 }
 
@@ -1003,12 +1374,16 @@ fn parse_opt_level(key: &str, raw: String) -> Result<GraphOptimizationLevel, Inf
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::RetainedLinuxOrtRuntime;
     use super::{
         ACTIVE_WATCHDOG_LIMITS, AsyncIntraThreadPolicy, InferenceBackend, InferenceError,
-        OrtThreadCount, WatchdogConfigError, WatchdogDuration, WatchdogLimits, WatchdogScope,
-        cpu_provider_may_be_configured, parse_opt_level, preflight_ort_runtime, run_with_limits,
-        run_with_limits_at, run_with_watchdog,
+        OrtThreadCount, PinnedOrtRuntime, WatchdogConfigError, WatchdogDuration, WatchdogLimits,
+        WatchdogScope, cpu_provider_may_be_configured, parse_opt_level, preflight_ort_runtime,
+        run_with_limits, run_with_limits_at, run_with_watchdog,
     };
+    #[cfg(not(target_os = "linux"))]
+    use super::{OrtRuntimePinError, pin_ort_runtime_from_memory};
     use ort::session::builder::GraphOptimizationLevel;
     use std::cell::Cell;
     use std::num::NonZeroUsize;
@@ -1412,5 +1787,82 @@ mod tests {
             preflight_ort_runtime(&missing),
             Err(InferenceError::RuntimeLibraryUnavailable { .. })
         ));
+    }
+
+    #[test]
+    fn retained_model_constructor_signatures_require_the_runtime_proof() {
+        let _superpoint_default: fn(
+            &[u8],
+            PinnedOrtRuntime,
+        ) -> Result<super::SuperPoint, InferenceError> = super::SuperPoint::new_from_memory;
+        let _superpoint_backend: fn(
+            &[u8],
+            PinnedOrtRuntime,
+            InferenceBackend,
+        ) -> Result<super::SuperPoint, InferenceError> =
+            super::SuperPoint::new_from_memory_with_backend;
+        let _lightglue_default: fn(
+            &[u8],
+            PinnedOrtRuntime,
+        ) -> Result<super::LightGlue, InferenceError> = super::LightGlue::new_from_memory;
+        let _lightglue_backend: fn(
+            &[u8],
+            PinnedOrtRuntime,
+            InferenceBackend,
+        ) -> Result<super::LightGlue, InferenceError> =
+            super::LightGlue::new_from_memory_with_backend;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn retained_runtime_pinning_is_a_typed_unsupported_operation_off_linux() {
+        assert!(matches!(
+            pin_ort_runtime_from_memory(b"not-a-runtime"),
+            Err(InferenceError::RuntimePin(
+                OrtRuntimePinError::UnsupportedPlatform { target_os }
+            )) if target_os == std::env::consts::OS
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_runtime_memfd_is_exact_and_immutable() {
+        use std::os::unix::fs::FileExt;
+
+        let bytes = b"retained-runtime-fixture";
+        let runtime =
+            RetainedLinuxOrtRuntime::try_new(bytes).expect("fixture bytes enter a sealed memfd");
+
+        assert!(runtime.matches(bytes).expect("compare identical bytes"));
+        assert!(
+            !runtime
+                .matches(b"retained-runtime-fixturE")
+                .expect("compare different bytes")
+        );
+        assert!(
+            !runtime
+                .matches(b"retained-runtime-fixture-longer")
+                .expect("compare different lengths")
+        );
+        assert!(runtime.file.write_at(b"X", 0).is_err());
+        assert!(runtime.file.set_len(1).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn retained_runtime_memfd_has_every_required_seal() {
+        use std::os::fd::AsRawFd;
+
+        let runtime =
+            RetainedLinuxOrtRuntime::try_new(b"sealed").expect("fixture bytes enter a memfd");
+        // SAFETY: the runtime retains a valid memfd for the entire call.
+        let observed = unsafe { libc::fcntl(runtime.file.as_raw_fd(), libc::F_GET_SEALS) };
+
+        assert!(observed >= 0);
+        assert_eq!(
+            observed & RetainedLinuxOrtRuntime::REQUIRED_SEALS,
+            RetainedLinuxOrtRuntime::REQUIRED_SEALS
+        );
     }
 }

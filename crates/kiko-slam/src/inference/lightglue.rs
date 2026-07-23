@@ -1,4 +1,7 @@
-use super::{InferenceBackend, InferenceError, ManagedSession, build_session};
+use super::{
+    InferenceBackend, InferenceError, ManagedSession, PinnedOrtRuntime, build_session,
+    build_session_from_memory,
+};
 use crate::DESCRIPTOR_DIM;
 use crate::Detections;
 use crate::Matches;
@@ -25,6 +28,30 @@ impl LightGlue {
         let path = path.as_ref();
         let (session, selected) = build_session(path, backend)?;
 
+        Ok(Self {
+            session,
+            backend: selected,
+        })
+    }
+
+    /// Build a session directly from retained ONNX bytes.
+    ///
+    /// The runtime proof ensures this path cannot silently consult
+    /// `ORT_DYLIB_PATH` or reopen a deployment pathname.
+    pub fn new_from_memory(
+        model_bytes: &[u8],
+        runtime: PinnedOrtRuntime,
+    ) -> Result<Self, InferenceError> {
+        Self::new_from_memory_with_backend(model_bytes, runtime, InferenceBackend::auto())
+    }
+
+    pub fn new_from_memory_with_backend(
+        model_bytes: &[u8],
+        runtime: PinnedOrtRuntime,
+        backend: InferenceBackend,
+    ) -> Result<Self, InferenceError> {
+        let (session, selected) =
+            build_session_from_memory("lightglue", model_bytes, backend, runtime)?;
         Ok(Self {
             session,
             backend: selected,
