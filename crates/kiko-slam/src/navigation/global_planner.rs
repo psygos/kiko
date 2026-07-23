@@ -29,6 +29,114 @@ pub struct GlobalPlannerConfig {
     unknown_space: UnknownSpacePolicy,
 }
 
+/// A closed, finite rectangle constraining robot-center path geometry in the
+/// displayed occupancy-map frame.
+///
+/// The private fields make invalid or reversed bounds unrepresentable. A
+/// bounded planner admits only start/goal points and grid-cell centres inside
+/// this rectangle; because the rectangle is convex, every straight path
+/// segment between admitted points also remains inside it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapTraversalBoundary {
+    minimum_x_m: f64,
+    minimum_y_m: f64,
+    maximum_x_m: f64,
+    maximum_y_m: f64,
+}
+
+impl MapTraversalBoundary {
+    pub fn try_new(
+        minimum_x_m: f64,
+        minimum_y_m: f64,
+        maximum_x_m: f64,
+        maximum_y_m: f64,
+    ) -> Result<Self, MapTraversalBoundaryError> {
+        for (component, value) in [
+            (MapTraversalBoundaryComponent::MinimumX, minimum_x_m),
+            (MapTraversalBoundaryComponent::MinimumY, minimum_y_m),
+            (MapTraversalBoundaryComponent::MaximumX, maximum_x_m),
+            (MapTraversalBoundaryComponent::MaximumY, maximum_y_m),
+        ] {
+            if !value.is_finite() {
+                return Err(MapTraversalBoundaryError::NonFinite { component, value });
+            }
+        }
+        if minimum_x_m >= maximum_x_m {
+            return Err(MapTraversalBoundaryError::EmptyOrReversedX {
+                minimum_x_m,
+                maximum_x_m,
+            });
+        }
+        if minimum_y_m >= maximum_y_m {
+            return Err(MapTraversalBoundaryError::EmptyOrReversedY {
+                minimum_y_m,
+                maximum_y_m,
+            });
+        }
+        Ok(Self {
+            minimum_x_m,
+            minimum_y_m,
+            maximum_x_m,
+            maximum_y_m,
+        })
+    }
+
+    pub const fn minimum_x_m(self) -> f64 {
+        self.minimum_x_m
+    }
+
+    pub const fn minimum_y_m(self) -> f64 {
+        self.minimum_y_m
+    }
+
+    pub const fn maximum_x_m(self) -> f64 {
+        self.maximum_x_m
+    }
+
+    pub const fn maximum_y_m(self) -> f64 {
+        self.maximum_y_m
+    }
+
+    pub fn contains(self, point: MapPoint) -> bool {
+        point.x_m() >= self.minimum_x_m
+            && point.x_m() <= self.maximum_x_m
+            && point.y_m() >= self.minimum_y_m
+            && point.y_m() <= self.maximum_y_m
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapTraversalBoundaryComponent {
+    MinimumX,
+    MinimumY,
+    MaximumX,
+    MaximumY,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MapTraversalBoundaryError {
+    NonFinite {
+        component: MapTraversalBoundaryComponent,
+        value: f64,
+    },
+    EmptyOrReversedX {
+        minimum_x_m: f64,
+        maximum_x_m: f64,
+    },
+    EmptyOrReversedY {
+        minimum_y_m: f64,
+        maximum_y_m: f64,
+    },
+}
+
+impl std::fmt::Display for MapTraversalBoundaryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "invalid map traversal boundary: {self:?}")
+    }
+}
+
+impl std::error::Error for MapTraversalBoundaryError {}
+
 impl GlobalPlannerConfig {
     /// Parse a circular footprint-clearance policy.
     ///
@@ -88,6 +196,24 @@ pub enum GlobalPlanError {
     },
     GoalOutsideMap {
         point: MapPoint,
+    },
+    StartOutsideTraversalBoundary {
+        point: MapPoint,
+        boundary: MapTraversalBoundary,
+    },
+    GoalOutsideTraversalBoundary {
+        point: MapPoint,
+        boundary: MapTraversalBoundary,
+    },
+    StartCellCenterOutsideTraversalBoundary {
+        point: MapPoint,
+        cell_center: MapPoint,
+        boundary: MapTraversalBoundary,
+    },
+    GoalCellCenterOutsideTraversalBoundary {
+        point: MapPoint,
+        cell_center: MapPoint,
+        boundary: MapTraversalBoundary,
     },
     StartBlocked {
         point: MapPoint,
@@ -155,6 +281,46 @@ impl std::fmt::Display for GlobalPlanError {
                 "navigation goal [{}, {}] m is outside the occupancy map",
                 point.x_m(),
                 point.y_m()
+            ),
+            Self::StartOutsideTraversalBoundary { point, boundary } => write!(
+                f,
+                "robot start [{}, {}] m is outside traversal boundary [{}, {}]..=[{}, {}] m",
+                point.x_m(),
+                point.y_m(),
+                boundary.minimum_x_m(),
+                boundary.minimum_y_m(),
+                boundary.maximum_x_m(),
+                boundary.maximum_y_m()
+            ),
+            Self::GoalOutsideTraversalBoundary { point, boundary } => write!(
+                f,
+                "navigation goal [{}, {}] m is outside traversal boundary [{}, {}]..=[{}, {}] m",
+                point.x_m(),
+                point.y_m(),
+                boundary.minimum_x_m(),
+                boundary.minimum_y_m(),
+                boundary.maximum_x_m(),
+                boundary.maximum_y_m()
+            ),
+            Self::StartCellCenterOutsideTraversalBoundary {
+                point, cell_center, ..
+            } => write!(
+                f,
+                "robot start [{}, {}] m belongs to cell center [{}, {}] m outside the traversal boundary",
+                point.x_m(),
+                point.y_m(),
+                cell_center.x_m(),
+                cell_center.y_m()
+            ),
+            Self::GoalCellCenterOutsideTraversalBoundary {
+                point, cell_center, ..
+            } => write!(
+                f,
+                "navigation goal [{}, {}] m belongs to cell center [{}, {}] m outside the traversal boundary",
+                point.x_m(),
+                point.y_m(),
+                cell_center.x_m(),
+                cell_center.y_m()
             ),
             Self::StartBlocked { point } => write!(
                 f,
@@ -263,6 +429,7 @@ pub struct GlobalPlanIdentity {
     start: PlanStart,
     goal: PointGoal,
     safety_profile: GlobalPlannerConfig,
+    traversal_boundary: Option<MapTraversalBoundary>,
 }
 
 impl GlobalPlanIdentity {
@@ -296,6 +463,10 @@ impl GlobalPlanIdentity {
 
     pub fn safety_profile(self) -> GlobalPlannerConfig {
         self.safety_profile
+    }
+
+    pub fn traversal_boundary(self) -> Option<MapTraversalBoundary> {
+        self.traversal_boundary
     }
 }
 
@@ -415,6 +586,10 @@ impl GlobalPath {
         self.identity.safety_profile
     }
 
+    pub fn traversal_boundary(&self) -> Option<MapTraversalBoundary> {
+        self.identity.traversal_boundary
+    }
+
     pub fn points(&self) -> &[MapPoint] {
         self.points.as_slice()
     }
@@ -432,6 +607,7 @@ pub struct GlobalPlanner {
     map_instance_id: MapInstanceId,
     map_revision: u64,
     safety_profile: GlobalPlannerConfig,
+    traversal_boundary: Option<MapTraversalBoundary>,
     geometry: OccupancyGridGeometry,
     width: usize,
     height: usize,
@@ -443,7 +619,26 @@ impl GlobalPlanner {
         snapshot: &OccupancyGridSnapshot,
         config: GlobalPlannerConfig,
     ) -> Result<Self, GlobalPlanError> {
-        Self::try_new_with_instance_id(snapshot, config, GlobalPlannerInstanceId::allocate()?)
+        Self::try_new_with_optional_boundary_and_instance_id(
+            snapshot,
+            config,
+            None,
+            GlobalPlannerInstanceId::allocate()?,
+        )
+    }
+
+    /// Construct a planner whose actual output path cannot leave `boundary`.
+    pub fn try_new_bounded(
+        snapshot: &OccupancyGridSnapshot,
+        config: GlobalPlannerConfig,
+        boundary: MapTraversalBoundary,
+    ) -> Result<Self, GlobalPlanError> {
+        Self::try_new_with_optional_boundary_and_instance_id(
+            snapshot,
+            config,
+            Some(boundary),
+            GlobalPlannerInstanceId::allocate()?,
+        )
     }
 
     /// Reconstruct a planner under an exact recorded identity for replay.
@@ -454,6 +649,31 @@ impl GlobalPlanner {
     pub fn try_new_with_instance_id(
         snapshot: &OccupancyGridSnapshot,
         config: GlobalPlannerConfig,
+        instance_id: GlobalPlannerInstanceId,
+    ) -> Result<Self, GlobalPlanError> {
+        Self::try_new_with_optional_boundary_and_instance_id(snapshot, config, None, instance_id)
+    }
+
+    /// Reconstruct a boundary-constrained planner under an exact recorded
+    /// identity for replay.
+    pub fn try_new_bounded_with_instance_id(
+        snapshot: &OccupancyGridSnapshot,
+        config: GlobalPlannerConfig,
+        boundary: MapTraversalBoundary,
+        instance_id: GlobalPlannerInstanceId,
+    ) -> Result<Self, GlobalPlanError> {
+        Self::try_new_with_optional_boundary_and_instance_id(
+            snapshot,
+            config,
+            Some(boundary),
+            instance_id,
+        )
+    }
+
+    fn try_new_with_optional_boundary_and_instance_id(
+        snapshot: &OccupancyGridSnapshot,
+        config: GlobalPlannerConfig,
+        traversal_boundary: Option<MapTraversalBoundary>,
         instance_id: GlobalPlannerInstanceId,
     ) -> Result<Self, GlobalPlanError> {
         let map_instance_id = snapshot
@@ -478,13 +698,20 @@ impl GlobalPlanner {
                 };
             }
         }
-        let blocked = inflate_blocked_cells(
+        let mut blocked = inflate_blocked_cells(
             sources,
             width,
             height,
             geometry.resolution_m(),
             config.clearance_radius_m,
         )?;
+        if let Some(boundary) = traversal_boundary {
+            for (index, cell_blocked) in blocked.iter_mut().enumerate() {
+                if !boundary.contains(cell_center_for_geometry(geometry, width, index)) {
+                    *cell_blocked = true;
+                }
+            }
+        }
 
         Ok(Self {
             instance_id,
@@ -492,6 +719,7 @@ impl GlobalPlanner {
             map_instance_id,
             map_revision: snapshot.revision(),
             safety_profile: config,
+            traversal_boundary,
             geometry,
             width,
             height,
@@ -517,6 +745,10 @@ impl GlobalPlanner {
 
     pub fn safety_profile(&self) -> GlobalPlannerConfig {
         self.safety_profile
+    }
+
+    pub fn traversal_boundary(&self) -> Option<MapTraversalBoundary> {
+        self.traversal_boundary
     }
 
     pub fn is_current_for(&self, snapshot: &OccupancyGridSnapshot) -> bool {
@@ -550,12 +782,44 @@ impl GlobalPlanner {
         let identity = self.plan_identity(invocation_id, start, goal);
         let start = start.point;
         let goal = goal.point;
+        if let Some(boundary) = self.traversal_boundary {
+            if !boundary.contains(start) {
+                return Err(GlobalPlanError::StartOutsideTraversalBoundary {
+                    point: start,
+                    boundary,
+                });
+            }
+            if !boundary.contains(goal) {
+                return Err(GlobalPlanError::GoalOutsideTraversalBoundary {
+                    point: goal,
+                    boundary,
+                });
+            }
+        }
         let start_index = self
             .point_index(start)
             .ok_or(GlobalPlanError::StartOutsideMap { point: start })?;
         let goal_index = self
             .point_index(goal)
             .ok_or(GlobalPlanError::GoalOutsideMap { point: goal })?;
+        if let Some(boundary) = self.traversal_boundary {
+            let start_cell_center = self.cell_center(start_index);
+            if !boundary.contains(start_cell_center) {
+                return Err(GlobalPlanError::StartCellCenterOutsideTraversalBoundary {
+                    point: start,
+                    cell_center: start_cell_center,
+                    boundary,
+                });
+            }
+            let goal_cell_center = self.cell_center(goal_index);
+            if !boundary.contains(goal_cell_center) {
+                return Err(GlobalPlanError::GoalCellCenterOutsideTraversalBoundary {
+                    point: goal,
+                    cell_center: goal_cell_center,
+                    boundary,
+                });
+            }
+        }
         if self.blocked[start_index] {
             return Err(GlobalPlanError::StartBlocked { point: start });
         }
@@ -634,6 +898,7 @@ impl GlobalPlanner {
             start,
             goal,
             safety_profile: self.safety_profile,
+            traversal_boundary: self.traversal_boundary,
         }
     }
 
@@ -642,16 +907,24 @@ impl GlobalPlanner {
     }
 
     fn cell_center(&self, index: usize) -> MapPoint {
-        let column = index % self.width;
-        let row = index / self.width;
-        let lower_bound_m = self.geometry.lower_bound_m();
-        let resolution_m = self.geometry.resolution_m();
-        MapPoint::try_new(
-            lower_bound_m[0] + (column as f64 + 0.5) * resolution_m,
-            lower_bound_m[1] + (row as f64 + 0.5) * resolution_m,
-        )
-        .expect("parsed occupancy geometry produces finite cell centres")
+        cell_center_for_geometry(self.geometry, self.width, index)
     }
+}
+
+fn cell_center_for_geometry(
+    geometry: OccupancyGridGeometry,
+    width: usize,
+    index: usize,
+) -> MapPoint {
+    let column = index % width;
+    let row = index / width;
+    let lower_bound_m = geometry.lower_bound_m();
+    let resolution_m = geometry.resolution_m();
+    MapPoint::try_new(
+        lower_bound_m[0] + (column as f64 + 0.5) * resolution_m,
+        lower_bound_m[1] + (row as f64 + 0.5) * resolution_m,
+    )
+    .expect("parsed occupancy geometry produces finite cell centres")
 }
 
 fn try_bool_grid(cell_count: usize, context: &'static str) -> Result<Vec<bool>, GlobalPlanError> {
@@ -1103,6 +1376,54 @@ mod tests {
         assert_eq!(
             negative_zero.clearance_radius_m().to_bits(),
             0.0_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn bounded_planner_retains_constraint_and_cannot_take_shorter_outside_route() {
+        let geometry =
+            OccupancyGridGeometry::try_new(1.0, [0.0, 0.0], 7, 5, 35).expect("test geometry");
+        let mut cells = vec![OccupancyCell::Occupied; 35];
+        for row in [0, 3] {
+            cells.chunks_exact_mut(7).nth(row).expect("fixture row")[1..=5]
+                .fill(OccupancyCell::Free);
+        }
+        for row in cells.chunks_exact_mut(7).skip(1).take(2) {
+            row[1] = OccupancyCell::Free;
+            row[5] = OccupancyCell::Free;
+        }
+        let snapshot = snapshot(geometry, &cells, new_map_instance_id(), 1);
+        let config = GlobalPlannerConfig::try_new(0.0, UnknownSpacePolicy::Blocked)
+            .expect("point-robot planner");
+        let start = PlanStart::for_snapshot(point(1.5, 1.5), &snapshot).expect("map-bound start");
+        let goal = PointGoal::for_snapshot(point(5.5, 1.5), &snapshot).expect("map-bound goal");
+
+        let mut unbounded = GlobalPlanner::try_new(&snapshot, config).expect("unbounded planner");
+        let unbounded_path = unbounded.plan(start, goal).expect("outside route");
+        assert!(
+            unbounded_path
+                .points()
+                .iter()
+                .any(|point| point.y_m() < 1.0),
+            "fixture must expose the shorter route outside the future boundary"
+        );
+
+        let boundary = MapTraversalBoundary::try_new(0.0, 1.0, 7.0, 4.0).expect("closed boundary");
+        let mut bounded =
+            GlobalPlanner::try_new_bounded(&snapshot, config, boundary).expect("bounded planner");
+        let bounded_path = bounded.plan(start, goal).expect("inside route");
+        assert_eq!(bounded_path.traversal_boundary(), Some(boundary));
+        assert_eq!(bounded_path.identity().traversal_boundary(), Some(boundary));
+        assert!(
+            bounded_path
+                .points()
+                .iter()
+                .copied()
+                .all(|point| boundary.contains(point))
+        );
+        assert!(
+            bounded_path.points().iter().any(|point| point.y_m() > 3.0),
+            "bounded planner must take the available inside route"
         );
     }
 

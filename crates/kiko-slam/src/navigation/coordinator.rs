@@ -17,9 +17,10 @@ use crate::{
 };
 
 use super::frames::{BaseFrame, PlanarPoint, PlanarTransformError};
+use super::frontier::FrontierGoal;
 use super::global_planner::{
     GlobalPath, GlobalPlanError, GlobalPlanIdentity, GlobalPlanner, GlobalPlannerConfig, MapPoint,
-    PlanStart, PointGoal,
+    MapTraversalBoundary, PlanStart, PointGoal,
 };
 use super::goal_input::MapPointGoalSelection;
 use super::ingress::{
@@ -254,17 +255,87 @@ pub enum CoordinatorLatch {
     JournalFailure,
     ClockBoundary,
     MapEpochIdExhausted,
+    GoalGenerationExhausted,
+    MotionModeGenerationExhausted,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BoundPointGoal {
+    point_goal: PointGoal,
+    traversal_boundary: Option<MapTraversalBoundary>,
+}
+
+impl BoundPointGoal {
+    const fn unbounded(point_goal: PointGoal) -> Self {
+        Self {
+            point_goal,
+            traversal_boundary: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum GoalBinding {
     Unavailable,
     Pending(MapPoint),
-    Bound(PointGoal),
+    Bound(BoundPointGoal),
     Invalidated {
         previous_map_instance_id: MapInstanceId,
         replacement_map_instance_id: MapInstanceId,
     },
+}
+
+/// Non-mutating proof that one map-point goal was valid for an exact immutable
+/// displayed snapshot and the coordinator state observed during preparation.
+///
+/// The snapshot borrow is retained rather than reducing it to a revision
+/// number. A caller can therefore perform a separately evidenced authority
+/// handover and fresh-zero barrier between preparation and commit without
+/// being able to substitute different occupancy content at commit. The proof
+/// is deliberately neither `Copy` nor `Clone`; commit consumes it.
+pub struct PreparedMapPointGoal<'snapshot> {
+    displayed_snapshot: &'snapshot OccupancyGridSnapshot,
+    current_map: CurrentOccupancyMap,
+    goal_generation: u64,
+    motion_mode_generation: u64,
+    previous_goal: GoalBinding,
+    previous_motion_mode: CoordinatorMotionModeV1,
+    goal: PointGoal,
+    traversal_boundary: Option<MapTraversalBoundary>,
+}
+
+impl fmt::Debug for PreparedMapPointGoal<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedMapPointGoal")
+            .field("map_binding", &self.current_map.binding)
+            .field("displayed_revision", &self.current_map.revision)
+            .field("goal_generation", &self.goal_generation)
+            .field("motion_mode_generation", &self.motion_mode_generation)
+            .field("previous_goal", &self.previous_goal)
+            .field("previous_motion_mode", &self.previous_motion_mode)
+            .field("goal", &self.goal)
+            .field("traversal_boundary", &self.traversal_boundary)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedMapPointGoal<'_> {
+    pub fn map_binding(&self) -> CurrentMapEpochBinding {
+        self.current_map.binding
+    }
+
+    pub fn displayed_revision(&self) -> u64 {
+        self.current_map.revision
+    }
+
+    pub fn goal(&self) -> PointGoal {
+        self.goal
+    }
+
+    pub fn traversal_boundary(&self) -> Option<MapTraversalBoundary> {
+        self.traversal_boundary
+    }
 }
 
 /// Mutually exclusive reference mode owned by this coordinator.
@@ -292,6 +363,7 @@ pub enum CoordinatorMotionModeError {
         bound: NonZeroU64,
         supplied: NonZeroU64,
     },
+    GenerationExhausted,
 }
 
 impl fmt::Display for CoordinatorMotionModeError {
@@ -489,6 +561,27 @@ pub enum CoordinatorAdmissionError<E> {
         displayed: u64,
         snapshot: u64,
     },
+    FrontierGoalMapMismatch {
+        expected: MapInstanceId,
+        actual: MapInstanceId,
+    },
+    FrontierGoalRevisionMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    FrontierGoalMissingTraversalBoundary,
+    PointGoalPreparationStale {
+        prepared_map_binding: CurrentMapEpochBinding,
+        prepared_revision: u64,
+        current_map_binding: Option<CurrentMapEpochBinding>,
+        current_revision: Option<u64>,
+        prepared_motion_mode: CoordinatorMotionModeV1,
+        current_motion_mode: CoordinatorMotionModeV1,
+        prepared_goal_generation: u64,
+        current_goal_generation: u64,
+        prepared_motion_mode_generation: u64,
+        current_motion_mode_generation: u64,
+    },
     PointGoalModeConflict {
         actual: CoordinatorMotionModeV1,
     },
@@ -515,6 +608,10 @@ impl<E: std::error::Error + 'static> std::error::Error for CoordinatorAdmissionE
             | Self::GoalDisplayedRevisionMismatch { .. }
             | Self::GoalSnapshotMapMismatch { .. }
             | Self::GoalSnapshotRevisionMismatch { .. }
+            | Self::FrontierGoalMapMismatch { .. }
+            | Self::FrontierGoalRevisionMismatch { .. }
+            | Self::FrontierGoalMissingTraversalBoundary
+            | Self::PointGoalPreparationStale { .. }
             | Self::PointGoalModeConflict { .. } => None,
         }
     }
@@ -704,6 +801,8 @@ pub struct ShadowNavigationCoordinator<J: NavigationIngressSink> {
     map_epochs: NavigationMapEpochCoordinator,
     current_map: Option<CurrentOccupancyMap>,
     goal: GoalBinding,
+    goal_generation: u64,
+    motion_mode_generation: u64,
     odometry: PlanarOdometry,
     next_segment_id: Option<NonZeroU64>,
     latest_device_time: Option<(DeviceSessionId, DeviceTimestamp)>,
@@ -806,6 +905,8 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
             map_epochs: NavigationMapEpochCoordinator::new(),
             current_map: None,
             goal: pending_goal.map_or(GoalBinding::Unavailable, GoalBinding::Pending),
+            goal_generation: 0,
+            motion_mode_generation: 0,
             odometry,
             next_segment_id: NonZeroU64::new(1),
             latest_device_time: None,
@@ -874,8 +975,8 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
             GoalBinding::Unavailable => NavigationGoalState::Unavailable,
             GoalBinding::Pending(_) => NavigationGoalState::PendingFirstMap,
             GoalBinding::Bound(goal) => NavigationGoalState::Bound {
-                map_instance_id: goal.map_instance_id(),
-                selected_revision: goal.selected_revision(),
+                map_instance_id: goal.point_goal.map_instance_id(),
+                selected_revision: goal.point_goal.selected_revision(),
             },
             GoalBinding::Invalidated {
                 previous_map_instance_id,
@@ -893,7 +994,7 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
     /// not exposed as actionable map goals.
     pub fn current_goal(&self) -> Option<PointGoal> {
         match self.goal {
-            GoalBinding::Bound(goal) => Some(goal),
+            GoalBinding::Bound(goal) => Some(goal.point_goal),
             GoalBinding::Unavailable
             | GoalBinding::Pending(_)
             | GoalBinding::Invalidated { .. } => None,
@@ -918,7 +1019,11 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
                 actual: self.motion_mode,
             });
         }
+        let next_motion_mode_generation = self
+            .reserve_motion_mode_generation()
+            .map_err(|_| CoordinatorMotionModeError::GenerationExhausted)?;
         self.motion_mode = CoordinatorMotionModeV1::Manual { authority_lease_id };
+        self.motion_mode_generation = next_motion_mode_generation;
         self.direct_localization_binding = None;
         self.last_manual_command = None;
         self.last_frontier_yaw_command = None;
@@ -940,7 +1045,11 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
                 actual: self.motion_mode,
             });
         }
+        let next_motion_mode_generation = self
+            .reserve_motion_mode_generation()
+            .map_err(|_| CoordinatorMotionModeError::GenerationExhausted)?;
         self.motion_mode = CoordinatorMotionModeV1::FrontierInPlaceYaw { authority_lease_id };
+        self.motion_mode_generation = next_motion_mode_generation;
         self.direct_localization_binding = None;
         self.last_manual_command = None;
         self.last_frontier_yaw_command = None;
@@ -973,7 +1082,11 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
                 supplied: authority_lease_id,
             });
         }
+        let next_motion_mode_generation = self
+            .reserve_motion_mode_generation()
+            .map_err(|_| CoordinatorMotionModeError::GenerationExhausted)?;
         self.motion_mode = CoordinatorMotionModeV1::MappingOnly;
+        self.motion_mode_generation = next_motion_mode_generation;
         self.direct_localization_binding = None;
         self.last_manual_command = None;
         self.last_frontier_yaw_command = None;
@@ -988,7 +1101,20 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
     /// was applied. Proof-bearing in-crate supervisor actions own that
     /// handover. Mapping and point-goal modes return to mapping-only.
     pub fn clear_goal(&mut self) {
+        let next_goal_generation = self.reserve_goal_generation().ok();
+        let returns_to_mapping = !matches!(
+            self.motion_mode,
+            CoordinatorMotionModeV1::MappingOnly
+                | CoordinatorMotionModeV1::Manual { .. }
+                | CoordinatorMotionModeV1::FrontierInPlaceYaw { .. }
+        );
+        let next_motion_mode_generation = returns_to_mapping
+            .then(|| self.reserve_motion_mode_generation().ok())
+            .flatten();
         self.goal = GoalBinding::Unavailable;
+        if let Some(next_goal_generation) = next_goal_generation {
+            self.goal_generation = next_goal_generation;
+        }
         self.path = None;
         self.plan_fault = None;
         if !matches!(
@@ -997,6 +1123,9 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
                 | CoordinatorMotionModeV1::FrontierInPlaceYaw { .. }
         ) {
             self.motion_mode = CoordinatorMotionModeV1::MappingOnly;
+            if let Some(next_motion_mode_generation) = next_motion_mode_generation {
+                self.motion_mode_generation = next_motion_mode_generation;
+            }
             self.direct_localization_binding = None;
             self.last_manual_command = None;
             self.last_frontier_yaw_command = None;
@@ -1287,10 +1416,12 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         if let GoalBinding::Pending(point) = self.goal {
             let goal = PointGoal::for_snapshot(point, snapshot)
                 .map_err(CoordinatorAdmissionError::Plan)?;
+            let next_goal_generation = self.reserve_goal_generation()?;
             let ingress = MapPointGoalIngress::parse(self.clock_epoch, host_arrival, binding, goal)
                 .map_err(CoordinatorAdmissionError::Boundary)?;
             self.append(NavigationIngressEvent::PointGoal(ingress))?;
-            self.goal = GoalBinding::Bound(goal);
+            self.goal = GoalBinding::Bound(BoundPointGoal::unbounded(goal));
+            self.goal_generation = next_goal_generation;
         }
 
         let planning = self.plan_snapshot(snapshot);
@@ -1303,18 +1434,17 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         })
     }
 
-    /// Replace the active point goal using the exact immutable map snapshot
-    /// displayed by the control surface.
+    /// Prepare a point-goal replacement without mutating coordinator state.
     ///
     /// The epoch, accepted revision, snapshot map instance, and snapshot
-    /// revision must all agree before the goal is journaled. This prevents a
-    /// delayed Rerun/UI click from silently steering in a reset or newer map.
-    pub fn select_map_point_goal(
-        &mut self,
-        host_arrival: HostMonotonicTimestamp,
+    /// revision must all agree. The returned proof retains a borrow of that
+    /// exact snapshot so a later commit cannot substitute equal-looking
+    /// metadata around different occupancy content.
+    pub fn prepare_map_point_goal<'snapshot>(
+        &self,
         selection: MapPointGoalSelection,
-        displayed_snapshot: &OccupancyGridSnapshot,
-    ) -> Result<GoalSelectionOutcome, CoordinatorAdmissionError<J::Error>> {
+        displayed_snapshot: &'snapshot OccupancyGridSnapshot,
+    ) -> Result<PreparedMapPointGoal<'snapshot>, CoordinatorAdmissionError<J::Error>> {
         self.ensure_open()?;
         if !matches!(
             self.motion_mode,
@@ -1354,21 +1484,193 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
 
         let goal = PointGoal::for_snapshot(selection.point(), displayed_snapshot)
             .map_err(CoordinatorAdmissionError::Plan)?;
-        let ingress =
-            MapPointGoalIngress::parse(self.clock_epoch, host_arrival, current.binding, goal)
-                .map_err(CoordinatorAdmissionError::Boundary)?;
+        Ok(PreparedMapPointGoal {
+            displayed_snapshot,
+            current_map: current,
+            goal_generation: self.goal_generation,
+            motion_mode_generation: self.motion_mode_generation,
+            previous_goal: self.goal,
+            previous_motion_mode: self.motion_mode,
+            goal,
+            traversal_boundary: None,
+        })
+    }
+
+    /// Prepare a Nano-bounded frontier goal without discarding the selector's
+    /// non-forgeable traversal constraint.
+    ///
+    /// The returned proof is consumed by the same commit path as an operator
+    /// click, but every plan and subsequent replan for this goal remains bound
+    /// to the exact closed map-frame rectangle carried by `frontier`.
+    pub fn prepare_frontier_goal<'snapshot>(
+        &self,
+        frontier: FrontierGoal,
+        displayed_snapshot: &'snapshot OccupancyGridSnapshot,
+    ) -> Result<PreparedMapPointGoal<'snapshot>, CoordinatorAdmissionError<J::Error>> {
+        self.ensure_open()?;
+        if !matches!(
+            self.motion_mode,
+            CoordinatorMotionModeV1::MappingOnly | CoordinatorMotionModeV1::PointGoal
+        ) {
+            return Err(CoordinatorAdmissionError::PointGoalModeConflict {
+                actual: self.motion_mode,
+            });
+        }
+        let current = self
+            .current_map
+            .ok_or(CoordinatorAdmissionError::NoCurrentMapForGoal)?;
+        if displayed_snapshot.map_instance_id() != Some(current.binding.map_instance_id()) {
+            return Err(CoordinatorAdmissionError::GoalSnapshotMapMismatch {
+                expected: current.binding.map_instance_id(),
+                actual: displayed_snapshot.map_instance_id(),
+            });
+        }
+        if displayed_snapshot.revision() != current.revision {
+            return Err(CoordinatorAdmissionError::GoalSnapshotRevisionMismatch {
+                displayed: current.revision,
+                snapshot: displayed_snapshot.revision(),
+            });
+        }
+        if frontier.map_instance_id() != current.binding.map_instance_id() {
+            return Err(CoordinatorAdmissionError::FrontierGoalMapMismatch {
+                expected: current.binding.map_instance_id(),
+                actual: frontier.map_instance_id(),
+            });
+        }
+        if frontier.map_revision() != current.revision {
+            return Err(CoordinatorAdmissionError::FrontierGoalRevisionMismatch {
+                expected: current.revision,
+                actual: frontier.map_revision(),
+            });
+        }
+        let Some(traversal_boundary) = frontier.traversal_boundary() else {
+            return Err(CoordinatorAdmissionError::FrontierGoalMissingTraversalBoundary);
+        };
+        let goal = frontier.point_goal();
+        if !goal.was_selected_from(displayed_snapshot) {
+            return Err(CoordinatorAdmissionError::FrontierGoalRevisionMismatch {
+                expected: displayed_snapshot.revision(),
+                actual: goal.selected_revision(),
+            });
+        }
+        Ok(PreparedMapPointGoal {
+            displayed_snapshot,
+            current_map: current,
+            goal_generation: self.goal_generation,
+            motion_mode_generation: self.motion_mode_generation,
+            previous_goal: self.goal,
+            previous_motion_mode: self.motion_mode,
+            goal,
+            traversal_boundary: Some(traversal_boundary),
+        })
+    }
+
+    /// Commit a previously prepared point goal after exact state rechecking.
+    ///
+    /// Any intervening map admission, map reset, goal change, clear, or motion
+    /// mode transition makes the proof stale. Rejection is non-mutating and
+    /// emits no ingress record.
+    pub fn commit_prepared_map_point_goal(
+        &mut self,
+        host_arrival: HostMonotonicTimestamp,
+        prepared: PreparedMapPointGoal<'_>,
+    ) -> Result<GoalSelectionOutcome, CoordinatorAdmissionError<J::Error>> {
+        self.ensure_open()?;
+        let current_map = self.current_map;
+        if current_map != Some(prepared.current_map)
+            || self.goal != prepared.previous_goal
+            || self.motion_mode != prepared.previous_motion_mode
+            || self.goal_generation != prepared.goal_generation
+            || self.motion_mode_generation != prepared.motion_mode_generation
+        {
+            return Err(CoordinatorAdmissionError::PointGoalPreparationStale {
+                prepared_map_binding: prepared.current_map.binding,
+                prepared_revision: prepared.current_map.revision,
+                current_map_binding: current_map.map(|current| current.binding),
+                current_revision: current_map.map(|current| current.revision),
+                prepared_motion_mode: prepared.previous_motion_mode,
+                current_motion_mode: self.motion_mode,
+                prepared_goal_generation: prepared.goal_generation,
+                current_goal_generation: self.goal_generation,
+                prepared_motion_mode_generation: prepared.motion_mode_generation,
+                current_motion_mode_generation: self.motion_mode_generation,
+            });
+        }
+        if !matches!(
+            self.motion_mode,
+            CoordinatorMotionModeV1::MappingOnly | CoordinatorMotionModeV1::PointGoal
+        ) {
+            return Err(CoordinatorAdmissionError::PointGoalModeConflict {
+                actual: self.motion_mode,
+            });
+        }
+        if !prepared.goal.was_selected_from(prepared.displayed_snapshot) {
+            return Err(CoordinatorAdmissionError::GoalSnapshotRevisionMismatch {
+                displayed: prepared.goal.selected_revision(),
+                snapshot: prepared.displayed_snapshot.revision(),
+            });
+        }
+        let next_goal_generation = self.reserve_goal_generation()?;
+        let next_motion_mode_generation = (self.motion_mode != CoordinatorMotionModeV1::PointGoal)
+            .then(|| self.reserve_motion_mode_generation())
+            .transpose()
+            .map_err(CoordinatorAdmissionError::Latched)?;
+        let ingress = MapPointGoalIngress::parse(
+            self.clock_epoch,
+            host_arrival,
+            prepared.current_map.binding,
+            prepared.goal,
+        )
+        .map_err(CoordinatorAdmissionError::Boundary)?;
         self.append(NavigationIngressEvent::PointGoal(ingress))?;
 
-        self.goal = GoalBinding::Bound(goal);
+        self.goal = GoalBinding::Bound(BoundPointGoal {
+            point_goal: prepared.goal,
+            traversal_boundary: prepared.traversal_boundary,
+        });
+        self.goal_generation = next_goal_generation;
         self.motion_mode = CoordinatorMotionModeV1::PointGoal;
+        if let Some(next_motion_mode_generation) = next_motion_mode_generation {
+            self.motion_mode_generation = next_motion_mode_generation;
+        }
         self.direct_localization_binding = None;
         self.path = None;
         self.plan_fault = None;
-        let planning = self.plan_snapshot(displayed_snapshot);
+        let planning = self.plan_snapshot(prepared.displayed_snapshot);
         Ok(GoalSelectionOutcome {
             goal_state: self.goal_state(),
             planning,
         })
+    }
+
+    /// Replace the active point goal using the exact immutable map snapshot
+    /// displayed by the control surface.
+    ///
+    /// This compatibility API performs prepare and commit adjacently. Live
+    /// owners that need an authority/fresh-zero handover must use the explicit
+    /// two-phase API above.
+    pub fn select_map_point_goal(
+        &mut self,
+        host_arrival: HostMonotonicTimestamp,
+        selection: MapPointGoalSelection,
+        displayed_snapshot: &OccupancyGridSnapshot,
+    ) -> Result<GoalSelectionOutcome, CoordinatorAdmissionError<J::Error>> {
+        let prepared = self.prepare_map_point_goal(selection, displayed_snapshot)?;
+        self.commit_prepared_map_point_goal(host_arrival, prepared)
+    }
+
+    /// Select a frontier while retaining its mandatory execution boundary.
+    ///
+    /// Production exploration owners needing an authority/fresh-zero handover
+    /// should call [`Self::prepare_frontier_goal`] and commit separately.
+    pub fn select_frontier_goal(
+        &mut self,
+        host_arrival: HostMonotonicTimestamp,
+        frontier: FrontierGoal,
+        displayed_snapshot: &OccupancyGridSnapshot,
+    ) -> Result<GoalSelectionOutcome, CoordinatorAdmissionError<J::Error>> {
+        let prepared = self.prepare_frontier_goal(frontier, displayed_snapshot)?;
+        self.commit_prepared_map_point_goal(host_arrival, prepared)
     }
 
     pub fn tick<C: HostMonotonicClock>(
@@ -2288,14 +2590,20 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
                 return GlobalPlanningOutcome::Failed(source);
             }
         };
-        let mut planner = match GlobalPlanner::try_new(snapshot, self.planner_config) {
+        let planner = match goal.traversal_boundary {
+            Some(boundary) => {
+                GlobalPlanner::try_new_bounded(snapshot, self.planner_config, boundary)
+            }
+            None => GlobalPlanner::try_new(snapshot, self.planner_config),
+        };
+        let mut planner = match planner {
             Ok(planner) => planner,
             Err(source) => {
                 self.plan_fault = Some(StoredPlanFault::PlannerConstruction);
                 return GlobalPlanningOutcome::Failed(source);
             }
         };
-        match planner.plan(start, goal) {
+        match planner.plan(start, goal.point_goal) {
             Ok(path) => {
                 let identity = path.identity();
                 self.path = Some(path);
@@ -2388,10 +2696,14 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         replacement_map_instance_id: MapInstanceId,
     ) {
         if let GoalBinding::Bound(_) = self.goal {
+            let next_goal_generation = self.reserve_goal_generation().ok();
             self.goal = GoalBinding::Invalidated {
                 previous_map_instance_id,
                 replacement_map_instance_id,
             };
+            if let Some(next_goal_generation) = next_goal_generation {
+                self.goal_generation = next_goal_generation;
+            }
         }
         self.path = None;
         self.plan_fault = None;
@@ -2408,6 +2720,32 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         match self.latch {
             Some(latch) => Err(CoordinatorAdmissionError::Latched(latch)),
             None => Ok(()),
+        }
+    }
+
+    fn reserve_goal_generation(&mut self) -> Result<u64, CoordinatorAdmissionError<J::Error>> {
+        match self.goal_generation.checked_add(1) {
+            Some(next) => Ok(next),
+            None => {
+                if self.latch.is_none() {
+                    self.latch = Some(CoordinatorLatch::GoalGenerationExhausted);
+                }
+                Err(CoordinatorAdmissionError::Latched(
+                    CoordinatorLatch::GoalGenerationExhausted,
+                ))
+            }
+        }
+    }
+
+    fn reserve_motion_mode_generation(&mut self) -> Result<u64, CoordinatorLatch> {
+        match self.motion_mode_generation.checked_add(1) {
+            Some(next) => Ok(next),
+            None => {
+                if self.latch.is_none() {
+                    self.latch = Some(CoordinatorLatch::MotionModeGenerationExhausted);
+                }
+                Err(CoordinatorLatch::MotionModeGenerationExhausted)
+            }
         }
     }
 
@@ -2502,6 +2840,8 @@ mod tests {
     use super::super::shadow_command::{
         ShadowCommandConfig, ShadowCommandConfigDto, ShadowCommandDisposition,
     };
+    #[cfg(all(feature = "agent-runtime", unix))]
+    use super::super::{NanoBoundaryFrontierExplorer, NanoExploreBoundaryMeters};
 
     const IDENTITY_3: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     const SESSION_RAW: u64 = 7;
@@ -3673,6 +4013,347 @@ mod tests {
         assert_eq!(goals[1].map_epoch_id(), binding.map_epoch_id());
         assert_eq!(goals[1].selected_revision(), 1);
         assert_eq!(goals[1].point().as_array(), [1.5, 0.5]);
+    }
+
+    #[test]
+    fn point_goal_preparation_is_non_mutating_and_commit_consumes_exact_snapshot_proof() {
+        let mut coordinator = coordinator_without_goal();
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let snapshot = occupancy(map, 1);
+        coordinator
+            .accept_global_map(host(1_050), Timestamp::from_nanos(100), &snapshot)
+            .expect("mapping-only map");
+        let binding = coordinator.current_map_binding().expect("map binding");
+        let records_before_prepare = coordinator.journal().len();
+
+        let prepared = coordinator
+            .prepare_map_point_goal(
+                goal_selection(binding.map_epoch_id(), 1, 1.5, 0.5),
+                &snapshot,
+            )
+            .expect("prepared exact click");
+        assert_eq!(prepared.map_binding(), binding);
+        assert_eq!(prepared.displayed_revision(), 1);
+        assert_eq!(prepared.goal().point().as_array(), [1.5, 0.5]);
+        assert_eq!(coordinator.journal().len(), records_before_prepare);
+        assert_eq!(coordinator.goal_state(), NavigationGoalState::Unavailable);
+        assert_eq!(
+            coordinator.motion_mode(),
+            CoordinatorMotionModeV1::MappingOnly
+        );
+        assert!(coordinator.global_path().is_none());
+
+        let committed = coordinator
+            .commit_prepared_map_point_goal(host(1_060), prepared)
+            .expect("commit exact prepared click");
+        assert!(matches!(
+            committed.planning(),
+            GlobalPlanningOutcome::Planned(_)
+        ));
+        assert_eq!(
+            coordinator.goal_state(),
+            NavigationGoalState::Bound {
+                map_instance_id: map.instance_id(),
+                selected_revision: 1,
+            }
+        );
+        assert_eq!(coordinator.journal().len(), records_before_prepare + 1);
+    }
+
+    #[test]
+    fn prepared_point_goal_fails_closed_after_map_or_goal_state_changes() {
+        let mut coordinator = coordinator_without_goal();
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let first_snapshot = occupancy(map, 1);
+        coordinator
+            .accept_global_map(host(1_050), Timestamp::from_nanos(100), &first_snapshot)
+            .expect("first mapping snapshot");
+        let binding = coordinator.current_map_binding().expect("map binding");
+        let stale_by_map = coordinator
+            .prepare_map_point_goal(
+                goal_selection(binding.map_epoch_id(), 1, 1.5, 0.5),
+                &first_snapshot,
+            )
+            .expect("first prepared goal");
+
+        let second_snapshot = occupancy(map, 2);
+        coordinator
+            .accept_global_map(host(1_060), Timestamp::from_nanos(101), &second_snapshot)
+            .expect("newer mapping snapshot");
+        let records_before_stale_commit = coordinator.journal().len();
+        assert!(matches!(
+            coordinator.commit_prepared_map_point_goal(host(1_061), stale_by_map),
+            Err(CoordinatorAdmissionError::PointGoalPreparationStale {
+                prepared_revision: 1,
+                current_revision: Some(2),
+                ..
+            })
+        ));
+        assert_eq!(coordinator.journal().len(), records_before_stale_commit);
+        assert_eq!(coordinator.goal_state(), NavigationGoalState::Unavailable);
+
+        let prepared_first = coordinator
+            .prepare_map_point_goal(
+                goal_selection(binding.map_epoch_id(), 2, 1.5, 0.5),
+                &second_snapshot,
+            )
+            .expect("first concurrent preparation");
+        let prepared_second = coordinator
+            .prepare_map_point_goal(
+                goal_selection(binding.map_epoch_id(), 2, 2.5, 0.5),
+                &second_snapshot,
+            )
+            .expect("second concurrent preparation");
+        coordinator
+            .commit_prepared_map_point_goal(host(1_062), prepared_first)
+            .expect("first preparation wins");
+        let records_before_losing_commit = coordinator.journal().len();
+        assert!(matches!(
+            coordinator.commit_prepared_map_point_goal(host(1_063), prepared_second),
+            Err(CoordinatorAdmissionError::PointGoalPreparationStale { .. })
+        ));
+        assert_eq!(coordinator.journal().len(), records_before_losing_commit);
+        assert_eq!(
+            coordinator
+                .current_goal()
+                .expect("winning goal remains")
+                .point()
+                .as_array(),
+            [1.5, 0.5]
+        );
+    }
+
+    #[test]
+    fn prepared_point_goal_cannot_cross_a_direct_mode_transition() {
+        let mut coordinator = coordinator_without_goal();
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let snapshot = occupancy(map, 1);
+        coordinator
+            .accept_global_map(host(1_050), Timestamp::from_nanos(100), &snapshot)
+            .expect("mapping snapshot");
+        let binding = coordinator.current_map_binding().expect("map binding");
+        let prepared = coordinator
+            .prepare_map_point_goal(
+                goal_selection(binding.map_epoch_id(), 1, 1.5, 0.5),
+                &snapshot,
+            )
+            .expect("prepared goal");
+        coordinator
+            .enter_manual_mode(NonZeroU64::new(17).expect("lease"))
+            .expect("separately authorized direct-mode fixture");
+        let records_before_commit = coordinator.journal().len();
+
+        assert!(matches!(
+            coordinator.commit_prepared_map_point_goal(host(1_060), prepared),
+            Err(CoordinatorAdmissionError::PointGoalPreparationStale {
+                prepared_motion_mode: CoordinatorMotionModeV1::MappingOnly,
+                current_motion_mode: CoordinatorMotionModeV1::Manual { .. },
+                ..
+            })
+        ));
+        assert_eq!(coordinator.journal().len(), records_before_commit);
+        assert_eq!(coordinator.goal_state(), NavigationGoalState::Unavailable);
+        assert!(matches!(
+            coordinator.motion_mode(),
+            CoordinatorMotionModeV1::Manual { .. }
+        ));
+    }
+
+    #[test]
+    fn prepared_point_goal_detects_motion_mode_enter_leave_aba() {
+        let mut coordinator = coordinator_without_goal();
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let snapshot = occupancy(map, 1);
+        coordinator
+            .accept_global_map(host(1_050), Timestamp::from_nanos(100), &snapshot)
+            .expect("mapping snapshot");
+        let binding = coordinator.current_map_binding().expect("map binding");
+        let prepared = coordinator
+            .prepare_map_point_goal(
+                goal_selection(binding.map_epoch_id(), 1, 1.5, 0.5),
+                &snapshot,
+            )
+            .expect("prepared goal");
+        let lease = NonZeroU64::new(17).expect("lease");
+        coordinator
+            .enter_manual_mode(lease)
+            .expect("enter direct-mode fixture");
+        coordinator
+            .leave_direct_mode(lease)
+            .expect("leave direct-mode fixture");
+        assert_eq!(
+            coordinator.motion_mode(),
+            CoordinatorMotionModeV1::MappingOnly,
+            "visible motion mode returned to its prepared value"
+        );
+        let records_before_commit = coordinator.journal().len();
+
+        assert!(matches!(
+            coordinator.commit_prepared_map_point_goal(host(1_060), prepared),
+            Err(CoordinatorAdmissionError::PointGoalPreparationStale {
+                prepared_motion_mode_generation: 0,
+                current_motion_mode_generation: 2,
+                ..
+            })
+        ));
+        assert_eq!(coordinator.journal().len(), records_before_commit);
+        assert_eq!(coordinator.goal_state(), NavigationGoalState::Unavailable);
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn bounded_frontier_constraint_survives_coordinator_commit_and_replan() {
+        let planner_config =
+            GlobalPlannerConfig::try_new(0.0, super::super::UnknownSpacePolicy::Traversable)
+                .expect("point-robot planner");
+        let mpc = mpc_config();
+        let mut coordinator = ShadowNavigationCoordinator::new_without_goal(
+            clock_epoch(),
+            journal(),
+            odometry(),
+            local_costmap(1_000, 0.0),
+            planner_config,
+            reference_builder(2.0),
+            mpc,
+            SolverBudgetNs::try_new(10).expect("nonzero solver budget"),
+            safety(mpc),
+        );
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let geometry =
+            OccupancyGridGeometry::try_new(1.0, [-3.0, -3.0], 7, 7, 49).expect("global grid");
+        let mut cells = vec![OccupancyCell::Free; geometry.cell_count()];
+        cells[3 * 7 + 5] = OccupancyCell::Unknown;
+        let first_snapshot =
+            OccupancyGridSnapshot::from_test_cells(geometry, &cells, map.instance_id(), 1);
+        coordinator
+            .accept_global_map(host(1_050), Timestamp::from_nanos(100), &first_snapshot)
+            .expect("first global map");
+        let start = coordinator
+            .plan_start_for_snapshot(&first_snapshot)
+            .expect("map-bound start");
+        let boundary =
+            NanoExploreBoundaryMeters::try_new(-0.5, -0.5, 2.5, 1.5).expect("operator boundary");
+        let frontier_config =
+            FrontierExplorerConfig::try_new(0.0, 49, 49, 392).expect("frontier resources");
+        let mut explorer =
+            NanoBoundaryFrontierExplorer::try_new(&first_snapshot, frontier_config, boundary)
+                .expect("bounded explorer");
+        let FrontierSearchOutcome::Selected(frontier) =
+            explorer.select(start).expect("frontier selection")
+        else {
+            panic!("fixture must produce a positive-distance frontier")
+        };
+        let traversal_boundary = frontier
+            .traversal_boundary()
+            .expect("Nano frontier retains traversal boundary");
+        coordinator
+            .select_frontier_goal(host(1_060), frontier, &first_snapshot)
+            .expect("commit bounded frontier");
+        let first_path = coordinator.global_path().expect("first bounded path");
+        assert_eq!(first_path.traversal_boundary(), Some(traversal_boundary));
+        assert!(
+            first_path
+                .points()
+                .iter()
+                .copied()
+                .all(|point| traversal_boundary.contains(point))
+        );
+
+        let second_snapshot =
+            OccupancyGridSnapshot::from_test_cells(geometry, &cells, map.instance_id(), 2);
+        coordinator
+            .accept_global_map(host(1_070), Timestamp::from_nanos(101), &second_snapshot)
+            .expect("newer global map replans");
+        let replanned = coordinator.global_path().expect("replanned bounded path");
+        assert_eq!(replanned.traversal_boundary(), Some(traversal_boundary));
+        assert!(
+            replanned
+                .points()
+                .iter()
+                .copied()
+                .all(|point| traversal_boundary.contains(point))
+        );
+    }
+
+    #[test]
+    fn prepared_point_goal_detects_goal_change_clear_aba_and_generation_exhaustion() {
+        let mut coordinator = coordinator_without_goal();
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let snapshot = occupancy(map, 1);
+        coordinator
+            .accept_global_map(host(1_050), Timestamp::from_nanos(100), &snapshot)
+            .expect("mapping snapshot");
+        let binding = coordinator.current_map_binding().expect("map binding");
+        let prepared_before_aba = coordinator
+            .prepare_map_point_goal(
+                goal_selection(binding.map_epoch_id(), 1, 1.5, 0.5),
+                &snapshot,
+            )
+            .expect("prepared before ABA");
+        coordinator
+            .select_map_point_goal(
+                host(1_060),
+                goal_selection(binding.map_epoch_id(), 1, 2.5, 0.5),
+                &snapshot,
+            )
+            .expect("intervening goal");
+        coordinator.clear_goal();
+        assert_eq!(
+            coordinator.goal_state(),
+            NavigationGoalState::Unavailable,
+            "visible goal state returned to its prepared value"
+        );
+        let records_before_aba_commit = coordinator.journal().len();
+        assert!(matches!(
+            coordinator.commit_prepared_map_point_goal(host(1_061), prepared_before_aba),
+            Err(CoordinatorAdmissionError::PointGoalPreparationStale {
+                prepared_goal_generation: 0,
+                current_goal_generation: 2,
+                ..
+            })
+        ));
+        assert_eq!(coordinator.journal().len(), records_before_aba_commit);
+
+        let prepared_at_limit = coordinator
+            .prepare_map_point_goal(
+                goal_selection(binding.map_epoch_id(), 1, 1.5, 0.5),
+                &snapshot,
+            )
+            .expect("prepared at finite generation");
+        coordinator.goal_generation = u64::MAX;
+        let records_before_exhausted_commit = coordinator.journal().len();
+        assert!(matches!(
+            coordinator.commit_prepared_map_point_goal(host(1_062), prepared_at_limit),
+            Err(CoordinatorAdmissionError::PointGoalPreparationStale {
+                current_goal_generation: u64::MAX,
+                ..
+            })
+        ));
+        assert_eq!(coordinator.journal().len(), records_before_exhausted_commit);
+
+        let prepared_at_exact_limit = coordinator
+            .prepare_map_point_goal(
+                goal_selection(binding.map_epoch_id(), 1, 1.5, 0.5),
+                &snapshot,
+            )
+            .expect("prepare observes exact generation limit");
+        assert!(matches!(
+            coordinator.commit_prepared_map_point_goal(host(1_063), prepared_at_exact_limit),
+            Err(CoordinatorAdmissionError::Latched(
+                CoordinatorLatch::GoalGenerationExhausted
+            ))
+        ));
+        assert_eq!(
+            coordinator.latch(),
+            Some(CoordinatorLatch::GoalGenerationExhausted)
+        );
+        assert_eq!(coordinator.journal().len(), records_before_exhausted_commit);
     }
 
     #[test]

@@ -875,6 +875,49 @@ pub struct NanoExploreBoundaryMeters {
 }
 
 impl NanoExploreBoundaryMeters {
+    pub fn try_new(
+        minimum_x_m: f64,
+        minimum_y_m: f64,
+        maximum_x_m: f64,
+        maximum_y_m: f64,
+    ) -> Result<Self, NanoExploreBoundaryError> {
+        for (component, value) in [
+            (NanoExploreBoundaryComponent::MinimumX, minimum_x_m),
+            (NanoExploreBoundaryComponent::MinimumY, minimum_y_m),
+            (NanoExploreBoundaryComponent::MaximumX, maximum_x_m),
+            (NanoExploreBoundaryComponent::MaximumY, maximum_y_m),
+        ] {
+            if !value.is_finite() {
+                return Err(NanoExploreBoundaryError::NonFinite { component, value });
+            }
+            if value.abs() > MAX_NANO_AGENT_ABS_EXPLORE_BOUNDARY_M {
+                return Err(NanoExploreBoundaryError::OutsideSupportedRange {
+                    component,
+                    value_m: value,
+                    maximum_absolute_m: MAX_NANO_AGENT_ABS_EXPLORE_BOUNDARY_M,
+                });
+            }
+        }
+        if minimum_x_m >= maximum_x_m {
+            return Err(NanoExploreBoundaryError::EmptyOrReversedX {
+                minimum_x_m,
+                maximum_x_m,
+            });
+        }
+        if minimum_y_m >= maximum_y_m {
+            return Err(NanoExploreBoundaryError::EmptyOrReversedY {
+                minimum_y_m,
+                maximum_y_m,
+            });
+        }
+        Ok(Self {
+            minimum_x_m,
+            minimum_y_m,
+            maximum_x_m,
+            maximum_y_m,
+        })
+    }
+
     pub const fn minimum_x_m(self) -> f64 {
         self.minimum_x_m
     }
@@ -1651,49 +1694,8 @@ fn parse_explore_boundary(
     maximum_x_m: f64,
     maximum_y_m: f64,
 ) -> Result<NanoExploreBoundaryMeters, NanoAgentPolicyConfigParseError> {
-    for (component, value) in [
-        (NanoExploreBoundaryComponent::MinimumX, minimum_x_m),
-        (NanoExploreBoundaryComponent::MinimumY, minimum_y_m),
-        (NanoExploreBoundaryComponent::MaximumX, maximum_x_m),
-        (NanoExploreBoundaryComponent::MaximumY, maximum_y_m),
-    ] {
-        if !value.is_finite() {
-            return Err(NanoAgentPolicyConfigParseError::ExploreBoundary {
-                source: NanoExploreBoundaryError::NonFinite { component, value },
-            });
-        }
-        if value.abs() > MAX_NANO_AGENT_ABS_EXPLORE_BOUNDARY_M {
-            return Err(NanoAgentPolicyConfigParseError::ExploreBoundary {
-                source: NanoExploreBoundaryError::OutsideSupportedRange {
-                    component,
-                    value_m: value,
-                    maximum_absolute_m: MAX_NANO_AGENT_ABS_EXPLORE_BOUNDARY_M,
-                },
-            });
-        }
-    }
-    if minimum_x_m >= maximum_x_m {
-        return Err(NanoAgentPolicyConfigParseError::ExploreBoundary {
-            source: NanoExploreBoundaryError::EmptyOrReversedX {
-                minimum_x_m,
-                maximum_x_m,
-            },
-        });
-    }
-    if minimum_y_m >= maximum_y_m {
-        return Err(NanoAgentPolicyConfigParseError::ExploreBoundary {
-            source: NanoExploreBoundaryError::EmptyOrReversedY {
-                minimum_y_m,
-                maximum_y_m,
-            },
-        });
-    }
-    Ok(NanoExploreBoundaryMeters {
-        minimum_x_m,
-        minimum_y_m,
-        maximum_x_m,
-        maximum_y_m,
-    })
+    NanoExploreBoundaryMeters::try_new(minimum_x_m, minimum_y_m, maximum_x_m, maximum_y_m)
+        .map_err(|source| NanoAgentPolicyConfigParseError::ExploreBoundary { source })
 }
 
 fn parse_absolute_path(
@@ -2813,6 +2815,50 @@ mod tests {
             parse(&too_long),
             Err(NanoAgentPolicyConfigParseError::ExploreRuntime { .. })
         ));
+    }
+
+    #[test]
+    fn exploration_boundary_domain_constructor_rejects_invalid_rectangles_once() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                NanoExploreBoundaryMeters::try_new(invalid, -1.0, 1.0, 1.0),
+                Err(NanoExploreBoundaryError::NonFinite {
+                    component: NanoExploreBoundaryComponent::MinimumX,
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            NanoExploreBoundaryMeters::try_new(-1.0, -1.0, -1.0, 1.0),
+            Err(NanoExploreBoundaryError::EmptyOrReversedX { .. })
+        ));
+        assert!(matches!(
+            NanoExploreBoundaryMeters::try_new(-1.0, 1.0, 1.0, 1.0),
+            Err(NanoExploreBoundaryError::EmptyOrReversedY { .. })
+        ));
+        assert!(matches!(
+            NanoExploreBoundaryMeters::try_new(
+                -1.0,
+                -1.0,
+                MAX_NANO_AGENT_ABS_EXPLORE_BOUNDARY_M + 1.0,
+                1.0,
+            ),
+            Err(NanoExploreBoundaryError::OutsideSupportedRange {
+                component: NanoExploreBoundaryComponent::MaximumX,
+                ..
+            })
+        ));
+        let parsed =
+            NanoExploreBoundaryMeters::try_new(-2.0, -1.0, 3.0, 4.0).expect("valid rectangle");
+        assert_eq!(
+            (
+                parsed.minimum_x_m(),
+                parsed.minimum_y_m(),
+                parsed.maximum_x_m(),
+                parsed.maximum_y_m(),
+            ),
+            (-2.0, -1.0, 3.0, 4.0)
+        );
     }
 
     #[cfg(not(feature = "actuation"))]

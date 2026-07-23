@@ -15,8 +15,10 @@ use std::num::{NonZeroU8, NonZeroUsize};
 use crate::dense::occupancy::{OccupancyCell, OccupancyGridGeometry, OccupancyGridSnapshot};
 use crate::map::MapInstanceId;
 
+#[cfg(all(feature = "agent-runtime", unix))]
+use super::NanoExploreBoundaryMeters;
 use super::cell_inflation::{CellInflationError, CellSquareInflation};
-use super::global_planner::{MapPoint, PlanStart, PointGoal};
+use super::global_planner::{MapPoint, MapTraversalBoundary, PlanStart, PointGoal};
 
 const CARDINAL_COST_DECICELLS: u64 = 10;
 const DIAGONAL_COST_DECICELLS: u64 = 14;
@@ -222,6 +224,13 @@ pub enum FrontierSearchError {
     StartOutsideMap {
         point: MapPoint,
     },
+    StartOutsideExplorationBoundary {
+        point: MapPoint,
+    },
+    StartCellCenterOutsideExplorationBoundary {
+        point: MapPoint,
+        cell_center: MapPoint,
+    },
     StartBlocked {
         point: MapPoint,
     },
@@ -257,6 +266,20 @@ impl std::fmt::Display for FrontierSearchError {
                 "frontier start [{}, {}] m is outside the occupancy map",
                 point.x_m(),
                 point.y_m()
+            ),
+            Self::StartOutsideExplorationBoundary { point } => write!(
+                formatter,
+                "frontier start [{}, {}] m is outside the operator exploration boundary",
+                point.x_m(),
+                point.y_m()
+            ),
+            Self::StartCellCenterOutsideExplorationBoundary { point, cell_center } => write!(
+                formatter,
+                "frontier start [{}, {}] m belongs to cell center [{}, {}] m outside the operator exploration boundary",
+                point.x_m(),
+                point.y_m(),
+                cell_center.x_m(),
+                cell_center.y_m()
             ),
             Self::StartBlocked { point } => write!(
                 formatter,
@@ -315,6 +338,7 @@ impl FrontierScore {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrontierGoal {
     point_goal: PointGoal,
+    traversal_boundary: Option<MapTraversalBoundary>,
     column: u32,
     row: u32,
     score: FrontierScore,
@@ -324,6 +348,13 @@ pub struct FrontierGoal {
 impl FrontierGoal {
     pub fn point_goal(self) -> PointGoal {
         self.point_goal
+    }
+
+    /// The exact robot-centre traversal boundary enforced while selecting this
+    /// goal. `Some` is retained by Nano-bounded selection and must be carried
+    /// into every planner invocation which may execute this goal.
+    pub fn traversal_boundary(self) -> Option<MapTraversalBoundary> {
+        self.traversal_boundary
     }
 
     pub fn point(self) -> MapPoint {
@@ -500,6 +531,103 @@ struct Candidate {
     adjacent_unknown_cells: u8,
 }
 
+/// Closed metric rectangle reduced once to an exact set of cell centers.
+///
+/// Every search edge joins two admitted centers inside the same convex
+/// rectangle, so the whole straight edge remains inside the operator
+/// boundary. Unknown cells outside this range cannot create a frontier.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrontierTraversalBoundary {
+    minimum_x_m: f64,
+    minimum_y_m: f64,
+    maximum_x_m: f64,
+    maximum_y_m: f64,
+    minimum_column: usize,
+    maximum_column_exclusive: usize,
+    minimum_row: usize,
+    maximum_row_exclusive: usize,
+    map_boundary: Option<MapTraversalBoundary>,
+}
+
+impl FrontierTraversalBoundary {
+    fn unbounded(width: usize, height: usize) -> Self {
+        Self {
+            minimum_x_m: f64::NEG_INFINITY,
+            minimum_y_m: f64::NEG_INFINITY,
+            maximum_x_m: f64::INFINITY,
+            maximum_y_m: f64::INFINITY,
+            minimum_column: 0,
+            maximum_column_exclusive: width,
+            minimum_row: 0,
+            maximum_row_exclusive: height,
+            map_boundary: None,
+        }
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn for_nano(
+        geometry: OccupancyGridGeometry,
+        width: usize,
+        height: usize,
+        boundary: NanoExploreBoundaryMeters,
+    ) -> Self {
+        let lower = geometry.lower_bound_m();
+        let resolution_m = geometry.resolution_m();
+        let map_boundary = MapTraversalBoundary::try_new(
+            boundary.minimum_x_m(),
+            boundary.minimum_y_m(),
+            boundary.maximum_x_m(),
+            boundary.maximum_y_m(),
+        )
+        .expect("parsed Nano exploration boundary is a finite ordered rectangle");
+        Self {
+            minimum_x_m: boundary.minimum_x_m(),
+            minimum_y_m: boundary.minimum_y_m(),
+            maximum_x_m: boundary.maximum_x_m(),
+            maximum_y_m: boundary.maximum_y_m(),
+            minimum_column: first_center_not_less_than(
+                width,
+                lower[0],
+                resolution_m,
+                boundary.minimum_x_m(),
+            ),
+            maximum_column_exclusive: first_center_greater_than(
+                width,
+                lower[0],
+                resolution_m,
+                boundary.maximum_x_m(),
+            ),
+            minimum_row: first_center_not_less_than(
+                height,
+                lower[1],
+                resolution_m,
+                boundary.minimum_y_m(),
+            ),
+            maximum_row_exclusive: first_center_greater_than(
+                height,
+                lower[1],
+                resolution_m,
+                boundary.maximum_y_m(),
+            ),
+            map_boundary: Some(map_boundary),
+        }
+    }
+
+    fn contains_point(self, point: MapPoint) -> bool {
+        point.x_m() >= self.minimum_x_m
+            && point.x_m() <= self.maximum_x_m
+            && point.y_m() >= self.minimum_y_m
+            && point.y_m() <= self.maximum_y_m
+    }
+
+    fn contains_cell(self, column: usize, row: usize) -> bool {
+        column >= self.minimum_column
+            && column < self.maximum_column_exclusive
+            && row >= self.minimum_row
+            && row < self.maximum_row_exclusive
+    }
+}
+
 /// Reusable frontier selector bound to one immutable occupancy-map revision.
 pub struct FrontierExplorer<'map> {
     snapshot: &'map OccupancyGridSnapshot,
@@ -513,6 +641,67 @@ pub struct FrontierExplorer<'map> {
     distances_decicells: Vec<u64>,
     settled: Vec<bool>,
     open: BinaryHeap<SearchNode>,
+}
+
+/// Nano frontier selector whose operator boundary is mandatory and immutable.
+///
+/// Metric bounds are converted to cell-center ranges once at construction;
+/// every subsequent `select` enforces that same parsed contract.
+#[cfg(all(feature = "agent-runtime", unix))]
+pub struct NanoBoundaryFrontierExplorer<'map> {
+    inner: FrontierExplorer<'map>,
+    boundary: NanoExploreBoundaryMeters,
+    traversal_boundary: FrontierTraversalBoundary,
+}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+impl<'map> NanoBoundaryFrontierExplorer<'map> {
+    pub fn try_new(
+        snapshot: &'map OccupancyGridSnapshot,
+        config: FrontierExplorerConfig,
+        boundary: NanoExploreBoundaryMeters,
+    ) -> Result<Self, FrontierBuildError> {
+        let inner = FrontierExplorer::try_new(snapshot, config)?;
+        let traversal_boundary = FrontierTraversalBoundary::for_nano(
+            inner.geometry,
+            inner.width,
+            inner.height,
+            boundary,
+        );
+        Ok(Self {
+            inner,
+            boundary,
+            traversal_boundary,
+        })
+    }
+
+    pub fn map_instance_id(&self) -> MapInstanceId {
+        self.inner.map_instance_id()
+    }
+
+    pub fn map_revision(&self) -> u64 {
+        self.inner.map_revision()
+    }
+
+    pub fn config(&self) -> FrontierExplorerConfig {
+        self.inner.config()
+    }
+
+    pub fn boundary(&self) -> NanoExploreBoundaryMeters {
+        self.boundary
+    }
+
+    pub fn is_current_for(&self, snapshot: &OccupancyGridSnapshot) -> bool {
+        self.inner.is_current_for(snapshot)
+    }
+
+    pub fn select(
+        &mut self,
+        start: PlanStart,
+    ) -> Result<FrontierSearchOutcome, FrontierSearchError> {
+        self.inner
+            .select_in_boundary(start, self.traversal_boundary)
+    }
 }
 
 impl<'map> FrontierExplorer<'map> {
@@ -611,6 +800,15 @@ impl<'map> FrontierExplorer<'map> {
         &mut self,
         start: PlanStart,
     ) -> Result<FrontierSearchOutcome, FrontierSearchError> {
+        let boundary = FrontierTraversalBoundary::unbounded(self.width, self.height);
+        self.select_in_boundary(start, boundary)
+    }
+
+    fn select_in_boundary(
+        &mut self,
+        start: PlanStart,
+        boundary: FrontierTraversalBoundary,
+    ) -> Result<FrontierSearchOutcome, FrontierSearchError> {
         if start.map_instance_id() != self.map_instance_id
             || start.map_revision() != self.map_revision
         {
@@ -626,6 +824,21 @@ impl<'map> FrontierExplorer<'map> {
             .geometry
             .point_index(start_point.as_array())
             .ok_or(FrontierSearchError::StartOutsideMap { point: start_point })?;
+        if !boundary.contains_point(start_point) {
+            return Err(FrontierSearchError::StartOutsideExplorationBoundary {
+                point: start_point,
+            });
+        }
+        let start_column = start_index % self.width;
+        let start_row = start_index / self.width;
+        if !boundary.contains_cell(start_column, start_row) {
+            return Err(
+                FrontierSearchError::StartCellCenterOutsideExplorationBoundary {
+                    point: start_point,
+                    cell_center: self.cell_center(start_index)?,
+                },
+            );
+        }
         if !self.traversable.get(start_index).copied().unwrap_or(false) {
             return Err(FrontierSearchError::StartBlocked { point: start_point });
         }
@@ -661,7 +874,7 @@ impl<'map> FrontierExplorer<'map> {
             self.settled[current.index] = true;
             settled_cells += 1;
 
-            let unknown_directions = self.adjacent_unknown_directions(current.index)?;
+            let unknown_directions = self.adjacent_unknown_directions(current.index, boundary)?;
             if current.index == start_index {
                 start_frontier = unknown_directions;
             } else if let Some(unknown_directions) = unknown_directions {
@@ -681,7 +894,7 @@ impl<'map> FrontierExplorer<'map> {
             if best.is_some() {
                 continue;
             }
-            self.expand(current)?;
+            self.expand(current, boundary)?;
         }
 
         let Some(best) = best else {
@@ -721,6 +934,7 @@ impl<'map> FrontierExplorer<'map> {
             .map_err(|_| FrontierSearchError::SearchInvariant)?;
         Ok(FrontierSearchOutcome::Selected(FrontierGoal {
             point_goal,
+            traversal_boundary: boundary.map_boundary,
             column,
             row,
             score: FrontierScore {
@@ -741,7 +955,11 @@ impl<'map> FrontierExplorer<'map> {
         Ok(())
     }
 
-    fn expand(&mut self, current: SearchNode) -> Result<(), FrontierSearchError> {
+    fn expand(
+        &mut self,
+        current: SearchNode,
+        boundary: FrontierTraversalBoundary,
+    ) -> Result<(), FrontierSearchError> {
         let column = current.index % self.width;
         let row = current.index / self.width;
         for (dx, dy, step_cost) in search_neighbors() {
@@ -753,6 +971,9 @@ impl<'map> FrontierExplorer<'map> {
             if next_column >= self.width || next_row >= self.height {
                 continue;
             }
+            if !boundary.contains_cell(next_column, next_row) {
+                continue;
+            }
             let next = self.index(next_column, next_row)?;
             if !self.traversable[next] || self.settled[next] {
                 continue;
@@ -760,7 +981,11 @@ impl<'map> FrontierExplorer<'map> {
             if dx != 0 && dy != 0 {
                 let horizontal = self.index(next_column, row)?;
                 let vertical = self.index(column, next_row)?;
-                if !self.traversable[horizontal] || !self.traversable[vertical] {
+                if !boundary.contains_cell(next_column, row)
+                    || !boundary.contains_cell(column, next_row)
+                    || !self.traversable[horizontal]
+                    || !self.traversable[vertical]
+                {
                     continue;
                 }
             }
@@ -782,6 +1007,7 @@ impl<'map> FrontierExplorer<'map> {
     fn adjacent_unknown_directions(
         &self,
         index: usize,
+        boundary: FrontierTraversalBoundary,
     ) -> Result<Option<FrontierUnknownDirections>, FrontierSearchError> {
         let column = index % self.width;
         let row = index / self.width;
@@ -798,6 +1024,9 @@ impl<'map> FrontierExplorer<'map> {
                 continue;
             };
             if neighbor_column >= self.width || neighbor_row >= self.height {
+                continue;
+            }
+            if !boundary.contains_cell(neighbor_column, neighbor_row) {
                 continue;
             }
             let neighbor = self.index(neighbor_column, neighbor_row)?;
@@ -824,6 +1053,50 @@ impl<'map> FrontierExplorer<'map> {
         let y_m = lower[1] + (row as f64 + 0.5) * resolution_m;
         MapPoint::try_new(x_m, y_m).map_err(|_| FrontierSearchError::MetricConversionOverflow)
     }
+}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+fn first_center_not_less_than(
+    count: usize,
+    lower_m: f64,
+    resolution_m: f64,
+    boundary_m: f64,
+) -> usize {
+    first_center_matching(count, |index| {
+        cell_center_axis(lower_m, resolution_m, index) >= boundary_m
+    })
+}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+fn first_center_greater_than(
+    count: usize,
+    lower_m: f64,
+    resolution_m: f64,
+    boundary_m: f64,
+) -> usize {
+    first_center_matching(count, |index| {
+        cell_center_axis(lower_m, resolution_m, index) > boundary_m
+    })
+}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+fn first_center_matching(count: usize, predicate: impl Fn(usize) -> bool) -> usize {
+    let mut lower = 0_usize;
+    let mut upper = count;
+    while lower < upper {
+        let midpoint = lower + (upper - lower) / 2;
+        if predicate(midpoint) {
+            upper = midpoint;
+        } else {
+            lower = midpoint + 1;
+        }
+    }
+    lower
+}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+fn cell_center_axis(lower_m: f64, resolution_m: f64, index: usize) -> f64 {
+    lower_m + (index as f64 + 0.5) * resolution_m
 }
 
 fn search_neighbors() -> [(isize, isize, u64); MAX_NEIGHBORS_PER_CELL] {
@@ -921,6 +1194,30 @@ mod tests {
 
     fn point(x_m: f64, y_m: f64) -> MapPoint {
         MapPoint::try_new(x_m, y_m).expect("test point")
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn boundary(
+        minimum_x_m: f64,
+        minimum_y_m: f64,
+        maximum_x_m: f64,
+        maximum_y_m: f64,
+    ) -> NanoExploreBoundaryMeters {
+        NanoExploreBoundaryMeters::try_new(minimum_x_m, minimum_y_m, maximum_x_m, maximum_y_m)
+            .expect("test exploration boundary")
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn bounded_explorer<'map>(
+        snapshot: &'map OccupancyGridSnapshot,
+        boundary: NanoExploreBoundaryMeters,
+    ) -> NanoBoundaryFrontierExplorer<'map> {
+        NanoBoundaryFrontierExplorer::try_new(
+            snapshot,
+            config(snapshot.geometry().cell_count()),
+            boundary,
+        )
+        .expect("bounded Nano explorer")
     }
 
     fn start_for(snapshot: &OccupancyGridSnapshot, column: usize, row: usize) -> PlanStart {
@@ -1085,6 +1382,89 @@ mod tests {
             explorer.select(start).expect("bounded search"),
             FrontierSearchOutcome::NoReachableFrontier { settled_cells: 9 }
         );
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn closed_exploration_boundary_excludes_outside_unknown_evidence_during_search() {
+        let map_geometry = geometry(1.0, [0.0, 0.0], 5, 3);
+        let mut cells = vec![OccupancyCell::Free; 15];
+        cells[3 + 5] = OccupancyCell::Unknown;
+        let map_snapshot = snapshot(map_geometry, &cells, map_instance_id(), 1);
+        let start = start_for(&map_snapshot, 0, 1);
+        let first_boundary = boundary(0.0, 1.0, 3.0, 2.0);
+        let mut explorer = bounded_explorer(&map_snapshot, first_boundary);
+        assert_eq!(explorer.boundary(), first_boundary);
+
+        assert_eq!(
+            explorer.select(start).expect("bounded search"),
+            FrontierSearchOutcome::NoReachableFrontier { settled_cells: 3 },
+            "an unknown cell whose center is outside the boundary is not frontier evidence"
+        );
+
+        let mut closed_edge_explorer =
+            bounded_explorer(&map_snapshot, boundary(0.0, 1.0, 3.5, 2.0));
+        let goal = selected(
+            closed_edge_explorer
+                .select(start)
+                .expect("closed-edge search"),
+        );
+        assert_eq!((goal.column(), goal.row()), (2, 1));
+        assert_eq!(goal.point(), point(2.5, 1.5));
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn frontier_search_cannot_detour_outside_boundary_and_reenter() {
+        let map_geometry = geometry(1.0, [0.0, 0.0], 7, 5);
+        let mut cells = vec![OccupancyCell::Occupied; 35];
+        cells[1..=5].fill(OccupancyCell::Free);
+        for row in cells.chunks_exact_mut(7).take(3) {
+            row[1] = OccupancyCell::Free;
+            row[5] = OccupancyCell::Free;
+        }
+        let third_row = cells.chunks_exact_mut(7).nth(2).expect("fixture row");
+        third_row[1..=2].fill(OccupancyCell::Free);
+        third_row[4..=5].fill(OccupancyCell::Free);
+        third_row[6] = OccupancyCell::Unknown;
+        let map_snapshot = snapshot(map_geometry, &cells, map_instance_id(), 2);
+        let start = start_for(&map_snapshot, 1, 2);
+        let mut explorer = FrontierExplorer::try_new(&map_snapshot, config(35)).expect("explorer");
+
+        let unbounded = selected(explorer.select(start).expect("unbounded detour"));
+        assert_eq!((unbounded.column(), unbounded.row()), (5, 2));
+
+        let mut bounded_explorer = bounded_explorer(&map_snapshot, boundary(0.0, 1.0, 7.0, 4.0));
+        assert!(matches!(
+            bounded_explorer.select(start).expect("bounded traversal"),
+            FrontierSearchOutcome::NoReachableFrontier { .. }
+        ));
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn boundary_rejects_outside_start_and_cell_center_conservatively() {
+        let map_geometry = geometry(1.0, [0.0, 0.0], 3, 3);
+        let cells = vec![OccupancyCell::Free; 9];
+        let map_snapshot = snapshot(map_geometry, &cells, map_instance_id(), 1);
+        let mut explorer = bounded_explorer(&map_snapshot, boundary(0.6, 1.0, 1.4, 2.0));
+        let outside = start_for(&map_snapshot, 0, 1);
+        assert!(matches!(
+            explorer.select(outside),
+            Err(FrontierSearchError::StartOutsideExplorationBoundary { .. })
+        ));
+
+        let center_outside = PlanStart::for_snapshot(point(0.6, 1.5), &map_snapshot)
+            .expect("start inside map and metric boundary");
+        assert!(matches!(
+            explorer.select(center_outside),
+            Err(
+                FrontierSearchError::StartCellCenterOutsideExplorationBoundary {
+                    cell_center,
+                    ..
+                }
+            ) if cell_center == point(0.5, 1.5)
+        ));
     }
 
     #[test]
@@ -1275,11 +1655,99 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn bounded_selection_matches_reference_across_cells_and_closed_edges() {
+        let map_geometry = geometry(1.0, [-1.5, -1.5], 3, 3);
+        let id = map_instance_id();
+        let boundaries = [
+            boundary(-0.1, -0.1, 0.1, 0.1),
+            boundary(-1.0, -1.0, 0.0, 1.0),
+            boundary(0.0, -1.0, 1.0, 1.0),
+            boundary(-1.0, -1.0, 1.0, 1.0),
+        ];
+        let mut state = 0x791F_02D4_u64;
+        for revision in 1..=256_u64 {
+            let mut cells = vec![OccupancyCell::Free; 9];
+            for (index, cell) in cells.iter_mut().enumerate() {
+                if index == 4 {
+                    continue;
+                }
+                state = state
+                    .wrapping_mul(2_862_933_555_777_941_757)
+                    .wrapping_add(3_037_000_493);
+                *cell = match state % 3 {
+                    0 => OccupancyCell::Unknown,
+                    1 => OccupancyCell::Free,
+                    _ => OccupancyCell::Occupied,
+                };
+            }
+            let map_snapshot = snapshot(map_geometry, &cells, id, revision);
+            let start = start_for(&map_snapshot, 1, 1);
+            for boundary in boundaries {
+                let allowed = (0..9)
+                    .map(|index| {
+                        let column = index % 3;
+                        let row = index / 3;
+                        let center = point(column as f64 - 1.0, row as f64 - 1.0);
+                        center.x_m() >= boundary.minimum_x_m()
+                            && center.x_m() <= boundary.maximum_x_m()
+                            && center.y_m() >= boundary.minimum_y_m()
+                            && center.y_m() <= boundary.maximum_y_m()
+                    })
+                    .collect::<Vec<_>>();
+                let expected = reference_best_with_allowed(&cells, 3, 3, 4, &allowed);
+                let start_unknown_directions =
+                    reference_unknown_directions_with_allowed(&cells, 3, 3, 4, &allowed);
+                let actual = bounded_explorer(&map_snapshot, boundary)
+                    .select(start)
+                    .expect("bounded reference search");
+                match (expected, actual) {
+                    (Some(expected), FrontierSearchOutcome::Selected(actual)) => {
+                        assert_eq!(
+                            actual.row() as usize * 3 + actual.column() as usize,
+                            expected.index,
+                            "revision {revision}, boundary {boundary:?}"
+                        );
+                        assert!(allowed[expected.index]);
+                        assert_eq!(
+                            actual.score().adjacent_unknown_cells(),
+                            expected.adjacent_unknown_cells
+                        );
+                    }
+                    (None, FrontierSearchOutcome::InPlaceScanRequired(scan)) => {
+                        assert_eq!(
+                            Some(scan.unknown_directions()),
+                            start_unknown_directions,
+                            "revision {revision}, boundary {boundary:?}"
+                        );
+                    }
+                    (None, FrontierSearchOutcome::NoReachableFrontier { .. }) => {
+                        assert_eq!(start_unknown_directions, None);
+                    }
+                    (expected, actual) => panic!(
+                        "bounded reference mismatch at revision {revision}, boundary {boundary:?}: expected {expected:?}, got {actual:?}"
+                    ),
+                }
+            }
+        }
+    }
+
     fn reference_best(
         cells: &[OccupancyCell],
         width: usize,
         height: usize,
         start: usize,
+    ) -> Option<Candidate> {
+        reference_best_with_allowed(cells, width, height, start, &vec![true; cells.len()])
+    }
+
+    fn reference_best_with_allowed(
+        cells: &[OccupancyCell],
+        width: usize,
+        height: usize,
+        start: usize,
+        allowed: &[bool],
     ) -> Option<Candidate> {
         let mut distances = vec![u64::MAX; cells.len()];
         let mut settled = vec![false; cells.len()];
@@ -1287,7 +1755,9 @@ mod tests {
         let mut best = None;
         for _ in 0..cells.len() {
             let Some(current) = (0..cells.len())
-                .filter(|index| cells[*index] == OccupancyCell::Free && !settled[*index])
+                .filter(|index| {
+                    allowed[*index] && cells[*index] == OccupancyCell::Free && !settled[*index]
+                })
                 .min_by_key(|index| (distances[*index], *index))
             else {
                 break;
@@ -1304,7 +1774,10 @@ mod tests {
                     Some((column.checked_add_signed(dx)?, row.checked_add_signed(dy)?))
                 })
                 .filter(|(column, row)| *column < width && *row < height)
-                .filter(|(column, row)| cells[row * width + column] == OccupancyCell::Unknown)
+                .filter(|(column, row)| {
+                    let index = row * width + column;
+                    allowed[index] && cells[index] == OccupancyCell::Unknown
+                })
                 .count() as u8;
             if current != start && unknown_count > 0 {
                 let candidate = Candidate {
@@ -1326,12 +1799,14 @@ mod tests {
                     continue;
                 }
                 let next = next_row * width + next_column;
-                if cells[next] != OccupancyCell::Free || settled[next] {
+                if !allowed[next] || cells[next] != OccupancyCell::Free || settled[next] {
                     continue;
                 }
                 if dx != 0
                     && dy != 0
-                    && (cells[row * width + next_column] != OccupancyCell::Free
+                    && (!allowed[row * width + next_column]
+                        || !allowed[next_row * width + column]
+                        || cells[row * width + next_column] != OccupancyCell::Free
                         || cells[next_row * width + column] != OccupancyCell::Free)
                 {
                     continue;
@@ -1347,6 +1822,22 @@ mod tests {
         width: usize,
         height: usize,
         index: usize,
+    ) -> Option<FrontierUnknownDirections> {
+        reference_unknown_directions_with_allowed(
+            cells,
+            width,
+            height,
+            index,
+            &vec![true; cells.len()],
+        )
+    }
+
+    fn reference_unknown_directions_with_allowed(
+        cells: &[OccupancyCell],
+        width: usize,
+        height: usize,
+        index: usize,
+        allowed: &[bool],
     ) -> Option<FrontierUnknownDirections> {
         let column = index % width;
         let row = index / width;
@@ -1364,6 +1855,7 @@ mod tests {
             };
             if neighbor_column < width
                 && neighbor_row < height
+                && allowed[neighbor_row * width + neighbor_column]
                 && cells[neighbor_row * width + neighbor_column] == OccupancyCell::Unknown
             {
                 bits |= direction.bit();
