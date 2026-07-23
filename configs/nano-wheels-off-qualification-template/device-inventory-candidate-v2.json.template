@@ -1,0 +1,52 @@
+{
+  "schema_version": 2,
+  "robot_id": "${ROBOT_ID}",
+  "oak": {
+    "mxid": "${OAK_MXID}",
+    "compiled_depthai_header_sdk_version": "${DEPTHAI_HEADER_SDK_VERSION}",
+    "compiled_depthai_header_sdk_commit": "${DEPTHAI_HEADER_SDK_COMMIT}",
+    "compiled_depthai_header_embedded_device_artifact_version": "${DEPTHAI_HEADER_DEVICE_ARTIFACT_VERSION}",
+    "compiled_depthai_header_embedded_bootloader_artifact_version": "${DEPTHAI_HEADER_BOOTLOADER_ARTIFACT_VERSION}"
+  },
+  "stm32": {
+    "serial_by_id_path": "${STM32_SERIAL_BY_ID_PATH}",
+    "control_endpoint_identity": "udp://127.0.0.1:8080",
+    "controller_uid": [${CONTROLLER_UID_U8_ARRAY}],
+    "firmware_abi": 2,
+    "firmware_build_id": 135169,
+    "hardware_profile_fingerprint": [75, 73, 75, 79, 45, 52, 80, 87, 77, 45, 67, 65, 78, 68, 49, 33],
+    "capabilities_bits": 575,
+    "controller_session_class": "operator_supervised_four_pwm_candidate",
+    "expected_max_abs_pwm_percent": 30,
+    "expected_physical_stop_semantics": "unverified"
+  },
+  "head": {
+    "adapter_serial_by_id_path": "${HEAD_SERIAL_BY_ID_PATH}",
+    "bow_servo_id": 1,
+    "curl_servo_id": 2,
+    "yaw_servo_id": 3,
+    "roll_servo_id": 4,
+    "baud_rate_bps": 1000000,
+    "dtr_asserted": false,
+    "rts_asserted": true
+  },
+  "eye": {
+    "serial_by_id_path": "${EYE_SERIAL_BY_ID_PATH}",
+    "kep_protocol_version": 2,
+    "device_uid": [${EYE_DEVICE_UID_U8_ARRAY}],
+    "firmware_build_id": [${EYE_FIRMWARE_BUILD_ID_U8_ARRAY}],
+    "capabilities_bits": 255
+  },
+  "calibration_artifacts": [
+    {
+      "artifact_id": "${CALIBRATION_ARTIFACT_ID}",
+      "sha256": [${CALIBRATION_ARTIFACT_SHA256_U8_ARRAY}]
+    }
+  ],
+  "plant_artifacts": [
+    {
+      "artifact_id": "${SHADOW_PLANT_ARTIFACT_ID}",
+      "sha256": [${SHADOW_PLANT_SHA256_U8_ARRAY}]
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "library_search_relative_path": "lib",
+  "libraries": [
+    {
+      "role": "depthai_core",
+      "soname": "${DEPTHAI_CORE_SONAME}",
+      "relative_path": "lib/${DEPTHAI_CORE_SONAME}",
+      "maximum_bytes": ${DEPTHAI_CORE_MAXIMUM_BYTES},
+      "sha256_hex": "${DEPTHAI_CORE_INSTALLED_SHA256}"
+    },
+    {
+      "role": "dynamic_calibration",
+      "soname": "${DYNAMIC_CALIBRATION_SONAME}",
+      "relative_path": "lib/${DYNAMIC_CALIBRATION_SONAME}",
+      "maximum_bytes": ${DYNAMIC_CALIBRATION_MAXIMUM_BYTES},
+      "sha256_hex": "${DYNAMIC_CALIBRATION_INSTALLED_SHA256}"
+    },
+    {
+      "role": "libusb_1_0",
+      "soname": "${LIBUSB_1_0_SONAME}",
+      "relative_path": "lib/${LIBUSB_1_0_SONAME}",
+      "maximum_bytes": ${LIBUSB_1_0_MAXIMUM_BYTES},
+      "sha256_hex": "${LIBUSB_1_0_INSTALLED_SHA256}"
+    },
+    {
+      "role": "onnxruntime",
+      "soname": "${ONNXRUNTIME_SONAME}",
+      "relative_path": "lib/${ONNXRUNTIME_SONAME}",
+      "maximum_bytes": ${ONNXRUNTIME_MAXIMUM_BYTES},
+      "sha256_hex": "${ONNXRUNTIME_INSTALLED_SHA256}"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "session_id": "${COMMISSIONING_SESSION_ID}",
+  "controller_session_id": "${COMMISSIONING_CONTROLLER_SESSION_ID}",
+  "command_udp_endpoint": "127.0.0.1:${COMMISSIONING_CONTROLLER_OWNER_LOOPBACK_PORT}",
+  "expected_hardware_profile_claim_id": "kiko-attended-wheel-on-commissioning-v1",
+  "maximum_abs_pwm_percent": 20,
+  "maximum_command_step_percent": 20,
+  "command_lease_ms": 250,
+  "status_timeout_ns": 100000000,
+  "acquire_timeout_ns": 1000000000,
+  "applied_ack_timeout_ns": 30000000,
+  "stop_attempt_timeout_ns": 30000000,
+  "max_stop_recovery_attempts": 3,
+  "attestation_lifetime_ns": 120000000000
+}

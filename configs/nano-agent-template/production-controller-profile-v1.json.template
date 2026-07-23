@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "admission_scope": "production_motion_profile_after_physical_wheels_off_review_v1",
+  "admission_id": "${PRODUCTION_ADMISSION_ID}",
+  "reviewer_id": "${PRODUCTION_REVIEWER_ID}",
+  "controller": {
+    "controller_uid_hex": "${CONTROLLER_UID_HEX}",
+    "firmware_abi": ${FIRMWARE_ABI},
+    "firmware_build_id": ${FIRMWARE_BUILD_ID},
+    "actuator_config_fingerprint_hex": "${ACTUATOR_CONFIG_FINGERPRINT_HEX}",
+    "hardware_profile_claim_id": "${HARDWARE_PROFILE_CLAIM_ID}",
+    "controller_ready_timeout_ms": ${CONTROLLER_READY_TIMEOUT_MS},
+    "heartbeat_period_ms": ${HEARTBEAT_PERIOD_MS},
+    "maximum_heartbeat_age_ms": ${MAXIMUM_HEARTBEAT_AGE_MS},
+    "maximum_host_command_rate_hz": ${MAXIMUM_HOST_COMMAND_RATE_HZ},
+    "serial_transmit_timeout_ms": ${SERIAL_TRANSMIT_TIMEOUT_MS},
+    "serial_applied_ack_timeout_ms": ${SERIAL_APPLIED_ACK_TIMEOUT_MS},
+    "controller_clock_abs_error_ppm_bound": ${CONTROLLER_CLOCK_ABS_ERROR_PPM_BOUND},
+    "deadline_quantization_margin_ms": ${DEADLINE_QUANTIZATION_MARGIN_MS},
+    "expected_max_abs_pwm_percent": ${EXPECTED_MAX_ABS_PWM_PERCENT},
+    "expected_pwm_frequency_hz": ${EXPECTED_PWM_FREQUENCY_HZ},
+    "expected_watchdog_nominal_timeout_ms": ${EXPECTED_WATCHDOG_NOMINAL_TIMEOUT_MS},
+    "expected_neutral_output": "${EXPECTED_NEUTRAL_OUTPUT}",
+    "expected_physical_stop_semantics": "${EXPECTED_PHYSICAL_STOP_SEMANTICS}",
+    "command_udp_port": ${CONTROLLER_OWNER_LOOPBACK_PORT}
+  },
+  "actuation": {
+    "plant_model_id": "${PLANT_MODEL_ID}",
+    "plant_model_version": ${PLANT_MODEL_VERSION},
+    "operator_claimed_physical_approval": {
+      "approval_id": "${PHYSICAL_APPROVAL_ID}",
+      "approver_id": "${PHYSICAL_APPROVER_ID}",
+      "plant_dataset_content_id": "${PLANT_DATASET_CONTENT_ID}",
+      "plant_identification_method_id": "${PLANT_IDENTIFICATION_METHOD_ID}",
+      "plant_sample_count": ${PLANT_SAMPLE_COUNT},
+      "plant_fit_residuals": {
+        "left_velocity_rmse_mps": ${LEFT_VELOCITY_RMSE_MPS},
+        "right_velocity_rmse_mps": ${RIGHT_VELOCITY_RMSE_MPS},
+        "yaw_rate_rmse_rad_s": ${YAW_RATE_RMSE_RAD_S},
+        "max_abs_velocity_error_mps": ${MAX_ABS_VELOCITY_ERROR_MPS}
+      },
+      "imu_calibration_id": "${IMU_CALIBRATION_ID}",
+      "stereo_calibration_id": "${STEREO_CALIBRATION_ID}",
+      "tracking_camera_to_base_calibration_id": "${TRACKING_CAMERA_TO_BASE_CALIBRATION_ID}"
+    },
+    "apply_ack_budget_ns": ${APPLY_ACK_BUDGET_NS},
+    "stop_ack_budget_ns": ${STOP_ACK_BUDGET_NS},
+    "scheduling_guard_ns": ${SCHEDULING_GUARD_NS},
+    "controller_motion_lease_ms": ${CONTROLLER_MOTION_LEASE_MS},
+    "controller_deadline_tolerance_ns": ${CONTROLLER_DEADLINE_TOLERANCE_NS},
+    "maximum_uncommanded_motion_ns": ${MAXIMUM_UNCOMMANDED_MOTION_NS}
+  },
+  "live_mode_policy": ${REVIEWED_LIVE_MODE_POLICY_JSON}
+}

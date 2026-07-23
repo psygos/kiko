@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "oak_mxid": "${OAK_MXID}",
+  "imu_calibration_id": "${IMU_CALIBRATION_ID}",
+  "stereo_calibration_id": "${STEREO_CALIBRATION_ID}",
+  "tracking_camera_to_base_calibration_id": "${TRACKING_CAMERA_TO_BASE_CALIBRATION_ID}",
+  "rectified_stereo": {
+    "rectified": true,
+    "left": {
+      "fx_px": ${RECTIFIED_LEFT_FX_PX},
+      "fy_px": ${RECTIFIED_LEFT_FY_PX},
+      "cx_px": ${RECTIFIED_LEFT_CX_PX},
+      "cy_px": ${RECTIFIED_LEFT_CY_PX},
+      "width_px": ${RECTIFIED_STEREO_WIDTH_PX},
+      "height_px": ${RECTIFIED_STEREO_HEIGHT_PX}
+    },
+    "right": {
+      "fx_px": ${RECTIFIED_RIGHT_FX_PX},
+      "fy_px": ${RECTIFIED_RIGHT_FY_PX},
+      "cx_px": ${RECTIFIED_RIGHT_CX_PX},
+      "cy_px": ${RECTIFIED_RIGHT_CY_PX},
+      "width_px": ${RECTIFIED_STEREO_WIDTH_PX},
+      "height_px": ${RECTIFIED_STEREO_HEIGHT_PX}
+    },
+    "baseline_m": ${RECTIFIED_STEREO_BASELINE_M}
+  },
+  "raw_imu_calibration": {
+    "format_version": 1,
+    "source_id": "${IMU_CALIBRATION_SOURCE_ID}",
+    "content_id": "${IMU_CALIBRATION_ID}",
+    "gyro_affine": ${IMU_GYRO_AFFINE_F64_MATRIX},
+    "gyro_bias_native_rad_per_sec": ${IMU_GYRO_BIAS_NATIVE_RAD_PER_SEC_F64_ARRAY},
+    "accel_affine": ${IMU_ACCEL_AFFINE_F64_MATRIX},
+    "accel_bias_native_m_per_sec2": ${IMU_ACCEL_BIAS_NATIVE_M_PER_SEC2_F64_ARRAY},
+    "native_imu_to_base_rotation": ${NATIVE_IMU_TO_BASE_ROTATION_F64_MATRIX}
+  },
+  "tracking_camera_to_base": {
+    "rotation": ${TRACKING_CAMERA_TO_BASE_ROTATION_F32_MATRIX},
+    "translation_m": ${TRACKING_CAMERA_TO_BASE_TRANSLATION_M_F32_ARRAY}
+  }
+}

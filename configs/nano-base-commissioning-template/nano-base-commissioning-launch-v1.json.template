@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "session_id": "${COMMISSIONING_SESSION_ID}",
+  "commissioning_policy_asset": {
+    "relative_path": "commissioning/base-commissioning-policy-v1.json",
+    "maximum_bytes": ${COMMISSIONING_POLICY_MAXIMUM_BYTES},
+    "sha256_hex": "${COMMISSIONING_POLICY_SHA256}"
+  },
+  "controller_profile_asset": {
+    "relative_path": "commissioning/controller-profile-v1.json",
+    "maximum_bytes": ${CONTROLLER_PROFILE_MAXIMUM_BYTES},
+    "sha256_hex": "${CONTROLLER_PROFILE_SHA256}"
+  },
+  "controller_server_contract_asset": {
+    "relative_path": "commissioning/controller-server-v3.json",
+    "maximum_bytes": ${CONTROLLER_SERVER_MAXIMUM_BYTES},
+    "sha256_hex": "${CONTROLLER_SERVER_SHA256}"
+  },
+  "device_manifest_asset": {
+    "relative_path": "commissioning/device-inventory-v3.json",
+    "maximum_bytes": ${DEVICE_INVENTORY_MAXIMUM_BYTES},
+    "sha256_hex": "${DEVICE_INVENTORY_SHA256}"
+  },
+  "calibration_artifact_asset": {
+    "relative_path": "artifacts/${CALIBRATION_ARTIFACT_RELATIVE_PATH}",
+    "maximum_bytes": ${CALIBRATION_ARTIFACT_MAXIMUM_BYTES},
+    "sha256_hex": "${CALIBRATION_ARTIFACT_SHA256}"
+  },
+  "live_graph_launch_asset": {
+    "relative_path": "nano-agent-launch-v2.json",
+    "maximum_bytes": ${LIVE_GRAPH_LAUNCH_MAXIMUM_BYTES},
+    "sha256_hex": "${LIVE_GRAPH_LAUNCH_SHA256}"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "schema_version": 2,
+  "serial_device": "${STM32_SERIAL_BY_ID_PATH}",
+  "controller_uid_hex": "${CONTROLLER_UID_HEX}",
+  "firmware_abi": 2,
+  "firmware_build_id": 135169,
+  "actuator_config_fingerprint_hex": "4b494b4f2d3450574d2d43414e443121",
+  "hardware_profile_claim_id": "kiko-four-pwm-candidate-wheels-off-v1",
+  "controller_ready_timeout_ms": 3000,
+  "heartbeat_period_ms": 20,
+  "maximum_heartbeat_age_ms": 60,
+  "maximum_host_command_rate_hz": 100,
+  "serial_transmit_timeout_ms": 10,
+  "serial_applied_ack_timeout_ms": 30,
+  "controller_clock_abs_error_ppm_bound": 50000,
+  "deadline_quantization_margin_ms": 2,
+  "expected_max_abs_pwm_percent": 30,
+  "expected_pwm_frequency_hz": 20000,
+  "expected_watchdog_nominal_timeout_ms": 250,
+  "expected_neutral_output": "both_low",
+  "expected_physical_stop_semantics": "unverified",
+  "controller_session_class": "operator_supervised_four_pwm_candidate"
+}

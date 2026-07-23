@@ -1,0 +1,94 @@
+{
+  "schema_version": 3,
+  "control": {
+    "socket_path": "/run/kiko/agent-control.sock",
+    "read_timeout_ms": 100,
+    "write_timeout_ms": 100,
+    "runtime_response_timeout_ms": 30000,
+    "terminal_response_timeout_ms": 300000,
+    "runtime_queue_capacity": 8,
+    "operator_console": {
+      "bind_address": "127.0.0.1:9877",
+      "capability_path": "/run/kiko/operator-console.capability",
+      "deadman_tick_ms": 20,
+      "manual_command_forward_mm_per_s": 100,
+      "manual_command_yaw_millirad_per_s": 500
+    }
+  },
+  "inventory": {
+    "manifest_path": "/opt/kiko/deployment/device-inventory-v1.json",
+    "artifact_root_path": "/opt/kiko/deployment/artifacts",
+    "artifact_bindings": [
+      {
+        "kind": "calibration",
+        "artifact_id": "${CALIBRATION_ARTIFACT_ID}",
+        "relative_path": "${CALIBRATION_ARTIFACT_RELATIVE_PATH}"
+      },
+      {
+        "kind": "plant",
+        "artifact_id": "${QUALIFIED_PLANT_ARTIFACT_ID}",
+        "relative_path": "${QUALIFIED_PLANT_ARTIFACT_RELATIVE_PATH}"
+      }
+    ]
+  },
+  "map_persistence": {
+    "save_snapshot_path": "/var/lib/kiko-nano-agent/maps/current.kmap",
+    "warm_start": ${MAP_WARM_START_JSON}
+  },
+  "eye": {
+    "mode": "kep2",
+    "device_path": "${EYE_SERIAL_BY_ID_PATH}",
+    "baud_rate_bps": 115200,
+    "response_timeout_ms": 20,
+    "write_timeout_ms": 5,
+    "write_attempts": 2,
+    "empty_delimiter_budget": 2,
+    "expected_device_uid": [${EYE_DEVICE_UID_U8_ARRAY}],
+    "expected_firmware_build_id": [${EYE_FIRMWARE_BUILD_ID_U8_ARRAY}],
+    "expected_capabilities_bits": ${EYE_CAPABILITIES_BITS},
+    "intent_lease_ms": 100
+  },
+  "head": {
+    "mode": "return_to_natural_and_hold_continuously",
+    "device_path": "${HEAD_SERIAL_BY_ID_PATH}",
+    "response_timeout_ms": ${HEAD_RESPONSE_TIMEOUT_MS},
+    "write_timeout_ms": ${HEAD_WRITE_TIMEOUT_MS},
+    "arming_freshness_ms": ${HEAD_ARMING_FRESHNESS_MS},
+    "write_attempts": ${HEAD_WRITE_ATTEMPTS},
+    "noise_budget_bytes": ${HEAD_NOISE_BUDGET_BYTES},
+    "redundant_read_tolerance_ticks": ${HEAD_REDUNDANT_READ_TOLERANCE_TICKS},
+    "readback_tolerance_ticks": ${HEAD_READBACK_TOLERANCE_TICKS},
+    "final_target_tolerance_ticks": ${HEAD_FINAL_TARGET_TOLERANCE_TICKS},
+    "path_corridor_tolerance_ticks": ${HEAD_PATH_CORRIDOR_TOLERANCE_TICKS},
+    "direction_regression_tolerance_ticks": ${HEAD_DIRECTION_REGRESSION_TOLERANCE_TICKS},
+    "goal_speed_ticks_per_second": ${HEAD_GOAL_SPEED_TICKS_PER_SECOND},
+    "torque_limit_permille": [${HEAD_TORQUE_LIMIT_PERMILLE_U16_ARRAY}],
+    "minimum_start_ticks": [${HEAD_MINIMUM_START_TICKS_U16_ARRAY}],
+    "maximum_start_ticks": [${HEAD_MAXIMUM_START_TICKS_U16_ARRAY}],
+    "reviewed_natural_target_ticks": [${HEAD_REVIEWED_NATURAL_TARGET_TICKS_U16_ARRAY}],
+    "maximum_travel_ticks": [${HEAD_MAXIMUM_TRAVEL_TICKS_U16_ARRAY}],
+    "physical_torque_consent": "enable_for_reviewed_natural_return_and_hold",
+    "physical_motion_consent": "return_to_reviewed_natural_target"
+  },
+  "rgb_expression": {
+    "mode": "scene_motion",
+    "sampling_columns": ${RGB_SAMPLING_COLUMNS},
+    "sampling_rows": ${RGB_SAMPLING_ROWS},
+    "minimum_residual_luma": ${RGB_MINIMUM_RESIDUAL_LUMA},
+    "minimum_active_fraction_basis_points": ${RGB_MINIMUM_ACTIVE_FRACTION_BASIS_POINTS},
+    "frame_freshness_ms": ${RGB_FRAME_FRESHNESS_MS},
+    "brightness_basis_points": ${RGB_BRIGHTNESS_BASIS_POINTS},
+    "color_rgb": [${RGB_COLOR_U8_ARRAY}],
+    "blink": ${RGB_BLINK},
+    "gaze_geometry": {
+      "schema_version": 1,
+      "head_origin_in_camera_m": [${HEAD_ORIGIN_IN_CAMERA_M_F64_ARRAY}],
+      "neutral_head_from_camera_quaternion_xyzw": [${NEUTRAL_HEAD_FROM_CAMERA_QUATERNION_XYZW_F64_ARRAY}]
+    }
+  },
+  "supervisor": {
+    "maximum_authority_lease_ms": 1000,
+    "maximum_zero_age_ms": 250
+  },
+  "live_mode_policy": ${REVIEWED_LIVE_MODE_POLICY_JSON}
+}

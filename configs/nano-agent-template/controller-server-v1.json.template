@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "serial_device": "${STM32_SERIAL_BY_ID_PATH}",
+  "controller_uid_hex": "${CONTROLLER_UID_HEX}",
+  "firmware_abi": ${FIRMWARE_ABI},
+  "firmware_build_id": ${FIRMWARE_BUILD_ID},
+  "actuator_config_fingerprint_hex": "${ACTUATOR_CONFIG_FINGERPRINT_HEX}",
+  "hardware_profile_claim_id": "${HARDWARE_PROFILE_CLAIM_ID}",
+  "controller_ready_timeout_ms": ${CONTROLLER_READY_TIMEOUT_MS},
+  "heartbeat_period_ms": ${HEARTBEAT_PERIOD_MS},
+  "maximum_heartbeat_age_ms": ${MAXIMUM_HEARTBEAT_AGE_MS},
+  "maximum_host_command_rate_hz": ${MAXIMUM_HOST_COMMAND_RATE_HZ},
+  "serial_transmit_timeout_ms": ${SERIAL_TRANSMIT_TIMEOUT_MS},
+  "serial_applied_ack_timeout_ms": ${SERIAL_APPLIED_ACK_TIMEOUT_MS},
+  "controller_clock_abs_error_ppm_bound": ${CONTROLLER_CLOCK_ABS_ERROR_PPM_BOUND},
+  "deadline_quantization_margin_ms": ${DEADLINE_QUANTIZATION_MARGIN_MS},
+  "expected_max_abs_pwm_percent": ${EXPECTED_MAX_ABS_PWM_PERCENT},
+  "expected_pwm_frequency_hz": ${EXPECTED_PWM_FREQUENCY_HZ},
+  "expected_watchdog_nominal_timeout_ms": ${EXPECTED_WATCHDOG_NOMINAL_TIMEOUT_MS},
+  "expected_neutral_output": "${EXPECTED_NEUTRAL_OUTPUT}",
+  "expected_physical_stop_semantics": "${EXPECTED_PHYSICAL_STOP_SEMANTICS}"
+}

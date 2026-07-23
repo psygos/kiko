@@ -1,50 +1,58 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "control": {
     "socket_path": "/run/kiko/agent-control.sock",
     "read_timeout_ms": 100,
     "write_timeout_ms": 100,
     "runtime_response_timeout_ms": 500,
-    "runtime_queue_capacity": 8
+    "terminal_response_timeout_ms": 300000,
+    "runtime_queue_capacity": 8,
+    "operator_console": {
+      "bind_address": "127.0.0.1:9877",
+      "capability_path": "/run/kiko/operator-console.capability",
+      "deadman_tick_ms": 20,
+      "manual_command_forward_mm_per_s": 100,
+      "manual_command_yaw_millirad_per_s": 500
+    }
   },
   "inventory": {
-    "manifest_path": "/opt/kiko/deployment/device-inventory-v1.json",
-    "artifact_root_path": "/opt/kiko/deployment/artifacts",
+    "manifest_path": "/opt/kiko/qualification/device-inventory-candidate-v2.json",
+    "artifact_root_path": "/opt/kiko/qualification/artifacts",
     "artifact_bindings": [
       {
         "kind": "calibration",
-        "artifact_id": "REPLACE-camera-calibration",
-        "relative_path": "calibration/camera-placeholder.json"
+        "artifact_id": "${CALIBRATION_ARTIFACT_ID}",
+        "relative_path": "${CALIBRATION_ARTIFACT_RELATIVE_PATH}"
       },
       {
         "kind": "plant",
-        "artifact_id": "REPLACE-drive-plant",
-        "relative_path": "plant/drive-placeholder.json"
+        "artifact_id": "${SHADOW_PLANT_ARTIFACT_ID}",
+        "relative_path": "${SHADOW_PLANT_ARTIFACT_RELATIVE_PATH}"
       }
     ]
   },
   "map_persistence": {
-    "save_snapshot_path": "/var/lib/kiko/maps/current.kmap",
+    "save_snapshot_path": "/var/lib/kiko-nano-qualification/maps/current.kmap",
     "warm_start": {
       "kind": "none"
     }
   },
   "eye": {
     "mode": "kep2",
-    "device_path": "/dev/serial/by-id/REPLACE_EYE_SERIAL_BY_ID",
+    "device_path": "${EYE_SERIAL_BY_ID_PATH}",
     "baud_rate_bps": 115200,
     "response_timeout_ms": 20,
     "write_timeout_ms": 5,
     "write_attempts": 2,
     "empty_delimiter_budget": 2,
-    "expected_device_uid": [238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238],
-    "expected_firmware_build_id": [238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238],
+    "expected_device_uid": [${EYE_DEVICE_UID_U8_ARRAY}],
+    "expected_firmware_build_id": [${EYE_FIRMWARE_BUILD_ID_U8_ARRAY}],
     "expected_capabilities_bits": 255,
     "intent_lease_ms": 100
   },
   "head": {
-    "mode": "natural_hold",
-    "device_path": "/dev/serial/by-id/REPLACE_HEAD_SERIAL_BY_ID",
+    "mode": "return_to_natural_and_hold_continuously",
+    "device_path": "${HEAD_SERIAL_BY_ID_PATH}",
     "response_timeout_ms": 100,
     "write_timeout_ms": 100,
     "arming_freshness_ms": 250,
@@ -52,9 +60,17 @@
     "noise_budget_bytes": 32,
     "redundant_read_tolerance_ticks": 10,
     "readback_tolerance_ticks": 20,
+    "final_target_tolerance_ticks": 20,
+    "path_corridor_tolerance_ticks": 20,
+    "direction_regression_tolerance_ticks": 20,
     "goal_speed_ticks_per_second": 50,
-    "torque_limit_permille": [100, 100, 100, 100],
-    "physical_torque_consent": "natural_hold_at_observed_pose"
+    "torque_limit_permille": [600, 400, 400, 400],
+    "minimum_start_ticks": [2135, 2525, 2842, 2856],
+    "maximum_start_ticks": [2227, 2592, 2963, 2922],
+    "reviewed_natural_target_ticks": [2155, 2545, 2943, 2876],
+    "maximum_travel_ticks": [80, 64, 128, 64],
+    "physical_torque_consent": "enable_for_reviewed_natural_return_and_hold",
+    "physical_motion_consent": "return_to_reviewed_natural_target"
   },
   "rgb_expression": {
     "mode": "scene_motion",

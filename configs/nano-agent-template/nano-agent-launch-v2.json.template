@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "agent_policy_asset": {
-    "relative_path": "agent-policy-v1.json",
+    "relative_path": "agent-policy-v3.json",
     "maximum_bytes": ${AGENT_POLICY_MAXIMUM_BYTES},
     "sha256_hex": "${AGENT_POLICY_SHA256}"
   },
@@ -11,7 +11,7 @@
     "sha256_hex": "${NAVIGATION_SHADOW_SHA256}"
   },
   "physical_actuation_config_asset": {
-    "relative_path": "navigation-actuation-v1.json",
+    "relative_path": "navigation-actuation-v2.json",
     "maximum_bytes": ${PHYSICAL_ACTUATION_MAXIMUM_BYTES},
     "sha256_hex": "${PHYSICAL_ACTUATION_SHA256}"
   },
@@ -21,7 +21,15 @@
       "maximum_bytes": ${CONTROLLER_SERVER_MAXIMUM_BYTES},
       "sha256_hex": "${CONTROLLER_SERVER_SHA256}"
     },
-    "command_udp_endpoint": "127.0.0.1:${ROBOT_SERVER_PORT}"
+    "command_udp_endpoint": "127.0.0.1:${CONTROLLER_OWNER_LOOPBACK_PORT}"
+  },
+  "calibration_artifact": {
+    "artifact_id": "${CALIBRATION_ARTIFACT_ID}",
+    "asset": {
+      "relative_path": "artifacts/${CALIBRATION_ARTIFACT_RELATIVE_PATH}",
+      "maximum_bytes": ${CALIBRATION_ARTIFACT_MAXIMUM_BYTES},
+      "sha256_hex": "${CALIBRATION_ARTIFACT_SHA256}"
+    }
   },
   "plant_artifact": {
     "artifact_id": "${QUALIFIED_PLANT_ARTIFACT_ID}",
@@ -100,12 +108,13 @@
   },
   "storage": {
     "map_snapshot_relative_path": "${MAP_SNAPSHOT_RELATIVE_PATH}",
-    "navigation_records_relative_path": "${NAVIGATION_RECORDS_RELATIVE_PATH}",
-    "startup_evidence_relative_path": "${STARTUP_EVIDENCE_RELATIVE_PATH}",
-    "maximum_map_bytes": ${MAXIMUM_MAP_BYTES},
-    "maximum_navigation_record_bytes": ${MAXIMUM_NAVIGATION_RECORD_BYTES},
-    "maximum_startup_evidence_bytes": ${MAXIMUM_STARTUP_EVIDENCE_BYTES},
-    "maximum_total_state_bytes": ${MAXIMUM_TOTAL_STATE_BYTES},
-    "minimum_free_bytes": ${MINIMUM_FREE_BYTES}
+    "navigation_dataset_directory_relative_path": "${NAVIGATION_DATASET_DIRECTORY_RELATIVE_PATH}",
+    "maximum_map_snapshot_bytes": ${MAXIMUM_MAP_SNAPSHOT_BYTES},
+    "minimum_free_bytes_after_map_save": ${MINIMUM_FREE_BYTES_AFTER_MAP_SAVE},
+    "maximum_navigation_dataset_bytes": ${MAXIMUM_NAVIGATION_DATASET_BYTES},
+    "maximum_navigation_dataset_files": ${MAXIMUM_NAVIGATION_DATASET_FILES},
+    "maximum_navigation_ingress_records": ${MAXIMUM_NAVIGATION_INGRESS_RECORDS},
+    "minimum_free_bytes_after_navigation_dataset_write": ${MINIMUM_FREE_BYTES_AFTER_NAVIGATION_DATASET_WRITE},
+    "navigation_dataset_terminal_reserve_bytes": ${NAVIGATION_DATASET_TERMINAL_RESERVE_BYTES}
   }
 }

@@ -1,12 +1,8 @@
 [Unit]
 Description=Kiko production Nano agent (manual qualification gate)
 Documentation=file:/opt/kiko/deployment/README.md
-Requires=kiko-robot-server.service
-BindsTo=kiko-robot-server.service
-After=local-fs.target kiko-robot-server.service
+After=local-fs.target
 RequiresMountsFor=/opt/kiko/deployment /var/lib/kiko-nano-agent
-ConditionPathIsExecutable=/opt/kiko/bin/kiko-nano-agent
-ConditionPathIsRegular=/opt/kiko/deployment/nano-agent-launch-v1.json
 
 [Service]
 Type=exec
@@ -14,15 +10,27 @@ User=makerspace
 SupplementaryGroups=dialout video render plugdev
 WorkingDirectory=/opt/kiko
 Environment=RUST_LOG=info
-Environment=KIKO_STATE_ROOT=/var/lib/kiko-nano-agent
-Environment=KIKO_RUNTIME_ROOT=/run/kiko-nano-agent
-ExecStart=/opt/kiko/bin/kiko-nano-agent --deployment-root /opt/kiko/deployment --launch-config nano-agent-launch-v1.json --state-root /var/lib/kiko-nano-agent
+# This invariant gate belongs to the base unit, not to an optional drop-in.
+# Once systemctl enable creates a persistent wants symlink, deleting a drop-in
+# must never leave an ungated boot path.
+ExecStartPre=+/opt/kiko/bin/kiko-nano-deployment-gate verify --marker /etc/kiko/nano-agent-offline-install-qualified-v1.json
+# Keep the native search path on the production executable only. Applying it
+# service-wide would load unverified deployment libraries into ExecStartPre
+# before the root-owned gate could verify their exact bytes.
+ExecStart=/usr/bin/env LD_LIBRARY_PATH=/opt/kiko/deployment/lib /opt/kiko/bin/kiko-slam nano-agent --deployment-root /opt/kiko/deployment --launch-config nano-agent-launch-v2.json --state-root /var/lib/kiko-nano-agent
 Restart=no
-TimeoutStopSec=30
+# Operational kill guard, not a proven graceful-shutdown bound. Parsed maxima
+# bound Rerun/controller/accessory attempts, but worker joins, dataset fsync and
+# finalization, OAK close, and native/OS I/O have no outer application deadline.
+# Timeout escalation therefore makes physical stop and durable state uncertain.
+TimeoutStopSec=420
 KillSignal=SIGTERM
 KillMode=mixed
-RuntimeDirectory=kiko-nano-agent
-RuntimeDirectoryMode=0750
+# The socket and per-boot console capability share this process-private parent.
+# The host boundary rejects a group-readable parent instead of weakening its
+# ownership assumptions.
+RuntimeDirectory=kiko
+RuntimeDirectoryMode=0700
 StateDirectory=kiko-nano-agent
 StateDirectoryMode=0750
 UMask=0077
@@ -39,7 +47,7 @@ AmbientCapabilities=
 ProtectSystem=strict
 ProtectHome=true
 ReadOnlyPaths=/opt/kiko/bin /opt/kiko/deployment
-ReadWritePaths=/run/kiko-nano-agent /var/lib/kiko-nano-agent
+ReadWritePaths=/run/kiko /var/lib/kiko-nano-agent
 PrivateTmp=true
 RemoveIPC=true
 KeyringMode=private

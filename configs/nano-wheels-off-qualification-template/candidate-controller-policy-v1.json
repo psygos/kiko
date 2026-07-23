@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "command_endpoint": "127.0.0.1:8080",
+  "status_timeout_ns": 40000000,
+  "acquire_timeout_ns": 40000000,
+  "applied_ack_timeout_ns": 40000000,
+  "stop_attempt_timeout_ns": 40000000,
+  "maximum_stop_recovery_attempts": 3,
+  "command_lease_ms": 100,
+  "command_interval_ns": 20000000,
+  "scheduling_margin_ns": 5000000,
+  "local_max_abs_pwm_percent": 30,
+  "manual_test_magnitude_timer_pwm_percent": 10,
+  "manual_deadman_ms": 150,
+  "maximum_attestation_age_ns": 30000000000
+}
