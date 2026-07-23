@@ -9,32 +9,32 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
-use robot_protocol::v2::{
-    decode_raw_frame, AcquireControl, AcquireResult, AcquireResultCode, ActuatorConfigFingerprint,
-    AppliedResult, AppliedResultCode, BeginSession, ControlEpoch, ControllerCapabilities,
-    ControllerFaults, ControllerHello, ControllerReady, ControllerUid, DeadlineRelation, ForceStop,
-    ForceStopReason, Heartbeat, HeartbeatPeriodMs, HostCommand, HostCommandResult,
-    HostCommandResultCode, HostStop, HostStopResult, MaxAbsPwmPercent, Message, MessageKind,
-    NeutralOutput, ObservationalOdometry, OutputState, PhysicalStopSemantics, PwmFrequencyHz,
-    RawFrame, RemainingLeaseMs, RequestId, StatusCode, StatusQuery, StatusReport, StopResultCode,
-    TargetBootId, TimerPwm, UartEncodeError, UartRecord, UartStreamDecoder, UartStreamError,
-    V2CommandSequence, WatchdogNominalPeriodMs, MAX_RAW_FRAME_BYTES,
-};
 use robot_protocol::ControllerUptimeMsWrapping;
+use robot_protocol::v2::{
+    AcquireControl, AcquireResult, AcquireResultCode, ActuatorConfigFingerprint, AppliedResult,
+    AppliedResultCode, BeginSession, ControlEpoch, ControllerCapabilities, ControllerFaults,
+    ControllerHello, ControllerReady, ControllerUid, DeadlineRelation, ForceStop, ForceStopReason,
+    Heartbeat, HeartbeatPeriodMs, HostCommand, HostCommandResult, HostCommandResultCode, HostStop,
+    HostStopResult, MAX_RAW_FRAME_BYTES, MaxAbsPwmPercent, Message, MessageKind, NeutralOutput,
+    ObservationalOdometry, OutputState, PhysicalStopSemantics, PwmFrequencyHz, RawFrame,
+    RemainingLeaseMs, RequestId, StatusCode, StatusQuery, StatusReport, StopResultCode,
+    TargetBootId, TimerPwm, UartEncodeError, UartRecord, UartStreamDecoder, UartStreamError,
+    V2CommandSequence, WatchdogNominalPeriodMs, decode_raw_frame,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_serial::SerialPortBuilderExt;
 
 use crate::config::ControllerServerConfigV1;
 use crate::deadline::{
-    conservative_remaining_lease, translate_command_deadline, HeartbeatClockSample,
-    TranslatedCommandDeadline,
+    HeartbeatClockSample, TranslatedCommandDeadline, conservative_remaining_lease,
+    translate_command_deadline,
 };
 
 const SERIAL_BAUD: u32 = 115_200;
@@ -373,10 +373,16 @@ impl std::error::Error for ActuationActorError {
 
 /// Open only the configured device, claim OS-level exclusive ownership, and
 /// spawn the sole serial/session actor.
+pub(crate) type StartedActuationActor = (
+    ActuationHandle,
+    oneshot::Receiver<()>,
+    JoinHandle<Result<(), ActuationActorError>>,
+);
+
 pub(crate) async fn start_serial_actor(
     config: ControllerServerConfigV1,
     telemetry: Arc<dyn ActuationTelemetry>,
-) -> Result<(ActuationHandle, JoinHandle<Result<(), ActuationActorError>>), ActuationStartError> {
+) -> Result<StartedActuationActor, ActuationStartError> {
     let actor_config = ActorConfig::from_server_config(&config)?;
     let device = config
         .serial_device()
@@ -394,7 +400,7 @@ fn spawn_actor<Transport>(
     transport: Transport,
     config: ActorConfig,
     telemetry: Arc<dyn ActuationTelemetry>,
-) -> (ActuationHandle, JoinHandle<Result<(), ActuationActorError>>)
+) -> StartedActuationActor
 where
     Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -404,12 +410,13 @@ where
         requests,
         shutdown: Arc::clone(&shutdown),
     };
+    let (startup_ready, startup_ready_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        SerialActor::new(transport, config, telemetry)
+        SerialActor::new(transport, config, telemetry, startup_ready)
             .run(receiver, shutdown)
             .await
     });
-    (handle, task)
+    (handle, startup_ready_rx, task)
 }
 
 #[cfg(test)]
@@ -417,7 +424,7 @@ pub(crate) fn spawn_actor_for_test<Transport>(
     transport: Transport,
     config: &ControllerServerConfigV1,
     telemetry: Arc<dyn ActuationTelemetry>,
-) -> Result<(ActuationHandle, JoinHandle<Result<(), ActuationActorError>>), ActuationStartError>
+) -> Result<StartedActuationActor, ActuationStartError>
 where
     Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -539,6 +546,7 @@ struct SerialActor<Transport> {
     decoder: UartStreamDecoder,
     config: ActorConfig,
     telemetry: Arc<dyn ActuationTelemetry>,
+    startup_ready: Option<oneshot::Sender<()>>,
     observed_hello: Option<TimedHello>,
     hello: Option<TimedHello>,
     ready: Option<ReadySession>,
@@ -559,12 +567,14 @@ where
         transport: Transport,
         config: ActorConfig,
         telemetry: Arc<dyn ActuationTelemetry>,
+        startup_ready: oneshot::Sender<()>,
     ) -> Self {
         Self {
             transport,
             decoder: UartStreamDecoder::new(),
             config,
             telemetry,
+            startup_ready: Some(startup_ready),
             observed_hello: None,
             hello: None,
             ready: None,
@@ -1272,6 +1282,9 @@ where
             received_at,
         });
         self.faulted = false;
+        if let Some(startup_ready) = self.startup_ready.take() {
+            let _ = startup_ready.send(());
+        }
         Ok(())
     }
 
@@ -2522,7 +2535,7 @@ mod tests {
         async fn ready() -> Self {
             let boot_id = boot(7);
             let (actor_stream, controller_stream) = tokio::io::duplex(4_096);
-            let (handle, actor) = spawn_actor(
+            let (handle, mut startup_ready, actor) = spawn_actor(
                 actor_stream,
                 actor_config(),
                 Arc::new(NoopActuationTelemetry),
@@ -2545,9 +2558,17 @@ mod tests {
             controller
                 .send(Message::ControllerReady(ready(boot_id)))
                 .await;
+            assert!(
+                timeout(SHORT_ABSENCE, &mut startup_ready).await.is_err(),
+                "ControllerReady without an exact stopped heartbeat is not startup evidence"
+            );
             controller
                 .send(Message::Heartbeat(zero_heartbeat(boot_id)))
                 .await;
+            timeout(IO_TIMEOUT, startup_ready)
+                .await
+                .expect("startup-ready signal timeout")
+                .expect("actor retains startup-ready sender");
             let source = "127.0.0.1:41000".parse().expect("source address");
             let shutdown = handle.shutdown_handle();
             let mut harness = Self {
@@ -3013,7 +3034,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_uid_never_reaches_begin_session() {
         let (actor_stream, controller_stream) = tokio::io::duplex(4_096);
-        let (handle, actor) = spawn_actor(
+        let (handle, _startup_ready, actor) = spawn_actor(
             actor_stream,
             actor_config(),
             Arc::new(NoopActuationTelemetry),
@@ -3047,10 +3068,12 @@ mod tests {
     #[test]
     fn hello_gate_requires_every_manifest_and_safety_claim() {
         let (actor_stream, _controller_stream) = tokio::io::duplex(256);
+        let (startup_ready, _startup_ready_rx) = oneshot::channel();
         let actor = SerialActor::new(
             actor_stream,
             actor_config(),
             Arc::new(NoopActuationTelemetry),
+            startup_ready,
         );
         let baseline = hello_with(uid(), boot(7));
         assert!(actor.hello_is_exact(baseline));
@@ -3162,7 +3185,7 @@ mod tests {
     #[tokio::test]
     async fn uid_targeted_stop_works_without_session_and_requires_matching_stop_result() {
         let (actor_stream, controller_stream) = tokio::io::duplex(4_096);
-        let (handle, actor) = spawn_actor(
+        let (handle, _startup_ready, actor) = spawn_actor(
             actor_stream,
             actor_config(),
             Arc::new(NoopActuationTelemetry),
@@ -3208,7 +3231,7 @@ mod tests {
     #[tokio::test]
     async fn mismatched_stop_result_is_never_promoted_to_controller_confirmation() {
         let (actor_stream, controller_stream) = tokio::io::duplex(4_096);
-        let (handle, actor) = spawn_actor(
+        let (handle, _startup_ready, actor) = spawn_actor(
             actor_stream,
             actor_config(),
             Arc::new(NoopActuationTelemetry),

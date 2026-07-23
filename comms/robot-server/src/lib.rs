@@ -9,10 +9,10 @@ mod controller_owner;
 mod deadline;
 
 pub use actuation_v2::{
-    unavailable_udp_service, ActuationActorError, ActuationSnapshot, ActuationStartError,
-    ActuationTelemetry, NoopActuationTelemetry, UdpServiceError,
+    ActuationActorError, ActuationSnapshot, ActuationStartError, ActuationTelemetry,
+    NoopActuationTelemetry, UdpServiceError, unavailable_udp_service,
 };
 pub use controller_owner::{
     ActuationTaskOutcome, UdpTaskOutcome, V2ControllerOwner, V2ControllerOwnerExitTrigger,
-    V2ControllerOwnerStartError, V2ControllerOwnerTerminationError,
+    V2ControllerOwnerStartCleanup, V2ControllerOwnerStartError, V2ControllerOwnerTerminationError,
 };

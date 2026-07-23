@@ -97,6 +97,7 @@ pub struct ControllerServerConfigV1 {
     firmware_build_id: NonZeroU32,
     actuator_config_fingerprint: ActuatorConfigFingerprint,
     hardware_profile_claim_id: String,
+    controller_ready_timeout: Duration,
     heartbeat_period: Duration,
     maximum_heartbeat_age: Duration,
     serial_applied_ack_timeout: Duration,
@@ -151,6 +152,12 @@ impl ControllerServerConfigV1 {
         &self.hardware_profile_claim_id
     }
 
+    /// Maximum time after exclusive serial acquisition to observe an exact
+    /// hello/session/ready/heartbeat sequence.
+    pub const fn controller_ready_timeout(&self) -> Duration {
+        self.controller_ready_timeout
+    }
+
     pub const fn heartbeat_period(&self) -> Duration {
         self.heartbeat_period
     }
@@ -189,6 +196,20 @@ impl ControllerServerConfigV1 {
 
     pub const fn expected_physical_stop_semantics(&self) -> PhysicalStopSemantics {
         self.expected_physical_stop_semantics
+    }
+
+    /// Upper bound used to collect the controller actor and UDP task after a
+    /// coordinated service shutdown.
+    ///
+    /// The budget is derived from the three already admitted controller timing
+    /// bounds instead of introducing an unrelated fallback timeout: one
+    /// heartbeat-age window, one serial acknowledgement window, and one
+    /// heartbeat period. Exceeding it is reported as an uncertain owner stop.
+    pub fn coordinated_shutdown_budget(&self) -> Duration {
+        self.maximum_heartbeat_age
+            .checked_add(self.serial_applied_ack_timeout)
+            .and_then(|budget| budget.checked_add(self.heartbeat_period))
+            .expect("validated millisecond controller bounds fit Duration")
     }
 }
 
@@ -355,6 +376,7 @@ struct ControllerServerConfigV1Dto {
     firmware_build_id: u32,
     actuator_config_fingerprint_hex: String,
     hardware_profile_claim_id: String,
+    controller_ready_timeout_ms: u16,
     heartbeat_period_ms: u16,
     maximum_heartbeat_age_ms: u16,
     serial_applied_ack_timeout_ms: u16,
@@ -441,6 +463,11 @@ fn parse_controller_config(bytes: &[u8]) -> Result<ControllerServerConfigV1, Ser
     {
         return Err(ServerConfigError::InvalidHardwareProfileClaimId);
     }
+    let controller_ready_timeout_ms = bounded_nonzero_u16(
+        "controller_ready_timeout_ms",
+        dto.controller_ready_timeout_ms,
+        30_000,
+    )?;
     let heartbeat_period_ms =
         bounded_nonzero_u16("heartbeat_period_ms", dto.heartbeat_period_ms, 100)?;
     let maximum_heartbeat_age_ms = bounded_nonzero_u16(
@@ -536,6 +563,9 @@ fn parse_controller_config(bytes: &[u8]) -> Result<ControllerServerConfigV1, Ser
         firmware_build_id,
         actuator_config_fingerprint,
         hardware_profile_claim_id: dto.hardware_profile_claim_id,
+        controller_ready_timeout: Duration::from_millis(u64::from(
+            controller_ready_timeout_ms.get(),
+        )),
         heartbeat_period: Duration::from_millis(u64::from(heartbeat_period_ms.get())),
         maximum_heartbeat_age: Duration::from_millis(u64::from(maximum_heartbeat_age_ms.get())),
         serial_applied_ack_timeout: Duration::from_millis(u64::from(
@@ -615,7 +645,7 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn valid() -> Value {
         json!({
@@ -626,6 +656,7 @@ mod tests {
             "firmware_build_id": 42,
             "actuator_config_fingerprint_hex": "11223344556677889900aabbccddeeff",
             "hardware_profile_claim_id": "kiko-driver-profile-v1",
+            "controller_ready_timeout_ms": 3000,
             "heartbeat_period_ms": 20,
             "maximum_heartbeat_age_ms": 60,
             "serial_applied_ack_timeout_ms": 30,
@@ -647,7 +678,12 @@ mod tests {
     fn exact_external_controller_authority_parses_once() {
         let config = parse(&valid()).expect("valid controller config");
         assert_eq!(config.serial_device(), Path::new("/dev/ttyACM0"));
+        assert_eq!(config.controller_ready_timeout(), Duration::from_secs(3));
         assert_eq!(config.heartbeat_period(), Duration::from_millis(20));
+        assert_eq!(
+            config.coordinated_shutdown_budget(),
+            Duration::from_millis(110)
+        );
         assert_eq!(
             config.expected_physical_stop_semantics(),
             PhysicalStopSemantics::CoastVerified

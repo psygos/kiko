@@ -407,6 +407,7 @@ mod tests {
             "firmware_build_id": 42,
             "actuator_config_fingerprint_hex": "112233445566778899aabbccddeeff00",
             "hardware_profile_claim_id": "kiko-driver-profile-v1",
+            "controller_ready_timeout_ms": 3000,
             "heartbeat_period_ms": 20,
             "maximum_heartbeat_age_ms": 60,
             "serial_applied_ack_timeout_ms": 30,

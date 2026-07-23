@@ -18,9 +18,10 @@ use crate::config::ControllerServerConfigV1;
 /// The sole in-process owner of one exact V2 controller and its loopback
 /// command endpoint.
 ///
-/// Construction does not return until the UDP address is bound and the exact
-/// configured serial path is open with OS-level exclusive ownership. The
-/// owner retains both task handles. Call [`Self::shutdown`] for an intentional
+/// Construction does not return until the UDP address is bound, the exact
+/// configured serial path is open with OS-level exclusive ownership, and an
+/// exact ready-stopped controller heartbeat has been observed. The owner
+/// retains both task handles. Call [`Self::shutdown`] for an intentional
 /// bounded stop or [`Self::join`] to supervise an unexpected task exit.
 #[must_use = "dropping the owner aborts both tasks; call shutdown or join and inspect the result"]
 #[derive(Debug)]
@@ -34,7 +35,8 @@ pub struct V2ControllerOwner {
 
 impl V2ControllerOwner {
     /// Bind `command_bind`, exclusively claim `controller.serial_device()`,
-    /// and start the two owned tasks without a secondary telemetry sink.
+    /// await its configured ready-stopped deadline, and start the two owned
+    /// tasks without a secondary telemetry sink.
     pub async fn start(
         controller: ControllerServerConfigV1,
         command_bind: SocketAddr,
@@ -49,21 +51,42 @@ impl V2ControllerOwner {
         command_bind: SocketAddr,
         telemetry: Arc<dyn ActuationTelemetry>,
     ) -> Result<Self, V2ControllerOwnerStartError> {
+        let controller_ready_timeout = controller.controller_ready_timeout();
+        let shutdown_timeout = controller.coordinated_shutdown_budget();
         let socket = actuation_v2::bind_udp_socket(command_bind)
             .await
             .map_err(V2ControllerOwnerStartError::CommandEndpoint)?;
         let command_address = socket
             .local_addr()
             .map_err(V2ControllerOwnerStartError::ReadBoundCommandAddress)?;
-        let (actuation, actuation_task) = actuation_v2::start_serial_actor(controller, telemetry)
-            .await
-            .map_err(V2ControllerOwnerStartError::Controller)?;
-        Ok(Self::from_acquired_resources(
-            command_address,
-            socket,
-            actuation,
-            actuation_task,
-        ))
+        let (actuation, startup_ready, actuation_task) =
+            actuation_v2::start_serial_actor(controller, telemetry)
+                .await
+                .map_err(V2ControllerOwnerStartError::Controller)?;
+        let owner =
+            Self::from_acquired_resources(command_address, socket, actuation, actuation_task);
+        match tokio::time::timeout(controller_ready_timeout, startup_ready).await {
+            Ok(Ok(())) => Ok(owner),
+            Ok(Err(_)) => {
+                let termination = owner
+                    .join(shutdown_timeout)
+                    .await
+                    .expect_err("closed readiness signal means its actor ended");
+                Err(V2ControllerOwnerStartError::ControllerStoppedBeforeReady {
+                    termination: Box::new(termination),
+                })
+            }
+            Err(_) => {
+                let cleanup = match owner.shutdown(shutdown_timeout).await {
+                    Ok(()) => V2ControllerOwnerStartCleanup::Confirmed,
+                    Err(source) => V2ControllerOwnerStartCleanup::Uncertain(Box::new(source)),
+                };
+                Err(V2ControllerOwnerStartError::ControllerReadyTimedOut {
+                    maximum_wait: controller_ready_timeout,
+                    cleanup,
+                })
+            }
+        }
     }
 
     /// The exact local address held by this owner.
@@ -304,6 +327,19 @@ pub enum V2ControllerOwnerStartError {
     CommandEndpoint(UdpServiceError),
     ReadBoundCommandAddress(std::io::Error),
     Controller(ActuationStartError),
+    ControllerReadyTimedOut {
+        maximum_wait: Duration,
+        cleanup: V2ControllerOwnerStartCleanup,
+    },
+    ControllerStoppedBeforeReady {
+        termination: Box<V2ControllerOwnerTerminationError>,
+    },
+}
+
+#[derive(Debug)]
+pub enum V2ControllerOwnerStartCleanup {
+    Confirmed,
+    Uncertain(Box<V2ControllerOwnerTerminationError>),
 }
 
 impl fmt::Display for V2ControllerOwnerStartError {
@@ -318,6 +354,26 @@ impl fmt::Display for V2ControllerOwnerStartError {
             Self::Controller(source) => {
                 write!(formatter, "cannot acquire exact V2 controller: {source}")
             }
+            Self::ControllerReadyTimedOut {
+                maximum_wait,
+                cleanup,
+            } => write!(
+                formatter,
+                "exact V2 controller did not reach ready-stopped within {maximum_wait:?}; {cleanup}"
+            ),
+            Self::ControllerStoppedBeforeReady { termination } => write!(
+                formatter,
+                "V2 controller owner stopped before exact ready-stopped evidence: {termination}"
+            ),
+        }
+    }
+}
+
+impl fmt::Display for V2ControllerOwnerStartCleanup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Confirmed => formatter.write_str("startup cleanup confirmed"),
+            Self::Uncertain(source) => write!(formatter, "startup cleanup uncertain: {source}"),
         }
     }
 }
@@ -328,6 +384,15 @@ impl std::error::Error for V2ControllerOwnerStartError {
             Self::CommandEndpoint(source) => Some(source),
             Self::ReadBoundCommandAddress(source) => Some(source),
             Self::Controller(source) => Some(source),
+            Self::ControllerReadyTimedOut {
+                cleanup: V2ControllerOwnerStartCleanup::Uncertain(source),
+                ..
+            } => Some(source.as_ref()),
+            Self::ControllerStoppedBeforeReady { termination } => Some(termination.as_ref()),
+            Self::ControllerReadyTimedOut {
+                cleanup: V2ControllerOwnerStartCleanup::Confirmed,
+                ..
+            } => None,
         }
     }
 }
@@ -454,6 +519,7 @@ mod tests {
                 "firmware_build_id": 42,
                 "actuator_config_fingerprint_hex": "11223344556677889900aabbccddeeff",
                 "hardware_profile_claim_id": "kiko-driver-profile-v1",
+                "controller_ready_timeout_ms": 3000,
                 "heartbeat_period_ms": 20,
                 "maximum_heartbeat_age_ms": 60,
                 "serial_applied_ack_timeout_ms": 30,
@@ -483,7 +549,7 @@ mod tests {
         let command_address = socket.local_addr().expect("bound fixture address");
         let (actor_stream, controller_stream) = tokio::io::duplex(serial_capacity);
         let config = exact_controller(Path::new("/dev/fake-kiko-controller"));
-        let (actuation, actuation_task) = actuation_v2::spawn_actor_for_test(
+        let (actuation, _startup_ready, actuation_task) = actuation_v2::spawn_actor_for_test(
             actor_stream,
             &config,
             Arc::new(NoopActuationTelemetry),
