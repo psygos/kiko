@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
-mod actuation_v2;
-mod deadline;
 mod protocol;
 use protocol::*;
 use robot_server::config;
+use robot_server::V2ControllerOwner;
+
+const OWNER_SIBLING_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,52 +35,27 @@ async fn main() -> Result<()> {
 }
 
 async fn run_v2(runtime_config: config::ServerRuntimeConfig) -> Result<()> {
-    let command_bind = runtime_config.command_bind();
-    if let Some(controller) = runtime_config.controller() {
+    let (command_bind, controller) = runtime_config.into_v2();
+    if let Some(controller) = controller {
         log::info!(
             "enabling V2 controller actor for claimed hardware profile {}",
             controller.hardware_profile_claim_id()
         );
-        let started = actuation_v2::start_serial_actor(
-            controller.clone(),
-            Arc::new(actuation_v2::NoopActuationTelemetry),
-        )
-        .await;
-        match started {
-            Ok((actuation, actor)) => {
-                tokio::try_join!(
-                    async {
-                        actuation_v2::udp_service(command_bind, actuation)
-                            .await
-                            .context("V2 command service stopped")
-                    },
-                    supervise_actuation_actor(actor),
-                )?;
-            }
-            Err(source) => {
-                return Err(source).context(
-                    "configured V2 controller could not start; refusing a degraded server",
-                );
-            }
-        }
+        let owner = V2ControllerOwner::start(controller, command_bind)
+            .await
+            .context("configured V2 controller could not start; refusing a degraded server")?;
+        owner
+            .join(OWNER_SIBLING_SHUTDOWN_TIMEOUT)
+            .await
+            .context("V2 controller owner stopped")?;
     } else {
         log::warn!(
             "no controller authority supplied; V2 actuation is unavailable and status reports disconnected"
         );
-        actuation_v2::unavailable_udp_service(command_bind)
+        robot_server::unavailable_udp_service(command_bind)
             .await
             .context("unavailable V2 status service stopped")?;
     }
 
     Ok(())
-}
-
-async fn supervise_actuation_actor(
-    actor: tokio::task::JoinHandle<std::result::Result<(), actuation_v2::ActuationActorError>>,
-) -> Result<()> {
-    match actor.await {
-        Ok(Ok(())) => anyhow::bail!("V2 controller actor ended unexpectedly without an error"),
-        Ok(Err(source)) => Err(source).context("V2 controller actor failed"),
-        Err(source) => Err(source).context("V2 controller actor task failed"),
-    }
 }

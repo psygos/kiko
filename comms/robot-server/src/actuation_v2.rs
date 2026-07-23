@@ -9,6 +9,7 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,7 @@ use robot_protocol::v2::{
 use robot_protocol::ControllerUptimeMsWrapping;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_serial::SerialPortBuilderExt;
 
@@ -74,8 +75,9 @@ impl ActuationTelemetry for NoopActuationTelemetry {
 }
 
 #[derive(Clone)]
-pub struct ActuationHandle {
+pub(crate) struct ActuationHandle {
     requests: mpsc::Sender<ActorRequest>,
+    shutdown: Arc<ActuationShutdownSignal>,
 }
 
 impl ActuationHandle {
@@ -104,6 +106,118 @@ impl ActuationHandle {
         receiver
             .await
             .map_err(|_| ActuationHandleError::ResponseDropped)
+    }
+
+    pub(crate) fn shutdown_handle(&self) -> ActuationShutdownHandle {
+        ActuationShutdownHandle {
+            signal: Arc::clone(&self.shutdown),
+        }
+    }
+
+    #[cfg(test)]
+    fn enqueue_for_test(
+        &self,
+        source: SocketAddr,
+        first_received_at: Instant,
+        message: Message,
+    ) -> oneshot::Receiver<Message> {
+        let request = HostRequest::try_from(message).expect("supported test request");
+        let (response, receiver) = oneshot::channel();
+        if self
+            .requests
+            .try_send(ActorRequest {
+                source,
+                first_received_at,
+                request,
+                response,
+            })
+            .is_err()
+        {
+            panic!("test actor mailbox must have capacity");
+        }
+        receiver
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActuationShutdownReason {
+    Operator,
+    SiblingFailure,
+}
+
+impl ActuationShutdownReason {
+    const OPERATOR: u8 = 1;
+    const SIBLING_FAILURE: u8 = 2;
+
+    const fn encoded(self) -> u8 {
+        match self {
+            Self::Operator => Self::OPERATOR,
+            Self::SiblingFailure => Self::SIBLING_FAILURE,
+        }
+    }
+
+    const fn force_stop_reason(self) -> ForceStopReason {
+        match self {
+            Self::Operator => ForceStopReason::Operator,
+            Self::SiblingFailure => ForceStopReason::TransportFault,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ActuationShutdownSignal {
+    reason: AtomicU8,
+    notify: Notify,
+}
+
+impl ActuationShutdownSignal {
+    fn new() -> Self {
+        Self {
+            reason: AtomicU8::new(0),
+            notify: Notify::new(),
+        }
+    }
+
+    fn request(&self, reason: ActuationShutdownReason) {
+        let _ =
+            self.reason
+                .compare_exchange(0, reason.encoded(), Ordering::AcqRel, Ordering::Acquire);
+        self.notify.notify_waiters();
+    }
+
+    fn requested_reason(&self) -> Option<ActuationShutdownReason> {
+        match self.reason.load(Ordering::Acquire) {
+            0 => None,
+            ActuationShutdownReason::OPERATOR => Some(ActuationShutdownReason::Operator),
+            ActuationShutdownReason::SIBLING_FAILURE => {
+                Some(ActuationShutdownReason::SiblingFailure)
+            }
+            _ => Some(ActuationShutdownReason::SiblingFailure),
+        }
+    }
+
+    async fn wait(&self) -> ActuationShutdownReason {
+        loop {
+            if let Some(reason) = self.requested_reason() {
+                return reason;
+            }
+            let notified = self.notify.notified();
+            if let Some(reason) = self.requested_reason() {
+                return reason;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ActuationShutdownHandle {
+    signal: Arc<ActuationShutdownSignal>,
+}
+
+impl ActuationShutdownHandle {
+    pub(crate) fn request(&self, reason: ActuationShutdownReason) {
+        self.signal.request(reason);
     }
 }
 
@@ -259,7 +373,7 @@ impl std::error::Error for ActuationActorError {
 
 /// Open only the configured device, claim OS-level exclusive ownership, and
 /// spawn the sole serial/session actor.
-pub async fn start_serial_actor(
+pub(crate) async fn start_serial_actor(
     config: ControllerServerConfigV1,
     telemetry: Arc<dyn ActuationTelemetry>,
 ) -> Result<(ActuationHandle, JoinHandle<Result<(), ActuationActorError>>), ActuationStartError> {
@@ -285,13 +399,33 @@ where
     Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (requests, receiver) = mpsc::channel(ACTOR_MAILBOX_CAPACITY);
-    let handle = ActuationHandle { requests };
+    let shutdown = Arc::new(ActuationShutdownSignal::new());
+    let handle = ActuationHandle {
+        requests,
+        shutdown: Arc::clone(&shutdown),
+    };
     let task = tokio::spawn(async move {
         SerialActor::new(transport, config, telemetry)
-            .run(receiver)
+            .run(receiver, shutdown)
             .await
     });
     (handle, task)
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_actor_for_test<Transport>(
+    transport: Transport,
+    config: &ControllerServerConfigV1,
+    telemetry: Arc<dyn ActuationTelemetry>,
+) -> Result<(ActuationHandle, JoinHandle<Result<(), ActuationActorError>>), ActuationStartError>
+where
+    Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    Ok(spawn_actor(
+        transport,
+        ActorConfig::from_server_config(config)?,
+        telemetry,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -447,6 +581,7 @@ where
     async fn run(
         &mut self,
         mut requests: mpsc::Receiver<ActorRequest>,
+        shutdown: Arc<ActuationShutdownSignal>,
     ) -> Result<(), ActuationActorError> {
         let mut read_buffer = [0_u8; 256];
         self.publish_snapshot(Instant::now());
@@ -459,8 +594,20 @@ where
             });
             let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at));
             tokio::pin!(sleep);
+            let owner_shutdown = shutdown.wait();
+            tokio::pin!(owner_shutdown);
 
             tokio::select! {
+                biased;
+                reason = &mut owner_shutdown => {
+                    self.fail_all_pending(
+                        HostCommandResultCode::ForceStopped,
+                        StopResultCode::ControllerUnavailable,
+                    );
+                    self.issue_internal_stop(reason.force_stop_reason()).await?;
+                    self.clear_authority(true);
+                    return Ok(());
+                }
                 read = self.transport.read(&mut read_buffer) => {
                     let count = match read {
                         Ok(value) => value,
@@ -1807,10 +1954,6 @@ impl std::error::Error for UdpServiceError {
 /// Serve binary V2 datagrams. Each datagram is parsed once and only the four
 /// host request kinds enter the actor. Work is bounded; backpressure reaches
 /// the UDP receive queue rather than creating an unbounded task population.
-pub async fn udp_service(bind: SocketAddr, handle: ActuationHandle) -> Result<(), UdpServiceError> {
-    udp_service_inner(bind, Some(handle)).await
-}
-
 /// Keep the loopback V2 endpoint truthful when no controller authority was
 /// configured. Status remains queryable and no request can reach actuation.
 pub async fn unavailable_udp_service(bind: SocketAddr) -> Result<(), UdpServiceError> {
@@ -1821,31 +1964,63 @@ async fn udp_service_inner(
     bind: SocketAddr,
     handle: Option<ActuationHandle>,
 ) -> Result<(), UdpServiceError> {
+    let socket = bind_udp_socket(bind).await?;
+    udp_service_on_socket(socket, handle).await
+}
+
+pub(crate) async fn bind_udp_socket(bind: SocketAddr) -> Result<UdpSocket, UdpServiceError> {
     if !bind.ip().is_loopback() || bind.port() == 0 {
         return Err(UdpServiceError::BindMustBeLoopback(bind));
     }
-    let socket = UdpSocket::bind(bind).await.map_err(UdpServiceError::Bind)?;
-    udp_service_on_socket(socket, handle).await
+    UdpSocket::bind(bind).await.map_err(UdpServiceError::Bind)
 }
 
 async fn udp_service_on_socket(
     socket: UdpSocket,
     handle: Option<ActuationHandle>,
 ) -> Result<(), UdpServiceError> {
+    udp_service_on_socket_inner(socket, handle, None).await
+}
+
+pub(crate) async fn udp_service_on_socket_until(
+    socket: UdpSocket,
+    handle: ActuationHandle,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<(), UdpServiceError> {
+    udp_service_on_socket_inner(socket, Some(handle), Some(shutdown)).await
+}
+
+async fn udp_service_on_socket_inner(
+    socket: UdpSocket,
+    handle: Option<ActuationHandle>,
+    mut shutdown: Option<oneshot::Receiver<()>>,
+) -> Result<(), UdpServiceError> {
     let socket = Arc::new(socket);
     let mut buffer = [0_u8; MAX_RAW_FRAME_BYTES + 1];
     let mut exchanges = JoinSet::new();
 
-    loop {
+    'serving: loop {
         while exchanges.len() >= MAX_UDP_EXCHANGES_IN_FLIGHT {
-            if let Some(result) = exchanges.join_next().await {
-                log_udp_task_result(result);
+            tokio::select! {
+                biased;
+                () = wait_for_udp_shutdown(&mut shutdown) => {
+                    break 'serving;
+                }
+                result = exchanges.join_next() => {
+                    if let Some(result) = result {
+                        log_udp_task_result(result);
+                    }
+                }
             }
         }
-        let (length, source) = socket
-            .recv_from(&mut buffer)
-            .await
-            .map_err(UdpServiceError::Receive)?;
+        let received = tokio::select! {
+            biased;
+            () = wait_for_udp_shutdown(&mut shutdown) => {
+                break 'serving;
+            }
+            result = socket.recv_from(&mut buffer) => result,
+        };
+        let (length, source) = received.map_err(UdpServiceError::Receive)?;
         let first_received_at = Instant::now();
         let message = match decode_raw_frame(&buffer[..length]) {
             Ok(message) => message,
@@ -1900,6 +2075,24 @@ async fn udp_service_on_socket(
             }
             Ok(())
         });
+    }
+
+    exchanges.abort_all();
+    while let Some(result) = exchanges.join_next().await {
+        match result {
+            Err(error) if error.is_cancelled() => {}
+            result => log_udp_task_result(result),
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_udp_shutdown(shutdown: &mut Option<oneshot::Receiver<()>>) {
+    match shutdown {
+        Some(shutdown) => {
+            let _ = shutdown.await;
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -2318,6 +2511,7 @@ mod tests {
 
     struct Harness {
         handle: ActuationHandle,
+        shutdown: ActuationShutdownHandle,
         controller: FakeController,
         actor: JoinHandle<Result<(), ActuationActorError>>,
         source: SocketAddr,
@@ -2355,8 +2549,10 @@ mod tests {
                 .send(Message::Heartbeat(zero_heartbeat(boot_id)))
                 .await;
             let source = "127.0.0.1:41000".parse().expect("source address");
+            let shutdown = handle.shutdown_handle();
             let mut harness = Self {
                 handle,
+                shutdown,
                 controller,
                 actor,
                 source,
@@ -2443,6 +2639,35 @@ mod tests {
             panic!("wrong host-command response")
         };
         result
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn priority_shutdown_preempts_an_already_queued_nonzero_command() {
+        let mut harness = Harness::ready().await;
+        harness.acquire().await;
+        let requested_pwm = TimerPwm::try_new(20, -20).expect("bounded motion PWM");
+        let response = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostCommand(command(harness.boot_id, 0, requested_pwm)),
+        );
+
+        // Both the queued request and shutdown are ready before the
+        // current-thread executor can poll the actor. The biased owner signal
+        // must win, so no ApplyPwm can precede this ForceStop.
+        harness.shutdown.request(ActuationShutdownReason::Operator);
+        let Message::ForceStop(stop) = harness.controller.receive().await else {
+            panic!("priority shutdown must emit ForceStop before queued motion")
+        };
+        assert_eq!(stop.reason, ForceStopReason::Operator);
+        assert!(
+            response.await.is_err(),
+            "the queued command must not receive an application result"
+        );
+        assert!(
+            harness.actor.await.expect("actor task join").is_ok(),
+            "priority shutdown is a clean actor exit after best-effort stop"
+        );
     }
 
     #[tokio::test]

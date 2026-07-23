@@ -81,6 +81,12 @@ impl ServerRuntimeConfig {
     pub const fn legacy_http_camera_enabled(&self) -> bool {
         self.legacy_http_camera
     }
+
+    /// Consume the one parsed runtime boundary and transfer its exact V2
+    /// resources without cloning path or identity data.
+    pub fn into_v2(self) -> (SocketAddr, Option<ControllerServerConfigV1>) {
+        (self.command_bind, self.controller)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
