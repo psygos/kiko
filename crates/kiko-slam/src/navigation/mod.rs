@@ -48,6 +48,15 @@ mod nano_agent_launch;
     unix
 ))]
 mod nano_observed_inventory;
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "record",
+    unix
+))]
+mod nano_production_admission;
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
+mod nano_startup;
 mod odometry;
 mod reference;
 mod safety;
@@ -215,6 +224,22 @@ pub use nano_observed_inventory::{
     AdmittedOakSuperSpeedEvidence, NanoObservedInventoryBuildError, NanoObservedInventoryBuilder,
     NanoObservedInventoryEvidenceError, NanoObservedInventoryEvidenceKind,
     ProductionObservedDeviceInventoryV1,
+};
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "record",
+    unix
+))]
+pub use nano_production_admission::{
+    NanoProductionAdmissionError, NanoProductionAdmissionPrimaryError, NanoProductionAdmissionStop,
+    NanoProductionAdmissionTimeline, NanoProductionAdmissionTimelineError,
+    PreparedNanoProductionRuntime, PreparedNanoProductionRuntimeParts,
+};
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
+pub use nano_startup::{
+    AdmittedNanoStartup, DisarmedNanoStartup, DisarmedNanoStartupParts, NanoStartupAdmissionError,
+    NanoStartupArtifactError, NanoStartupSupervisorError, NanoStartupSupervisorStage,
 };
 pub use odometry::{
     BaseAcceleration, BaseAngularVelocity, CalibratedQuantity, CalibrationMatrix,
