@@ -7,7 +7,7 @@
 use std::fmt;
 use std::time::Instant;
 
-use robot_command_client::{AppliedCommandReceipt, DisarmReceipt};
+use robot_command_client::{AppliedCommandReceipt, DisarmReceipt, VerifiedControllerAcquisition};
 
 use super::actuation::{LiveActuationError, PhysicalActuationSession};
 use super::mpc::HostMonotonicClock;
@@ -17,8 +17,8 @@ use super::{
 };
 #[cfg(feature = "agent-runtime")]
 use super::{
-    ManualDriveAcceptedIntent, ManualDriveOutput, ManualMpcCommandError, ManualMpcCommandV1,
-    NumericAuthorityLeaseId,
+    FrontierYawScanCommandV1, ManualDriveAcceptedIntent, ManualDriveOutput, ManualMpcCommandError,
+    ManualMpcCommandV1, NumericAuthorityLeaseId,
 };
 use crate::HostMonotonicTimestamp;
 
@@ -104,7 +104,150 @@ pub struct LiveMpcControlDriver {
     core: MpcControlCore<PhysicalActuationSession>,
 }
 
+/// Zero-only controller ownership acquired before exact deployment admission.
+///
+/// A live controller acquisition is itself one of the observations needed to
+/// construct an exact inventory admission. This intermediate type breaks that
+/// startup cycle without exposing any MPC or PWM-bearing API: callers may
+/// inspect the verified acquisition, refresh zero, explicitly disarm, or
+/// consume the owner through [`Self::admit`]. Only exact agreement with the
+/// subsequently admitted deployment authority produces a
+/// [`LiveMpcControlDriver`].
+#[cfg(all(feature = "agent-runtime", unix))]
+#[must_use = "a pending controller session must be admitted or explicitly disarmed"]
+pub struct PendingLiveMpcControlDriver {
+    core: MpcControlCore<PhysicalActuationSession>,
+    acquired_config: NavigationActuationConfigV1,
+}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+impl PendingLiveMpcControlDriver {
+    /// Acquire one exact-zero session while withholding every motion API.
+    pub fn acquire(
+        config: &NavigationActuationConfigV1,
+        clock_origin: Instant,
+    ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
+        let (session, initial_zero) = PhysicalActuationSession::acquire(config, clock_origin)?;
+        Ok((
+            Self {
+                core: MpcControlCore { port: session },
+                acquired_config: config.clone(),
+            },
+            initial_zero,
+        ))
+    }
+
+    /// Acquisition-time identity used to construct the observed inventory.
+    pub fn verified_controller_acquisition(
+        &self,
+    ) -> Result<VerifiedControllerAcquisition, LiveActuationError> {
+        self.core.port.verified_controller_acquisition()
+    }
+
+    /// Keep the pre-admission session at a newly acknowledged exact zero.
+    pub fn apply_fresh_zero(&mut self) -> Result<AppliedCommandReceipt, LiveActuationError> {
+        self.core.port.apply_fresh_zero()
+    }
+
+    /// Consume the pending session through a request-correlated stop.
+    pub fn disarm(mut self) -> Result<DisarmReceipt, LiveActuationError> {
+        self.core.port.disarm()
+    }
+
+    /// Promote this zero-only owner only when the exact admitted authority is
+    /// the same parsed document used for acquisition.
+    ///
+    /// A mismatch consumes the controller session through an explicit stop and
+    /// retains whether that stop was confirmed. It never drops an armed owner
+    /// while returning only a configuration error.
+    pub fn admit(
+        mut self,
+        admitted: &super::AdmittedNavigationActuationConfigV1,
+    ) -> Result<LiveMpcControlDriver, PendingLiveMpcAdmissionError> {
+        if self.acquired_config != *admitted.config() {
+            let stop = match self.core.port.disarm() {
+                Ok(receipt) => PendingLiveMpcAdmissionStop::Confirmed(receipt),
+                Err(source) => PendingLiveMpcAdmissionStop::Uncertain(source),
+            };
+            return Err(PendingLiveMpcAdmissionError::ConfigMismatch { stop });
+        }
+        Ok(LiveMpcControlDriver { core: self.core })
+    }
+}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+pub enum PendingLiveMpcAdmissionStop {
+    Confirmed(DisarmReceipt),
+    Uncertain(LiveActuationError),
+}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+pub enum PendingLiveMpcAdmissionError {
+    ConfigMismatch { stop: PendingLiveMpcAdmissionStop },
+}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+impl fmt::Debug for PendingLiveMpcAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+impl fmt::Display for PendingLiveMpcAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConfigMismatch {
+                stop: PendingLiveMpcAdmissionStop::Confirmed(receipt),
+            } => write!(
+                formatter,
+                "the admitted actuation authority differs from the document used to acquire the controller; controller stop was confirmed at {} ns",
+                receipt.acknowledged_at().nanos_since_clock_start()
+            ),
+            Self::ConfigMismatch {
+                stop: PendingLiveMpcAdmissionStop::Uncertain(source),
+            } => write!(
+                formatter,
+                "the admitted actuation authority differs from the document used to acquire the controller; controller stop is uncertain: {source}"
+            ),
+        }
+    }
+}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+impl std::error::Error for PendingLiveMpcAdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ConfigMismatch {
+                stop: PendingLiveMpcAdmissionStop::Confirmed(_),
+            } => None,
+            Self::ConfigMismatch {
+                stop: PendingLiveMpcAdmissionStop::Uncertain(source),
+            } => Some(source),
+        }
+    }
+}
+
 impl LiveMpcControlDriver {
+    /// Acquire the production physical driver only after exact deployment
+    /// admission has bound the weak V1 actuation document to the inventory and
+    /// selected plant artifact. The older [`Self::acquire`] remains the
+    /// explicit compatibility path for the standalone live CLI.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    pub fn acquire_admitted(
+        config: &super::AdmittedNavigationActuationConfigV1,
+        clock_origin: Instant,
+    ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
+        let (session, initial_zero) =
+            PhysicalActuationSession::acquire(config.config(), clock_origin)?;
+        Ok((
+            Self {
+                core: MpcControlCore { port: session },
+            },
+            initial_zero,
+        ))
+    }
+
     pub fn acquire(
         config: &NavigationActuationConfigV1,
         clock_origin: Instant,
@@ -145,6 +288,13 @@ impl LiveMpcControlDriver {
     /// host result to the supervisor which requested the zero.
     pub fn apply_fresh_zero(&mut self) -> Result<AppliedCommandReceipt, LiveActuationError> {
         self.core.port.apply_fresh_zero()
+    }
+
+    /// Acquisition-time controller identity for strict startup inventory.
+    pub fn verified_controller_acquisition(
+        &self,
+    ) -> Result<VerifiedControllerAcquisition, LiveActuationError> {
+        self.core.port.verified_controller_acquisition()
     }
 
     /// Run one already-admitted manual body-twist, explicit stop, or deadman
@@ -197,6 +347,31 @@ impl LiveMpcControlDriver {
                         coordinator.tick_manual_stopped(tick, stopped, clock)
                     }
                 },
+                CoordinatorTickOutcome::decision,
+            )
+            .map_err(LiveMpcControlError::from_cycle)?;
+        Ok(LiveAppliedMpcTick { outcome, receipt })
+    }
+
+    /// Run one map-revision-bound physical frontier-yaw tick through the same
+    /// preflight, coordinator/MPC/safety, and exact-receipt path as every other
+    /// motion mode.
+    #[cfg(feature = "agent-runtime")]
+    pub fn tick_frontier_yaw<J, C>(
+        &mut self,
+        coordinator: &mut ShadowNavigationCoordinator<J>,
+        tick: HostMonotonicTimestamp,
+        command: FrontierYawScanCommandV1,
+        clock: &mut C,
+    ) -> Result<LiveAppliedMpcTick<J::Error>, LiveMpcControlError>
+    where
+        J: NavigationIngressSink,
+        C: HostMonotonicClock,
+    {
+        let (outcome, receipt) = self
+            .core
+            .execute(
+                || coordinator.tick_frontier_yaw(tick, command, clock),
                 CoordinatorTickOutcome::decision,
             )
             .map_err(LiveMpcControlError::from_cycle)?;
@@ -440,6 +615,35 @@ mod tests {
         assert!(outcome.record().pwm().is_stop());
         assert_eq!(receipt, 7);
         assert_eq!(*events.borrow(), ["preflight", "tick", "apply"]);
+    }
+
+    #[test]
+    fn frontier_yaw_cycle_cannot_succeed_without_preflight_and_exact_application() {
+        let decision = stopped_decision();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut core = MpcControlCore {
+            port: FakePort {
+                events: Rc::clone(&events),
+                preflight_error: false,
+                apply_error: false,
+            },
+        };
+        let tick_events = Rc::clone(&events);
+        let (outcome, receipt) = core
+            .execute(
+                || {
+                    tick_events.borrow_mut().push("frontier-yaw-tick");
+                    Ok::<_, CoordinatorTickError>(decision)
+                },
+                |outcome| outcome,
+            )
+            .expect("receipt-gated frontier-yaw cycle");
+        assert!(outcome.record().pwm().is_stop());
+        assert_eq!(receipt, 7);
+        assert_eq!(
+            *events.borrow(),
+            ["preflight", "frontier-yaw-tick", "apply"]
+        );
     }
 
     #[test]

@@ -87,6 +87,15 @@ impl OperatorClaimedPhysicalApprovalV1 {
         self.approver_id.as_str()
     }
 
+    /// Caller-asserted content identity for the physical plant dataset.
+    ///
+    /// Parsing the V1 config only retains this bounded claim. Production
+    /// admission separately requires the canonical `sha256:<lowerhex>` value
+    /// to match an exact manifest-bound, no-follow hashed plant artifact.
+    pub fn plant_dataset_content_id(&self) -> &str {
+        self.plant_dataset_content_id.as_str()
+    }
+
     pub fn imu_calibration_id(&self) -> &str {
         self.imu_calibration_id.as_str()
     }

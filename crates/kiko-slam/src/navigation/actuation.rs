@@ -13,6 +13,7 @@ use robot_command_client::{
     AcquireFailure, AppliedCommandReceipt, ApplyFailure, ArmedCommandClient, ClientConfig,
     DisarmFailure, DisarmReceipt, DisarmedCommandClient, MonotonicClock, MonotonicInstant,
     PendingPhysicalCommand, RobotProtocolV2WireAdapter, UdpTransportBuildError, UdpV2Transport,
+    VerifiedControllerAcquisition,
 };
 use robot_protocol::v2::{DomainError, ForceStopReason, TimerPwm, V2CommandLeaseMs};
 
@@ -317,6 +318,19 @@ impl PhysicalActuationSession {
 
     pub const fn is_consumed(&self) -> bool {
         self.armed.is_none()
+    }
+
+    /// Retain the exact controller identity observed by the acquisition which
+    /// created this physical session. A consumed session has no live
+    /// acquisition capability and must be reinventoried rather than rebuilt
+    /// from expected configuration.
+    pub fn verified_controller_acquisition(
+        &self,
+    ) -> Result<VerifiedControllerAcquisition, LiveActuationError> {
+        self.armed
+            .as_ref()
+            .map(ArmedCommandClient::verified_acquisition)
+            .ok_or(LiveActuationError::SessionConsumed)
     }
 
     fn take_armed(&mut self) -> Result<ConcreteArmed, LiveActuationError> {

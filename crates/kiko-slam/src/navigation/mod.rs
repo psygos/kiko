@@ -2,6 +2,8 @@
 
 #[cfg(feature = "actuation")]
 pub mod actuation;
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
+mod actuation_admission;
 #[cfg(feature = "actuation")]
 mod actuation_config;
 #[cfg(all(feature = "agent-runtime", unix))]
@@ -42,6 +44,11 @@ mod zero_hold_keeper;
 #[cfg(all(feature = "nano-bench", unix))]
 mod zero_only_config;
 
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
+pub use actuation_admission::{
+    ActuationAdmissionError, AdmittedNavigationActuationConfigV1, AdmittedPlantArtifactIdentity,
+    ArtifactContentMismatch, PlantDatasetContentDigestMismatch,
+};
 #[cfg(feature = "actuation")]
 pub use actuation_config::{
     ActuationConfigParseError, ActuatorConfigFingerprint, ControllerUid,
@@ -140,6 +147,10 @@ pub use ingress::{
 };
 #[cfg(feature = "actuation")]
 pub use live_mpc_control::{LiveAppliedMpcTick, LiveMpcControlDriver, LiveMpcControlError};
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
+pub use live_mpc_control::{
+    PendingLiveMpcAdmissionError, PendingLiveMpcAdmissionStop, PendingLiveMpcControlDriver,
+};
 pub use local_costmap::{
     DepthFrameKey, LocalCostmap, LocalCostmapCell, LocalCostmapClockRegression, LocalCostmapConfig,
     LocalCostmapConfigError, LocalCostmapCoordinateError, LocalCostmapError, LocalCostmapFreshness,

@@ -40,6 +40,7 @@ pub const MAX_SUPPORTED_ABS_ODOM_COORDINATE_M: f64 = 1_000_000.0;
 pub const MAX_SUPPORTED_ABS_INPUT_YAW_RAD: f64 = std::f64::consts::TAU;
 pub const MAX_SUPPORTED_YAW_EXCURSION_PER_SUBSTEP_RAD: f64 = 0.25;
 const MAX_ID_BYTES: usize = 64;
+pub const MAX_PLANT_DATASET_CONTENT_ID_BYTES: usize = 128;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BoundedId {
@@ -51,9 +52,7 @@ impl BoundedId {
     pub(crate) fn parse(field: &'static str, value: String) -> Result<Self, IdentifierError> {
         if value.is_empty()
             || value.len() > MAX_ID_BYTES
-            || !value.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
-            })
+            || !value.bytes().all(valid_identifier_byte)
         {
             return Err(IdentifierError { field });
         }
@@ -69,6 +68,53 @@ impl BoundedId {
         std::str::from_utf8(&self.bytes[..usize::from(self.len)])
             .expect("BoundedId contains checked ASCII")
     }
+}
+
+/// Bounded plant-dataset identity with enough space for canonical
+/// `sha256:<lowerhex>` content addressing.
+///
+/// This is deliberately separate from the smaller general-purpose MPC
+/// identifier so cryptographic evidence does not enlarge every model, solver,
+/// and request identity.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PlantDatasetContentId {
+    bytes: [u8; MAX_PLANT_DATASET_CONTENT_ID_BYTES],
+    len: u8,
+}
+
+impl PlantDatasetContentId {
+    fn parse(field: &'static str, value: String) -> Result<Self, IdentifierError> {
+        if value.is_empty()
+            || value.len() > MAX_PLANT_DATASET_CONTENT_ID_BYTES
+            || !value.bytes().all(valid_identifier_byte)
+        {
+            return Err(IdentifierError { field });
+        }
+        let mut bytes = [0; MAX_PLANT_DATASET_CONTENT_ID_BYTES];
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        Ok(Self {
+            bytes,
+            len: value.len() as u8,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)])
+            .expect("PlantDatasetContentId contains checked ASCII")
+    }
+}
+
+impl fmt::Debug for PlantDatasetContentId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("PlantDatasetContentId")
+            .field(&self.as_str())
+            .finish()
+    }
+}
+
+const fn valid_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
 }
 
 impl fmt::Debug for BoundedId {
@@ -165,7 +211,7 @@ pub enum PlantEvidenceV1 {
         generator_id: BoundedId,
     },
     ClaimedPhysicalIdentification {
-        dataset_content_id: BoundedId,
+        dataset_content_id: PlantDatasetContentId,
         identification_method_id: BoundedId,
         sample_count: NonZeroU64,
         residuals: FitResidualsV1,
@@ -522,8 +568,11 @@ fn parse_evidence(dto: PlantEvidenceV1Dto) -> Result<PlantEvidenceV1, PlantModel
                 require_nonnegative_plant(field, value)?;
             }
             Ok(PlantEvidenceV1::ClaimedPhysicalIdentification {
-                dataset_content_id: BoundedId::parse("dataset_content_id", dataset_content_id)
-                    .map_err(PlantModelParseError::InvalidIdentifier)?,
+                dataset_content_id: PlantDatasetContentId::parse(
+                    "dataset_content_id",
+                    dataset_content_id,
+                )
+                .map_err(PlantModelParseError::InvalidIdentifier)?,
                 identification_method_id: BoundedId::parse(
                     "identification_method_id",
                     identification_method_id,
@@ -4339,6 +4388,44 @@ mod tests {
             slew_cost_per_percent2: 0.001,
             terminal_state_cost_multiplier: 2.0,
         }
+    }
+
+    #[test]
+    fn canonical_dataset_sha256_is_representable_without_widening_general_ids() {
+        let canonical_sha256 = format!("sha256:{}", "ab".repeat(32));
+        assert_eq!(canonical_sha256.len(), 71);
+        assert!(BoundedId::parse("general_id", "x".repeat(MAX_ID_BYTES + 1)).is_err());
+        assert!(
+            PlantDatasetContentId::parse("dataset_content_id", canonical_sha256.clone()).is_ok()
+        );
+        assert!(
+            PlantDatasetContentId::parse(
+                "dataset_content_id",
+                "x".repeat(MAX_PLANT_DATASET_CONTENT_ID_BYTES + 1),
+            )
+            .is_err()
+        );
+
+        let mut dto = plant_dto(0.1, 0.4, 0.5);
+        dto.evidence = PlantEvidenceV1Dto::ClaimedPhysicalIdentification {
+            dataset_content_id: canonical_sha256.clone(),
+            identification_method_id: "method-v1".into(),
+            sample_count: 1,
+            residuals: FitResidualsV1Dto {
+                left_velocity_rmse_mps: 0.0,
+                right_velocity_rmse_mps: 0.0,
+                yaw_rate_rmse_rad_s: 0.0,
+                max_abs_velocity_error_mps: 0.0,
+            },
+        };
+        let model = PlantModelV1::parse(dto).expect("canonical content-addressed dataset");
+        let PlantEvidenceV1::ClaimedPhysicalIdentification {
+            dataset_content_id, ..
+        } = model.evidence()
+        else {
+            panic!("claimed physical evidence");
+        };
+        assert_eq!(dataset_content_id.as_str(), canonical_sha256);
     }
 
     fn dimensions(width: u32, height: u32) -> FrameDimensions {
