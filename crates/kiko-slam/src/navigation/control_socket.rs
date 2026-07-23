@@ -31,7 +31,7 @@ use std::sync::mpsc::{
     self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
 };
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -58,6 +58,9 @@ pub const MAX_AGENT_CONTROL_RUNTIME_QUEUE_CAPACITY: usize = 64;
 const FRAME_LENGTH_BYTES: usize = 4;
 const MIN_SOCKET_TIMEOUT: Duration = Duration::from_millis(1);
 const MAX_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+const AGENT_CONTROL_SOCKET_THREAD_NAME: &str = "kiko-agent-control";
+const AGENT_CONTROL_SOCKET_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const AGENT_CONTROL_SOCKET_CANCELLATION_POLL: Duration = Duration::from_millis(5);
 
 /// Exact absolute pathname for one local control socket.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -749,6 +752,21 @@ impl AgentControlSocketServer {
     /// Every operation after a connection is accepted has an absolute deadline.
     /// The connection is dropped after one response regardless of extra frames.
     pub fn poll_one(&mut self) -> Result<AgentControlServeOutcome, AgentControlServeError> {
+        self.poll_one_with_cancellation(None)
+    }
+
+    fn poll_one_for_task(
+        &mut self,
+        running: &AtomicBool,
+    ) -> Result<AgentControlServeOutcome, AgentControlServeError> {
+        self.poll_one_with_cancellation(Some(running))
+    }
+
+    fn poll_one_with_cancellation(
+        &mut self,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<AgentControlServeOutcome, AgentControlServeError> {
+        require_not_cancelled(cancellation)?;
         self.path_guard.verify_current().map_err(|observed| {
             AgentControlServeError::SocketPathNoLongerOwned {
                 expected_device: self.path_guard.identity.device,
@@ -767,27 +785,34 @@ impl AgentControlSocketServer {
             .set_nonblocking(false)
             .map_err(|source| AgentControlServeError::ConfigureClient { source })?;
         let mut request_payload = [0_u8; MAX_AGENT_CONTROL_REQUEST_JSON_BYTES];
-        let (response, connection_issue) =
-            match read_request_frame_into(&mut stream, self.timeouts.read, &mut request_payload) {
-                Ok(payload) => self.handle_payload(payload)?,
-                Err(ReadRequestFrameError::InvalidLength { declared_bytes }) => (
-                    AgentControlResponseV1::rejected(
-                        None,
-                        AgentControlRejectionCodeV1::MalformedRequest,
-                        false,
-                    ),
-                    Some(AgentControlConnectionIssue::InvalidFrameLength { declared_bytes }),
+        let (response, connection_issue) = match read_request_frame_into(
+            &mut stream,
+            self.timeouts.read,
+            &mut request_payload,
+            cancellation,
+        ) {
+            Ok(payload) => self.handle_payload(payload, cancellation)?,
+            Err(ReadRequestFrameError::InvalidLength { declared_bytes }) => (
+                AgentControlResponseV1::rejected(
+                    None,
+                    AgentControlRejectionCodeV1::MalformedRequest,
+                    false,
                 ),
-                Err(ReadRequestFrameError::Io { source, timeout }) => (
-                    AgentControlResponseV1::rejected(
-                        None,
-                        AgentControlRejectionCodeV1::MalformedRequest,
-                        timeout,
-                    ),
-                    Some(AgentControlConnectionIssue::Read { source, timeout }),
+                Some(AgentControlConnectionIssue::InvalidFrameLength { declared_bytes }),
+            ),
+            Err(ReadRequestFrameError::Io { source, timeout }) => (
+                AgentControlResponseV1::rejected(
+                    None,
+                    AgentControlRejectionCodeV1::MalformedRequest,
+                    timeout,
                 ),
-            };
-        write_response_frame(&mut stream, response, self.timeouts.write)?;
+                Some(AgentControlConnectionIssue::Read { source, timeout }),
+            ),
+            Err(ReadRequestFrameError::ShutdownRequested) => {
+                return Err(AgentControlServeError::ShutdownRequested);
+            }
+        };
+        write_response_frame(&mut stream, response, self.timeouts.write, cancellation)?;
         Ok(AgentControlServeOutcome::Responded {
             response,
             connection_issue,
@@ -797,8 +822,10 @@ impl AgentControlSocketServer {
     fn handle_payload(
         &mut self,
         payload: &[u8],
+        cancellation: Option<&AtomicBool>,
     ) -> Result<(AgentControlResponseV1, Option<AgentControlConnectionIssue>), AgentControlServeError>
     {
+        require_not_cancelled(cancellation)?;
         let request = match self.parser.parse_next(payload) {
             Ok(request) => request,
             Err(source) => {
@@ -832,6 +859,7 @@ impl AgentControlSocketServer {
             claim: claim_sender,
             response: response_sender,
         };
+        require_not_cancelled(cancellation)?;
         match self.runtime.inner.try_send(dispatch) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
@@ -856,23 +884,9 @@ impl AgentControlSocketServer {
             }
         }
 
-        let claim_wait = match remaining_until(runtime_deadline) {
-            Ok(remaining) => remaining,
-            Err(AgentControlServeError::RuntimeDeadline) => {
-                return Ok((
-                    AgentControlResponseV1::rejected(
-                        Some(request.request_id()),
-                        AgentControlRejectionCodeV1::NotReady,
-                        true,
-                    ),
-                    Some(AgentControlConnectionIssue::RuntimeClaimTimeout),
-                ));
-            }
-            Err(other) => return Err(other),
-        };
-        match claim_receiver.recv_timeout(claim_wait) {
+        match recv_until(&claim_receiver, runtime_deadline, cancellation) {
             Ok(()) => {}
-            Err(RecvTimeoutError::Timeout) => {
+            Err(CancellableReceiveError::Deadline) => {
                 return Ok((
                     AgentControlResponseV1::rejected(
                         Some(request.request_id()),
@@ -882,7 +896,7 @@ impl AgentControlSocketServer {
                     Some(AgentControlConnectionIssue::RuntimeClaimTimeout),
                 ));
             }
-            Err(RecvTimeoutError::Disconnected) => {
+            Err(CancellableReceiveError::Disconnected) => {
                 return Ok((
                     AgentControlResponseV1::rejected(
                         Some(request.request_id()),
@@ -892,28 +906,26 @@ impl AgentControlSocketServer {
                     Some(AgentControlConnectionIssue::RuntimeClaimChannelClosed),
                 ));
             }
+            Err(CancellableReceiveError::ShutdownRequested) => {
+                return Err(AgentControlServeError::ShutdownRequested);
+            }
         }
 
-        let response_wait = remaining_until(runtime_deadline).map_err(|error| match error {
-            AgentControlServeError::RuntimeDeadline => {
-                AgentControlServeError::RuntimeResponseDeadlineAfterClaim {
-                    request_id: request.request_id(),
-                }
-            }
-            other => other,
-        })?;
-        match response_receiver.recv_timeout(response_wait) {
+        match recv_until(&response_receiver, runtime_deadline, cancellation) {
             Ok(response) => Ok((response, None)),
-            Err(RecvTimeoutError::Timeout) => {
+            Err(CancellableReceiveError::Deadline) => {
                 Err(AgentControlServeError::RuntimeResponseDeadlineAfterClaim {
                     request_id: request.request_id(),
                 })
             }
-            Err(RecvTimeoutError::Disconnected) => Err(
+            Err(CancellableReceiveError::Disconnected) => Err(
                 AgentControlServeError::RuntimeResponseChannelClosedAfterClaim {
                     request_id: request.request_id(),
                 },
             ),
+            Err(CancellableReceiveError::ShutdownRequested) => {
+                Err(AgentControlServeError::ShutdownRequested)
+            }
         }
     }
 
@@ -936,29 +948,107 @@ impl Drop for AgentControlSocketServer {
 /// fail-closed runtime fault.
 #[must_use = "the live owner must join the control socket task and inspect cleanup"]
 pub struct AgentControlSocketTask {
-    handle: JoinHandle<AgentControlSocketTaskExit>,
+    running: Arc<AtomicBool>,
+    handle: Option<JoinHandle<AgentControlSocketTaskExit>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentControlSocketChildStart {
+    Ready,
+    ShutdownRequested,
+    StartStateUnavailable,
 }
 
 impl AgentControlSocketTask {
     /// Bind before spawning, so startup cannot report readiness until the
-    /// private path and permissions have been established.
+    /// private path and permissions have been established. Thread creation is
+    /// fallible and reported without panicking; when creation fails, the
+    /// created socket is synchronously cleaned and its exact outcome is
+    /// retained in the error.
     pub fn bind_and_spawn(
         config: AgentControlSocketConfig,
         clock: AgentControlMonotonicOrigin,
         capacity: AgentControlRuntimeQueueCapacity,
         running: Arc<AtomicBool>,
-    ) -> Result<(Self, AgentControlRuntimeReceiver), AgentControlSocketBindError> {
+    ) -> Result<(Self, AgentControlRuntimeReceiver), AgentControlSocketTaskStartError> {
+        Self::bind_and_spawn_with(config, clock, capacity, running, |task_main| {
+            thread::Builder::new()
+                .name(AGENT_CONTROL_SOCKET_THREAD_NAME.to_owned())
+                .spawn(task_main)
+        })
+    }
+
+    fn bind_and_spawn_with<Spawn>(
+        config: AgentControlSocketConfig,
+        clock: AgentControlMonotonicOrigin,
+        capacity: AgentControlRuntimeQueueCapacity,
+        running: Arc<AtomicBool>,
+        spawn: Spawn,
+    ) -> Result<(Self, AgentControlRuntimeReceiver), AgentControlSocketTaskStartError>
+    where
+        Spawn: FnOnce(
+            Box<dyn FnOnce() -> AgentControlSocketTaskExit + Send + 'static>,
+        ) -> io::Result<JoinHandle<AgentControlSocketTaskExit>>,
+    {
+        if !running.load(Ordering::Acquire) {
+            return Err(AgentControlSocketTaskStartError::ShutdownAlreadyRequested);
+        }
         let (sender, receiver) = agent_control_runtime_queue(capacity);
-        let mut server = AgentControlSocketServer::bind(config, clock, sender)?;
-        let handle = thread::spawn(move || {
-            while running.load(Ordering::Acquire) {
-                match server.poll_one() {
+        let server = match AgentControlSocketServer::bind(config, clock, sender) {
+            Ok(server) => server,
+            Err(source) => {
+                running.store(false, Ordering::Release);
+                return Err(AgentControlSocketTaskStartError::Bind { source });
+            }
+        };
+
+        // Keep ownership outside the task closure until the spawn operation
+        // succeeds. If the OS refuses the thread, the caller can explicitly
+        // shut down the still-owned server and report its cleanup outcome.
+        let pending_server = Arc::new(Mutex::new(Some(server)));
+        let task_server = Arc::clone(&pending_server);
+        let task_running = Arc::clone(&running);
+        let (start_sender, start_receiver) = mpsc::sync_channel(1);
+        let task_main = Box::new(move || {
+            let mut server_slot = task_server
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(mut server) = server_slot.take() else {
+                task_running.store(false, Ordering::Release);
+                let _ = start_sender.send(AgentControlSocketChildStart::StartStateUnavailable);
+                return AgentControlSocketTaskExit::StartStateUnavailable;
+            };
+            drop(server_slot);
+
+            if !task_running.load(Ordering::Acquire) {
+                let _ = start_sender.send(AgentControlSocketChildStart::ShutdownRequested);
+                return AgentControlSocketTaskExit::Shutdown {
+                    cleanup: server.shutdown(),
+                };
+            }
+            if start_sender
+                .send(AgentControlSocketChildStart::Ready)
+                .is_err()
+            {
+                task_running.store(false, Ordering::Release);
+                return AgentControlSocketTaskExit::StartupObserverUnavailable {
+                    cleanup: server.shutdown(),
+                };
+            }
+
+            while task_running.load(Ordering::Acquire) {
+                match server.poll_one_for_task(&task_running) {
                     Ok(AgentControlServeOutcome::Idle) => {
                         thread::park_timeout(Duration::from_millis(1));
                     }
                     Ok(AgentControlServeOutcome::Responded { .. }) => {}
+                    Err(AgentControlServeError::ShutdownRequested) => {
+                        return AgentControlSocketTaskExit::Shutdown {
+                            cleanup: server.shutdown(),
+                        };
+                    }
                     Err(source) => {
-                        running.store(false, Ordering::Release);
+                        task_running.store(false, Ordering::Release);
                         return AgentControlSocketTaskExit::ServeFailed {
                             source,
                             cleanup: server.shutdown(),
@@ -970,13 +1060,190 @@ impl AgentControlSocketTask {
                 cleanup: server.shutdown(),
             }
         });
-        Ok((Self { handle }, receiver))
+        let handle = match spawn(task_main) {
+            Ok(handle) => handle,
+            Err(source) => {
+                running.store(false, Ordering::Release);
+                let mut server_slot = pending_server
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                return match server_slot.take() {
+                    Some(server) => Err(AgentControlSocketTaskStartError::ThreadSpawn {
+                        source,
+                        cleanup: server.shutdown(),
+                    }),
+                    None => {
+                        Err(AgentControlSocketTaskStartError::ThreadSpawnOwnershipLost { source })
+                    }
+                };
+            }
+        };
+        drop(pending_server);
+        let mut task = Self {
+            running,
+            handle: Some(handle),
+        };
+        match start_receiver.recv_timeout(AGENT_CONTROL_SOCKET_STARTUP_TIMEOUT) {
+            Ok(AgentControlSocketChildStart::Ready) => Ok((task, receiver)),
+            Ok(AgentControlSocketChildStart::ShutdownRequested) => {
+                task.request_shutdown();
+                let task_exit = task.join_handle();
+                Err(AgentControlSocketTaskStartError::ChildNotReady {
+                    reason: AgentControlSocketTaskStartFailure::ShutdownRequested,
+                    task_exit: Box::new(task_exit),
+                })
+            }
+            Ok(AgentControlSocketChildStart::StartStateUnavailable) => {
+                task.request_shutdown();
+                let task_exit = task.join_handle();
+                Err(AgentControlSocketTaskStartError::ChildNotReady {
+                    reason: AgentControlSocketTaskStartFailure::StartStateUnavailable,
+                    task_exit: Box::new(task_exit),
+                })
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                drop(start_receiver);
+                task.request_shutdown();
+                let task_exit = task.join_handle();
+                Err(AgentControlSocketTaskStartError::ChildNotReady {
+                    reason: AgentControlSocketTaskStartFailure::ReadyTimeout {
+                        timeout: AGENT_CONTROL_SOCKET_STARTUP_TIMEOUT,
+                    },
+                    task_exit: Box::new(task_exit),
+                })
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                task.request_shutdown();
+                let task_exit = task.join_handle();
+                Err(AgentControlSocketTaskStartError::ChildNotReady {
+                    reason: AgentControlSocketTaskStartFailure::ReadyChannelClosed,
+                    task_exit: Box::new(task_exit),
+                })
+            }
+        }
     }
 
+    /// Signal this task and the shared fail-closed runtime flag to stop.
+    ///
+    /// This is nonblocking. Call [`shutdown`](Self::shutdown) when cleanup
+    /// evidence is required before proceeding.
+    pub fn request_shutdown(&self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(handle) = &self.handle {
+            handle.thread().unpark();
+        }
+    }
+
+    /// Explicitly signal, wake, and join the socket owner.
+    ///
+    /// The returned exit contains the conditional socket cleanup outcome.
+    /// In-flight read, runtime-rendezvous, and write waits cooperatively poll
+    /// the same run flag, so shutdown does not wait for their longer configured
+    /// deadlines.
+    pub fn shutdown(
+        mut self,
+    ) -> Result<AgentControlSocketTaskExit, AgentControlSocketTaskJoinError> {
+        self.request_shutdown();
+        self.join_handle()
+    }
+
+    /// Backwards-compatible stop-and-join operation.
+    ///
+    /// There is deliberately no public wait-only join: waiting on a healthy
+    /// owner without first clearing its run flag would never complete.
     pub fn join(self) -> Result<AgentControlSocketTaskExit, AgentControlSocketTaskJoinError> {
-        self.handle
+        self.shutdown()
+    }
+
+    fn join_handle(
+        &mut self,
+    ) -> Result<AgentControlSocketTaskExit, AgentControlSocketTaskJoinError> {
+        let handle = self
+            .handle
+            .take()
+            .ok_or(AgentControlSocketTaskJoinError::HandleUnavailable)?;
+        handle
             .join()
             .map_err(|_| AgentControlSocketTaskJoinError::Panicked)
+    }
+}
+
+impl Drop for AgentControlSocketTask {
+    fn drop(&mut self) {
+        if self.handle.is_none() {
+            return;
+        }
+        // A dropped owner is a fail-closed shutdown, never a detached control
+        // thread. Explicit shutdown should normally be used so the caller can
+        // inspect the exit and cleanup evidence.
+        self.request_shutdown();
+        let _ = self.join_handle();
+    }
+}
+
+/// Failure before a control-socket task becomes an owned live thread.
+#[derive(Debug)]
+pub enum AgentControlSocketTaskStartError {
+    ShutdownAlreadyRequested,
+    Bind {
+        source: AgentControlSocketBindError,
+    },
+    ThreadSpawn {
+        source: io::Error,
+        cleanup: AgentControlSocketCleanupOutcome,
+    },
+    /// Internal ownership invariant failure retained instead of guessing that
+    /// cleanup occurred. The production thread spawner cannot start a closure
+    /// while returning an error.
+    ThreadSpawnOwnershipLost {
+        source: io::Error,
+    },
+    ChildNotReady {
+        reason: AgentControlSocketTaskStartFailure,
+        task_exit: Box<Result<AgentControlSocketTaskExit, AgentControlSocketTaskJoinError>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentControlSocketTaskStartFailure {
+    ShutdownRequested,
+    StartStateUnavailable,
+    ReadyTimeout { timeout: Duration },
+    ReadyChannelClosed,
+}
+
+impl fmt::Display for AgentControlSocketTaskStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShutdownAlreadyRequested => formatter.write_str(
+                "agent-control task startup rejected because shutdown was already requested",
+            ),
+            Self::Bind { source } => write!(formatter, "{source}"),
+            Self::ThreadSpawn { source, cleanup } => write!(
+                formatter,
+                "agent-control thread creation failed: {source}; socket cleanup: {cleanup:?}"
+            ),
+            Self::ThreadSpawnOwnershipLost { source } => write!(
+                formatter,
+                "agent-control thread creation failed and bound-server ownership was unexpectedly lost: {source}"
+            ),
+            Self::ChildNotReady { reason, task_exit } => write!(
+                formatter,
+                "agent-control child did not establish readiness: {reason:?}; task exit: {task_exit:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AgentControlSocketTaskStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Bind { source } => Some(source),
+            Self::ThreadSpawn { source, .. } | Self::ThreadSpawnOwnershipLost { source } => {
+                Some(source)
+            }
+            Self::ShutdownAlreadyRequested | Self::ChildNotReady { .. } => None,
+        }
     }
 }
 
@@ -989,16 +1256,28 @@ pub enum AgentControlSocketTaskExit {
         source: AgentControlServeError,
         cleanup: AgentControlSocketCleanupOutcome,
     },
+    StartupObserverUnavailable {
+        cleanup: AgentControlSocketCleanupOutcome,
+    },
+    /// The spawned closure could not acquire the server placed there before
+    /// thread creation. This is an internal ownership invariant failure.
+    StartStateUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentControlSocketTaskJoinError {
     Panicked,
+    HandleUnavailable,
 }
 
 impl fmt::Display for AgentControlSocketTaskJoinError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("agent-control socket task panicked")
+        match self {
+            Self::Panicked => formatter.write_str("agent-control socket task panicked"),
+            Self::HandleUnavailable => {
+                formatter.write_str("agent-control socket task join handle is unavailable")
+            }
+        }
     }
 }
 
@@ -1039,6 +1318,9 @@ pub enum AgentControlConnectionIssue {
 /// Listener or response-write failure.
 #[derive(Debug)]
 pub enum AgentControlServeError {
+    /// Internal cooperative cancellation used by the owned socket task. The
+    /// public standalone poll path never produces this variant.
+    ShutdownRequested,
     Accept {
         source: io::Error,
     },
@@ -1056,7 +1338,6 @@ pub enum AgentControlServeError {
         source: io::Error,
     },
     DeadlineOverflow,
-    RuntimeDeadline,
     RuntimeResponseDeadlineAfterClaim {
         request_id: AgentControlRequestId,
     },
@@ -1073,6 +1354,9 @@ pub enum AgentControlServeError {
 impl fmt::Display for AgentControlServeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ShutdownRequested => {
+                formatter.write_str("agent-control socket shutdown was requested")
+            }
             Self::Accept { source } => write!(formatter, "agent-control accept failed: {source}"),
             Self::ConfigureClient { source } => {
                 write!(formatter, "agent-control client setup failed: {source}")
@@ -1095,9 +1379,6 @@ impl fmt::Display for AgentControlServeError {
             }
             Self::DeadlineOverflow => {
                 formatter.write_str("agent-control response deadline overflowed Instant")
-            }
-            Self::RuntimeDeadline => {
-                formatter.write_str("agent-control runtime claim deadline expired")
             }
             Self::RuntimeResponseDeadlineAfterClaim { request_id } => write!(
                 formatter,
@@ -1128,10 +1409,10 @@ impl std::error::Error for AgentControlServeError {
             | Self::ConfigureClient { source }
             | Self::ResponseWrite { source } => Some(source),
             Self::ResponseSerialization { source } => Some(source),
-            Self::ResponseTooLarge { .. }
+            Self::ShutdownRequested
+            | Self::ResponseTooLarge { .. }
             | Self::ResponseDeadline
             | Self::DeadlineOverflow
-            | Self::RuntimeDeadline
             | Self::RuntimeResponseDeadlineAfterClaim { .. }
             | Self::RuntimeResponseChannelClosedAfterClaim { .. }
             | Self::SocketPathNoLongerOwned { .. } => None,
@@ -1428,12 +1709,14 @@ fn parse_rejection(source: &AgentControlRequestParseError) -> AgentControlRespon
 enum ReadRequestFrameError {
     InvalidLength { declared_bytes: u32 },
     Io { source: io::Error, timeout: bool },
+    ShutdownRequested,
 }
 
 fn read_request_frame_into<'buffer>(
     stream: &mut UnixStream,
     timeout: Duration,
     payload: &'buffer mut [u8; MAX_AGENT_CONTROL_REQUEST_JSON_BYTES],
+    cancellation: Option<&AtomicBool>,
 ) -> Result<&'buffer [u8], ReadRequestFrameError> {
     let deadline =
         Instant::now()
@@ -1443,10 +1726,8 @@ fn read_request_frame_into<'buffer>(
                 timeout: false,
             })?;
     let mut length = [0_u8; FRAME_LENGTH_BYTES];
-    read_exact_until(stream, &mut length, deadline).map_err(|source| {
-        let timeout = is_timeout_error(&source);
-        ReadRequestFrameError::Io { source, timeout }
-    })?;
+    read_exact_until_cancellable(stream, &mut length, deadline, cancellation)
+        .map_err(map_request_read_error)?;
     let declared_wire_bytes = u32::from_be_bytes(length);
     let declared_bytes =
         usize::try_from(declared_wire_bytes).map_err(|_| ReadRequestFrameError::InvalidLength {
@@ -1457,17 +1738,31 @@ fn read_request_frame_into<'buffer>(
             declared_bytes: declared_wire_bytes,
         });
     }
-    read_exact_until(stream, &mut payload[..declared_bytes], deadline).map_err(|source| {
-        let timeout = is_timeout_error(&source);
-        ReadRequestFrameError::Io { source, timeout }
-    })?;
+    read_exact_until_cancellable(
+        stream,
+        &mut payload[..declared_bytes],
+        deadline,
+        cancellation,
+    )
+    .map_err(map_request_read_error)?;
     Ok(&payload[..declared_bytes])
+}
+
+fn map_request_read_error(source: CancellableIoError) -> ReadRequestFrameError {
+    match source {
+        CancellableIoError::Io(source) => {
+            let timeout = is_timeout_error(&source);
+            ReadRequestFrameError::Io { source, timeout }
+        }
+        CancellableIoError::ShutdownRequested => ReadRequestFrameError::ShutdownRequested,
+    }
 }
 
 fn write_response_frame(
     stream: &mut UnixStream,
     response: AgentControlResponseV1,
     timeout: Duration,
+    cancellation: Option<&AtomicBool>,
 ) -> Result<(), AgentControlServeError> {
     let mut payload = FixedResponseBuffer::new();
     serde_json::to_writer(&mut payload, &response).map_err(|source| {
@@ -1487,62 +1782,167 @@ fn write_response_frame(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(AgentControlServeError::DeadlineOverflow)?;
-    write_all_until(stream, &length, deadline).map_err(map_response_write_error)?;
-    write_all_until(stream, payload.as_slice(), deadline).map_err(map_response_write_error)
+    write_all_until_cancellable(stream, &length, deadline, cancellation)
+        .map_err(map_response_write_error)?;
+    write_all_until_cancellable(stream, payload.as_slice(), deadline, cancellation)
+        .map_err(map_response_write_error)
 }
 
-fn map_response_write_error(source: io::Error) -> AgentControlServeError {
-    if is_timeout_error(&source) {
-        AgentControlServeError::ResponseDeadline
-    } else {
-        AgentControlServeError::ResponseWrite { source }
+fn map_response_write_error(source: CancellableIoError) -> AgentControlServeError {
+    match source {
+        CancellableIoError::Io(source) if is_timeout_error(&source) => {
+            AgentControlServeError::ResponseDeadline
+        }
+        CancellableIoError::Io(source) => AgentControlServeError::ResponseWrite { source },
+        CancellableIoError::ShutdownRequested => AgentControlServeError::ShutdownRequested,
     }
 }
 
-fn remaining_until(deadline: Instant) -> Result<Duration, AgentControlServeError> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or(AgentControlServeError::RuntimeDeadline)
+fn require_not_cancelled(cancellation: Option<&AtomicBool>) -> Result<(), AgentControlServeError> {
+    if cancellation.is_some_and(|running| !running.load(Ordering::Acquire)) {
+        Err(AgentControlServeError::ShutdownRequested)
+    } else {
+        Ok(())
+    }
 }
 
-fn read_exact_until(
-    stream: &mut UnixStream,
-    mut destination: &mut [u8],
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CancellableReceiveError {
+    Deadline,
+    Disconnected,
+    ShutdownRequested,
+}
+
+fn recv_until<T>(
+    receiver: &Receiver<T>,
     deadline: Instant,
-) -> io::Result<()> {
-    while !destination.is_empty() {
+    cancellation: Option<&AtomicBool>,
+) -> Result<T, CancellableReceiveError> {
+    loop {
+        if cancellation.is_some_and(|running| !running.load(Ordering::Acquire)) {
+            return Err(CancellableReceiveError::ShutdownRequested);
+        }
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(deadline_io_error)?;
-        stream.set_read_timeout(Some(remaining))?;
+            .ok_or(CancellableReceiveError::Deadline)?;
+        let wait = if cancellation.is_some() {
+            remaining.min(AGENT_CONTROL_SOCKET_CANCELLATION_POLL)
+        } else {
+            remaining
+        };
+        match receiver.recv_timeout(wait) {
+            Ok(value) => return Ok(value),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(CancellableReceiveError::Disconnected);
+            }
+            Err(RecvTimeoutError::Timeout) if cancellation.is_some() => {}
+            Err(RecvTimeoutError::Timeout) => return Err(CancellableReceiveError::Deadline),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CancellableIoError {
+    Io(io::Error),
+    ShutdownRequested,
+}
+
+#[cfg(test)]
+fn read_exact_until(
+    stream: &mut UnixStream,
+    destination: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    match read_exact_until_cancellable(stream, destination, deadline, None) {
+        Ok(()) => Ok(()),
+        Err(CancellableIoError::Io(source)) => Err(source),
+        Err(CancellableIoError::ShutdownRequested) => {
+            unreachable!("uncancellable read cannot observe shutdown")
+        }
+    }
+}
+
+fn read_exact_until_cancellable(
+    stream: &mut UnixStream,
+    mut destination: &mut [u8],
+    deadline: Instant,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), CancellableIoError> {
+    while !destination.is_empty() {
+        if cancellation.is_some_and(|running| !running.load(Ordering::Acquire)) {
+            return Err(CancellableIoError::ShutdownRequested);
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| CancellableIoError::Io(deadline_io_error()))?;
+        let wait = if cancellation.is_some() {
+            remaining.min(AGENT_CONTROL_SOCKET_CANCELLATION_POLL)
+        } else {
+            remaining
+        };
+        stream
+            .set_read_timeout(Some(wait))
+            .map_err(CancellableIoError::Io)?;
         match stream.read(destination) {
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(0) => {
+                return Err(CancellableIoError::Io(io::Error::from(
+                    io::ErrorKind::UnexpectedEof,
+                )));
+            }
             Ok(read) => destination = &mut destination[read..],
             Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
-            Err(source) => return Err(source),
+            Err(source) if cancellation.is_some() && is_timeout_error(&source) => {}
+            Err(source) => return Err(CancellableIoError::Io(source)),
         }
     }
     Ok(())
 }
 
-fn write_all_until(
+#[cfg(test)]
+fn write_all_until(stream: &mut UnixStream, source: &[u8], deadline: Instant) -> io::Result<()> {
+    match write_all_until_cancellable(stream, source, deadline, None) {
+        Ok(()) => Ok(()),
+        Err(CancellableIoError::Io(source)) => Err(source),
+        Err(CancellableIoError::ShutdownRequested) => {
+            unreachable!("uncancellable write cannot observe shutdown")
+        }
+    }
+}
+
+fn write_all_until_cancellable(
     stream: &mut UnixStream,
     mut source: &[u8],
     deadline: Instant,
-) -> io::Result<()> {
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), CancellableIoError> {
     while !source.is_empty() {
+        if cancellation.is_some_and(|running| !running.load(Ordering::Acquire)) {
+            return Err(CancellableIoError::ShutdownRequested);
+        }
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(deadline_io_error)?;
-        stream.set_write_timeout(Some(remaining))?;
+            .ok_or_else(|| CancellableIoError::Io(deadline_io_error()))?;
+        let wait = if cancellation.is_some() {
+            remaining.min(AGENT_CONTROL_SOCKET_CANCELLATION_POLL)
+        } else {
+            remaining
+        };
+        stream
+            .set_write_timeout(Some(wait))
+            .map_err(CancellableIoError::Io)?;
         match stream.write(source) {
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(0) => {
+                return Err(CancellableIoError::Io(io::Error::from(
+                    io::ErrorKind::WriteZero,
+                )));
+            }
             Ok(written) => source = &source[written..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+            Err(error) if cancellation.is_some() && is_timeout_error(&error) => {}
+            Err(error) => return Err(CancellableIoError::Io(error)),
         }
     }
     Ok(())
@@ -1655,6 +2055,15 @@ mod tests {
             runtime,
         )
         .expect("test timeouts")
+    }
+
+    fn long_cancellable_timeouts() -> AgentControlSocketTimeouts {
+        AgentControlSocketTimeouts::try_new(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .expect("maximum bounded cancellation test timeouts")
     }
 
     fn bind_server(
@@ -2180,6 +2589,51 @@ mod tests {
     }
 
     #[test]
+    fn cancellable_write_observes_shutdown_while_peer_is_not_reading() {
+        let (mut writer, _reader) = UnixStream::pair().expect("socket pair");
+        writer
+            .set_nonblocking(true)
+            .expect("make writer nonblocking while filling its kernel buffer");
+        let fill = [0_u8; 8 * 1_024];
+        loop {
+            match writer.write(&fill) {
+                Ok(0) => panic!("socket write unexpectedly returned zero"),
+                Ok(_) => {}
+                Err(source) if source.kind() == io::ErrorKind::WouldBlock => break,
+                Err(source) => panic!("fill socket write buffer: {source}"),
+            }
+        }
+        writer
+            .set_nonblocking(false)
+            .expect("restore blocking writer");
+
+        let running = Arc::new(AtomicBool::new(true));
+        let writer_running = Arc::clone(&running);
+        let write_thread = thread::spawn(move || {
+            let deadline = Instant::now()
+                .checked_add(Duration::from_secs(30))
+                .expect("bounded future deadline");
+            write_all_until_cancellable(&mut writer, &[1], deadline, Some(&writer_running))
+        });
+        thread::sleep(Duration::from_millis(25));
+        assert!(
+            !write_thread.is_finished(),
+            "the unread peer must keep the write in flight"
+        );
+
+        let started = Instant::now();
+        running.store(false, Ordering::Release);
+        assert!(matches!(
+            write_thread.join().expect("join cancellable writer"),
+            Err(CancellableIoError::ShutdownRequested)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "write cancellation must poll shutdown instead of the 30-second deadline"
+        );
+    }
+
+    #[test]
     fn idle_poll_is_bounded_and_shutdown_removes_only_created_socket() {
         let directory = TestDirectory::new(0o700);
         let socket_path = directory.socket_path();
@@ -2195,6 +2649,326 @@ mod tests {
             AgentControlSocketCleanupOutcome::RemovedCreatedSocket
         ));
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn task_thread_creation_failure_is_typed_fail_closed_and_cleans_socket() {
+        let directory = TestDirectory::new(0o700);
+        let socket_path = directory.socket_path();
+        let path = AgentControlSocketPath::parse(&socket_path).expect("socket path");
+        let config = AgentControlSocketConfig::new(path, timeouts(Duration::from_millis(100)));
+        let capacity = AgentControlRuntimeQueueCapacity::try_new(1).expect("queue capacity");
+        let running = Arc::new(AtomicBool::new(true));
+
+        let result = AgentControlSocketTask::bind_and_spawn_with(
+            config,
+            AgentControlMonotonicOrigin::new(Instant::now(), HostMonotonicTimestamp::from_nanos(0)),
+            capacity,
+            Arc::clone(&running),
+            |_task_main| {
+                Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    "forced thread creation failure",
+                ))
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("forced thread creation must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            AgentControlSocketTaskStartError::ThreadSpawn {
+                source,
+                cleanup: AgentControlSocketCleanupOutcome::RemovedCreatedSocket,
+            } if source.kind() == io::ErrorKind::ResourceBusy
+        ));
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn task_start_rejects_an_already_cleared_run_flag_before_binding() {
+        let directory = TestDirectory::new(0o700);
+        let socket_path = directory.socket_path();
+        let path = AgentControlSocketPath::parse(&socket_path).expect("socket path");
+        let config = AgentControlSocketConfig::new(path, long_cancellable_timeouts());
+        let capacity = AgentControlRuntimeQueueCapacity::try_new(1).expect("queue capacity");
+        let running = Arc::new(AtomicBool::new(false));
+
+        assert!(matches!(
+            AgentControlSocketTask::bind_and_spawn(
+                config,
+                AgentControlMonotonicOrigin::new(
+                    Instant::now(),
+                    HostMonotonicTimestamp::from_nanos(0),
+                ),
+                capacity,
+                Arc::clone(&running),
+            ),
+            Err(AgentControlSocketTaskStartError::ShutdownAlreadyRequested)
+        ));
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn task_start_waits_until_the_child_has_taken_ownership_and_reported_ready() {
+        let directory = TestDirectory::new(0o700);
+        let socket_path = directory.socket_path();
+        let path = AgentControlSocketPath::parse(&socket_path).expect("socket path");
+        let config = AgentControlSocketConfig::new(path, long_cancellable_timeouts());
+        let capacity = AgentControlRuntimeQueueCapacity::try_new(1).expect("queue capacity");
+        let running = Arc::new(AtomicBool::new(true));
+        let task_running = Arc::clone(&running);
+        let (child_entered_sender, child_entered_receiver) = mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+
+        let starter = thread::spawn(move || {
+            AgentControlSocketTask::bind_and_spawn_with(
+                config,
+                AgentControlMonotonicOrigin::new(
+                    Instant::now(),
+                    HostMonotonicTimestamp::from_nanos(0),
+                ),
+                capacity,
+                task_running,
+                move |task_main| {
+                    thread::Builder::new().spawn(move || {
+                        child_entered_sender
+                            .send(())
+                            .expect("startup observer remains live");
+                        release_receiver
+                            .recv()
+                            .expect("test releases child startup");
+                        task_main()
+                    })
+                },
+            )
+        });
+
+        child_entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("child thread entered");
+        assert!(
+            !starter.is_finished(),
+            "bind_and_spawn must wait for the child readiness handshake"
+        );
+        release_sender.send(()).expect("release child startup");
+        let (task, receiver) = starter
+            .join()
+            .expect("join startup caller")
+            .expect("child reports ready");
+        assert!(socket_path.exists());
+        assert!(!task.handle.as_ref().expect("live handle").is_finished());
+        assert!(matches!(
+            task.shutdown().expect("shutdown ready task"),
+            AgentControlSocketTaskExit::Shutdown {
+                cleanup: AgentControlSocketCleanupOutcome::RemovedCreatedSocket,
+            }
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(AgentControlRuntimeReceiveError::Disconnected)
+        ));
+        assert!(!running.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn explicit_task_shutdown_joins_and_returns_cleanup_evidence() {
+        let directory = TestDirectory::new(0o700);
+        let socket_path = directory.socket_path();
+        let path = AgentControlSocketPath::parse(&socket_path).expect("socket path");
+        let config = AgentControlSocketConfig::new(path, timeouts(Duration::from_millis(100)));
+        let capacity = AgentControlRuntimeQueueCapacity::try_new(1).expect("queue capacity");
+        let running = Arc::new(AtomicBool::new(true));
+        let (task, receiver) = AgentControlSocketTask::bind_and_spawn(
+            config,
+            AgentControlMonotonicOrigin::new(Instant::now(), HostMonotonicTimestamp::from_nanos(0)),
+            capacity,
+            Arc::clone(&running),
+        )
+        .expect("spawn socket task");
+
+        assert!(socket_path.exists());
+        assert!(matches!(
+            task.shutdown().expect("join socket task"),
+            AgentControlSocketTaskExit::Shutdown {
+                cleanup: AgentControlSocketCleanupOutcome::RemovedCreatedSocket,
+            }
+        ));
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!socket_path.exists());
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(AgentControlRuntimeReceiveError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn public_join_initiates_shutdown_instead_of_waiting_forever() {
+        let directory = TestDirectory::new(0o700);
+        let socket_path = directory.socket_path();
+        let path = AgentControlSocketPath::parse(&socket_path).expect("socket path");
+        let config = AgentControlSocketConfig::new(path, long_cancellable_timeouts());
+        let capacity = AgentControlRuntimeQueueCapacity::try_new(1).expect("queue capacity");
+        let running = Arc::new(AtomicBool::new(true));
+        let (task, _receiver) = AgentControlSocketTask::bind_and_spawn(
+            config,
+            AgentControlMonotonicOrigin::new(Instant::now(), HostMonotonicTimestamp::from_nanos(0)),
+            capacity,
+            Arc::clone(&running),
+        )
+        .expect("spawn socket task");
+
+        let started = Instant::now();
+        assert!(matches!(
+            task.join().expect("stop and join socket task"),
+            AgentControlSocketTaskExit::Shutdown {
+                cleanup: AgentControlSocketCleanupOutcome::RemovedCreatedSocket,
+            }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn shutdown_cancels_an_in_flight_partial_read_without_waiting_for_io_timeout() {
+        let directory = TestDirectory::new(0o700);
+        let socket_path = directory.socket_path();
+        let path = AgentControlSocketPath::parse(&socket_path).expect("socket path");
+        let config = AgentControlSocketConfig::new(path, long_cancellable_timeouts());
+        let capacity = AgentControlRuntimeQueueCapacity::try_new(1).expect("queue capacity");
+        let running = Arc::new(AtomicBool::new(true));
+        let (task, _receiver) = AgentControlSocketTask::bind_and_spawn(
+            config,
+            AgentControlMonotonicOrigin::new(Instant::now(), HostMonotonicTimestamp::from_nanos(0)),
+            capacity,
+            Arc::clone(&running),
+        )
+        .expect("spawn socket task");
+        let mut client = UnixStream::connect(&socket_path).expect("connect partial client");
+        client.write_all(&[0]).expect("write partial frame header");
+        thread::sleep(Duration::from_millis(25));
+
+        let started = Instant::now();
+        assert!(matches!(
+            task.shutdown().expect("cancel partial read"),
+            AgentControlSocketTaskExit::Shutdown {
+                cleanup: AgentControlSocketCleanupOutcome::RemovedCreatedSocket,
+            }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown must poll cancellation instead of the 30-second read deadline"
+        );
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn dropping_task_cancels_an_in_flight_read_without_detaching_or_waiting() {
+        let directory = TestDirectory::new(0o700);
+        let socket_path = directory.socket_path();
+        let path = AgentControlSocketPath::parse(&socket_path).expect("socket path");
+        let config = AgentControlSocketConfig::new(path, long_cancellable_timeouts());
+        let capacity = AgentControlRuntimeQueueCapacity::try_new(1).expect("queue capacity");
+        let running = Arc::new(AtomicBool::new(true));
+        let (task, receiver) = AgentControlSocketTask::bind_and_spawn(
+            config,
+            AgentControlMonotonicOrigin::new(Instant::now(), HostMonotonicTimestamp::from_nanos(0)),
+            capacity,
+            Arc::clone(&running),
+        )
+        .expect("spawn socket task");
+        let mut client = UnixStream::connect(&socket_path).expect("connect partial client");
+        client.write_all(&[0]).expect("write partial frame header");
+        thread::sleep(Duration::from_millis(25));
+
+        let started = Instant::now();
+        drop(task);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "Drop must join through cooperative cancellation, not the 30-second read deadline"
+        );
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!socket_path.exists());
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(AgentControlRuntimeReceiveError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn shutdown_while_runtime_holds_claim_does_not_wait_for_the_claimed_response() {
+        let directory = TestDirectory::new(0o700);
+        let socket_path = directory.socket_path();
+        let path = AgentControlSocketPath::parse(&socket_path).expect("socket path");
+        let config = AgentControlSocketConfig::new(path, long_cancellable_timeouts());
+        let capacity = AgentControlRuntimeQueueCapacity::try_new(1).expect("queue capacity");
+        let running = Arc::new(AtomicBool::new(true));
+        let (task, receiver) = AgentControlSocketTask::bind_and_spawn(
+            config,
+            AgentControlMonotonicOrigin::new(Instant::now(), HostMonotonicTimestamp::from_nanos(0)),
+            capacity,
+            Arc::clone(&running),
+        )
+        .expect("spawn socket task");
+        let mut client = UnixStream::connect(&socket_path).expect("connect control client");
+        write_request(&mut client, &request(1, json!({"kind": "query_status"})));
+        let dispatch = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime receives request");
+        let claimed = dispatch.claim().expect("claim rendezvous");
+
+        let started = Instant::now();
+        assert!(matches!(
+            task.shutdown().expect("cancel claimed response wait"),
+            AgentControlSocketTaskExit::Shutdown {
+                cleanup: AgentControlSocketCleanupOutcome::RemovedCreatedSocket,
+            }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown must not wait for the held response or its 30-second deadline"
+        );
+        assert_eq!(
+            claimed.reject(AgentControlRejectionCodeV1::ShutdownInProgress, false),
+            Err(AgentControlDispatchResponseError::ClientUnavailable)
+        );
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn dropping_task_never_detaches_and_completes_idle_cleanup_synchronously() {
+        let directory = TestDirectory::new(0o700);
+        let socket_path = directory.socket_path();
+        let path = AgentControlSocketPath::parse(&socket_path).expect("socket path");
+        let config = AgentControlSocketConfig::new(path, timeouts(Duration::from_millis(100)));
+        let capacity = AgentControlRuntimeQueueCapacity::try_new(1).expect("queue capacity");
+        let running = Arc::new(AtomicBool::new(true));
+        let (task, receiver) = AgentControlSocketTask::bind_and_spawn(
+            config,
+            AgentControlMonotonicOrigin::new(Instant::now(), HostMonotonicTimestamp::from_nanos(0)),
+            capacity,
+            Arc::clone(&running),
+        )
+        .expect("spawn socket task");
+
+        let started = Instant::now();
+        drop(task);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "idle cancellation must wake the parked task"
+        );
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!socket_path.exists());
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(AgentControlRuntimeReceiveError::Disconnected)
+        ));
     }
 
     #[test]
