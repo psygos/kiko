@@ -2,7 +2,7 @@ use std::fmt;
 use std::time::Duration;
 
 use kiko_head_protocol::{
-    FullTelemetry, HeadJoint, HeadPose, HeadPoseError, PositionAgreementError,
+    ExactHeadTargetPose, FullTelemetry, HeadJoint, HeadPose, HeadPoseError, PositionAgreementError,
     PositionAgreementTicks, PositionTicks, PresentPosition, TelemetryParseError, TorqueSwitch,
     ValidatedPresentPosition, build_full_telemetry_read, build_goal_with_speed_write,
     build_natural_hold_frames, build_position_read, build_torque_switch_write,
@@ -354,13 +354,44 @@ impl HeadHealthJointEvidence {
     }
 }
 
+/// Exact provenance of the goal against which periodic head health is checked.
+///
+/// Startup can only hold a redundantly observed pose. A successful configured
+/// return instead holds the exact reviewed target. Recoverable return faults
+/// may leave a complete host-commanded position set active; that state remains
+/// distinguishable from both observed and reviewed targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadHoldTarget {
+    StartupObserved(HeadPose),
+    ReviewedReturn(ExactHeadTargetPose),
+    RecoverableReturnCommand([PositionTicks; 4]),
+}
+
+impl HeadHoldTarget {
+    pub const fn position(self, joint: HeadJoint) -> PositionTicks {
+        match self {
+            Self::StartupObserved(pose) => pose.position(joint),
+            Self::ReviewedReturn(target) => target.position(joint),
+            Self::RecoverableReturnCommand(positions) => positions[joint as usize],
+        }
+    }
+
+    pub const fn positions(self) -> [PositionTicks; 4] {
+        match self {
+            Self::StartupObserved(pose) => pose.positions(),
+            Self::ReviewedReturn(target) => target.positions(),
+            Self::RecoverableReturnCommand(positions) => positions,
+        }
+    }
+}
+
 /// A complete canonical bow/curl/yaw/roll health observation made while the
 /// actor retained exclusive ownership of the servo bus.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedHeadHealthEvidence {
     started_at: MonotonicTime,
     completed_at: MonotonicTime,
-    natural_hold_target: HeadPose,
+    hold_target: HeadHoldTarget,
     tolerance: PositionAgreementTicks,
     joints: [HeadHealthJointEvidence; 4],
 }
@@ -374,8 +405,8 @@ impl VerifiedHeadHealthEvidence {
         self.completed_at
     }
 
-    pub const fn natural_hold_target(&self) -> HeadPose {
-        self.natural_hold_target
+    pub const fn hold_target(&self) -> HeadHoldTarget {
+        self.hold_target
     }
 
     pub const fn tolerance(&self) -> PositionAgreementTicks {
@@ -1116,6 +1147,23 @@ impl HeadReturnActorHandle {
             .map_err(|_| HeadCommandError::ActorStoppedBeforeReporting)
     }
 
+    /// Observe the complete head against the currently active target.
+    ///
+    /// Before a return succeeds this is the startup-observed pose. Afterwards
+    /// it is the exact reviewed return target. A recoverable return fault
+    /// retains the complete host-commanded goal it reports.
+    pub async fn check_health(&self) -> Result<VerifiedHeadHealthEvidence, HeadHealthRequestError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::CheckHealth { response })
+            .await
+            .map_err(|_| HeadHealthRequestError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| HeadHealthRequestError::ActorStoppedBeforeReporting)?
+            .map_err(|source| HeadHealthRequestError::Check { source })
+    }
+
     pub async fn shutdown(self) -> Result<TorqueDisableReport, ShutdownError> {
         let (response, result) = oneshot::channel();
         self.commands
@@ -1576,6 +1624,7 @@ where
         start_pose: HeadPose,
         head_return: &mut Option<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
     ) -> ActorTermination {
+        let mut hold_target = HeadHoldTarget::StartupObserved(start_pose);
         loop {
             match commands.recv().await {
                 Some(HeadCommand::Shutdown { response }) => {
@@ -1584,7 +1633,7 @@ where
                 }
                 Some(HeadCommand::CheckHealth { response }) => {
                     let result = self
-                        .observe_natural_hold_health(start_pose, commands, control)
+                        .observe_natural_hold_health(hold_target, commands, control)
                         .await
                         .map_err(|source| HeadHealthCheckError::Observation(Box::new(source)));
                     let _requester_present = response.send(result).is_ok();
@@ -1608,6 +1657,18 @@ where
                     let owner_retained_after_fault = result
                         .as_ref()
                         .is_err_and(HeadReturnError::retains_owner_after_fault);
+                    hold_target = match &result {
+                        Ok(evidence) => HeadHoldTarget::ReviewedReturn(evidence.target()),
+                        Err(HeadReturnError::KinematicFaultExistingGoalRetained {
+                            commanded_positions,
+                            ..
+                        }) => HeadHoldTarget::RecoverableReturnCommand(*commanded_positions),
+                        Err(HeadReturnError::KinematicFaultRecoveryWritten {
+                            held_positions,
+                            ..
+                        }) => HeadHoldTarget::RecoverableReturnCommand(*held_positions),
+                        Err(_) => hold_target,
+                    };
                     let _requester_present = response.send(result.clone()).is_ok();
                     *head_return = Some(result.clone());
                     if result.is_err() && !owner_retained_after_fault {
@@ -2261,7 +2322,7 @@ where
 
     async fn observe_natural_hold_health(
         &mut self,
-        natural_hold_target: HeadPose,
+        hold_target: HeadHoldTarget,
         commands: &mut mpsc::Receiver<HeadCommand>,
         control: &mut ControlState,
     ) -> Result<VerifiedHeadHealthEvidence, HeadHealthObservationError> {
@@ -2343,7 +2404,7 @@ where
                 });
             }
 
-            let target = natural_hold_target.position(joint);
+            let target = hold_target.position(joint);
             let absolute_difference_ticks = target.get().abs_diff(telemetry.position().get());
             if absolute_difference_ticks > tolerance.get() {
                 return Err(HeadHealthObservationError {
@@ -2389,7 +2450,7 @@ where
         Ok(VerifiedHeadHealthEvidence {
             started_at,
             completed_at,
-            natural_hold_target,
+            hold_target,
             tolerance,
             joints,
         })
@@ -3520,12 +3581,13 @@ mod tests {
 
         let evidence = handle.check_health().await.expect("verified health");
         assert_eq!(
-            evidence
-                .natural_hold_target()
-                .positions()
-                .map(PositionTicks::get),
+            evidence.hold_target().positions().map(PositionTicks::get),
             positions
         );
+        assert!(matches!(
+            evidence.hold_target(),
+            HeadHoldTarget::StartupObserved(_)
+        ));
         assert_eq!(evidence.tolerance().get(), 20);
         assert!(evidence.started_at() <= evidence.completed_at());
         for (index, (joint, sample)) in HeadJoint::ALL
@@ -3900,10 +3962,10 @@ mod tests {
     #[tokio::test]
     async fn stationary_return_requires_two_samples_and_retains_exact_evidence() {
         let target = [2_127, 2_558, 2_925, 2_930];
-        let (handle, receipt, task, shared) = spawn_return_fake(
-            successful_reads_with_stationary_return(),
-            valid_return_config(target, [1; 4]),
-        );
+        let mut reads = successful_reads_with_stationary_return();
+        reads.extend(health_reads(target));
+        let (handle, receipt, task, shared) =
+            spawn_return_fake(reads, valid_return_config(target, [1; 4]));
         receipt
             .wait()
             .await
@@ -3933,6 +3995,24 @@ mod tests {
                 .chain(evidence.second_stopped())
                 .all(|sample| !sample.is_moving() && sample.device_status_raw() == 0)
         );
+        let health = handle
+            .check_health()
+            .await
+            .expect("post-return health uses the reviewed target");
+        assert_eq!(
+            health.hold_target(),
+            HeadHoldTarget::ReviewedReturn(evidence.target())
+        );
+        assert_eq!(
+            health.hold_target().positions().map(PositionTicks::get),
+            target
+        );
+        assert!(
+            health
+                .joints()
+                .iter()
+                .all(|joint| joint.absolute_difference_ticks() == 0)
+        );
         assert_eq!(
             handle
                 .return_to_target()
@@ -3949,8 +4029,8 @@ mod tests {
         assert_eq!(exit.termination(), &ActorTermination::RequestedShutdown);
 
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.read_calls, 144);
-        assert_eq!(shared.writes.len(), 60);
+        assert_eq!(shared.read_calls, 160);
+        assert_eq!(shared.writes.len(), 64);
         assert_eq!(
             shared
                 .writes

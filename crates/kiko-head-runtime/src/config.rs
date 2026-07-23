@@ -516,6 +516,11 @@ impl ReturnToTargetConfig {
         &self.runtime
     }
 
+    /// Exact reviewed target retained by this inseparable return plan.
+    pub const fn target(&self) -> ExactHeadTargetPose {
+        self.plan.target()
+    }
+
     pub const fn start_bounds(&self) -> ConfiguredHeadPoseBounds {
         self.start_bounds
     }
