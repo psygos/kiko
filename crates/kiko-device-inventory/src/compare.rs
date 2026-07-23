@@ -181,6 +181,23 @@ impl ExactInventoryAdmission {
     pub fn observed(&self) -> &ObservedDeviceInventoryV1 {
         &self.observed
     }
+
+    /// The exact admitted OAK. This is total because OAK is mandatory in the
+    /// expected manifest and an absent observation is an admission mismatch.
+    pub fn observed_oak(&self) -> &crate::OakIdentity {
+        self.observed
+            .oak()
+            .expect("exact admission always contains the mandatory OAK")
+    }
+
+    /// The exact admitted STM32, including its observed boot identity. This
+    /// is total because STM32 is mandatory in the expected manifest and an
+    /// absent observation is an admission mismatch.
+    pub fn observed_stm32(&self) -> &crate::ObservedStm32 {
+        self.observed
+            .stm32()
+            .expect("exact admission always contains the mandatory STM32")
+    }
 }
 
 /// Owned, bounded, lossless evidence for a failed exact-inventory admission.

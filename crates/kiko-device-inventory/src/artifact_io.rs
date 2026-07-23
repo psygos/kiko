@@ -328,6 +328,7 @@ impl ArtifactContentIdentity {
 pub struct ManifestArtifactHashes {
     entries: [Option<ArtifactContentIdentity>; MAX_ARTIFACTS],
     len: u8,
+    artifact_root_path: PathBuf,
 }
 
 /// Deterministic identity of the exact calibration files admitted at startup.
@@ -365,6 +366,11 @@ impl fmt::Display for CalibrationBundleHashError<'_> {
 impl std::error::Error for CalibrationBundleHashError<'_> {}
 
 impl ManifestArtifactHashes {
+    /// Exact no-follow root beneath which every retained artifact was opened.
+    pub fn artifact_root_path(&self) -> &Path {
+        &self.artifact_root_path
+    }
+
     pub fn len(&self) -> usize {
         usize::from(self.len)
     }
@@ -462,6 +468,7 @@ pub fn hash_manifest_artifacts(
     let mut output = ManifestArtifactHashes {
         entries: core::array::from_fn(|_| None),
         len: 0,
+        artifact_root_path: artifact_root.to_path_buf(),
     };
     for expected in manifest.artifacts().iter() {
         let binding_index = bindings.entries[..bindings.len()]

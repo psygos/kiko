@@ -204,9 +204,10 @@ fn borrowed_exact_comparison_mints_owned_admission() {
         admission.expected().robot_id().as_str(),
         "kiko-production-01"
     );
+    assert_eq!(admission.observed_stm32().boot_id().get(), 71);
     assert_eq!(
-        admission.observed().stm32().expect("STM32").boot_id().get(),
-        71
+        admission.observed_oak().mxid().as_str(),
+        admission.expected().oak().mxid().as_str()
     );
     assert!(
         InventoryComparison::compare(admission.expected(), admission.observed()).is_exact_match()

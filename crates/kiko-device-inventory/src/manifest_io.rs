@@ -21,6 +21,7 @@ pub struct LoadedExpectedManifestV1 {
     manifest: DeviceInventoryManifestV1,
     json_bytes: usize,
     content_sha256: ManifestContentSha256,
+    source_path: Option<PathBuf>,
 }
 
 /// SHA-256 identity of the exact admitted JSON bytes.
@@ -51,6 +52,13 @@ impl LoadedExpectedManifestV1 {
         self.content_sha256
     }
 
+    /// Exact no-follow source path when the manifest crossed the file
+    /// boundary. `None` identifies an in-memory parse and cannot satisfy a
+    /// production policy which names a deployment path.
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
     pub fn into_manifest(self) -> DeviceInventoryManifestV1 {
         self.manifest
     }
@@ -77,6 +85,7 @@ pub fn load_expected_manifest_v1_from_slice(
         manifest,
         json_bytes: json.len(),
         content_sha256: ManifestContentSha256(Sha256::digest(json).into()),
+        source_path: None,
     })
 }
 
@@ -157,7 +166,9 @@ pub fn load_expected_manifest_v1_file(
             bytes_read: host_usize_to_u64(json.len()),
         });
     }
-    load_expected_manifest_v1_from_slice(&json)
+    let mut loaded = load_expected_manifest_v1_from_slice(&json)?;
+    loaded.source_path = Some(path.to_path_buf());
+    Ok(loaded)
 }
 
 fn host_usize_to_u64(value: usize) -> u64 {

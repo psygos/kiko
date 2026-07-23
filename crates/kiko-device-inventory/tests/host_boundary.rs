@@ -114,6 +114,7 @@ fn slice_and_file_load_once_through_the_existing_domain_dto() {
     let loaded = load_expected_manifest_v1_from_slice(&json).expect("bounded slice manifest");
     assert_eq!(loaded.json_bytes(), json.len());
     assert_eq!(loaded.content_sha256().as_bytes(), &sha256(&json));
+    assert_eq!(loaded.source_path(), None);
     assert_eq!(loaded.manifest().robot_id().as_str(), "kiko-production-01");
     assert_eq!(loaded.manifest().artifacts().len(), 2);
 
@@ -124,6 +125,7 @@ fn slice_and_file_load_once_through_the_existing_domain_dto() {
     assert_eq!(from_file.json_bytes(), json.len());
     assert_eq!(from_file.manifest(), loaded.manifest());
     assert_eq!(from_file.content_sha256(), loaded.content_sha256());
+    assert_eq!(from_file.source_path(), Some(path.as_path()));
 
     let value: serde_json::Value = serde_json::from_slice(&json).expect("fixture JSON");
     let pretty = serde_json::to_vec_pretty(&value).expect("pretty fixture JSON");
@@ -265,6 +267,7 @@ fn hashes_exact_manifest_bindings_and_exposes_changed_content() {
     write_artifacts(temp.path(), calibration, plant);
 
     let exact = hash_manifest_artifacts(&manifest, temp.path(), parsed_bindings()).expect("hashes");
+    assert_eq!(exact.artifact_root_path(), temp.path());
     assert_eq!(exact.len(), 2);
     assert!(exact.all_content_matches_manifest());
     assert!(exact.iter().all(|entry| entry.bytes_hashed() != 0));
