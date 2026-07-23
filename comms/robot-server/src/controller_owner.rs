@@ -97,6 +97,59 @@ impl V2ControllerOwner {
         }
     }
 
+    /// Supervise both owned tasks until an explicit shutdown request or the
+    /// first unexpected task exit.
+    ///
+    /// This is the process-lifecycle entry point for an embedding service. It
+    /// permits that service to retain a small request handle while this owner
+    /// remains the sole holder of the task and transport resources. An
+    /// explicit request returns `Ok(())` only when both tasks shut down
+    /// cleanly. A task exit always reports the exact trigger and both terminal
+    /// outcomes after stopping its sibling.
+    pub async fn run_until_shutdown(
+        mut self,
+        shutdown: oneshot::Receiver<()>,
+        shutdown_timeout: Duration,
+    ) -> Result<(), V2ControllerOwnerTerminationError> {
+        tokio::pin!(shutdown);
+        let (trigger, actuation, udp) = tokio::select! {
+            _ = &mut shutdown => (
+                V2ControllerOwnerExitTrigger::ExplicitShutdown,
+                None,
+                None,
+            ),
+            result = Self::take_actuation_result(&mut self.actuation_task) => (
+                V2ControllerOwnerExitTrigger::ActuationTask,
+                Some(result),
+                None,
+            ),
+            result = Self::take_udp_result(&mut self.udp_task) => (
+                V2ControllerOwnerExitTrigger::UdpTask,
+                None,
+                Some(result),
+            ),
+        };
+        let reason = if trigger == V2ControllerOwnerExitTrigger::ExplicitShutdown {
+            ActuationShutdownReason::Operator
+        } else {
+            ActuationShutdownReason::SiblingFailure
+        };
+        self.request_shutdown(reason);
+        let (actuation, udp) = self.collect_until(shutdown_timeout, actuation, udp).await;
+        if trigger == V2ControllerOwnerExitTrigger::ExplicitShutdown
+            && actuation.is_clean()
+            && udp.is_clean()
+        {
+            Ok(())
+        } else {
+            Err(V2ControllerOwnerTerminationError {
+                trigger,
+                actuation,
+                udp,
+            })
+        }
+    }
+
     /// Wait for either owned task to end unexpectedly, stop its sibling, and
     /// collect both terminal outcomes within `shutdown_timeout`.
     ///
@@ -460,6 +513,48 @@ mod tests {
 
         let rebound =
             std::net::UdpSocket::bind(command_address).expect("shutdown released UDP ownership");
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn supervised_explicit_shutdown_joins_both_owned_tasks_and_releases_udp() {
+        let (owner, _controller) = fake_owner().await;
+        let command_address = owner.command_address();
+        let (request_shutdown, shutdown) = oneshot::channel();
+        let task = tokio::spawn(owner.run_until_shutdown(shutdown, Duration::from_millis(250)));
+
+        request_shutdown
+            .send(())
+            .expect("live supervision task receives shutdown");
+        task.await
+            .expect("supervision task joins")
+            .expect("both owner tasks shut down cleanly");
+
+        let rebound =
+            std::net::UdpSocket::bind(command_address).expect("shutdown released UDP ownership");
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn supervised_actor_failure_stops_udp_and_reports_the_exact_trigger() {
+        let (owner, controller) = fake_owner().await;
+        let command_address = owner.command_address();
+        let (_request_shutdown, shutdown) = oneshot::channel();
+        drop(controller);
+
+        let error = owner
+            .run_until_shutdown(shutdown, Duration::from_millis(250))
+            .await
+            .expect_err("serial EOF is an owner failure");
+        assert_eq!(error.trigger(), V2ControllerOwnerExitTrigger::ActuationTask);
+        assert!(matches!(
+            error.actuation(),
+            ActuationTaskOutcome::Failed(ActuationActorError::SerialEof)
+        ));
+        assert!(matches!(error.udp(), UdpTaskOutcome::Clean));
+
+        let rebound =
+            std::net::UdpSocket::bind(command_address).expect("failure released UDP ownership");
         drop(rebound);
     }
 
