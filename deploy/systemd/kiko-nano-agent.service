@@ -1,0 +1,67 @@
+[Unit]
+Description=Kiko production Nano agent (manual qualification gate)
+Documentation=file:/opt/kiko/deployment/README.md
+Requires=kiko-robot-server.service
+BindsTo=kiko-robot-server.service
+After=local-fs.target kiko-robot-server.service
+RequiresMountsFor=/opt/kiko/deployment /var/lib/kiko-nano-agent
+ConditionPathIsExecutable=/opt/kiko/bin/kiko-nano-agent
+ConditionPathIsRegular=/opt/kiko/deployment/nano-agent-launch-v1.json
+
+[Service]
+Type=exec
+User=makerspace
+SupplementaryGroups=dialout video render plugdev
+WorkingDirectory=/opt/kiko
+Environment=RUST_LOG=info
+Environment=KIKO_STATE_ROOT=/var/lib/kiko-nano-agent
+Environment=KIKO_RUNTIME_ROOT=/run/kiko-nano-agent
+ExecStart=/opt/kiko/bin/kiko-nano-agent --deployment-root /opt/kiko/deployment --launch-config nano-agent-launch-v1.json --state-root /var/lib/kiko-nano-agent
+Restart=no
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+RuntimeDirectory=kiko-nano-agent
+RuntimeDirectoryMode=0750
+StateDirectory=kiko-nano-agent
+StateDirectoryMode=0750
+UMask=0077
+
+# The agent must see the real USB/serial devices, but receives no capabilities.
+# Device admission remains the application's exact by-id/MXID responsibility.
+PrivateDevices=false
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Root-owned code/config stay read-only. Only systemd-managed runtime and state
+# directories are writable and persistent state is not removed on service stop.
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/kiko/bin /opt/kiko/deployment
+ReadWritePaths=/run/kiko-nano-agent /var/lib/kiko-nano-agent
+PrivateTmp=true
+RemoveIPC=true
+KeyringMode=private
+
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=localhost
+TasksMax=256
+LimitNOFILE=4096
+StandardOutput=journal
+StandardError=journal
+
+# Deliberately no [Install] section. Qualification must start this unit
+# explicitly; packaging must not enable it automatically.

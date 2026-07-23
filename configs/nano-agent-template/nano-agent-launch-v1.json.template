@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "agent_policy_asset": {
+    "relative_path": "agent-policy-v1.json",
+    "maximum_bytes": ${AGENT_POLICY_MAXIMUM_BYTES},
+    "sha256_hex": "${AGENT_POLICY_SHA256}"
+  },
+  "navigation_shadow_config_asset": {
+    "relative_path": "navigation-shadow-v1.json",
+    "maximum_bytes": ${NAVIGATION_SHADOW_MAXIMUM_BYTES},
+    "sha256_hex": "${NAVIGATION_SHADOW_SHA256}"
+  },
+  "physical_actuation_config_asset": {
+    "relative_path": "navigation-actuation-v1.json",
+    "maximum_bytes": ${PHYSICAL_ACTUATION_MAXIMUM_BYTES},
+    "sha256_hex": "${PHYSICAL_ACTUATION_SHA256}"
+  },
+  "controller_server": {
+    "contract_asset": {
+      "relative_path": "controller-server-v1.json",
+      "maximum_bytes": ${CONTROLLER_SERVER_MAXIMUM_BYTES},
+      "sha256_hex": "${CONTROLLER_SERVER_SHA256}"
+    },
+    "command_udp_endpoint": "127.0.0.1:${ROBOT_SERVER_PORT}"
+  },
+  "plant_artifact": {
+    "artifact_id": "${QUALIFIED_PLANT_ARTIFACT_ID}",
+    "asset": {
+      "relative_path": "${QUALIFIED_PLANT_RELATIVE_PATH}",
+      "maximum_bytes": ${QUALIFIED_PLANT_MAXIMUM_BYTES},
+      "sha256_hex": "${QUALIFIED_PLANT_SHA256}"
+    }
+  },
+  "oak": {
+    "selector_source": "exact_inventory_oak_mxid",
+    "maximum_usb_speed": "SUPER",
+    "minimum_usb_speed": "SUPER",
+    "rgb": {
+      "width_px": ${OAK_RGB_WIDTH_PX},
+      "height_px": ${OAK_RGB_HEIGHT_PX},
+      "fps": ${OAK_RGB_FPS}
+    },
+    "rectified_stereo": {
+      "width_px": ${OAK_STEREO_WIDTH_PX},
+      "height_px": ${OAK_STEREO_HEIGHT_PX},
+      "fps": ${OAK_STEREO_FPS},
+      "rectified": true
+    },
+    "depth": {
+      "width_px": ${OAK_STEREO_WIDTH_PX},
+      "height_px": ${OAK_STEREO_HEIGHT_PX},
+      "fps": ${OAK_STEREO_FPS},
+      "alignment": "rectified_left"
+    },
+    "imu": {
+      "rate_hz": ${OAK_IMU_RATE_HZ}
+    },
+    "queue": {
+      "size": ${OAK_QUEUE_SIZE},
+      "blocking": false
+    }
+  },
+  "inference": {
+    "onnx_runtime_library_asset": {
+      "relative_path": "${ONNX_RUNTIME_LIBRARY_RELATIVE_PATH}",
+      "maximum_bytes": ${ONNX_RUNTIME_LIBRARY_MAXIMUM_BYTES},
+      "sha256_hex": "${ONNX_RUNTIME_LIBRARY_SHA256}"
+    },
+    "superpoint_model_asset": {
+      "relative_path": "${SUPERPOINT_MODEL_RELATIVE_PATH}",
+      "maximum_bytes": ${SUPERPOINT_MODEL_MAXIMUM_BYTES},
+      "sha256_hex": "${SUPERPOINT_MODEL_SHA256}"
+    },
+    "lightglue_model_asset": {
+      "relative_path": "${LIGHTGLUE_MODEL_RELATIVE_PATH}",
+      "maximum_bytes": ${LIGHTGLUE_MODEL_MAXIMUM_BYTES},
+      "sha256_hex": "${LIGHTGLUE_MODEL_SHA256}"
+    },
+    "superpoint_backend": "${SUPERPOINT_BACKEND}",
+    "lightglue_backend": "${LIGHTGLUE_BACKEND}",
+    "downscale_factor": ${INFERENCE_DOWNSCALE_FACTOR},
+    "maximum_keypoints": ${INFERENCE_MAXIMUM_KEYPOINTS}
+  },
+  "rerun": {
+    "kind": "serve_loopback",
+    "bind": "127.0.0.1:${RERUN_PORT}",
+    "decimation": ${RERUN_DECIMATION},
+    "memory_limit_bytes": ${RERUN_MEMORY_LIMIT_BYTES},
+    "flush_timeout_ms": ${RERUN_FLUSH_TIMEOUT_MS}
+  },
+  "storage": {
+    "map_snapshot_relative_path": "${MAP_SNAPSHOT_RELATIVE_PATH}",
+    "navigation_records_relative_path": "${NAVIGATION_RECORDS_RELATIVE_PATH}",
+    "startup_evidence_relative_path": "${STARTUP_EVIDENCE_RELATIVE_PATH}",
+    "maximum_map_bytes": ${MAXIMUM_MAP_BYTES},
+    "maximum_navigation_record_bytes": ${MAXIMUM_NAVIGATION_RECORD_BYTES},
+    "maximum_startup_evidence_bytes": ${MAXIMUM_STARTUP_EVIDENCE_BYTES},
+    "maximum_total_state_bytes": ${MAXIMUM_TOTAL_STATE_BYTES},
+    "minimum_free_bytes": ${MINIMUM_FREE_BYTES}
+  }
+}
