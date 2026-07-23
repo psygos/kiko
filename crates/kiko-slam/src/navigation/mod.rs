@@ -26,6 +26,8 @@ mod frontier;
 mod global_planner;
 mod goal_input;
 mod ingress;
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
+mod live_motion_owner;
 #[cfg(feature = "actuation")]
 mod live_mpc_control;
 mod local_costmap;
@@ -127,8 +129,8 @@ pub use coordinator::{
     CoordinatorMotionModeV1, CoordinatorTickBlocker, CoordinatorTickError, CoordinatorTickOutcome,
     DepthAdmissionOutcome, GlobalMapAdmissionOutcome, GlobalPlanningOutcome, GoalSelectionOutcome,
     ImuAdmissionOutcome, NavigationGoalState, NavigationIngressSink, PlanStartBuildError,
-    ShadowNavigationCoordinator, StoredPlanFault, VisualAdmission, VisualAdmissionError,
-    VisualAdmissionOutcome,
+    PreparedMapPointGoal, ShadowNavigationCoordinator, StoredPlanFault, VisualAdmission,
+    VisualAdmissionError, VisualAdmissionOutcome,
 };
 #[cfg(all(feature = "agent-runtime", feature = "record", unix))]
 pub use expression_bridge::{
@@ -141,6 +143,8 @@ pub use frames::{
     PlanarPointError, PlanarTransform, PlanarTransformComponent, PlanarTransformError,
     PlanarTransformOperation,
 };
+#[cfg(all(feature = "agent-runtime", unix))]
+pub use frontier::NanoBoundaryFrontierExplorer;
 pub use frontier::{
     FrontierBuildError, FrontierExplorer, FrontierExplorerConfig, FrontierExplorerConfigError,
     FrontierGoal, FrontierInPlaceScan, FrontierScore, FrontierSearchError, FrontierSearchOutcome,
@@ -148,7 +152,8 @@ pub use frontier::{
 };
 pub use global_planner::{
     GlobalPath, GlobalPlanError, GlobalPlanIdentity, GlobalPlanner, GlobalPlannerConfig,
-    GlobalPlannerInstanceId, GlobalPlannerInvocationId, GlobalPlannerRevision, MapPoint, PlanStart,
+    GlobalPlannerInstanceId, GlobalPlannerInvocationId, GlobalPlannerRevision, MapPoint,
+    MapTraversalBoundary, MapTraversalBoundaryComponent, MapTraversalBoundaryError, PlanStart,
     PointGoal, UnknownSpacePolicy,
 };
 pub use goal_input::{
@@ -172,6 +177,14 @@ pub use ingress::{
     NavigationReplayClock, NavigationReplayClockError, PendingVisualAttemptIngress,
     RecordedImuReport, RecordedMapEpochId, RecordedMapEpochIdError, ReplayMapEpochBinding,
     VisualAttemptIngress, VisualAttemptOutcome,
+};
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
+pub use live_motion_owner::{
+    LiveMotionActuationFaultEvidence, LiveMotionActuationPort, LiveMotionApplied,
+    LiveMotionAppliedReceipt, LiveMotionCompletedSafetyAction, LiveMotionFaultLatch,
+    LiveMotionOperationError, LiveMotionOwner, LiveMotionOwnerError, LiveMotionOwnerOutcome,
+    LiveMotionOwnerTerminalReport, LiveMotionPortTickError, LiveMotionTerminalActuationPort,
+    LiveMotionTerminalStop,
 };
 #[cfg(feature = "actuation")]
 pub use live_mpc_control::{LiveAppliedMpcTick, LiveMpcControlDriver, LiveMpcControlError};
