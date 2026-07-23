@@ -50,30 +50,33 @@ use kiko_slam::dataset::{
     DatasetWriterConfig, DatasetWriterHandle, DepthMeta, ImuExtrinsicProvenance, ImuMeta,
     ImuStreamMetadata, Meta, MonoMeta, PairedDatasetWriter, WriteOutcome,
 };
-#[cfg(any(feature = "record", test))]
+#[cfg(feature = "record")]
+use kiko_slam::live_runtime::LiveNavigationRequest;
+#[cfg(feature = "record")]
+use kiko_slam::live_runtime::{
+    LiveNavigationPrerequisites, PreparedLiveNavigationRuntime, PreparedLiveNavigationRuntimeParts,
+    prepare_live_navigation_runtime,
+};
+#[cfg(feature = "record")]
 use kiko_slam::navigation::NavigationGoalArg;
 #[cfg(all(feature = "record", feature = "actuation"))]
 use kiko_slam::navigation::actuation::LiveActuationError;
+#[cfg(feature = "record")]
+use kiko_slam::navigation::mpc::HostMonotonicClock;
 #[cfg(any(feature = "record", test))]
 use kiko_slam::navigation::mpc::HostMonotonicClockReadError;
 #[cfg(feature = "record")]
-use kiko_slam::navigation::mpc::{HostMonotonicClock, MpcConfigV1};
-#[cfg(feature = "record")]
 use kiko_slam::navigation::{
     ControlPeriodNs, CoordinatorAdmissionError, CoordinatorTickError, CoordinatorTickOutcome,
-    GlobalPlannerConfig, LocalCostmap, MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
     NAVIGATION_INGRESS_STREAM_FILE, NavigationClockEpoch, NavigationIngressBoundaryError,
-    NavigationIngressCapacity, NavigationIngressSidecarDescriptor,
-    NavigationIngressStreamWriteError, NavigationIngressWriter, NavigationRecordingId,
-    NavigationRecordingIdError, PathReferenceBuilderV1, PendingVisualAttemptIngress,
-    PlanarOdometry, SafetyDecisionOutcome, ShadowNavigationConfigV1, ShadowNavigationCoordinator,
-    ShadowSafetySupervisor, SolverBudgetNs, VisualAdmission, VisualAdmissionError,
+    NavigationIngressSidecarDescriptor, NavigationIngressStreamWriteError, NavigationIngressWriter,
+    NavigationRecordingId, NavigationRecordingIdError, PendingVisualAttemptIngress,
+    SafetyDecisionOutcome, ShadowNavigationCoordinator, VisualAdmission, VisualAdmissionError,
     VisualAttemptOutcome,
 };
 #[cfg(all(feature = "record", feature = "actuation"))]
 use kiko_slam::navigation::{
-    LiveMpcControlDriver, LiveMpcControlError, MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES,
-    NavigationActuationConfigV1,
+    LiveMpcControlDriver, LiveMpcControlError, NavigationActuationConfigV1,
 };
 #[cfg(feature = "record")]
 use kiko_slam::{
@@ -984,61 +987,6 @@ fn build_occupancy_runtime_config(
         camera_height_m,
     );
 
-    Ok(OccupancyRuntimeConfig::new(mapper, snapshot_cadence))
-}
-
-/// Build the global dense map from the already-parsed navigation contract.
-///
-/// Global map extent, evidence retention, and publication cadence remain host
-/// resource policy at their existing environment boundary. Coordinate frame,
-/// runtime camera, height/depth eligibility, and pixel sampling come from the
-/// one strict navigation JSON parse and are not independently reconstructed.
-#[cfg(feature = "record")]
-fn build_navigation_occupancy_runtime_config(
-    navigation: &ShadowNavigationConfigV1,
-) -> Result<OccupancyRuntimeConfig, Box<dyn std::error::Error>> {
-    let resolution_m = env_f64("KIKO_OCCUPANCY_RESOLUTION_M")?.unwrap_or(0.05);
-    let lower_x_m = env_f64("KIKO_OCCUPANCY_LOWER_X_M")?.unwrap_or(-10.0);
-    let lower_y_m = env_f64("KIKO_OCCUPANCY_LOWER_Y_M")?.unwrap_or(-5.0);
-    let width = env_u32("KIKO_OCCUPANCY_WIDTH_CELLS")?.unwrap_or(400);
-    let height = env_u32("KIKO_OCCUPANCY_HEIGHT_CELLS")?.unwrap_or(400);
-    let maximum_cells = env_usize("KIKO_OCCUPANCY_MAX_CELLS")?.unwrap_or(4_000_000);
-    let maximum_keyframes = env_usize("KIKO_OCCUPANCY_MAX_KEYFRAMES")?.unwrap_or(300);
-    let snapshot_cadence = OccupancySnapshotCadence::try_new(
-        env_usize("KIKO_OCCUPANCY_RERUN_EVERY_KEYFRAMES")?.unwrap_or(5),
-    )?;
-    let geometry = OccupancyGridGeometry::try_new(
-        resolution_m,
-        [lower_x_m, lower_y_m],
-        width,
-        height,
-        maximum_cells,
-    )?;
-    let local = navigation.local_costmap();
-    let world_to_occupancy = navigation.world_to_occupancy();
-    let evidence = OccupancyEvidenceModel::try_new(-1, 3, -2, 2)?;
-    let mapper = OccupancyConfig::try_new(
-        geometry,
-        world_to_occupancy,
-        local.camera(),
-        local.obstacle_height_range(),
-        local.depth_range(),
-        local.sampling_block(),
-        evidence,
-        maximum_keyframes,
-    )?;
-    eprintln!(
-        "navigation occupancy: geometric=true learned=false grid={}x{} resolution_m={} lower_xy_m=[{},{}] max_keyframes={} snapshot_every_keyframes={} world_to_occupancy_rotation={:?} world_to_occupancy_translation_m={:?}",
-        width,
-        height,
-        resolution_m,
-        lower_x_m,
-        lower_y_m,
-        maximum_keyframes,
-        snapshot_cadence.get(),
-        world_to_occupancy.rotation(),
-        world_to_occupancy.translation_m(),
-    );
     Ok(OccupancyRuntimeConfig::new(mapper, snapshot_cadence))
 }
 
@@ -3332,314 +3280,11 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(any(feature = "record", test))]
-#[derive(Clone, Debug, PartialEq)]
-enum LiveNavigationRequest {
-    Disabled,
-    Enabled {
-        config_path: PathBuf,
-        goal: Option<NavigationGoalArg>,
-        dataset_path: PathBuf,
-        actuation: LiveActuationRequest,
-    },
-}
-
-#[cfg(any(feature = "record", test))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum LiveActuationRequest {
-    ShadowOnly,
-    Physical {
-        config_path: PathBuf,
-        exact_robot_id: String,
-    },
-}
-
-#[cfg(any(feature = "record", test))]
-impl LiveNavigationRequest {
-    fn parse(
-        config_path: Option<PathBuf>,
-        goal: Option<NavigationGoalArg>,
-        dataset_path: Option<PathBuf>,
-        actuation_config_path: Option<PathBuf>,
-        exact_robot_id: Option<String>,
-    ) -> Result<Self, LiveNavigationBoundaryError> {
-        match (config_path, dataset_path) {
-            (None, None) if goal.is_none() => {
-                if actuation_config_path.is_some() || exact_robot_id.is_some() {
-                    Err(LiveNavigationBoundaryError::ActuationRequiresNavigation)
-                } else {
-                    Ok(Self::Disabled)
-                }
-            }
-            (Some(config_path), Some(dataset_path)) => {
-                let actuation = match (actuation_config_path, exact_robot_id) {
-                    (None, None) => LiveActuationRequest::ShadowOnly,
-                    (Some(config_path), Some(exact_robot_id)) => LiveActuationRequest::Physical {
-                        config_path,
-                        exact_robot_id,
-                    },
-                    (config_path, exact_robot_id) => {
-                        return Err(LiveNavigationBoundaryError::IncompleteActuation {
-                            missing_config: config_path.is_none(),
-                            missing_robot_id: exact_robot_id.is_none(),
-                        });
-                    }
-                };
-                Ok(Self::Enabled {
-                    config_path,
-                    goal,
-                    dataset_path,
-                    actuation,
-                })
-            }
-            (config_path, dataset_path) => Err(LiveNavigationBoundaryError::IncompleteNavigation {
-                missing_config: config_path.is_none(),
-                missing_dataset: dataset_path.is_none(),
-            }),
-        }
-    }
-
-    fn is_enabled(&self) -> bool {
-        matches!(self, Self::Enabled { .. })
-    }
-}
-
-#[cfg(any(feature = "record", test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LiveNavigationBoundaryError {
-    IncompleteNavigation {
-        missing_config: bool,
-        missing_dataset: bool,
-    },
-    IncompleteActuation {
-        missing_config: bool,
-        missing_robot_id: bool,
-    },
-    ActuationRequiresNavigation,
-}
-
-#[cfg(any(feature = "record", test))]
-impl std::fmt::Display for LiveNavigationBoundaryError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            Self::IncompleteNavigation {
-                missing_config,
-                missing_dataset,
-            } => {
-                formatter.write_str(
-                    "live navigation requires --navigation-config and --navigation-record together; --navigation-goal is optional; missing",
-                )?;
-                if missing_config {
-                    formatter.write_str(" --navigation-config")?;
-                }
-                if missing_dataset {
-                    formatter.write_str(" --navigation-record")?;
-                }
-                Ok(())
-            }
-            Self::IncompleteActuation {
-                missing_config,
-                missing_robot_id,
-            } => {
-                formatter.write_str(
-                    "physical navigation actuation requires --navigation-actuation-config and --navigation-arm-robot together; missing",
-                )?;
-                if missing_config {
-                    formatter.write_str(" --navigation-actuation-config")?;
-                }
-                if missing_robot_id {
-                    formatter.write_str(" --navigation-arm-robot")?;
-                }
-                Ok(())
-            }
-            Self::ActuationRequiresNavigation => formatter
-                .write_str("physical actuation options require a complete live navigation request"),
-        }
-    }
-}
-
-#[cfg(any(feature = "record", test))]
-impl std::error::Error for LiveNavigationBoundaryError {}
-
-#[cfg(any(feature = "record", test))]
 fn navigation_dataset_may_publish(
     authoritative_failure: bool,
     journal_descriptor_finalized: bool,
 ) -> bool {
     !authoritative_failure && journal_descriptor_finalized
-}
-
-#[cfg(feature = "record")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LiveNavigationPrerequisiteError {
-    DepthDisabled,
-    ImuDisabled,
-    DenseOccupancyDisabled,
-    UnrectifiedStereo,
-}
-
-#[cfg(feature = "record")]
-impl std::fmt::Display for LiveNavigationPrerequisiteError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::DepthDisabled => {
-                "live navigation requires KIKO_LIVE_DEPTH=true and rectified-left metric depth"
-            }
-            Self::ImuDisabled => "live navigation requires --imu-rate-hz (or KIKO_IMU_RATE_HZ)",
-            Self::DenseOccupancyDisabled => {
-                "live navigation requires KIKO_DENSE=true for global occupancy snapshots"
-            }
-            Self::UnrectifiedStereo => {
-                "live navigation requires --rectified=true for the rectified-left depth contract"
-            }
-        })
-    }
-}
-
-#[cfg(feature = "record")]
-impl std::error::Error for LiveNavigationPrerequisiteError {}
-
-#[cfg(feature = "record")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LiveNavigationPreparationError {
-    MissingNavigationPolicy,
-    NavigationPolicyWhileDisabled,
-    #[cfg(feature = "actuation")]
-    MissingPhysicalAuthority,
-    PhysicalAuthorityInShadowMode,
-    #[cfg(not(feature = "actuation"))]
-    PhysicalActuationFeatureDisabled,
-}
-
-#[cfg(feature = "record")]
-impl std::fmt::Display for LiveNavigationPreparationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::MissingNavigationPolicy => {
-                "enabled live navigation has no bounded navigation-config input"
-            }
-            Self::NavigationPolicyWhileDisabled => {
-                "disabled live navigation received unexpected navigation-config input"
-            }
-            #[cfg(feature = "actuation")]
-            Self::MissingPhysicalAuthority => {
-                "physical live navigation has no bounded actuation-config input"
-            }
-            Self::PhysicalAuthorityInShadowMode => {
-                "shadow-only live navigation received unexpected actuation-config input"
-            }
-            #[cfg(not(feature = "actuation"))]
-            Self::PhysicalActuationFeatureDisabled => {
-                "physical live navigation was requested without the actuation build feature"
-            }
-        })
-    }
-}
-
-#[cfg(feature = "record")]
-impl std::error::Error for LiveNavigationPreparationError {}
-
-#[cfg(feature = "record")]
-#[derive(Debug)]
-enum LiveNavigationConfigReadError {
-    Open {
-        kind: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    Read {
-        kind: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    InputTooLarge {
-        kind: &'static str,
-        path: PathBuf,
-        actual_bytes_at_least: usize,
-        maximum_bytes: usize,
-    },
-}
-
-#[cfg(feature = "record")]
-impl std::fmt::Display for LiveNavigationConfigReadError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Open { kind, path, source } => write!(
-                formatter,
-                "cannot open {kind} config {}: {source}",
-                path.display()
-            ),
-            Self::Read { kind, path, source } => write!(
-                formatter,
-                "cannot read {kind} config {}: {source}",
-                path.display()
-            ),
-            Self::InputTooLarge {
-                kind,
-                path,
-                actual_bytes_at_least,
-                maximum_bytes,
-            } => write!(
-                formatter,
-                "{kind} config {} is at least {actual_bytes_at_least} bytes; maximum is {maximum_bytes} bytes",
-                path.display()
-            ),
-        }
-    }
-}
-
-#[cfg(feature = "record")]
-impl std::error::Error for LiveNavigationConfigReadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Open { source, .. } | Self::Read { source, .. } => Some(source),
-            Self::InputTooLarge { .. } => None,
-        }
-    }
-}
-
-#[cfg(feature = "record")]
-fn read_navigation_config_bounded(path: &Path) -> Result<Vec<u8>, LiveNavigationConfigReadError> {
-    read_live_config_bounded(path, "navigation", MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES)
-}
-
-#[cfg(all(feature = "record", feature = "actuation"))]
-fn read_actuation_config_bounded(path: &Path) -> Result<Vec<u8>, LiveNavigationConfigReadError> {
-    read_live_config_bounded(
-        path,
-        "navigation actuation",
-        MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES,
-    )
-}
-
-#[cfg(feature = "record")]
-fn read_live_config_bounded(
-    path: &Path,
-    kind: &'static str,
-    maximum_bytes: usize,
-) -> Result<Vec<u8>, LiveNavigationConfigReadError> {
-    let file = File::open(path).map_err(|source| LiveNavigationConfigReadError::Open {
-        kind,
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let read_bound = u64::try_from(maximum_bytes).expect("live config byte bound fits u64") + 1;
-    let mut bytes = Vec::with_capacity(maximum_bytes.min(16 * 1024));
-    file.take(read_bound)
-        .read_to_end(&mut bytes)
-        .map_err(|source| LiveNavigationConfigReadError::Read {
-            kind,
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if bytes.len() > maximum_bytes {
-        return Err(LiveNavigationConfigReadError::InputTooLarge {
-            kind,
-            path: path.to_path_buf(),
-            actual_bytes_at_least: bytes.len(),
-            maximum_bytes,
-        });
-    }
-    Ok(bytes)
 }
 
 #[cfg(feature = "record")]
@@ -5231,24 +4876,6 @@ fn drain_depth_batch(rx: &DropReceiver<DepthImage>) -> Vec<DepthImage> {
 }
 
 #[cfg(feature = "record")]
-struct PreparedLiveNavigationRuntime {
-    goal: Option<NavigationGoalArg>,
-    dataset_path: PathBuf,
-    control_period: ControlPeriodNs,
-    occupancy_config: Option<OccupancyRuntimeConfig>,
-    ingress_capacity: NavigationIngressCapacity,
-    odometry: PlanarOdometry,
-    local_costmap: LocalCostmap,
-    global_planner: GlobalPlannerConfig,
-    reference_builder: PathReferenceBuilderV1,
-    mpc_config: MpcConfigV1,
-    solver_budget: SolverBudgetNs,
-    safety: ShadowSafetySupervisor,
-    #[cfg(feature = "actuation")]
-    actuation: Option<NavigationActuationConfigV1>,
-}
-
-#[cfg(feature = "record")]
 struct ActiveLiveNavigation {
     coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
     control_period: ControlPeriodNs,
@@ -5301,105 +4928,6 @@ fn fail_navigation_setup_after_dataset<T>(
 
 #[cfg(feature = "record")]
 #[allow(clippy::too_many_arguments)]
-fn prepare_live_navigation_runtime(
-    request: &LiveNavigationRequest,
-    config_bytes: Option<&[u8]>,
-    actuation_config_bytes: Option<&[u8]>,
-    runtime_depth_camera: DepthCameraModel,
-    device_session: DeviceSessionId,
-) -> Result<Option<PreparedLiveNavigationRuntime>, Box<dyn std::error::Error>> {
-    let LiveNavigationRequest::Enabled {
-        goal,
-        dataset_path,
-        actuation,
-        ..
-    } = request
-    else {
-        if config_bytes.is_some() {
-            return Err(Box::new(
-                LiveNavigationPreparationError::NavigationPolicyWhileDisabled,
-            ));
-        }
-        if actuation_config_bytes.is_some() {
-            return Err(Box::new(
-                LiveNavigationPreparationError::PhysicalAuthorityInShadowMode,
-            ));
-        }
-        return Ok(None);
-    };
-    let Some(bytes) = config_bytes else {
-        return Err(Box::new(
-            LiveNavigationPreparationError::MissingNavigationPolicy,
-        ));
-    };
-    let parsed = ShadowNavigationConfigV1::parse_json(bytes, runtime_depth_camera)?;
-    let occupancy_config = build_navigation_occupancy_runtime_config(&parsed)?;
-    let parts = parsed.into_runtime_parts();
-    #[cfg(feature = "actuation")]
-    let actuation = match actuation {
-        LiveActuationRequest::ShadowOnly => {
-            if actuation_config_bytes.is_some() {
-                return Err(Box::new(
-                    LiveNavigationPreparationError::PhysicalAuthorityInShadowMode,
-                ));
-            }
-            None
-        }
-        LiveActuationRequest::Physical { exact_robot_id, .. } => {
-            let Some(actuation_bytes) = actuation_config_bytes else {
-                return Err(Box::new(
-                    LiveNavigationPreparationError::MissingPhysicalAuthority,
-                ));
-            };
-            Some(NavigationActuationConfigV1::parse_and_authorize(
-                actuation_bytes,
-                exact_robot_id,
-                bytes,
-                parts.mpc_solver.model(),
-                parts.solver_budget,
-                parts.control_period,
-            )?)
-        }
-    };
-    #[cfg(not(feature = "actuation"))]
-    match actuation {
-        LiveActuationRequest::ShadowOnly if actuation_config_bytes.is_none() => {}
-        LiveActuationRequest::ShadowOnly => {
-            return Err(Box::new(
-                LiveNavigationPreparationError::PhysicalAuthorityInShadowMode,
-            ));
-        }
-        LiveActuationRequest::Physical { .. } => {
-            return Err(Box::new(
-                LiveNavigationPreparationError::PhysicalActuationFeatureDisabled,
-            ));
-        }
-    }
-    let mpc_config = parts.mpc_solver.config();
-    let odometry = PlanarOdometry::new(parts.odometry);
-    let local_costmap = LocalCostmap::try_new(parts.local_costmap, device_session)?;
-    let reference_builder = PathReferenceBuilderV1::new(parts.path_reference);
-    let safety = ShadowSafetySupervisor::try_new(parts.mpc_solver, parts.shadow_command)?;
-    Ok(Some(PreparedLiveNavigationRuntime {
-        goal: *goal,
-        dataset_path: dataset_path.clone(),
-        control_period: parts.control_period,
-        occupancy_config: Some(occupancy_config),
-        ingress_capacity: parts.ingress_capacity,
-        odometry,
-        local_costmap,
-        global_planner: parts.global_planner,
-        reference_builder,
-        mpc_config,
-        solver_budget: parts.solver_budget,
-        safety,
-        #[cfg(feature = "actuation")]
-        actuation,
-    }))
-}
-
-#[cfg(feature = "record")]
-#[allow(clippy::too_many_arguments)]
 fn activate_live_navigation(
     runtime: PreparedLiveNavigationRuntime,
     mono_config: &MonoConfig,
@@ -5411,6 +4939,21 @@ fn activate_live_navigation(
     clock_epoch: NavigationClockEpoch,
     oak_provenance: &OakRuntimeProvenance,
 ) -> Result<ActiveLiveNavigation, Box<dyn std::error::Error>> {
+    let PreparedLiveNavigationRuntimeParts {
+        goal,
+        dataset_path,
+        control_period,
+        ingress_capacity,
+        odometry,
+        local_costmap,
+        global_planner,
+        reference_builder,
+        mpc_config,
+        solver_budget,
+        safety,
+        #[cfg(feature = "actuation")]
+        actuation,
+    } = runtime.into_parts();
     let meta = build_meta(mono_config, depth_config, imu_config, oak_provenance);
     let imu_metadata = ImuStreamMetadata::new(
         device_session,
@@ -5421,14 +4964,14 @@ fn activate_live_navigation(
         ..DatasetWriterConfig::default()
     };
     let (dataset_writer, dataset_handle) = DatasetWriter::create_paired_with_imu_config(
-        &runtime.dataset_path,
+        &dataset_path,
         &meta,
         calibration,
         pairing_window,
         imu_metadata,
         writer_config,
     )?;
-    let journal_path = runtime.dataset_path.join(NAVIGATION_INGRESS_STREAM_FILE);
+    let journal_path = dataset_path.join(NAVIGATION_INGRESS_STREAM_FILE);
     let journal_file = match OpenOptions::new()
         .read(true)
         .write(true)
@@ -5446,45 +4989,44 @@ fn activate_live_navigation(
             return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
         }
     };
-    let journal =
-        match NavigationIngressWriter::new(journal_file, recording_id, runtime.ingress_capacity) {
-            Ok(journal) => journal,
-            Err(source) => {
-                return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
-            }
-        };
-    let coordinator = match runtime.goal {
+    let journal = match NavigationIngressWriter::new(journal_file, recording_id, ingress_capacity) {
+        Ok(journal) => journal,
+        Err(source) => {
+            return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
+        }
+    };
+    let coordinator = match goal {
         Some(goal) => ShadowNavigationCoordinator::new(
             clock_epoch,
             journal,
             goal.point(),
-            runtime.odometry,
-            runtime.local_costmap,
-            runtime.global_planner,
-            runtime.reference_builder,
-            runtime.mpc_config,
-            runtime.solver_budget,
-            runtime.safety,
+            odometry,
+            local_costmap,
+            global_planner,
+            reference_builder,
+            mpc_config,
+            solver_budget,
+            safety,
         ),
         None => ShadowNavigationCoordinator::new_without_goal(
             clock_epoch,
             journal,
-            runtime.odometry,
-            runtime.local_costmap,
-            runtime.global_planner,
-            runtime.reference_builder,
-            runtime.mpc_config,
-            runtime.solver_budget,
-            runtime.safety,
+            odometry,
+            local_costmap,
+            global_planner,
+            reference_builder,
+            mpc_config,
+            solver_budget,
+            safety,
         ),
     };
     Ok(ActiveLiveNavigation {
         coordinator,
-        control_period: runtime.control_period,
+        control_period,
         dataset_writer,
         dataset_handle,
         #[cfg(feature = "actuation")]
-        actuation: runtime.actuation,
+        actuation,
     })
 }
 
@@ -5503,27 +5045,8 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.navigation_record.clone(),
         navigation_actuation_config,
         navigation_arm_robot,
-    )?;
-    let navigation_config_bytes = match &navigation_request {
-        LiveNavigationRequest::Disabled => None,
-        LiveNavigationRequest::Enabled { config_path, .. } => {
-            Some(read_navigation_config_bounded(config_path)?)
-        }
-    };
-    #[cfg(feature = "actuation")]
-    let navigation_actuation_config_bytes = match &navigation_request {
-        LiveNavigationRequest::Enabled {
-            actuation: LiveActuationRequest::Physical { config_path, .. },
-            ..
-        } => Some(read_actuation_config_bounded(config_path)?),
-        LiveNavigationRequest::Disabled
-        | LiveNavigationRequest::Enabled {
-            actuation: LiveActuationRequest::ShadowOnly,
-            ..
-        } => None,
-    };
-    #[cfg(not(feature = "actuation"))]
-    let navigation_actuation_config_bytes: Option<Vec<u8>> = None;
+    )?
+    .load()?;
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
@@ -5556,20 +5079,13 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let imu_config = args.camera.imu_rate_hz.map(|rate_hz| ImuConfig {
         rate_hz: rate_hz.get(),
     });
-    if navigation_request.is_enabled() {
-        if !depth_enabled {
-            return Err(LiveNavigationPrerequisiteError::DepthDisabled.into());
-        }
-        if imu_config.is_none() {
-            return Err(LiveNavigationPrerequisiteError::ImuDisabled.into());
-        }
-        if !dense_requested {
-            return Err(LiveNavigationPrerequisiteError::DenseOccupancyDisabled.into());
-        }
-        if !mono_config.rectified {
-            return Err(LiveNavigationPrerequisiteError::UnrectifiedStereo.into());
-        }
-    }
+    LiveNavigationPrerequisites::new(
+        depth_enabled,
+        imu_config.is_some(),
+        dense_requested,
+        mono_config.rectified,
+    )
+    .require_for(navigation_request.request())?;
     // This command does not reconnect. One invocation is therefore one
     // explicitly delimited device-clock session.
     let device_session = DeviceSessionId::try_new(1)?;
@@ -5624,9 +5140,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             DepthToTrackingCamera::identity(),
         );
         let mut prepared_navigation_runtime = prepare_live_navigation_runtime(
-            &navigation_request,
-            navigation_config_bytes.as_deref(),
-            navigation_actuation_config_bytes.as_deref(),
+            navigation_request,
             runtime_depth_camera,
             device_session,
         )?;
@@ -5683,7 +5197,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let mut navigation_occupancy_config = prepared_navigation_runtime
             .as_mut()
-            .and_then(|runtime| runtime.occupancy_config.take());
+            .and_then(PreparedLiveNavigationRuntime::take_occupancy_config);
         let (navigation_visual_tx, navigation_visual_rx) = if navigation_enabled {
             let (tx, rx) = crossbeam_channel::bounded(LIVE_NAVIGATION_VISUAL_QUEUE_CAPACITY);
             (Some(tx), Some(rx))
@@ -6904,10 +6418,9 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, LiveActuationRequest,
-        LiveDecisionVizKind, LiveDenseCommandClass, LiveDenseRouteContext,
-        LiveDenseRouteDisposition, LiveDenseRouteError, LiveLosslessRouteError,
-        LiveNavigationBoundaryError, LiveNavigationRequest, LiveThreadExitGuard, LiveVisualShape,
+        BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, LiveDecisionVizKind,
+        LiveDenseCommandClass, LiveDenseRouteContext, LiveDenseRouteDisposition,
+        LiveDenseRouteError, LiveLosslessRouteError, LiveThreadExitGuard, LiveVisualShape,
         OccupancyProjectionContractError, OdometryVizProcessingError, OfflineDepthSelector,
         OfflineFatalDenseError, OfflineFatalTrackerError, RerunDestination, RerunDestinationError,
         RerunFinishTimeout, RerunSessionError, build_ba_config_from_values,
@@ -6926,7 +6439,7 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::num::NonZeroU16;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -6969,201 +6482,6 @@ mod tests {
             height,
         )
         .expect("valid test projection")
-    }
-
-    #[test]
-    fn live_navigation_boundary_disables_only_when_all_options_are_absent() {
-        let request =
-            LiveNavigationRequest::parse(None, None, None, None, None).expect("all options absent");
-        assert_eq!(request, LiveNavigationRequest::Disabled);
-        assert!(!request.is_enabled());
-    }
-
-    #[test]
-    fn live_navigation_boundary_preserves_a_complete_typed_request() {
-        let config_path = PathBuf::from("navigation.json");
-        let goal = "1.25,-2.5"
-            .parse::<kiko_slam::navigation::NavigationGoalArg>()
-            .expect("finite map-frame goal");
-        let dataset_path = PathBuf::from("capture");
-
-        let request = LiveNavigationRequest::parse(
-            Some(config_path.clone()),
-            Some(goal),
-            Some(dataset_path.clone()),
-            None,
-            None,
-        )
-        .expect("complete navigation request");
-        assert!(request.is_enabled());
-        assert_eq!(
-            request,
-            LiveNavigationRequest::Enabled {
-                config_path,
-                goal: Some(goal),
-                dataset_path,
-                actuation: LiveActuationRequest::ShadowOnly,
-            }
-        );
-    }
-
-    #[test]
-    fn live_navigation_boundary_accepts_safe_mapping_without_an_initial_goal() {
-        let request = LiveNavigationRequest::parse(
-            Some(PathBuf::from("navigation.json")),
-            None,
-            Some(PathBuf::from("capture")),
-            None,
-            None,
-        )
-        .expect("mapping-only navigation request");
-        assert_eq!(
-            request,
-            LiveNavigationRequest::Enabled {
-                config_path: PathBuf::from("navigation.json"),
-                goal: None,
-                dataset_path: PathBuf::from("capture"),
-                actuation: LiveActuationRequest::ShadowOnly,
-            }
-        );
-    }
-
-    #[test]
-    fn live_actuation_requires_an_explicit_paired_manifest_and_robot_id() {
-        let goal = "1.25,-2.5"
-            .parse::<kiko_slam::navigation::NavigationGoalArg>()
-            .expect("finite map-frame goal");
-        let request = LiveNavigationRequest::parse(
-            Some(PathBuf::from("navigation.json")),
-            Some(goal),
-            Some(PathBuf::from("capture")),
-            Some(PathBuf::from("actuation.json")),
-            Some("kiko-01".to_string()),
-        )
-        .expect("complete physical request");
-        assert_eq!(
-            request,
-            LiveNavigationRequest::Enabled {
-                config_path: PathBuf::from("navigation.json"),
-                goal: Some(goal),
-                dataset_path: PathBuf::from("capture"),
-                actuation: LiveActuationRequest::Physical {
-                    config_path: PathBuf::from("actuation.json"),
-                    exact_robot_id: "kiko-01".to_string(),
-                },
-            }
-        );
-
-        for (config, robot, expected) in [
-            (
-                Some(PathBuf::from("actuation.json")),
-                None,
-                LiveNavigationBoundaryError::IncompleteActuation {
-                    missing_config: false,
-                    missing_robot_id: true,
-                },
-            ),
-            (
-                None,
-                Some("kiko-01".to_string()),
-                LiveNavigationBoundaryError::IncompleteActuation {
-                    missing_config: true,
-                    missing_robot_id: false,
-                },
-            ),
-        ] {
-            assert_eq!(
-                LiveNavigationRequest::parse(
-                    Some(PathBuf::from("navigation.json")),
-                    Some(goal),
-                    Some(PathBuf::from("capture")),
-                    config,
-                    robot,
-                )
-                .expect_err("partial actuation authority must reject"),
-                expected
-            );
-        }
-
-        assert_eq!(
-            LiveNavigationRequest::parse(
-                None,
-                None,
-                None,
-                Some(PathBuf::from("actuation.json")),
-                Some("kiko-01".to_string()),
-            )
-            .expect_err("actuation without navigation must reject"),
-            LiveNavigationBoundaryError::ActuationRequiresNavigation
-        );
-    }
-
-    #[test]
-    fn live_navigation_boundary_reports_each_partial_option_set_exactly() {
-        let goal = "1,2"
-            .parse::<kiko_slam::navigation::NavigationGoalArg>()
-            .expect("finite map-frame goal");
-        let cases = [
-            (
-                0b001,
-                LiveNavigationBoundaryError::IncompleteNavigation {
-                    missing_config: false,
-                    missing_dataset: true,
-                },
-                " --navigation-record",
-            ),
-            (
-                0b010,
-                LiveNavigationBoundaryError::IncompleteNavigation {
-                    missing_config: true,
-                    missing_dataset: true,
-                },
-                " --navigation-config --navigation-record",
-            ),
-            (
-                0b100,
-                LiveNavigationBoundaryError::IncompleteNavigation {
-                    missing_config: true,
-                    missing_dataset: false,
-                },
-                " --navigation-config",
-            ),
-            (
-                0b011,
-                LiveNavigationBoundaryError::IncompleteNavigation {
-                    missing_config: false,
-                    missing_dataset: true,
-                },
-                " --navigation-record",
-            ),
-            (
-                0b110,
-                LiveNavigationBoundaryError::IncompleteNavigation {
-                    missing_config: true,
-                    missing_dataset: false,
-                },
-                " --navigation-config",
-            ),
-        ];
-
-        for (present, expected, missing_flags) in cases {
-            let actual = LiveNavigationRequest::parse(
-                (present & 0b001 != 0).then(|| PathBuf::from("navigation.json")),
-                (present & 0b010 != 0).then_some(goal),
-                (present & 0b100 != 0).then(|| PathBuf::from("capture")),
-                None,
-                None,
-            )
-            .expect_err("every nonempty partial request must fail");
-            assert_eq!(actual, expected, "present mask {present:#05b}");
-            assert_eq!(
-                actual.to_string(),
-                format!(
-                    "live navigation requires --navigation-config and --navigation-record together; --navigation-goal is optional; missing{missing_flags}"
-                ),
-                "present mask {present:#05b}"
-            );
-        }
     }
 
     #[test]

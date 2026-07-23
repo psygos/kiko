@@ -15,6 +15,7 @@ pub mod env;
 mod geometry;
 mod inertial;
 mod inference;
+pub mod live_runtime;
 mod local_ba;
 pub mod loop_closure;
 pub mod map;
