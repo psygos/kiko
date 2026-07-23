@@ -6,10 +6,11 @@ use crate::domain::{
 use crate::transport::{MonotonicClock, V2CommandTransport};
 use robot_protocol::v2::{
     AcquireControl, AcquireResult, AcquireResultCode, ControlEpoch, ControllerBootId,
-    ControllerCapabilities, ControllerFaults, ControllerUid, DeadlineRelation, ForceStopReason,
-    HostCommand, HostCommandResult, HostCommandResultCode, HostStop, HostStopResult, Message,
-    MessageKind, OutputState, RequestId, StatusCode, StatusQuery, StatusReport, StopResultCode,
-    TargetBootId, TimerPwm, V2CommandLeaseMs, V2CommandSequence,
+    ControllerCapabilities, ControllerFaults, ControllerSessionClass, ControllerUid,
+    DeadlineRelation, ForceStopReason, HostCommand, HostCommandResult, HostCommandResultCode,
+    HostStop, HostStopResult, Message, MessageKind, OutputState, RequestId, StatusCode,
+    StatusQuery, StatusReport, StopResultCode, TargetBootId, TimerPwm, V2CommandLeaseMs,
+    V2CommandSequence,
 };
 use std::fmt;
 use std::time::Duration;
@@ -671,7 +672,12 @@ pub enum EvidenceError {
     StatusHasControlEpoch(ControlEpoch),
     StatusHasNoExactBootId,
     RequiredCapabilitiesMissing(ControllerCapabilities),
+    SessionClassCapabilitiesMismatch {
+        expected: ControllerSessionClass,
+        actual: ControllerCapabilities,
+    },
     ControllerFaultsPresent(ControllerFaults),
+    OutputEvidenceUnknown,
     OutputNotSafe(OutputState),
     StatusTimerPwmNonzero(TimerPwm),
     StatusRemainingLeaseNonzero(u16),
@@ -732,11 +738,33 @@ fn verify_common_identity(
 }
 
 fn verify_capabilities_and_faults(
+    expected_class: ControllerSessionClass,
     capabilities: ControllerCapabilities,
     faults: ControllerFaults,
 ) -> Result<(), EvidenceError> {
-    if !capabilities.supports_required_safety() {
-        return Err(EvidenceError::RequiredCapabilitiesMissing(capabilities));
+    match expected_class {
+        ControllerSessionClass::OperatorSupervisedFourPwmCandidate
+            if !capabilities.supports_operator_supervised_four_pwm_candidate() =>
+        {
+            return Err(EvidenceError::SessionClassCapabilitiesMismatch {
+                expected: expected_class,
+                actual: capabilities,
+            });
+        }
+        ControllerSessionClass::AttendedWheelOnCommissioning
+            if !capabilities.supports_attended_wheel_on_commissioning() =>
+        {
+            return Err(EvidenceError::SessionClassCapabilitiesMismatch {
+                expected: expected_class,
+                actual: capabilities,
+            });
+        }
+        ControllerSessionClass::ProductionExternalInterlocks
+            if !capabilities.supports_required_safety() =>
+        {
+            return Err(EvidenceError::RequiredCapabilitiesMissing(capabilities));
+        }
+        _ => {}
     }
     if !faults.is_clear() {
         return Err(EvidenceError::ControllerFaultsPresent(faults));
@@ -759,24 +787,30 @@ fn verify_status_report(
     if report.status != StatusCode::ReadyStopped {
         return Err(EvidenceError::StatusNotReadyStopped(report.status));
     }
+    let output = report
+        .output_evidence()
+        .observed()
+        .ok_or(EvidenceError::OutputEvidenceUnknown)?;
     if let Some(epoch) = report.control_epoch {
         return Err(EvidenceError::StatusHasControlEpoch(epoch));
     }
     let TargetBootId::Exact(boot_id) = report.observed_boot_id else {
         return Err(EvidenceError::StatusHasNoExactBootId);
     };
-    verify_capabilities_and_faults(report.capabilities, report.faults)?;
-    if !report.output_state.is_safe() {
-        return Err(EvidenceError::OutputNotSafe(report.output_state));
+    verify_capabilities_and_faults(
+        config.expected_controller_session_class(),
+        report.capabilities,
+        output.faults(),
+    )?;
+    if !output.output_state().is_safe() {
+        return Err(EvidenceError::OutputNotSafe(output.output_state()));
     }
-    if !report.controller_timer_pwm.is_zero() {
-        return Err(EvidenceError::StatusTimerPwmNonzero(
-            report.controller_timer_pwm,
-        ));
+    if !output.timer_pwm().is_zero() {
+        return Err(EvidenceError::StatusTimerPwmNonzero(output.timer_pwm()));
     }
-    if report.remaining_lease.get() != 0 {
+    if output.remaining_lease().get() != 0 {
         return Err(EvidenceError::StatusRemainingLeaseNonzero(
-            report.remaining_lease.get(),
+            output.remaining_lease().get(),
         ));
     }
     Ok(boot_id)
@@ -807,7 +841,11 @@ fn verify_acquire_result(
     let epoch = result
         .control_epoch
         .ok_or(EvidenceError::GrantedAcquireMissingEpoch)?;
-    verify_capabilities_and_faults(result.capabilities, result.faults)?;
+    verify_capabilities_and_faults(
+        config.expected_controller_session_class(),
+        result.capabilities,
+        result.faults,
+    )?;
     if result.observed_firmware_abi != config.expected_firmware_abi() {
         return Err(EvidenceError::FirmwareAbiMismatch {
             expected: config.expected_firmware_abi(),
@@ -836,6 +874,7 @@ fn verify_acquire_result(
         firmware_build_id,
         result.observed_actuator_config_fingerprint,
         result.capabilities,
+        config.expected_controller_session_class(),
     ))
 }
 
@@ -876,31 +915,35 @@ fn verify_command_result(
     if !accepted_result {
         return Err(EvidenceError::CommandResultNotFreshlyApplied(result.result));
     }
+    let output = result
+        .output_evidence()
+        .observed()
+        .ok_or(EvidenceError::OutputEvidenceUnknown)?;
     if result.requested_timer_pwm != expected_pwm {
         return Err(EvidenceError::RequestedTimerPwmMismatch {
             expected: expected_pwm,
             actual: result.requested_timer_pwm,
         });
     }
-    if result.controller_timer_pwm != expected_pwm {
+    if output.timer_pwm() != expected_pwm {
         return Err(EvidenceError::ControllerTimerPwmMismatch {
             expected: expected_pwm,
-            actual: result.controller_timer_pwm,
+            actual: output.timer_pwm(),
         });
     }
-    if expected_pwm.is_zero() && !result.output_state.is_safe() {
-        return Err(EvidenceError::OutputNotSafe(result.output_state));
+    if expected_pwm.is_zero() && !output.output_state().is_safe() {
+        return Err(EvidenceError::OutputNotSafe(output.output_state()));
     }
-    if !expected_pwm.is_zero() && result.output_state != OutputState::NonzeroPwm {
+    if !expected_pwm.is_zero() && output.output_state() != OutputState::NonzeroPwm {
         return Err(EvidenceError::OutputStateMismatch {
             expected: OutputState::NonzeroPwm,
-            actual: result.output_state,
+            actual: output.output_state(),
         });
     }
-    if !result.faults.is_clear() {
-        return Err(EvidenceError::ControllerFaultsPresent(result.faults));
+    if !output.faults().is_clear() {
+        return Err(EvidenceError::ControllerFaultsPresent(output.faults()));
     }
-    let remaining_ms = result.remaining_lease.get();
+    let remaining_ms = output.remaining_lease().get();
     if remaining_ms == 0 {
         return Err(EvidenceError::RemainingLeaseZero);
     }
@@ -910,10 +953,7 @@ fn verify_command_result(
             requested_ms: expected_lease.get(),
         });
     }
-    let deadline_delta_ms = match result
-        .controller_expires_at
-        .relation_to(result.controller_applied_at)
-    {
+    let deadline_delta_ms = match output.expires_at().relation_to(output.applied_at()) {
         DeadlineRelation::Future { remaining_ms } => remaining_ms,
         DeadlineRelation::Expired | DeadlineRelation::AmbiguousHalfRange => {
             return Err(EvidenceError::ControllerDeadlineNotFuture);
@@ -950,8 +990,12 @@ fn verify_stop_result(
     if result.result != StopResultCode::ControllerConfirmed {
         return Err(EvidenceError::StopNotConfirmed(result.result));
     }
-    if !result.output_state.is_safe() {
-        return Err(EvidenceError::OutputNotSafe(result.output_state));
+    let output = result
+        .output_evidence()
+        .observed()
+        .ok_or(EvidenceError::OutputEvidenceUnknown)?;
+    if !output.output_state().is_safe() {
+        return Err(EvidenceError::OutputNotSafe(output.output_state()));
     }
     let TargetBootId::Exact(observed_boot_id) = result.observed_boot_id else {
         return Err(EvidenceError::StopResultHasNoExactBootId);
@@ -960,8 +1004,8 @@ fn verify_stop_result(
         result.controller_uid,
         observed_boot_id,
         result.request_id,
-        result.output_state,
-        result.faults,
+        output.output_state(),
+        output.faults(),
         acknowledged_at,
     ))
 }

@@ -13,8 +13,8 @@
 use core::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use crate::{
-    ControllerUptimeMsWrapping, EstimatedWrappingEncoderTicks, ModuloEncoderDeltaTicks, PwmPercent,
-    PwmPercentError,
+    ControllerUptimeMsWrapping, EstimatedWrappingEncoderTicks,
+    MAX_UNAMBIGUOUS_WRAPPING_TIMER_TICKS, ModuloEncoderDeltaTicks, PwmPercent, PwmPercentError,
 };
 
 pub const MAGIC: [u8; 4] = *b"KRP2";
@@ -29,13 +29,45 @@ pub const MAX_UART_RECORD_BYTES: usize = MAX_COBS_FRAME_BYTES + 1;
 pub const MIN_V2_COMMAND_LEASE_MS: u16 = 50;
 pub const MAX_V2_COMMAND_LEASE_MS: u16 = 250;
 pub const MAX_HEARTBEAT_PERIOD_MS: u16 = 1_000;
+/// Canonical firmware cadence for idle identity observations.
+pub const CANONICAL_CONTROLLER_HELLO_PERIOD_MS: u32 = 1_000;
+/// Canonical firmware cadence for observational odometry reports when the
+/// admitted hardware profile provides encoder observations.
+pub const CANONICAL_ODOMETRY_REPORT_PERIOD_MS: u32 = 100;
+/// Hard protocol ceiling for the explicitly provisional four-PWM profile.
+///
+/// This is only an electrical command cap. It is not a minimum useful duty,
+/// velocity, torque, stopping-distance, or wheel-motion claim.
+pub const MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT: u8 = 30;
+/// Exact firmware identity for the provisional four-PWM candidate.
+///
+/// Keeping this identity in the protocol contract prevents the client, server,
+/// inventory, and firmware from silently drifting to different candidate
+/// meanings.
+pub const OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID: u32 = 0x0002_1001;
+pub const OPERATOR_SUPERVISED_FOUR_PWM_FINGERPRINT_BYTES: [u8; 16] = *b"KIKO-4PWM-CAND1!";
+/// Exact per-command delta accepted by the provisional four-PWM firmware.
+///
+/// This is a percentage-point step invariant, not a rate, acceleration, or
+/// measured physical-response bound.
+pub const OPERATOR_SUPERVISED_FOUR_PWM_MAX_COMMAND_STEP_PERCENT: u8 = 5;
+/// Distinct, unverified wheel-on commissioning image identity and bounds.
+///
+/// These values never satisfy the production external-interlock contract.
+pub const MAX_ATTENDED_WHEEL_ON_COMMISSIONING_PWM_PERCENT: u8 = 20;
+pub const ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID: u32 = 0x0002_2001;
+pub const ATTENDED_WHEEL_ON_COMMISSIONING_FINGERPRINT_BYTES: [u8; 16] = *b"KIKO-WHEELON-CM1";
+pub const ATTENDED_WHEEL_ON_COMMISSIONING_MAX_COMMAND_STEP_PERCENT: u8 = 20;
+pub const TRANSPORT_DIAGNOSTIC_PATTERN_BYTES: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DomainError {
     ZeroControllerUid,
     ZeroControllerBootId,
     ZeroControlEpoch,
+    ZeroTransportDiagnosticRunId,
     ZeroActuatorConfigFingerprint,
+    TransportDiagnosticPatternMismatch,
     CommandLeaseOutOfRange {
         value: u16,
         minimum: u16,
@@ -64,8 +96,32 @@ pub enum DomainError {
     UnknownCapabilityBits {
         bits: u32,
     },
+    InvalidCapabilityCombination {
+        bits: u32,
+    },
+    MotionAuthorityWithoutAdmissibleSafetyClass {
+        bits: u32,
+        max_abs_pwm_percent: u8,
+    },
+    OperatorSupervisedFourPwmCapOutOfRange {
+        value: u8,
+        minimum: u8,
+        maximum: u8,
+    },
+    OperatorSupervisedFourPwmCannotClaimVerifiedStop,
+    AttendedWheelOnCommissioningCapOutOfRange {
+        value: u8,
+        minimum: u8,
+        maximum: u8,
+    },
+    AttendedWheelOnCommissioningCannotClaimVerifiedStop,
+    ProductionMotionRequiresVerifiedStop,
     UnknownReadinessBits {
         bits: u16,
+    },
+    ReadinessDoesNotMatchSessionClass {
+        bits: u16,
+        session_class: ControllerSessionClass,
     },
     UnknownFaultBits {
         bits: u32,
@@ -80,9 +136,15 @@ impl core::fmt::Display for DomainError {
             Self::ZeroControllerUid => formatter.write_str("controller UID must not be all zero"),
             Self::ZeroControllerBootId => formatter.write_str("controller boot ID must be nonzero"),
             Self::ZeroControlEpoch => formatter.write_str("control epoch must be nonzero"),
+            Self::ZeroTransportDiagnosticRunId => {
+                formatter.write_str("transport-diagnostic run ID must be nonzero")
+            }
             Self::ZeroActuatorConfigFingerprint => {
                 formatter.write_str("actuator-config fingerprint must not be all zero")
             }
+            Self::TransportDiagnosticPatternMismatch => formatter.write_str(
+                "transport-diagnostic pattern does not match its run, sequence, and host token",
+            ),
             Self::CommandLeaseOutOfRange {
                 value,
                 minimum,
@@ -123,9 +185,52 @@ impl core::fmt::Display for DomainError {
             Self::UnknownCapabilityBits { bits } => {
                 write!(formatter, "unknown controller capability bits 0x{bits:08x}")
             }
+            Self::InvalidCapabilityCombination { bits } => write!(
+                formatter,
+                "controller capability bits 0x{bits:08x} combine incompatible safety classes"
+            ),
+            Self::MotionAuthorityWithoutAdmissibleSafetyClass {
+                bits,
+                max_abs_pwm_percent,
+            } => write!(
+                formatter,
+                "controller capability bits 0x{bits:08x} cannot admit {max_abs_pwm_percent}% motion authority"
+            ),
+            Self::OperatorSupervisedFourPwmCapOutOfRange {
+                value,
+                minimum,
+                maximum,
+            } => write!(
+                formatter,
+                "operator-supervised four-PWM cap {value}% is outside {minimum}..={maximum}%"
+            ),
+            Self::OperatorSupervisedFourPwmCannotClaimVerifiedStop => formatter.write_str(
+                "operator-supervised four-PWM candidate must report unverified physical-stop semantics",
+            ),
+            Self::AttendedWheelOnCommissioningCapOutOfRange {
+                value,
+                minimum,
+                maximum,
+            } => write!(
+                formatter,
+                "attended wheel-on commissioning cap {value}% is outside {minimum}..={maximum}%"
+            ),
+            Self::AttendedWheelOnCommissioningCannotClaimVerifiedStop => formatter.write_str(
+                "attended wheel-on commissioning must report unverified physical-stop semantics",
+            ),
+            Self::ProductionMotionRequiresVerifiedStop => formatter.write_str(
+                "production motion authority requires verified physical-stop semantics",
+            ),
             Self::UnknownReadinessBits { bits } => {
                 write!(formatter, "unknown controller readiness bits 0x{bits:04x}")
             }
+            Self::ReadinessDoesNotMatchSessionClass {
+                bits,
+                session_class,
+            } => write!(
+                formatter,
+                "controller readiness bits 0x{bits:04x} do not match {session_class:?}"
+            ),
             Self::UnknownFaultBits { bits } => {
                 write!(formatter, "unknown controller fault bits 0x{bits:08x}")
             }
@@ -200,6 +305,49 @@ impl RequestId {
     }
 
     pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TransportDiagnosticRunId(NonZeroU64);
+
+impl TransportDiagnosticRunId {
+    pub fn try_new(value: u64) -> Result<Self, DomainError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(DomainError::ZeroTransportDiagnosticRunId)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TransportDiagnosticSequence(u32);
+
+impl TransportDiagnosticSequence {
+    pub const FIRST: Self = Self(0);
+
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HostElapsedNsToken(u64);
+
+impl HostElapsedNsToken {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
         self.0
     }
 }
@@ -496,6 +644,42 @@ impl OutputState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControllerCapabilities(u32);
 
+/// Truthful controller safety classification derived from capability bits.
+///
+/// The operator-supervised class is intentionally distinct from production:
+/// it does not assert an external driver-enable gate, a driver-fault input, or
+/// verified physical stop behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerSafetyClass {
+    Incomplete,
+    SoftwareGuardedMotorInert,
+    MotorInertTransportDiagnostic,
+    OperatorSupervisedFourPwmCandidate,
+    AttendedWheelOnCommissioning,
+    ProductionExternalInterlocks,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerSessionClass {
+    OperatorSupervisedFourPwmCandidate,
+    AttendedWheelOnCommissioning,
+    ProductionExternalInterlocks,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerSessionAdmission {
+    MotionDisabled,
+    OperatorSupervisedFourPwmCandidate,
+    AttendedWheelOnCommissioning,
+    ProductionExternalInterlocks,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerSessionReadiness {
+    Stopped,
+    DeadlineArmed,
+}
+
 impl ControllerCapabilities {
     pub const DEADLINE_TIMER_ISR: u32 = 1 << 0;
     pub const INDEPENDENT_WATCHDOG: u32 = 1 << 1;
@@ -509,15 +693,46 @@ impl ControllerCapabilities {
     /// The selected hardware profile claims a driver-fault input is configured.
     /// This is configuration evidence, not physical proof.
     pub const DRIVER_FAULT_INPUT_CONFIGURED: u32 = 1 << 7;
-    pub const KNOWN_BITS: u32 = (1 << 8) - 1;
-    pub const REQUIRED_BITS: u32 = Self::KNOWN_BITS;
+    /// The firmware supports the bounded motor-inert UART qualification
+    /// exchange. This capability never grants motion authority.
+    pub const MOTOR_INERT_TRANSPORT_DIAGNOSTICS: u32 = 1 << 8;
+    /// A provisional PA0/PA1 + PB4/PB5 four-PWM profile with software
+    /// deadline/watchdog/ordering guards, admitted only under direct operator
+    /// supervision. This bit explicitly does not imply either production
+    /// external-interlock capability.
+    pub const OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE: u32 = 1 << 9;
+    /// A separately built, journal-gated wheel-on commissioning image. This
+    /// bit carries no production interlock or physical-stop claim.
+    pub const ATTENDED_WHEEL_ON_COMMISSIONING: u32 = 1 << 10;
+    pub const KNOWN_BITS: u32 = (1 << 11) - 1;
+    pub const SOFTWARE_GUARD_BITS: u32 = Self::DEADLINE_TIMER_ISR
+        | Self::INDEPENDENT_WATCHDOG
+        | Self::BREAK_BEFORE_MAKE
+        | Self::APPLIED_ACK
+        | Self::HEARTBEAT
+        | Self::V2_ONLY;
+    pub const PRODUCTION_EXTERNAL_INTERLOCK_BITS: u32 =
+        Self::EXTERNAL_DRIVER_ENABLE_GATE_CONFIGURED | Self::DRIVER_FAULT_INPUT_CONFIGURED;
+    /// Diagnostics are intentionally not a motion-safety prerequisite.
+    pub const REQUIRED_BITS: u32 =
+        Self::SOFTWARE_GUARD_BITS | Self::PRODUCTION_EXTERNAL_INTERLOCK_BITS;
 
     pub fn try_from_bits(bits: u32) -> Result<Self, DomainError> {
         if bits & !Self::KNOWN_BITS != 0 {
-            Err(DomainError::UnknownCapabilityBits { bits })
-        } else {
-            Ok(Self(bits))
+            return Err(DomainError::UnknownCapabilityBits { bits });
         }
+        let candidate = bits & Self::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE != 0;
+        let attended = bits & Self::ATTENDED_WHEEL_ON_COMMISSIONING != 0;
+        let conflicting_class_bits =
+            Self::PRODUCTION_EXTERNAL_INTERLOCK_BITS | Self::MOTOR_INERT_TRANSPORT_DIAGNOSTICS;
+        if (candidate || attended)
+            && (bits & conflicting_class_bits != 0
+                || bits & Self::SOFTWARE_GUARD_BITS != Self::SOFTWARE_GUARD_BITS
+                || candidate == attended)
+        {
+            return Err(DomainError::InvalidCapabilityCombination { bits });
+        }
+        Ok(Self(bits))
     }
 
     pub const fn bits(self) -> u32 {
@@ -526,6 +741,118 @@ impl ControllerCapabilities {
 
     pub const fn supports_required_safety(self) -> bool {
         self.0 & Self::REQUIRED_BITS == Self::REQUIRED_BITS
+    }
+
+    pub const fn supports_motor_inert_transport_diagnostics(self) -> bool {
+        self.0 & Self::MOTOR_INERT_TRANSPORT_DIAGNOSTICS != 0
+    }
+
+    pub const fn supports_operator_supervised_four_pwm_candidate(self) -> bool {
+        self.0 & Self::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE != 0
+            && self.0 & Self::SOFTWARE_GUARD_BITS == Self::SOFTWARE_GUARD_BITS
+            && self.0 & Self::PRODUCTION_EXTERNAL_INTERLOCK_BITS == 0
+            && self.0 & Self::MOTOR_INERT_TRANSPORT_DIAGNOSTICS == 0
+    }
+
+    pub const fn supports_attended_wheel_on_commissioning(self) -> bool {
+        self.0 & Self::ATTENDED_WHEEL_ON_COMMISSIONING != 0
+            && self.0 & Self::SOFTWARE_GUARD_BITS == Self::SOFTWARE_GUARD_BITS
+            && self.0 & Self::PRODUCTION_EXTERNAL_INTERLOCK_BITS == 0
+            && self.0 & Self::MOTOR_INERT_TRANSPORT_DIAGNOSTICS == 0
+            && self.0 & Self::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE == 0
+    }
+
+    pub const fn safety_class(self) -> ControllerSafetyClass {
+        if self.supports_operator_supervised_four_pwm_candidate() {
+            ControllerSafetyClass::OperatorSupervisedFourPwmCandidate
+        } else if self.supports_attended_wheel_on_commissioning() {
+            ControllerSafetyClass::AttendedWheelOnCommissioning
+        } else if self.supports_required_safety() {
+            ControllerSafetyClass::ProductionExternalInterlocks
+        } else if self.0 & Self::SOFTWARE_GUARD_BITS != Self::SOFTWARE_GUARD_BITS {
+            ControllerSafetyClass::Incomplete
+        } else if self.supports_motor_inert_transport_diagnostics() {
+            ControllerSafetyClass::MotorInertTransportDiagnostic
+        } else {
+            ControllerSafetyClass::SoftwareGuardedMotorInert
+        }
+    }
+
+    /// Classifies the cross-field motion grant without weakening production
+    /// admission. A zero cap is always motion-disabled. A nonzero cap requires
+    /// either the existing production contract or the explicit provisional
+    /// candidate contract.
+    pub fn classify_session_admission(
+        self,
+        max_abs_pwm_percent: MaxAbsPwmPercent,
+        physical_stop_semantics: PhysicalStopSemantics,
+    ) -> Result<ControllerSessionAdmission, DomainError> {
+        if !max_abs_pwm_percent.grants_motion_authority() {
+            if self.supports_operator_supervised_four_pwm_candidate() {
+                return Err(DomainError::OperatorSupervisedFourPwmCapOutOfRange {
+                    value: 0,
+                    minimum: 1,
+                    maximum: MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT,
+                });
+            }
+            if self.supports_attended_wheel_on_commissioning() {
+                return Err(DomainError::AttendedWheelOnCommissioningCapOutOfRange {
+                    value: 0,
+                    minimum: 1,
+                    maximum: MAX_ATTENDED_WHEEL_ON_COMMISSIONING_PWM_PERCENT,
+                });
+            }
+            return Ok(ControllerSessionAdmission::MotionDisabled);
+        }
+
+        match self.safety_class() {
+            ControllerSafetyClass::OperatorSupervisedFourPwmCandidate => {
+                if max_abs_pwm_percent.get() > MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT {
+                    return Err(DomainError::OperatorSupervisedFourPwmCapOutOfRange {
+                        value: max_abs_pwm_percent.get(),
+                        minimum: 1,
+                        maximum: MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT,
+                    });
+                }
+                if !matches!(physical_stop_semantics, PhysicalStopSemantics::Unverified) {
+                    return Err(DomainError::OperatorSupervisedFourPwmCannotClaimVerifiedStop);
+                }
+                Ok(ControllerSessionAdmission::OperatorSupervisedFourPwmCandidate)
+            }
+            ControllerSafetyClass::AttendedWheelOnCommissioning => {
+                if max_abs_pwm_percent.get() > MAX_ATTENDED_WHEEL_ON_COMMISSIONING_PWM_PERCENT {
+                    return Err(DomainError::AttendedWheelOnCommissioningCapOutOfRange {
+                        value: max_abs_pwm_percent.get(),
+                        minimum: 1,
+                        maximum: MAX_ATTENDED_WHEEL_ON_COMMISSIONING_PWM_PERCENT,
+                    });
+                }
+                if !matches!(physical_stop_semantics, PhysicalStopSemantics::Unverified) {
+                    return Err(DomainError::AttendedWheelOnCommissioningCannotClaimVerifiedStop);
+                }
+                Ok(ControllerSessionAdmission::AttendedWheelOnCommissioning)
+            }
+            ControllerSafetyClass::ProductionExternalInterlocks => {
+                if matches!(physical_stop_semantics, PhysicalStopSemantics::Unverified) {
+                    return Err(DomainError::ProductionMotionRequiresVerifiedStop);
+                }
+                Ok(ControllerSessionAdmission::ProductionExternalInterlocks)
+            }
+            ControllerSafetyClass::Incomplete
+            | ControllerSafetyClass::SoftwareGuardedMotorInert
+            | ControllerSafetyClass::MotorInertTransportDiagnostic => {
+                Err(DomainError::MotionAuthorityWithoutAdmissibleSafetyClass {
+                    bits: self.bits(),
+                    max_abs_pwm_percent: max_abs_pwm_percent.get(),
+                })
+            }
+        }
+    }
+
+    pub const fn permits_controller_ready(self) -> bool {
+        self.supports_required_safety()
+            || self.supports_operator_supervised_four_pwm_candidate()
+            || self.supports_attended_wheel_on_commissioning()
     }
 }
 
@@ -537,10 +864,19 @@ impl ReadinessFlags {
     pub const DEADLINE_ARMED: u16 = 1 << 1;
     pub const WATCHDOG_RUNNING: u16 = 1 << 2;
     pub const DRIVER_FAULT_CLEAR: u16 = 1 << 3;
-    pub const KNOWN_BITS: u16 = (1 << 4) - 1;
-    pub const READY_BITS: u16 = Self::KNOWN_BITS;
+    pub const ATTENDED_COMMISSIONING_SESSION: u16 = 1 << 4;
+    pub const KNOWN_BITS: u16 = (1 << 5) - 1;
+    pub const READY_BITS: u16 = Self::STOPPED_READY_BITS | Self::DEADLINE_ARMED;
     pub const STOPPED_READY_BITS: u16 =
         Self::SESSION_ESTABLISHED | Self::WATCHDOG_RUNNING | Self::DRIVER_FAULT_CLEAR;
+    pub const OPERATOR_SUPERVISED_STOPPED_READY_BITS: u16 =
+        Self::SESSION_ESTABLISHED | Self::WATCHDOG_RUNNING;
+    pub const OPERATOR_SUPERVISED_READY_BITS: u16 =
+        Self::OPERATOR_SUPERVISED_STOPPED_READY_BITS | Self::DEADLINE_ARMED;
+    pub const ATTENDED_COMMISSIONING_STOPPED_READY_BITS: u16 =
+        Self::SESSION_ESTABLISHED | Self::WATCHDOG_RUNNING | Self::ATTENDED_COMMISSIONING_SESSION;
+    pub const ATTENDED_COMMISSIONING_READY_BITS: u16 =
+        Self::ATTENDED_COMMISSIONING_STOPPED_READY_BITS | Self::DEADLINE_ARMED;
 
     pub fn try_from_bits(bits: u16) -> Result<Self, DomainError> {
         if bits & !Self::KNOWN_BITS != 0 {
@@ -563,6 +899,59 @@ impl ReadinessFlags {
     /// it before sequence zero would claim a lease that does not exist.
     pub const fn is_stopped_ready_for_acquisition(self) -> bool {
         self.0 == Self::STOPPED_READY_BITS
+    }
+
+    pub const fn for_established_session(
+        session_class: ControllerSessionClass,
+        readiness: ControllerSessionReadiness,
+    ) -> Self {
+        let stopped_bits = match session_class {
+            ControllerSessionClass::OperatorSupervisedFourPwmCandidate => {
+                Self::OPERATOR_SUPERVISED_STOPPED_READY_BITS
+            }
+            ControllerSessionClass::AttendedWheelOnCommissioning => {
+                Self::ATTENDED_COMMISSIONING_STOPPED_READY_BITS
+            }
+            ControllerSessionClass::ProductionExternalInterlocks => Self::STOPPED_READY_BITS,
+        };
+        match readiness {
+            ControllerSessionReadiness::Stopped => Self(stopped_bits),
+            ControllerSessionReadiness::DeadlineArmed => Self(stopped_bits | Self::DEADLINE_ARMED),
+        }
+    }
+
+    pub fn try_for_established_session(
+        bits: u16,
+        session_class: ControllerSessionClass,
+    ) -> Result<Self, DomainError> {
+        let value = Self::try_from_bits(bits)?;
+        if value.is_stopped_ready_for_session(session_class)
+            || value.is_deadline_ready_for_session(session_class)
+        {
+            Ok(value)
+        } else {
+            Err(DomainError::ReadinessDoesNotMatchSessionClass {
+                bits,
+                session_class,
+            })
+        }
+    }
+
+    pub const fn is_stopped_ready_for_session(self, session_class: ControllerSessionClass) -> bool {
+        self.0
+            == Self::for_established_session(session_class, ControllerSessionReadiness::Stopped).0
+    }
+
+    pub const fn is_deadline_ready_for_session(
+        self,
+        session_class: ControllerSessionClass,
+    ) -> bool {
+        self.0
+            == Self::for_established_session(
+                session_class,
+                ControllerSessionReadiness::DeadlineArmed,
+            )
+            .0
     }
 }
 
@@ -812,6 +1201,40 @@ impl StatusCode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+pub enum TransportDiagnosticResultCode {
+    EchoedMotorInert = 0,
+    DeniedIdentityMismatch = 1,
+    DeniedCapabilityUnavailable = 2,
+    DeniedMotionCapableProfile = 3,
+    DeniedSessionActive = 4,
+    DeniedUnsafeOutput = 5,
+    DeniedControllerFault = 6,
+}
+
+impl TransportDiagnosticResultCode {
+    fn parse(value: u8) -> Result<Self, PayloadError> {
+        match value {
+            0 => Ok(Self::EchoedMotorInert),
+            1 => Ok(Self::DeniedIdentityMismatch),
+            2 => Ok(Self::DeniedCapabilityUnavailable),
+            3 => Ok(Self::DeniedMotionCapableProfile),
+            4 => Ok(Self::DeniedSessionActive),
+            5 => Ok(Self::DeniedUnsafeOutput),
+            6 => Ok(Self::DeniedControllerFault),
+            _ => Err(PayloadError::UnknownEnum {
+                field: "transport-diagnostic result code",
+                value,
+            }),
+        }
+    }
+
+    pub const fn proves_motor_inert_echo(self) -> bool {
+        matches!(self, Self::EchoedMotorInert)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum MessageKind {
     AcquireControl = 0x01,
     HostCommand = 0x02,
@@ -825,6 +1248,8 @@ pub enum MessageKind {
     AppliedResult = 0x30,
     Heartbeat = 0x31,
     ObservationalOdometry = 0x32,
+    TransportDiagnosticProbe = 0x40,
+    TransportDiagnosticReport = 0x41,
     AcquireResult = 0x81,
     HostCommandResult = 0x82,
     HostStopResult = 0x83,
@@ -846,6 +1271,8 @@ impl MessageKind {
             0x30 => Ok(Self::AppliedResult),
             0x31 => Ok(Self::Heartbeat),
             0x32 => Ok(Self::ObservationalOdometry),
+            0x40 => Ok(Self::TransportDiagnosticProbe),
+            0x41 => Ok(Self::TransportDiagnosticReport),
             0x81 => Ok(Self::AcquireResult),
             0x82 => Ok(Self::HostCommandResult),
             0x83 => Ok(Self::HostStopResult),
@@ -910,6 +1337,11 @@ pub struct ControllerHello {
 
 impl ControllerHello {
     pub const PAYLOAD_BYTES: usize = 56;
+
+    pub fn session_admission(self) -> Result<ControllerSessionAdmission, DomainError> {
+        self.capabilities
+            .classify_session_admission(self.max_abs_pwm_percent, self.physical_stop_semantics)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1025,6 +1457,112 @@ impl ObservationalOdometry {
     pub const PAYLOAD_BYTES: usize = 48;
 }
 
+/// A bounded, full-payload UART transport probe.
+///
+/// The derived pattern distinguishes the expected diagnostic load from other
+/// traffic and catches application-level construction mistakes. It is not a
+/// secret, MAC, signature, or authentication mechanism; CRC-32C remains the
+/// frame-integrity check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransportDiagnosticProbe {
+    pub expected_controller_uid: ControllerUid,
+    pub expected_boot_id: ControllerBootId,
+    pub run_id: TransportDiagnosticRunId,
+    pub sequence: TransportDiagnosticSequence,
+    pub host_elapsed_ns_token: HostElapsedNsToken,
+    pattern: [u8; TRANSPORT_DIAGNOSTIC_PATTERN_BYTES],
+}
+
+impl TransportDiagnosticProbe {
+    pub const PAYLOAD_BYTES: usize = MAX_PAYLOAD_BYTES;
+
+    pub fn new(
+        expected_controller_uid: ControllerUid,
+        expected_boot_id: ControllerBootId,
+        run_id: TransportDiagnosticRunId,
+        sequence: TransportDiagnosticSequence,
+        host_elapsed_ns_token: HostElapsedNsToken,
+    ) -> Self {
+        Self {
+            expected_controller_uid,
+            expected_boot_id,
+            run_id,
+            sequence,
+            host_elapsed_ns_token,
+            pattern: transport_diagnostic_pattern(run_id, sequence, host_elapsed_ns_token),
+        }
+    }
+
+    fn try_from_wire(
+        expected_controller_uid: ControllerUid,
+        expected_boot_id: ControllerBootId,
+        run_id: TransportDiagnosticRunId,
+        sequence: TransportDiagnosticSequence,
+        host_elapsed_ns_token: HostElapsedNsToken,
+        pattern: [u8; TRANSPORT_DIAGNOSTIC_PATTERN_BYTES],
+    ) -> Result<Self, DomainError> {
+        let expected_pattern =
+            transport_diagnostic_pattern(run_id, sequence, host_elapsed_ns_token);
+        if pattern != expected_pattern {
+            return Err(DomainError::TransportDiagnosticPatternMismatch);
+        }
+        Ok(Self {
+            expected_controller_uid,
+            expected_boot_id,
+            run_id,
+            sequence,
+            host_elapsed_ns_token,
+            pattern,
+        })
+    }
+}
+
+/// Derives deterministic load-discrimination bytes for one probe.
+///
+/// This public function is intentionally reproducible and therefore provides
+/// no authentication.
+pub const fn transport_diagnostic_pattern(
+    run_id: TransportDiagnosticRunId,
+    sequence: TransportDiagnosticSequence,
+    host_elapsed_ns_token: HostElapsedNsToken,
+) -> [u8; TRANSPORT_DIAGNOSTIC_PATTERN_BYTES] {
+    let mut state = run_id.get()
+        ^ host_elapsed_ns_token.get().rotate_left(17)
+        ^ (sequence.get() as u64).rotate_left(41)
+        ^ 0x6b72_7032_6469_6167;
+    let mut pattern = [0_u8; TRANSPORT_DIAGNOSTIC_PATTERN_BYTES];
+    let mut index = 0;
+    while index < TRANSPORT_DIAGNOSTIC_PATTERN_BYTES {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        pattern[index] = state.to_le_bytes()[index % 8] ^ (index as u8).wrapping_mul(0x5b);
+        index += 1;
+    }
+    pattern
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransportDiagnosticReport {
+    pub controller_uid: ControllerUid,
+    pub boot_id: ControllerBootId,
+    pub run_id: TransportDiagnosticRunId,
+    pub sequence: TransportDiagnosticSequence,
+    pub host_elapsed_ns_token: HostElapsedNsToken,
+    pub result: TransportDiagnosticResultCode,
+    pub output_state: OutputState,
+    pub timer_pwm: TimerPwm,
+    pub faults: ControllerFaults,
+    pub request_received_at: ControllerUptimeMsWrapping,
+    pub response_prepared_at: ControllerUptimeMsWrapping,
+    pub rx_queue_depth_bytes: u16,
+    pub tx_queue_depth_bytes: u16,
+}
+
+impl TransportDiagnosticReport {
+    pub const PAYLOAD_BYTES: usize = MAX_PAYLOAD_BYTES;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AcquireControl {
     pub expected_controller_uid: ControllerUid,
@@ -1075,6 +1613,123 @@ impl HostCommand {
     }
 }
 
+/// Host-side interpretation of concrete output bits carried by the frozen V2
+/// wire ABI.
+///
+/// Negative/unavailable responses must retain fixed-width concrete fields for
+/// compatibility, but those fields are not controller observations. Consumers
+/// must branch on this type before exposing output state, PWM, uptime, lease,
+/// or fault bits to an API or UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputEvidence<T> {
+    Observed(T),
+    Unknown,
+}
+
+impl<T> OutputEvidence<T> {
+    pub const fn observed(self) -> Option<T>
+    where
+        T: Copy,
+    {
+        match self {
+            Self::Observed(value) => Some(value),
+            Self::Unknown => None,
+        }
+    }
+
+    pub const fn is_observed(&self) -> bool {
+        matches!(self, Self::Observed(_))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedOutputObservation {
+    timer_pwm: TimerPwm,
+    output_state: OutputState,
+    applied_at: ControllerUptimeMsWrapping,
+    expires_at: ControllerDeadlineMsWrapping,
+    remaining_lease: RemainingLeaseMs,
+    faults: ControllerFaults,
+}
+
+impl AppliedOutputObservation {
+    pub const fn timer_pwm(self) -> TimerPwm {
+        self.timer_pwm
+    }
+
+    pub const fn output_state(self) -> OutputState {
+        self.output_state
+    }
+
+    pub const fn applied_at(self) -> ControllerUptimeMsWrapping {
+        self.applied_at
+    }
+
+    pub const fn expires_at(self) -> ControllerDeadlineMsWrapping {
+        self.expires_at
+    }
+
+    pub const fn remaining_lease(self) -> RemainingLeaseMs {
+        self.remaining_lease
+    }
+
+    pub const fn faults(self) -> ControllerFaults {
+        self.faults
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StopOutputObservation {
+    output_state: OutputState,
+    controller_uptime: ControllerUptimeMsWrapping,
+    faults: ControllerFaults,
+}
+
+impl StopOutputObservation {
+    pub const fn output_state(self) -> OutputState {
+        self.output_state
+    }
+
+    pub const fn controller_uptime(self) -> ControllerUptimeMsWrapping {
+        self.controller_uptime
+    }
+
+    pub const fn faults(self) -> ControllerFaults {
+        self.faults
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatusOutputObservation {
+    output_state: OutputState,
+    timer_pwm: TimerPwm,
+    controller_uptime: ControllerUptimeMsWrapping,
+    remaining_lease: RemainingLeaseMs,
+    faults: ControllerFaults,
+}
+
+impl StatusOutputObservation {
+    pub const fn output_state(self) -> OutputState {
+        self.output_state
+    }
+
+    pub const fn timer_pwm(self) -> TimerPwm {
+        self.timer_pwm
+    }
+
+    pub const fn controller_uptime(self) -> ControllerUptimeMsWrapping {
+        self.controller_uptime
+    }
+
+    pub const fn remaining_lease(self) -> RemainingLeaseMs {
+        self.remaining_lease
+    }
+
+    pub const fn faults(self) -> ControllerFaults {
+        self.faults
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostCommandResult {
     pub controller_uid: ControllerUid,
@@ -1095,6 +1750,21 @@ pub struct HostCommandResult {
 
 impl HostCommandResult {
     pub const PAYLOAD_BYTES: usize = 48;
+
+    pub const fn output_evidence(self) -> OutputEvidence<AppliedOutputObservation> {
+        if self.result.proves_controller_application() {
+            OutputEvidence::Observed(AppliedOutputObservation {
+                timer_pwm: self.controller_timer_pwm,
+                output_state: self.output_state,
+                applied_at: self.controller_applied_at,
+                expires_at: self.controller_expires_at,
+                remaining_lease: self.remaining_lease,
+                faults: self.faults,
+            })
+        } else {
+            OutputEvidence::Unknown
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1122,6 +1792,18 @@ pub struct HostStopResult {
 
 impl HostStopResult {
     pub const PAYLOAD_BYTES: usize = 34;
+
+    pub const fn output_evidence(self) -> OutputEvidence<StopOutputObservation> {
+        if self.result.proves_controller_stop() {
+            OutputEvidence::Observed(StopOutputObservation {
+                output_state: self.output_state,
+                controller_uptime: self.controller_uptime,
+                faults: self.faults,
+            })
+        } else {
+            OutputEvidence::Unknown
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1151,6 +1833,23 @@ pub struct StatusReport {
 
 impl StatusReport {
     pub const PAYLOAD_BYTES: usize = 46;
+
+    pub const fn output_evidence(self) -> OutputEvidence<StatusOutputObservation> {
+        if matches!(
+            self.status,
+            StatusCode::ReadyStopped | StatusCode::ReadyActive
+        ) {
+            OutputEvidence::Observed(StatusOutputObservation {
+                output_state: self.output_state,
+                timer_pwm: self.controller_timer_pwm,
+                controller_uptime: self.controller_uptime,
+                remaining_lease: self.remaining_lease,
+                faults: self.faults,
+            })
+        } else {
+            OutputEvidence::Unknown
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1167,6 +1866,8 @@ pub enum Message {
     AppliedResult(AppliedResult),
     Heartbeat(Heartbeat),
     ObservationalOdometry(ObservationalOdometry),
+    TransportDiagnosticProbe(TransportDiagnosticProbe),
+    TransportDiagnosticReport(TransportDiagnosticReport),
     AcquireResult(AcquireResult),
     HostCommandResult(HostCommandResult),
     HostStopResult(HostStopResult),
@@ -1188,6 +1889,8 @@ impl Message {
             Self::AppliedResult(_) => MessageKind::AppliedResult,
             Self::Heartbeat(_) => MessageKind::Heartbeat,
             Self::ObservationalOdometry(_) => MessageKind::ObservationalOdometry,
+            Self::TransportDiagnosticProbe(_) => MessageKind::TransportDiagnosticProbe,
+            Self::TransportDiagnosticReport(_) => MessageKind::TransportDiagnosticReport,
             Self::AcquireResult(_) => MessageKind::AcquireResult,
             Self::HostCommandResult(_) => MessageKind::HostCommandResult,
             Self::HostStopResult(_) => MessageKind::HostStopResult,
@@ -1209,6 +1912,8 @@ impl Message {
             Self::AppliedResult(_) => AppliedResult::PAYLOAD_BYTES,
             Self::Heartbeat(_) => Heartbeat::PAYLOAD_BYTES,
             Self::ObservationalOdometry(_) => ObservationalOdometry::PAYLOAD_BYTES,
+            Self::TransportDiagnosticProbe(_) => TransportDiagnosticProbe::PAYLOAD_BYTES,
+            Self::TransportDiagnosticReport(_) => TransportDiagnosticReport::PAYLOAD_BYTES,
             Self::AcquireResult(_) => AcquireResult::PAYLOAD_BYTES,
             Self::HostCommandResult(_) => HostCommandResult::PAYLOAD_BYTES,
             Self::HostStopResult(_) => HostStopResult::PAYLOAD_BYTES,
@@ -1562,6 +2267,8 @@ fn expected_payload_len(kind: MessageKind) -> usize {
         MessageKind::AppliedResult => AppliedResult::PAYLOAD_BYTES,
         MessageKind::Heartbeat => Heartbeat::PAYLOAD_BYTES,
         MessageKind::ObservationalOdometry => ObservationalOdometry::PAYLOAD_BYTES,
+        MessageKind::TransportDiagnosticProbe => TransportDiagnosticProbe::PAYLOAD_BYTES,
+        MessageKind::TransportDiagnosticReport => TransportDiagnosticReport::PAYLOAD_BYTES,
         MessageKind::AcquireResult => AcquireResult::PAYLOAD_BYTES,
         MessageKind::HostCommandResult => HostCommandResult::PAYLOAD_BYTES,
         MessageKind::HostStopResult => HostStopResult::PAYLOAD_BYTES,
@@ -1588,14 +2295,24 @@ fn validate_message(message: Message) -> Result<(), PayloadError> {
                     detail: "controller hello must report safe outputs",
                 });
             }
+            value.session_admission()?;
+            if value
+                .capabilities
+                .supports_motor_inert_transport_diagnostics()
+                && value.max_abs_pwm_percent.grants_motion_authority()
+            {
+                return Err(PayloadError::Invariant {
+                    detail: "motor-inert transport diagnostics cannot be advertised by a motion-capable profile",
+                });
+            }
         }
         Message::ControllerReady(value) => {
             if !value.output_state.is_safe()
-                || !value.capabilities.supports_required_safety()
+                || !value.capabilities.permits_controller_ready()
                 || !value.faults.is_clear()
             {
                 return Err(PayloadError::Invariant {
-                    detail: "controller ready requires safe outputs, all safety capabilities, and no faults",
+                    detail: "controller ready requires safe outputs, an explicit session safety class, and no faults",
                 });
             }
         }
@@ -1642,6 +2359,42 @@ fn validate_message(message: Message) -> Result<(), PayloadError> {
         Message::StatusReport(value) => {
             validate_output_matches_pwm(value.output_state, value.controller_timer_pwm)?;
         }
+        Message::TransportDiagnosticReport(value) => {
+            validate_output_matches_pwm(value.output_state, value.timer_pwm)?;
+            if value
+                .response_prepared_at
+                .wrapping_elapsed_since(value.request_received_at)
+                > MAX_UNAMBIGUOUS_WRAPPING_TIMER_TICKS
+            {
+                return Err(PayloadError::Invariant {
+                    detail: "transport-diagnostic response preparation predates request receipt in the wrapping half-range",
+                });
+            }
+            match value.result {
+                TransportDiagnosticResultCode::EchoedMotorInert
+                    if !value.output_state.is_safe()
+                        || !value.timer_pwm.is_zero()
+                        || !value.faults.is_clear() =>
+                {
+                    return Err(PayloadError::Invariant {
+                        detail: "an echoed motor-inert diagnostic requires safe zero output and clear faults",
+                    });
+                }
+                TransportDiagnosticResultCode::DeniedUnsafeOutput
+                    if value.output_state.is_safe() && value.timer_pwm.is_zero() =>
+                {
+                    return Err(PayloadError::Invariant {
+                        detail: "an unsafe-output diagnostic denial must report unsafe output evidence",
+                    });
+                }
+                TransportDiagnosticResultCode::DeniedControllerFault if value.faults.is_clear() => {
+                    return Err(PayloadError::Invariant {
+                        detail: "a controller-fault diagnostic denial must report nonzero fault evidence",
+                    });
+                }
+                _ => {}
+            }
+        }
         Message::AcquireControl(_)
         | Message::HostCommand(_)
         | Message::HostStop(_)
@@ -1649,6 +2402,7 @@ fn validate_message(message: Message) -> Result<(), PayloadError> {
         | Message::BeginSession(_)
         | Message::ApplyPwm(_)
         | Message::ForceStop(_)
+        | Message::TransportDiagnosticProbe(_)
         | Message::ObservationalOdometry(_) => {}
     }
     Ok(())
@@ -1923,6 +2677,29 @@ fn encode_payload(message: Message, writer: &mut PayloadWriter) -> Result<(), En
             writer.i16(value.right_sample_delta_ticks_modulo.get())?;
             writer.u32(value.controller_uptime.get())?;
         }
+        Message::TransportDiagnosticProbe(value) => {
+            writer.uid(value.expected_controller_uid)?;
+            writer.boot(value.expected_boot_id)?;
+            writer.u64(value.run_id.get())?;
+            writer.u32(value.sequence.get())?;
+            writer.u64(value.host_elapsed_ns_token.get())?;
+            writer.write_bytes(&value.pattern)?;
+        }
+        Message::TransportDiagnosticReport(value) => {
+            writer.uid(value.controller_uid)?;
+            writer.boot(value.boot_id)?;
+            writer.u64(value.run_id.get())?;
+            writer.u32(value.sequence.get())?;
+            writer.u64(value.host_elapsed_ns_token.get())?;
+            writer.u8(value.result as u8)?;
+            writer.u8(value.output_state as u8)?;
+            writer.pwm(value.timer_pwm)?;
+            writer.u32(value.faults.bits())?;
+            writer.u32(value.request_received_at.get())?;
+            writer.u32(value.response_prepared_at.get())?;
+            writer.u16(value.rx_queue_depth_bytes)?;
+            writer.u16(value.tx_queue_depth_bytes)?;
+        }
         Message::AcquireControl(value) => {
             writer.uid(value.expected_controller_uid)?;
             writer.boot(value.expected_boot_id)?;
@@ -2106,6 +2883,39 @@ fn decode_payload(kind: MessageKind, bytes: &[u8]) -> Result<Message, PayloadErr
                 left_sample_delta_ticks_modulo: ModuloEncoderDeltaTicks::new_modulo(reader.i16()?),
                 right_sample_delta_ticks_modulo: ModuloEncoderDeltaTicks::new_modulo(reader.i16()?),
                 controller_uptime: ControllerUptimeMsWrapping::new(reader.u32()?),
+            })
+        }
+        MessageKind::TransportDiagnosticProbe => {
+            let expected_controller_uid = reader.uid()?;
+            let expected_boot_id = reader.boot()?;
+            let run_id = TransportDiagnosticRunId::try_new(reader.u64()?)?;
+            let sequence = TransportDiagnosticSequence::new(reader.u32()?);
+            let host_elapsed_ns_token = HostElapsedNsToken::new(reader.u64()?);
+            let pattern = reader.take()?;
+            Message::TransportDiagnosticProbe(TransportDiagnosticProbe::try_from_wire(
+                expected_controller_uid,
+                expected_boot_id,
+                run_id,
+                sequence,
+                host_elapsed_ns_token,
+                pattern,
+            )?)
+        }
+        MessageKind::TransportDiagnosticReport => {
+            Message::TransportDiagnosticReport(TransportDiagnosticReport {
+                controller_uid: reader.uid()?,
+                boot_id: reader.boot()?,
+                run_id: TransportDiagnosticRunId::try_new(reader.u64()?)?,
+                sequence: TransportDiagnosticSequence::new(reader.u32()?),
+                host_elapsed_ns_token: HostElapsedNsToken::new(reader.u64()?),
+                result: TransportDiagnosticResultCode::parse(reader.u8()?)?,
+                output_state: OutputState::parse(reader.u8()?)?,
+                timer_pwm: reader.pwm()?,
+                faults: ControllerFaults::try_from_bits(reader.u32()?)?,
+                request_received_at: ControllerUptimeMsWrapping::new(reader.u32()?),
+                response_prepared_at: ControllerUptimeMsWrapping::new(reader.u32()?),
+                rx_queue_depth_bytes: reader.u16()?,
+                tx_queue_depth_bytes: reader.u16()?,
             })
         }
         MessageKind::AcquireControl => Message::AcquireControl(AcquireControl {
@@ -2479,6 +3289,22 @@ mod tests {
             .expect("known capability bits")
     }
 
+    fn operator_supervised_candidate_capabilities() -> ControllerCapabilities {
+        ControllerCapabilities::try_from_bits(
+            ControllerCapabilities::SOFTWARE_GUARD_BITS
+                | ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE,
+        )
+        .expect("exact candidate capabilities")
+    }
+
+    fn attended_wheel_on_commissioning_capabilities() -> ControllerCapabilities {
+        ControllerCapabilities::try_from_bits(
+            ControllerCapabilities::SOFTWARE_GUARD_BITS
+                | ControllerCapabilities::ATTENDED_WHEEL_ON_COMMISSIONING,
+        )
+        .expect("exact attended wheel-on commissioning capabilities")
+    }
+
     fn readiness() -> ReadinessFlags {
         ReadinessFlags::try_from_bits(ReadinessFlags::READY_BITS).expect("known readiness bits")
     }
@@ -2495,6 +3321,57 @@ mod tests {
         )
         .expect("known subset");
         assert!(!missing_driver_fault_evidence.is_stopped_ready_for_acquisition());
+    }
+
+    #[test]
+    fn session_readiness_is_class_specific_and_candidate_never_claims_driver_fault_evidence() {
+        for session_class in [
+            ControllerSessionClass::OperatorSupervisedFourPwmCandidate,
+            ControllerSessionClass::ProductionExternalInterlocks,
+        ] {
+            let stopped = ReadinessFlags::for_established_session(
+                session_class,
+                ControllerSessionReadiness::Stopped,
+            );
+            let armed = ReadinessFlags::for_established_session(
+                session_class,
+                ControllerSessionReadiness::DeadlineArmed,
+            );
+            assert!(stopped.is_stopped_ready_for_session(session_class));
+            assert!(armed.is_deadline_ready_for_session(session_class));
+            assert_eq!(
+                ReadinessFlags::try_for_established_session(stopped.bits(), session_class),
+                Ok(stopped)
+            );
+            assert_eq!(
+                ReadinessFlags::try_for_established_session(armed.bits(), session_class),
+                Ok(armed)
+            );
+        }
+
+        let candidate_stopped = ReadinessFlags::for_established_session(
+            ControllerSessionClass::OperatorSupervisedFourPwmCandidate,
+            ControllerSessionReadiness::Stopped,
+        );
+        assert_eq!(
+            candidate_stopped.bits() & ReadinessFlags::DRIVER_FAULT_CLEAR,
+            0
+        );
+        assert!(!candidate_stopped.is_stopped_ready_for_acquisition());
+        assert!(
+            ReadinessFlags::try_for_established_session(
+                ReadinessFlags::STOPPED_READY_BITS,
+                ControllerSessionClass::OperatorSupervisedFourPwmCandidate,
+            )
+            .is_err()
+        );
+        assert!(
+            ReadinessFlags::try_for_established_session(
+                ReadinessFlags::OPERATOR_SUPERVISED_STOPPED_READY_BITS,
+                ControllerSessionClass::ProductionExternalInterlocks,
+            )
+            .is_err()
+        );
     }
 
     fn moving_pwm() -> TimerPwm {
@@ -2517,11 +3394,15 @@ mod tests {
                 .expect("valid watchdog period"),
             pwm_frequency: PwmFrequencyHz::try_new(20_000).expect("valid PWM frequency"),
             neutral_output: NeutralOutput::BothLow,
-            physical_stop_semantics: PhysicalStopSemantics::Unverified,
+            physical_stop_semantics: PhysicalStopSemantics::CoastVerified,
         }
     }
 
-    fn messages() -> [Message; 16] {
+    fn diagnostic_run_id() -> TransportDiagnosticRunId {
+        TransportDiagnosticRunId::try_new(0xfeed_face_cafe_beef).expect("nonzero run ID")
+    }
+
+    fn messages() -> [Message; 18] {
         [
             Message::AcquireControl(AcquireControl {
                 expected_controller_uid: uid(),
@@ -2664,6 +3545,28 @@ mod tests {
                 remaining_lease: RemainingLeaseMs::try_new(80).expect("bounded lifetime"),
                 faults: ControllerFaults::NONE,
             }),
+            Message::TransportDiagnosticProbe(TransportDiagnosticProbe::new(
+                uid(),
+                boot(),
+                diagnostic_run_id(),
+                TransportDiagnosticSequence::new(9),
+                HostElapsedNsToken::new(1_234_567),
+            )),
+            Message::TransportDiagnosticReport(TransportDiagnosticReport {
+                controller_uid: uid(),
+                boot_id: boot(),
+                run_id: diagnostic_run_id(),
+                sequence: TransportDiagnosticSequence::new(9),
+                host_elapsed_ns_token: HostElapsedNsToken::new(1_234_567),
+                result: TransportDiagnosticResultCode::EchoedMotorInert,
+                output_state: OutputState::Disabled,
+                timer_pwm: TimerPwm::ZERO,
+                faults: ControllerFaults::NONE,
+                request_received_at: ControllerUptimeMsWrapping::new(4_000),
+                response_prepared_at: ControllerUptimeMsWrapping::new(4_001),
+                rx_queue_depth_bytes: 17,
+                tx_queue_depth_bytes: 29,
+            }),
         ]
     }
 
@@ -2716,6 +3619,150 @@ mod tests {
         assert_eq!(&bytes[32..36], &[7, 0, 0, 0]);
         assert_eq!(&bytes[36..40], &[0xd0, 0x07, 0, 0]);
         assert_eq!(&bytes[40..42], &[231, 40]);
+    }
+
+    #[test]
+    fn transport_diagnostic_wire_layout_fills_the_bounded_payload() {
+        let probe = messages()[16];
+        let frame = RawFrame::encode(probe).expect("diagnostic probe frame");
+        let bytes = frame.as_bytes();
+        assert_eq!(&bytes[..8], &[b'K', b'R', b'P', b'2', 2, 0x40, 60, 0]);
+        assert_eq!(&bytes[8..20], uid().as_bytes());
+        assert_eq!(&bytes[20..28], &[8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(&bytes[28..36], &diagnostic_run_id().get().to_le_bytes());
+        assert_eq!(&bytes[36..40], &9_u32.to_le_bytes());
+        assert_eq!(&bytes[40..48], &1_234_567_u64.to_le_bytes());
+        assert_eq!(
+            &bytes[48..68],
+            &transport_diagnostic_pattern(
+                diagnostic_run_id(),
+                TransportDiagnosticSequence::new(9),
+                HostElapsedNsToken::new(1_234_567),
+            )
+        );
+        assert_eq!(frame.len(), MAX_RAW_FRAME_BYTES);
+
+        let report = RawFrame::encode(messages()[17]).expect("diagnostic report frame");
+        let report_bytes = report.as_bytes();
+        assert_eq!(
+            &report_bytes[..8],
+            &[b'K', b'R', b'P', b'2', 2, 0x41, 60, 0]
+        );
+        assert_eq!(&report_bytes[8..20], uid().as_bytes());
+        assert_eq!(&report_bytes[20..28], &[8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(
+            &report_bytes[28..36],
+            &diagnostic_run_id().get().to_le_bytes()
+        );
+        assert_eq!(&report_bytes[36..40], &9_u32.to_le_bytes());
+        assert_eq!(&report_bytes[40..48], &1_234_567_u64.to_le_bytes());
+        assert_eq!(
+            &report_bytes[48..68],
+            &[
+                0, 0, 0, 0, // result, output, left PWM, right PWM
+                0, 0, 0, 0, // clear faults
+                0xa0, 0x0f, 0, 0, // received at 4000 ms
+                0xa1, 0x0f, 0, 0, // prepared at 4001 ms
+                17, 0, 29, 0, // observed RX/TX queue depths
+            ]
+        );
+        assert_eq!(report.len(), MAX_RAW_FRAME_BYTES);
+
+        let probe_uart = UartRecord::encode(probe).expect("diagnostic UART probe");
+        let report_uart = UartRecord::encode(messages()[17]).expect("diagnostic UART report");
+        assert_eq!(probe_uart.len(), MAX_UART_RECORD_BYTES);
+        assert_eq!(report_uart.len(), MAX_UART_RECORD_BYTES);
+    }
+
+    #[test]
+    fn diagnostic_pattern_changes_across_run_sequence_and_token_boundaries() {
+        let baseline = transport_diagnostic_pattern(
+            diagnostic_run_id(),
+            TransportDiagnosticSequence::FIRST,
+            HostElapsedNsToken::new(0),
+        );
+        for distinct in [
+            transport_diagnostic_pattern(
+                TransportDiagnosticRunId::try_new(1).expect("nonzero"),
+                TransportDiagnosticSequence::FIRST,
+                HostElapsedNsToken::new(0),
+            ),
+            transport_diagnostic_pattern(
+                diagnostic_run_id(),
+                TransportDiagnosticSequence::new(1),
+                HostElapsedNsToken::new(0),
+            ),
+            transport_diagnostic_pattern(
+                diagnostic_run_id(),
+                TransportDiagnosticSequence::FIRST,
+                HostElapsedNsToken::new(1),
+            ),
+        ] {
+            assert_ne!(baseline, distinct);
+        }
+    }
+
+    #[test]
+    fn valid_crc_cannot_hide_a_diagnostic_pattern_mismatch() {
+        let frame = RawFrame::encode(messages()[16]).expect("diagnostic probe frame");
+        let mut bytes = [0_u8; MAX_RAW_FRAME_BYTES];
+        bytes.copy_from_slice(frame.as_bytes());
+        bytes[48] ^= 1;
+        replace_crc(&mut bytes);
+        assert!(matches!(
+            decode_raw_frame(&bytes),
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::TransportDiagnosticPatternMismatch
+            )))
+        ));
+    }
+
+    #[test]
+    fn every_transport_diagnostic_result_code_round_trips() {
+        let results = [
+            TransportDiagnosticResultCode::EchoedMotorInert,
+            TransportDiagnosticResultCode::DeniedIdentityMismatch,
+            TransportDiagnosticResultCode::DeniedCapabilityUnavailable,
+            TransportDiagnosticResultCode::DeniedMotionCapableProfile,
+            TransportDiagnosticResultCode::DeniedSessionActive,
+            TransportDiagnosticResultCode::DeniedUnsafeOutput,
+            TransportDiagnosticResultCode::DeniedControllerFault,
+        ];
+        let Message::TransportDiagnosticReport(fixture) = messages()[17] else {
+            unreachable!("diagnostic report fixture")
+        };
+        for result in results {
+            let mut report = TransportDiagnosticReport { result, ..fixture };
+            if result == TransportDiagnosticResultCode::DeniedUnsafeOutput {
+                report.output_state = OutputState::NonzeroPwm;
+                report.timer_pwm = moving_pwm();
+            }
+            if result == TransportDiagnosticResultCode::DeniedControllerFault {
+                report.faults = ControllerFaults::try_from_bits(ControllerFaults::SERIAL_INTEGRITY)
+                    .expect("known fault");
+            }
+            let message = Message::TransportDiagnosticReport(report);
+            assert_eq!(
+                RawFrame::encode(message)
+                    .expect("valid result code")
+                    .decode(),
+                Ok(message)
+            );
+        }
+
+        let frame =
+            RawFrame::encode(Message::TransportDiagnosticReport(fixture)).expect("valid report");
+        let mut bytes = [0_u8; MAX_RAW_FRAME_BYTES];
+        bytes.copy_from_slice(frame.as_bytes());
+        bytes[48] = u8::MAX;
+        replace_crc(&mut bytes);
+        assert!(matches!(
+            decode_raw_frame(&bytes),
+            Err(FrameError::Payload(PayloadError::UnknownEnum {
+                field: "transport-diagnostic result code",
+                value: u8::MAX,
+            }))
+        ));
     }
 
     #[test]
@@ -2922,6 +3969,38 @@ mod tests {
             ))
         ));
 
+        let mut motion_capable_diagnostic_hello = hello();
+        motion_capable_diagnostic_hello.capabilities = ControllerCapabilities::try_from_bits(
+            ControllerCapabilities::REQUIRED_BITS
+                | ControllerCapabilities::MOTOR_INERT_TRANSPORT_DIAGNOSTICS,
+        )
+        .expect("known capabilities");
+        assert!(
+            RawFrame::encode(Message::ControllerHello(motion_capable_diagnostic_hello)).is_err()
+        );
+
+        let mut unsafe_echo = match messages()[17] {
+            Message::TransportDiagnosticReport(value) => value,
+            _ => unreachable!("diagnostic report fixture"),
+        };
+        unsafe_echo.output_state = OutputState::NonzeroPwm;
+        unsafe_echo.timer_pwm = moving_pwm();
+        assert!(RawFrame::encode(Message::TransportDiagnosticReport(unsafe_echo)).is_err());
+
+        let mut reversed_diagnostic_clock = match messages()[17] {
+            Message::TransportDiagnosticReport(value) => value,
+            _ => unreachable!("diagnostic report fixture"),
+        };
+        reversed_diagnostic_clock.response_prepared_at = ControllerUptimeMsWrapping::new(
+            reversed_diagnostic_clock.request_received_at.get() - 1,
+        );
+        assert!(
+            RawFrame::encode(Message::TransportDiagnosticReport(
+                reversed_diagnostic_clock
+            ))
+            .is_err()
+        );
+
         let mut invalid_acquire = match messages()[12] {
             Message::AcquireResult(value) => value,
             _ => unreachable!("fixture kind"),
@@ -2945,6 +4024,222 @@ mod tests {
     }
 
     #[test]
+    fn candidate_hello_and_ready_round_trip_without_satisfying_production_safety() {
+        let candidate_capabilities = operator_supervised_candidate_capabilities();
+        assert!(candidate_capabilities.supports_operator_supervised_four_pwm_candidate());
+        assert!(!candidate_capabilities.supports_required_safety());
+        assert_eq!(
+            candidate_capabilities.safety_class(),
+            ControllerSafetyClass::OperatorSupervisedFourPwmCandidate
+        );
+
+        let candidate_hello = ControllerHello {
+            capabilities: candidate_capabilities,
+            max_abs_pwm_percent: MaxAbsPwmPercent::try_new(
+                MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT,
+            )
+            .expect("candidate cap is in the wire domain"),
+            physical_stop_semantics: PhysicalStopSemantics::Unverified,
+            ..hello()
+        };
+        assert_eq!(
+            candidate_hello.session_admission(),
+            Ok(ControllerSessionAdmission::OperatorSupervisedFourPwmCandidate)
+        );
+        let hello_message = Message::ControllerHello(candidate_hello);
+        assert_eq!(
+            RawFrame::encode(hello_message)
+                .expect("candidate hello")
+                .decode()
+                .expect("candidate hello decode"),
+            hello_message
+        );
+
+        let ready_message = Message::ControllerReady(ControllerReady {
+            controller_uid: uid(),
+            boot_id: boot(),
+            control_epoch: epoch(),
+            controller_uptime: ControllerUptimeMsWrapping::new(11),
+            capabilities: candidate_capabilities,
+            output_state: OutputState::Disabled,
+            faults: ControllerFaults::NONE,
+        });
+        assert_eq!(
+            RawFrame::encode(ready_message)
+                .expect("candidate ready")
+                .decode()
+                .expect("candidate ready decode"),
+            ready_message
+        );
+    }
+
+    #[test]
+    fn candidate_cross_field_claims_are_strictly_bounded_and_unverified() {
+        let capabilities = operator_supervised_candidate_capabilities();
+        for max_pwm in 0..=100 {
+            let cap = MaxAbsPwmPercent::try_new(max_pwm).expect("complete valid cap domain");
+            for physical_stop in [
+                PhysicalStopSemantics::Unverified,
+                PhysicalStopSemantics::CoastVerified,
+                PhysicalStopSemantics::BrakeVerified,
+            ] {
+                let result = capabilities.classify_session_admission(cap, physical_stop);
+                let expected = (1..=MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT)
+                    .contains(&max_pwm)
+                    && physical_stop == PhysicalStopSemantics::Unverified;
+                assert_eq!(
+                    result == Ok(ControllerSessionAdmission::OperatorSupervisedFourPwmCandidate),
+                    expected,
+                    "max_pwm={max_pwm}, physical_stop={physical_stop:?}"
+                );
+            }
+        }
+
+        let diagnostic_conflict = ControllerCapabilities::SOFTWARE_GUARD_BITS
+            | ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE
+            | ControllerCapabilities::MOTOR_INERT_TRANSPORT_DIAGNOSTICS;
+        assert!(matches!(
+            ControllerCapabilities::try_from_bits(diagnostic_conflict),
+            Err(DomainError::InvalidCapabilityCombination { .. })
+        ));
+        let production_conflict = ControllerCapabilities::SOFTWARE_GUARD_BITS
+            | ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE
+            | ControllerCapabilities::PRODUCTION_EXTERNAL_INTERLOCK_BITS;
+        assert!(matches!(
+            ControllerCapabilities::try_from_bits(production_conflict),
+            Err(DomainError::InvalidCapabilityCombination { .. })
+        ));
+        assert!(matches!(
+            ControllerCapabilities::try_from_bits(
+                ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE
+            ),
+            Err(DomainError::InvalidCapabilityCombination { .. })
+        ));
+    }
+
+    #[test]
+    fn attended_commissioning_claims_are_strictly_bounded_unverified_and_cross_class_exclusive() {
+        let capabilities = attended_wheel_on_commissioning_capabilities();
+        for max_pwm in 0..=100 {
+            let cap = MaxAbsPwmPercent::try_new(max_pwm).expect("complete valid cap domain");
+            for physical_stop in [
+                PhysicalStopSemantics::Unverified,
+                PhysicalStopSemantics::CoastVerified,
+                PhysicalStopSemantics::BrakeVerified,
+            ] {
+                let result = capabilities.classify_session_admission(cap, physical_stop);
+                let expected = (1..=MAX_ATTENDED_WHEEL_ON_COMMISSIONING_PWM_PERCENT)
+                    .contains(&max_pwm)
+                    && physical_stop == PhysicalStopSemantics::Unverified;
+                assert_eq!(
+                    result == Ok(ControllerSessionAdmission::AttendedWheelOnCommissioning),
+                    expected,
+                    "max_pwm={max_pwm}, physical_stop={physical_stop:?}"
+                );
+            }
+        }
+
+        for conflict in [
+            ControllerCapabilities::MOTOR_INERT_TRANSPORT_DIAGNOSTICS,
+            ControllerCapabilities::PRODUCTION_EXTERNAL_INTERLOCK_BITS,
+            ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE,
+        ] {
+            let bits = ControllerCapabilities::SOFTWARE_GUARD_BITS
+                | ControllerCapabilities::ATTENDED_WHEEL_ON_COMMISSIONING
+                | conflict;
+            assert!(matches!(
+                ControllerCapabilities::try_from_bits(bits),
+                Err(DomainError::InvalidCapabilityCombination { .. })
+            ));
+        }
+        assert!(matches!(
+            ControllerCapabilities::try_from_bits(
+                ControllerCapabilities::ATTENDED_WHEEL_ON_COMMISSIONING
+            ),
+            Err(DomainError::InvalidCapabilityCombination { .. })
+        ));
+    }
+
+    #[test]
+    fn every_known_capability_combination_has_deterministic_motion_class_admission() {
+        for bits in 0..=ControllerCapabilities::KNOWN_BITS {
+            let parsed = ControllerCapabilities::try_from_bits(bits);
+            let candidate_bit =
+                bits & ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE != 0;
+            let attended_bit = bits & ControllerCapabilities::ATTENDED_WHEEL_ON_COMMISSIONING != 0;
+            let exact_software_guards = bits & ControllerCapabilities::SOFTWARE_GUARD_BITS
+                == ControllerCapabilities::SOFTWARE_GUARD_BITS;
+            let common_conflict = bits
+                & (ControllerCapabilities::PRODUCTION_EXTERNAL_INTERLOCK_BITS
+                    | ControllerCapabilities::MOTOR_INERT_TRANSPORT_DIAGNOSTICS)
+                != 0;
+            let has_motion_class = candidate_bit || attended_bit;
+            let motion_classes_are_exclusive = candidate_bit != attended_bit;
+            assert_eq!(
+                parsed.is_ok(),
+                !has_motion_class
+                    || (exact_software_guards && !common_conflict && motion_classes_are_exclusive),
+                "bits=0x{bits:08x}"
+            );
+            let Ok(capabilities) = parsed else {
+                continue;
+            };
+            assert_eq!(
+                capabilities.supports_operator_supervised_four_pwm_candidate(),
+                candidate_bit
+            );
+            assert_eq!(
+                capabilities.supports_attended_wheel_on_commissioning(),
+                attended_bit
+            );
+            if has_motion_class {
+                assert!(!capabilities.supports_required_safety());
+                assert!(!capabilities.supports_motor_inert_transport_diagnostics());
+            }
+        }
+    }
+
+    #[test]
+    fn negative_host_results_expose_wire_placeholders_only_as_unknown_evidence() {
+        let mut command_result = messages()
+            .into_iter()
+            .find_map(|message| match message {
+                Message::HostCommandResult(result) => Some(result),
+                _ => None,
+            })
+            .expect("host-command result fixture");
+        assert!(command_result.output_evidence().is_observed());
+        command_result.result = HostCommandResultCode::ForceStopped;
+        command_result.controller_timer_pwm = TimerPwm::ZERO;
+        command_result.output_state = OutputState::Disabled;
+        command_result.remaining_lease = RemainingLeaseMs::ZERO;
+        command_result.faults = ControllerFaults::NONE;
+        assert_eq!(command_result.output_evidence(), OutputEvidence::Unknown);
+
+        let mut stop_result = messages()
+            .into_iter()
+            .find_map(|message| match message {
+                Message::HostStopResult(result) => Some(result),
+                _ => None,
+            })
+            .expect("host-stop result fixture");
+        assert!(stop_result.output_evidence().is_observed());
+        stop_result.result = StopResultCode::ControllerUnavailable;
+        assert_eq!(stop_result.output_evidence(), OutputEvidence::Unknown);
+
+        let mut status = messages()
+            .into_iter()
+            .find_map(|message| match message {
+                Message::StatusReport(report) => Some(report),
+                _ => None,
+            })
+            .expect("status-report fixture");
+        assert!(status.output_evidence().is_observed());
+        status.status = StatusCode::Disconnected;
+        assert_eq!(status.output_evidence(), OutputEvidence::Unknown);
+    }
+
+    #[test]
     fn domains_cover_lease_sequence_identity_and_wrapping_deadline_edges() {
         assert!(V2CommandLeaseMs::try_new(MIN_V2_COMMAND_LEASE_MS).is_ok());
         assert!(V2CommandLeaseMs::try_new(MAX_V2_COMMAND_LEASE_MS).is_ok());
@@ -2962,8 +4257,15 @@ mod tests {
         assert!(MaxAbsPwmPercent::try_new(101).is_err());
         assert_eq!(V2CommandSequence::new(u32::MAX).checked_successor(), None);
         assert!(ControllerUid::try_new([0; 12]).is_err());
+        assert!(TransportDiagnosticRunId::try_new(0).is_err());
         assert!(ActuatorConfigFingerprint::try_new([0; 16]).is_err());
         assert!(ControllerCapabilities::try_from_bits(1 << 31).is_err());
+        let diagnostic_capabilities = ControllerCapabilities::try_from_bits(
+            ControllerCapabilities::MOTOR_INERT_TRANSPORT_DIAGNOSTICS,
+        )
+        .expect("known diagnostic bit");
+        assert!(diagnostic_capabilities.supports_motor_inert_transport_diagnostics());
+        assert!(!diagnostic_capabilities.supports_required_safety());
 
         let before_wrap = ControllerUptimeMsWrapping::new(u32::MAX - 5);
         let after_wrap = ControllerDeadlineMsWrapping::new(3);

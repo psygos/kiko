@@ -4,9 +4,46 @@
 //! STM32F446 host-control firmware.
 //!
 //! The compiled default actuator profile deliberately grants no motion
-//! authority. It emits V2 diagnostics but cannot establish a control session
-//! until a separately reviewed hardware profile proves the external enable
-//! gate, driver-fault input, and physical stop semantics.
+//! authority. A separate feature builds an explicitly provisional,
+//! operator-supervised four-PWM candidate or the distinctly identified
+//! attended wheel-on commissioning profile. Neither claims production
+//! external interlocks or verified physical stop behavior.
+
+#[cfg(all(feature = "external-boot-identity", feature = "flash-boot-journal"))]
+compile_error!(
+    "select exactly one boot-identity source: external-boot-identity or flash-boot-journal"
+);
+#[cfg(all(
+    feature = "operator-supervised-four-pwm-candidate",
+    not(feature = "flash-boot-journal")
+))]
+compile_error!(
+    "operator-supervised-four-pwm-candidate requires the flash-boot-journal identity source"
+);
+#[cfg(all(
+    feature = "operator-supervised-four-pwm-candidate",
+    feature = "external-boot-identity"
+))]
+compile_error!(
+    "operator-supervised-four-pwm-candidate is incompatible with external-boot-identity"
+);
+#[cfg(all(
+    feature = "attended-wheel-on-commissioning",
+    not(feature = "flash-boot-journal")
+))]
+compile_error!("attended-wheel-on-commissioning requires the flash-boot-journal identity source");
+#[cfg(all(
+    feature = "attended-wheel-on-commissioning",
+    feature = "external-boot-identity"
+))]
+compile_error!("attended-wheel-on-commissioning is incompatible with external-boot-identity");
+#[cfg(all(
+    feature = "attended-wheel-on-commissioning",
+    feature = "operator-supervised-four-pwm-candidate"
+))]
+compile_error!(
+    "attended-wheel-on-commissioning and operator-supervised-four-pwm-candidate are distinct images and cannot be combined"
+);
 
 use core::{
     cell::{Cell, RefCell},
@@ -17,16 +54,34 @@ use core::{
 
 use cortex_m::{interrupt::Mutex, peripheral::NVIC};
 use cortex_m_rt::{ExceptionFrame, entry, exception};
+#[cfg(feature = "attended-wheel-on-commissioning")]
+use embedded::attended_wheel_on_commissioning::{
+    ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID, AttendedWheelOnCommissioningProfile,
+};
+#[cfg(feature = "flash-boot-journal")]
+use embedded::boot_journal::{plan_next_boot, verify_commit};
+#[cfg(not(any(
+    feature = "operator-supervised-four-pwm-candidate",
+    feature = "attended-wheel-on-commissioning"
+)))]
+use embedded::motor_inert_profile::{MOTOR_INERT_FIRMWARE_BUILD_ID, MotorInertProfile};
+#[cfg(feature = "operator-supervised-four-pwm-candidate")]
+use embedded::provisional_four_pwm::{
+    OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID, OperatorSupervisedFourPwmProfile,
+};
 use embedded::{
+    FIRMWARE_V2_WATCHDOG_NOMINAL_PERIOD_MS,
     controller::{
         Controller, ControllerCommand, ControllerConfig, ControllerEvent as PureControllerEvent,
         ControllerMode, ControllerStep, ControllerWatchdogStatus, DeadlineTimerSnapshot, FaultCode,
     },
-    encoder_wraps_with_pending_direction_assumption,
+    encoder_wraps_with_pending_direction_assumption, established_session_readiness,
     motor::{
         ActuatorEnvelope, DriveOutput, DurationMs, MotorDirective, MotorTiming,
         MotorTransitionPhase, ObservationalOdometryContract, PwmPair, WheelDrive,
     },
+    transport_diagnostic::TransportDiagnosticGateSnapshot,
+    transport_scheduler::{PriorityTxScheduler, TxAdmissionError, TxTrafficClass},
     watchdog_gate::{CompletedLoopSafety, LoopIteration, WatchdogDecision, WatchdogGate},
 };
 use heapless::spsc::Queue;
@@ -34,14 +89,18 @@ use robot_protocol::{
     ControllerUptimeMsWrapping, EstimatedWrappingEncoderTicks, ModuloEncoderDeltaTicks,
     v2::{
         ActuatorConfigFingerprint, AppliedResult, AppliedResultCode, ApplyPwm, BeginSession,
-        ControlEpoch, ControllerBootId, ControllerCapabilities, ControllerDeadlineMsWrapping,
-        ControllerFaults, ControllerHello, ControllerReady, ControllerUid, DeadlineRelation,
-        ForceStop, Heartbeat, HostStopResult, MAX_V2_COMMAND_LEASE_MS, MaxAbsPwmPercent, Message,
-        NeutralOutput, ObservationalOdometry, OutputState, PhysicalStopSemantics, PwmFrequencyHz,
-        ReadinessFlags, StopResultCode, TargetBootId, TimerPwm, UartRecord, UartStreamDecoder,
-        V2CommandLeaseMs, WatchdogNominalPeriodMs,
+        CANONICAL_CONTROLLER_HELLO_PERIOD_MS, CANONICAL_ODOMETRY_REPORT_PERIOD_MS, ControlEpoch,
+        ControllerBootId, ControllerCapabilities, ControllerDeadlineMsWrapping, ControllerFaults,
+        ControllerHello, ControllerReady, ControllerSessionAdmission, ControllerUid,
+        DeadlineRelation, ForceStop, Heartbeat, HostStopResult, MAX_UART_RECORD_BYTES,
+        MAX_V2_COMMAND_LEASE_MS, MaxAbsPwmPercent, Message, NeutralOutput, ObservationalOdometry,
+        OutputState, PhysicalStopSemantics, PwmFrequencyHz, ReadinessFlags, StopResultCode,
+        TargetBootId, TimerPwm, TransportDiagnosticProbe, TransportDiagnosticReport, UartRecord,
+        UartStreamDecoder, V2CommandLeaseMs, WatchdogNominalPeriodMs,
     },
 };
+#[cfg(feature = "flash-boot-journal")]
+use stm32f4xx_hal::flash::{FlashExt, LockedFlash};
 use stm32f4xx_hal::{
     pac::{self, interrupt},
     prelude::*,
@@ -50,24 +109,41 @@ use stm32f4xx_hal::{
     watchdog::IndependentWatchdog,
 };
 
-const WATCHDOG_PERIOD_MS: u16 = 500;
 const MAIN_LOOP_DELAY_MS: u32 = 1;
 const DEFAULT_HEARTBEAT_PERIOD_MS: u16 = 250;
-const HELLO_PERIOD_MS: u32 = 1_000;
 const ODOMETRY_SAMPLE_PERIOD_MS: u32 = 10;
-const ODOMETRY_REPORT_PERIOD_MS: u32 = 100;
 const PWM_FREQUENCY_HZ: u16 = 20_000;
 const FIRMWARE_ABI: u16 = 2;
-const FIRMWARE_BUILD_ID: u32 = 0x0002_0001;
+#[cfg(not(any(
+    feature = "operator-supervised-four-pwm-candidate",
+    feature = "attended-wheel-on-commissioning"
+)))]
+const FIRMWARE_BUILD_ID: u32 = MOTOR_INERT_FIRMWARE_BUILD_ID;
+#[cfg(feature = "operator-supervised-four-pwm-candidate")]
+const FIRMWARE_BUILD_ID: u32 = OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID;
+#[cfg(feature = "attended-wheel-on-commissioning")]
+const FIRMWARE_BUILD_ID: u32 = ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID;
 const STM32F446_UID_ADDRESS: usize = 0x1fff_7a10;
-const DEFAULT_PROFILE_FINGERPRINT: [u8; 16] = *b"KIKO-NO-ACT-V1!!";
+#[cfg(feature = "flash-boot-journal")]
+const STM32F446_FLASH_BYTES: usize = 512 * 1024;
+#[cfg(feature = "flash-boot-journal")]
+const BOOT_JOURNAL_FLASH_OFFSET: usize = 384 * 1024;
+#[cfg(feature = "flash-boot-journal")]
+const BOOT_JOURNAL_FLASH_BYTES: usize = 128 * 1024;
 
 const RX_QUEUE_BYTES: usize = 256;
-const TX_QUEUE_BYTES: usize = 512;
+const MAX_RX_BYTES_PER_LOOP: usize = MAX_UART_RECORD_BYTES;
+const MAX_RX_RECORDS_PER_LOOP: usize = 1;
+const TX_STOP_QUEUE_BYTES: usize = MAX_UART_RECORD_BYTES * 2;
+const TX_APPLIED_QUEUE_BYTES: usize = MAX_UART_RECORD_BYTES * 4;
+const TX_BEST_EFFORT_QUEUE_BYTES: usize = MAX_UART_RECORD_BYTES * 4;
 
 static RX_QUEUE: Mutex<RefCell<Queue<u8, RX_QUEUE_BYTES>>> = Mutex::new(RefCell::new(Queue::new()));
 static RX_STREAM_INVALIDATED: AtomicBool = AtomicBool::new(false);
-static TX_QUEUE: Mutex<RefCell<Queue<u8, TX_QUEUE_BYTES>>> = Mutex::new(RefCell::new(Queue::new()));
+type FirmwareTxScheduler =
+    PriorityTxScheduler<TX_STOP_QUEUE_BYTES, TX_APPLIED_QUEUE_BYTES, TX_BEST_EFFORT_QUEUE_BYTES>;
+static TX_SCHEDULER: Mutex<RefCell<FirmwareTxScheduler>> =
+    Mutex::new(RefCell::new(FirmwareTxScheduler::new()));
 static TX_PATH_FAILED: AtomicBool = AtomicBool::new(false);
 static SERIAL: Mutex<RefCell<Option<Serial<pac::USART2>>>> = Mutex::new(RefCell::new(None));
 
@@ -96,35 +172,76 @@ struct CompiledActuatorProfile {
 }
 
 impl CompiledActuatorProfile {
-    fn load_default(per_boot_identity_is_session_unique: bool) -> Option<Self> {
-        let core_capabilities = ControllerCapabilities::DEADLINE_TIMER_ISR
-            | ControllerCapabilities::INDEPENDENT_WATCHDOG
-            | ControllerCapabilities::BREAK_BEFORE_MAKE
-            | ControllerCapabilities::APPLIED_ACK
-            | ControllerCapabilities::HEARTBEAT
-            | ControllerCapabilities::V2_ONLY;
+    #[cfg(not(any(
+        feature = "operator-supervised-four-pwm-candidate",
+        feature = "attended-wheel-on-commissioning"
+    )))]
+    fn load(per_boot_identity_is_session_unique: bool) -> Option<Self> {
+        let profile = MotorInertProfile::try_new().ok()?;
         Some(Self {
-            fingerprint: ActuatorConfigFingerprint::try_new(DEFAULT_PROFILE_FINGERPRINT).ok()?,
-            controller_envelope: ActuatorEnvelope::unvalidated(),
-            capabilities: ControllerCapabilities::try_from_bits(core_capabilities).ok()?,
-            max_abs_pwm: MaxAbsPwmPercent::try_new(0).ok()?,
+            fingerprint: profile.fingerprint(),
+            controller_envelope: profile.envelope(),
+            capabilities: profile.capabilities(),
+            max_abs_pwm: profile.max_abs_pwm(),
             maximum_command_lease: V2CommandLeaseMs::try_new(MAX_V2_COMMAND_LEASE_MS).ok()?,
             neutral_output: NeutralOutput::BothLow,
-            physical_stop_semantics: PhysicalStopSemantics::Unverified,
+            physical_stop_semantics: profile.physical_stop_semantics(),
+            per_boot_identity_is_session_unique,
+            observational_odometry: ObservationalOdometryContract::Absent,
+        })
+    }
+
+    #[cfg(feature = "operator-supervised-four-pwm-candidate")]
+    fn load(per_boot_identity_is_session_unique: bool) -> Option<Self> {
+        let profile = OperatorSupervisedFourPwmProfile::try_new().ok()?;
+        Some(Self {
+            fingerprint: profile.fingerprint(),
+            controller_envelope: profile.envelope(),
+            capabilities: profile.capabilities(),
+            max_abs_pwm: profile.max_abs_pwm(),
+            maximum_command_lease: V2CommandLeaseMs::try_new(MAX_V2_COMMAND_LEASE_MS).ok()?,
+            neutral_output: NeutralOutput::BothLow,
+            physical_stop_semantics: profile.physical_stop_semantics(),
+            per_boot_identity_is_session_unique,
+            observational_odometry: ObservationalOdometryContract::Absent,
+        })
+    }
+
+    #[cfg(feature = "attended-wheel-on-commissioning")]
+    fn load(per_boot_identity_is_session_unique: bool) -> Option<Self> {
+        let profile = AttendedWheelOnCommissioningProfile::try_new().ok()?;
+        Some(Self {
+            fingerprint: profile.fingerprint(),
+            controller_envelope: profile.envelope(),
+            capabilities: profile.capabilities(),
+            max_abs_pwm: profile.max_abs_pwm(),
+            maximum_command_lease: V2CommandLeaseMs::try_new(MAX_V2_COMMAND_LEASE_MS).ok()?,
+            neutral_output: NeutralOutput::BothLow,
+            physical_stop_semantics: profile.physical_stop_semantics(),
             per_boot_identity_is_session_unique,
             observational_odometry: ObservationalOdometryContract::Absent,
         })
     }
 
     fn grants_motion_authority(self) -> bool {
-        self.max_abs_pwm.grants_motion_authority()
-            && self.per_boot_identity_is_session_unique
-            && self.capabilities.supports_required_safety()
-            && !matches!(
-                self.physical_stop_semantics,
-                PhysicalStopSemantics::Unverified
-            )
-            && matches!(self.controller_envelope, ActuatorEnvelope::Validated { .. })
+        if !self.per_boot_identity_is_session_unique {
+            return false;
+        }
+        match self
+            .capabilities
+            .classify_session_admission(self.max_abs_pwm, self.physical_stop_semantics)
+        {
+            Ok(ControllerSessionAdmission::OperatorSupervisedFourPwmCandidate) => self
+                .controller_envelope
+                .is_operator_supervised_four_pwm_candidate(),
+            Ok(ControllerSessionAdmission::AttendedWheelOnCommissioning) => self
+                .controller_envelope
+                .is_attended_wheel_on_commissioning(),
+            Ok(ControllerSessionAdmission::ProductionExternalInterlocks) => {
+                matches!(self.controller_envelope, ActuatorEnvelope::Validated { .. })
+            }
+            Ok(ControllerSessionAdmission::MotionDisabled) | Err(_) => false,
+        }
     }
 }
 
@@ -436,7 +553,7 @@ fn main() -> ! {
     // IWDG uses its independent LSI clock and is intentionally started before
     // clock-tree, identity, GPIO, timer, or serial initialization can fail.
     let mut watchdog = IndependentWatchdog::new(dp.IWDG);
-    watchdog.start(u32::from(WATCHDOG_PERIOD_MS).millis());
+    watchdog.start(u32::from(FIRMWARE_V2_WATCHDOG_NOMINAL_PERIOD_MS).millis());
 
     let Some(mut cp) = cortex_m::peripheral::Peripherals::take() else {
         fatal_reset();
@@ -453,13 +570,12 @@ fn main() -> ! {
     let Some(controller_uid) = read_controller_uid() else {
         fatal_reset();
     };
-    let Some(boot_identity) = load_boot_identity(controller_uid) else {
+    let Some(boot_identity) = load_boot_identity(controller_uid, dp.FLASH) else {
         fatal_reset();
     };
     let boot_id = boot_identity.id;
     let mut epoch_generator = EpochGenerator::from_boot_id(boot_id);
-    let Some(profile) = CompiledActuatorProfile::load_default(boot_identity.is_session_unique)
-    else {
+    let Some(profile) = CompiledActuatorProfile::load(boot_identity.is_session_unique) else {
         fatal_reset();
     };
     let firmware_identity = FirmwareIdentity {
@@ -578,7 +694,8 @@ fn main() -> ! {
         // lease progression or the watchdog decision. Queue invalidation and
         // dequeue are one interrupt-masked observation: no byte following a
         // dropped byte can reach the decoder first.
-        for _ in 0..RX_QUEUE_BYTES {
+        let mut decoded_records = 0_usize;
+        for _ in 0..MAX_RX_BYTES_PER_LOOP {
             let byte = match dequeue_rx_event() {
                 RxDequeue::Empty => break,
                 RxDequeue::Invalidated => {
@@ -593,6 +710,7 @@ fn main() -> ! {
             let Some(record) = decoder.push(byte) else {
                 continue;
             };
+            decoded_records += 1;
             match record {
                 Ok(message) => {
                     let handled = handle_message(
@@ -621,6 +739,9 @@ fn main() -> ! {
                     motor_state_synchronized &= stop_and_drop_session(&mut session, &mut motor);
                     break;
                 }
+            }
+            if decoded_records >= MAX_RX_RECORDS_PER_LOOP {
+                break;
             }
         }
         if decoder.is_discarding_oversized_record() {
@@ -663,7 +784,7 @@ fn main() -> ! {
                 &mut previous_right_count,
             ));
         }
-        if now.wrapping_elapsed_since(last_odometry_report) >= ODOMETRY_REPORT_PERIOD_MS {
+        if now.wrapping_elapsed_since(last_odometry_report) >= CANONICAL_ODOMETRY_REPORT_PERIOD_MS {
             last_odometry_report = now;
             if let Some(odometry) = latest_odometry {
                 let epoch = session.as_ref().map(|active| active.epoch);
@@ -673,7 +794,8 @@ fn main() -> ! {
             }
         }
 
-        if now.wrapping_elapsed_since(last_hello) >= HELLO_PERIOD_MS && motor.output_state.is_safe()
+        if now.wrapping_elapsed_since(last_hello) >= CANONICAL_CONTROLLER_HELLO_PERIOD_MS
+            && motor.output_state.is_safe()
         {
             last_hello = now;
             if !send_hello(controller_uid, boot_id, profile) {
@@ -695,6 +817,7 @@ fn main() -> ! {
             if !send_heartbeat(
                 controller_uid,
                 boot_id,
+                profile,
                 session.as_ref(),
                 &motor,
                 fault_bits,
@@ -769,11 +892,64 @@ fn handle_message(
         Message::ApplyPwm(request) => {
             handle_apply_pwm(request, identity, session, motor, fault_bits, now)
         }
+        Message::TransportDiagnosticProbe(request) => handle_transport_diagnostic_probe(
+            request,
+            identity,
+            session.as_ref(),
+            motor,
+            *fault_bits,
+            now,
+        ),
         _ => {
             *fault_bits |= ControllerFaults::SERIAL_INTEGRITY;
             stop_and_drop_session(session, motor)
         }
     }
+}
+
+fn handle_transport_diagnostic_probe(
+    request: TransportDiagnosticProbe,
+    identity: FirmwareIdentity,
+    session: Option<&ControlSession>,
+    motor: &HardwareMotor,
+    fault_bits: u32,
+    request_received_at: ControllerUptimeMsWrapping,
+) -> bool {
+    let result = TransportDiagnosticGateSnapshot {
+        identity_matches: request.expected_controller_uid == identity.controller_uid
+            && request.expected_boot_id == identity.boot_id,
+        capability_available: identity
+            .profile
+            .capabilities
+            .supports_motor_inert_transport_diagnostics(),
+        profile_grants_motion_authority: identity.profile.max_abs_pwm.grants_motion_authority(),
+        session_active: session.is_some(),
+        output_state: motor.output_state,
+        timer_pwm: wire_pwm(motor.timer_pwm),
+        faults: wire_faults(fault_bits),
+    }
+    .classify();
+    let Some((rx_queue_depth_bytes, tx_queue_depth_bytes)) = serial_queue_depths() else {
+        return false;
+    };
+    let response_prepared_at = controller_uptime();
+    queue_message(Message::TransportDiagnosticReport(
+        TransportDiagnosticReport {
+            controller_uid: identity.controller_uid,
+            boot_id: identity.boot_id,
+            run_id: request.run_id,
+            sequence: request.sequence,
+            host_elapsed_ns_token: request.host_elapsed_ns_token,
+            result,
+            output_state: motor.output_state,
+            timer_pwm: wire_pwm(motor.timer_pwm),
+            faults: wire_faults(fault_bits),
+            request_received_at,
+            response_prepared_at,
+            rx_queue_depth_bytes,
+            tx_queue_depth_bytes,
+        },
+    ))
 }
 
 fn handle_force_stop(
@@ -1336,7 +1512,9 @@ fn send_hello(
     boot_id: ControllerBootId,
     profile: CompiledActuatorProfile,
 ) -> bool {
-    let Some(watchdog_period) = WatchdogNominalPeriodMs::try_new(WATCHDOG_PERIOD_MS).ok() else {
+    let Some(watchdog_period) =
+        WatchdogNominalPeriodMs::try_new(FIRMWARE_V2_WATCHDOG_NOMINAL_PERIOD_MS).ok()
+    else {
         return false;
     };
     let Some(pwm_frequency) = PwmFrequencyHz::try_new(PWM_FREQUENCY_HZ).ok() else {
@@ -1382,22 +1560,34 @@ fn send_ready(
 fn send_heartbeat(
     controller_uid: ControllerUid,
     boot_id: ControllerBootId,
+    profile: CompiledActuatorProfile,
     session: Option<&ControlSession>,
     motor: &HardwareMotor,
     fault_bits: u32,
     now: ControllerUptimeMsWrapping,
 ) -> bool {
-    let mut readiness_bits = ReadinessFlags::WATCHDOG_RUNNING;
-    if session.is_some() {
-        readiness_bits |= ReadinessFlags::SESSION_ESTABLISHED;
-    }
-    if LEASE_ARMED.load(Ordering::Acquire) {
-        readiness_bits |= ReadinessFlags::DEADLINE_ARMED;
-    }
-    // The default profile deliberately omits DRIVER_FAULT_CLEAR because no
-    // driver-fault input is configured.
-    let Some(readiness) = ReadinessFlags::try_from_bits(readiness_bits).ok() else {
-        return false;
+    let deadline_armed = LEASE_ARMED.load(Ordering::Acquire);
+    let readiness = if session.is_none() {
+        // Neither checked-in profile has a driver-fault input. A no-session
+        // heartbeat therefore reports only the independently observed
+        // software watchdog state.
+        let Some(value) = ReadinessFlags::try_from_bits(ReadinessFlags::WATCHDOG_RUNNING).ok()
+        else {
+            return false;
+        };
+        value
+    } else {
+        // No checked-in production adapter reads a physical driver-fault
+        // input. Its profile therefore cannot reach production admission here.
+        let Some(readiness) = established_session_readiness(
+            profile.capabilities,
+            profile.max_abs_pwm,
+            profile.physical_stop_semantics,
+            deadline_armed,
+        ) else {
+            return false;
+        };
+        readiness
     };
 
     let (control_epoch, last_sequence, expires_at) = match session {
@@ -1460,15 +1650,33 @@ fn queue_host_stop_result(result: HostStopResult) -> bool {
 }
 
 fn queue_message(message: Message) -> bool {
+    let class = match &message {
+        Message::HostStopResult(_) => TxTrafficClass::HostStopResult,
+        Message::AppliedResult(_) | Message::ControllerReady(_) => TxTrafficClass::AppliedControl,
+        Message::ControllerHello(_)
+        | Message::Heartbeat(_)
+        | Message::ObservationalOdometry(_)
+        | Message::TransportDiagnosticReport(_) => TxTrafficClass::BestEffort,
+        _ => {
+            TX_PATH_FAILED.store(true, Ordering::Release);
+            return false;
+        }
+    };
     let Ok(record) = UartRecord::encode(message) else {
         TX_PATH_FAILED.store(true, Ordering::Release);
         return false;
     };
-    if !try_queue_tx_record(record.as_bytes()) {
-        TX_PATH_FAILED.store(true, Ordering::Release);
-        return false;
+    match try_queue_tx_record(class, record.as_bytes()) {
+        Ok(()) => true,
+        Err(TxQueueError::Admission(TxAdmissionError::QueueFull {
+            class: TxTrafficClass::BestEffort,
+            ..
+        })) if class == TxTrafficClass::BestEffort => true,
+        Err(_) => {
+            TX_PATH_FAILED.store(true, Ordering::Release);
+            false
+        }
     }
-    true
 }
 
 const fn wire_pwm(pair: PwmPair) -> TimerPwm {
@@ -1490,9 +1698,12 @@ fn scale_duty(magnitude_percent: u8, maximum_duty: NonZeroU16) -> Option<u16> {
     u16::try_from(scaled).ok()
 }
 
-#[cfg(feature = "external-boot-identity")]
+#[cfg(all(
+    feature = "external-boot-identity",
+    not(feature = "flash-boot-journal")
+))]
 #[allow(unsafe_code)]
-fn load_boot_identity(_controller_uid: ControllerUid) -> Option<BootIdentity> {
+fn load_boot_identity(_controller_uid: ControllerUid, _flash: pac::FLASH) -> Option<BootIdentity> {
     unsafe extern "C" {
         /// Must return a nonzero identifier that cannot repeat across boots
         /// while any command from an earlier boot could remain in flight.
@@ -1508,8 +1719,39 @@ fn load_boot_identity(_controller_uid: ControllerUid) -> Option<BootIdentity> {
     })
 }
 
-#[cfg(not(feature = "external-boot-identity"))]
-fn load_boot_identity(controller_uid: ControllerUid) -> Option<BootIdentity> {
+#[cfg(all(
+    feature = "flash-boot-journal",
+    not(feature = "external-boot-identity")
+))]
+fn load_boot_identity(_controller_uid: ControllerUid, flash: pac::FLASH) -> Option<BootIdentity> {
+    let mut flash = LockedFlash::new(flash);
+    if flash.len() != STM32F446_FLASH_BYTES {
+        return None;
+    }
+    let journal_end = BOOT_JOURNAL_FLASH_OFFSET.checked_add(BOOT_JOURNAL_FLASH_BYTES)?;
+    let commit = {
+        let journal = flash.read().get(BOOT_JOURNAL_FLASH_OFFSET..journal_end)?;
+        plan_next_boot(journal).ok()?
+    };
+    {
+        let absolute_offset = BOOT_JOURNAL_FLASH_OFFSET.checked_add(commit.record_offset())?;
+        let mut unlocked = flash.unlocked();
+        unlocked
+            .program(absolute_offset, commit.record().iter())
+            .ok()?;
+    }
+    let boot_id = {
+        let journal = flash.read().get(BOOT_JOURNAL_FLASH_OFFSET..journal_end)?;
+        verify_commit(journal, commit).ok()?
+    };
+    Some(BootIdentity {
+        id: boot_id,
+        is_session_unique: true,
+    })
+}
+
+#[cfg(not(any(feature = "external-boot-identity", feature = "flash-boot-journal")))]
+fn load_boot_identity(controller_uid: ControllerUid, _flash: pac::FLASH) -> Option<BootIdentity> {
     // STM32F446 has no hardware RNG. This deterministic FNV-1a token exists
     // only so the motion-disabled default can correlate safe diagnostics. It
     // repeats after reset and is explicitly not a boot-session guarantee.
@@ -1546,23 +1788,32 @@ fn dequeue_rx_event() -> RxDequeue {
     })
 }
 
-fn try_queue_tx_record(record: &[u8]) -> bool {
+fn serial_queue_depths() -> Option<(u16, u16)> {
+    cortex_m::interrupt::free(|cs| {
+        let rx_depth = u16::try_from(RX_QUEUE.borrow(cs).borrow().len()).ok()?;
+        let tx_depth = u16::try_from(TX_SCHEDULER.borrow(cs).borrow().queued_bytes()).ok()?;
+        Some((rx_depth, tx_depth))
+    })
+}
+
+enum TxQueueError {
+    SerialUnavailable,
+    Admission(TxAdmissionError),
+}
+
+fn try_queue_tx_record(class: TxTrafficClass, record: &[u8]) -> Result<(), TxQueueError> {
     cortex_m::interrupt::free(|cs| {
         let mut serial_slot = SERIAL.borrow(cs).borrow_mut();
         let Some(serial) = serial_slot.as_mut() else {
-            return false;
+            return Err(TxQueueError::SerialUnavailable);
         };
-        let mut queue = TX_QUEUE.borrow(cs).borrow_mut();
-        if record.len() > queue.capacity() - queue.len() {
-            return false;
-        }
-        for &byte in record {
-            if queue.enqueue(byte).is_err() {
-                return false;
-            }
-        }
+        TX_SCHEDULER
+            .borrow(cs)
+            .borrow_mut()
+            .try_enqueue_record(class, record)
+            .map_err(TxQueueError::Admission)?;
         serial.listen(SerialEvent::TxEmpty);
-        true
+        Ok(())
     })
 }
 
@@ -1585,15 +1836,18 @@ fn USART2() {
             }
 
             if serial.is_tx_empty() {
-                let mut queue = TX_QUEUE.borrow(cs).borrow_mut();
-                if let Some(byte) = queue.peek().copied() {
+                let mut scheduler = TX_SCHEDULER.borrow(cs).borrow_mut();
+                if let Some(byte) = scheduler.peek_byte() {
                     match serial.write(byte) {
                         Ok(()) => {
-                            let _sent = queue.dequeue();
+                            let consumed = scheduler.consume_byte();
+                            if consumed != Some(byte) {
+                                TX_PATH_FAILED.store(true, Ordering::Release);
+                                serial.unlisten(SerialEvent::TxEmpty);
+                            }
                         }
                         Err(nb::Error::WouldBlock) => {}
                         Err(nb::Error::Other(_)) => {
-                            while queue.dequeue().is_some() {}
                             TX_PATH_FAILED.store(true, Ordering::Release);
                             serial.unlisten(SerialEvent::TxEmpty);
                         }

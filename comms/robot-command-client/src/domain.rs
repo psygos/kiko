@@ -1,9 +1,9 @@
 use robot_protocol::ControllerUptimeMsWrapping;
 use robot_protocol::v2::{
     ActuatorConfigFingerprint, ControlEpoch, ControllerBootId, ControllerCapabilities,
-    ControllerDeadlineMsWrapping, ControllerFaults, ControllerUid, HostCommandResult,
-    HostCommandResultCode, OutputState, RemainingLeaseMs, RequestId, TimerPwm, V2CommandLeaseMs,
-    V2CommandSequence,
+    ControllerDeadlineMsWrapping, ControllerFaults, ControllerSessionClass, ControllerUid,
+    HostCommandResult, HostCommandResultCode, OutputState, RemainingLeaseMs, RequestId, TimerPwm,
+    V2CommandLeaseMs, V2CommandSequence,
 };
 use std::num::{NonZeroU16, NonZeroU32};
 use std::time::Duration;
@@ -82,6 +82,7 @@ pub struct VerifiedControllerAcquisition {
     firmware_build_id: NonZeroU32,
     actuator_config_fingerprint: ActuatorConfigFingerprint,
     capabilities: ControllerCapabilities,
+    controller_session_class: ControllerSessionClass,
 }
 
 impl VerifiedControllerAcquisition {
@@ -91,6 +92,7 @@ impl VerifiedControllerAcquisition {
         firmware_build_id: NonZeroU32,
         actuator_config_fingerprint: ActuatorConfigFingerprint,
         capabilities: ControllerCapabilities,
+        controller_session_class: ControllerSessionClass,
     ) -> Self {
         Self {
             session,
@@ -98,6 +100,7 @@ impl VerifiedControllerAcquisition {
             firmware_build_id,
             actuator_config_fingerprint,
             capabilities,
+            controller_session_class,
         }
     }
 
@@ -131,6 +134,10 @@ impl VerifiedControllerAcquisition {
 
     pub const fn capabilities(self) -> ControllerCapabilities {
         self.capabilities
+    }
+
+    pub const fn controller_session_class(self) -> ControllerSessionClass {
+        self.controller_session_class
     }
 }
 

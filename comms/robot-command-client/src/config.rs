@@ -1,4 +1,12 @@
-use robot_protocol::v2::{ActuatorConfigFingerprint, ControllerUid, DomainError, V2CommandLeaseMs};
+pub use robot_protocol::v2::{
+    ATTENDED_WHEEL_ON_COMMISSIONING_FINGERPRINT_BYTES,
+    ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID,
+    OPERATOR_SUPERVISED_FOUR_PWM_FINGERPRINT_BYTES, OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID,
+};
+use robot_protocol::v2::{
+    ActuatorConfigFingerprint, ControllerSessionClass, ControllerUid, DomainError,
+    V2CommandLeaseMs, VERSION as ROBOT_PROTOCOL_V2,
+};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
@@ -109,6 +117,7 @@ pub struct ClientConfig {
     expected_firmware_abi: NonZeroU16,
     expected_firmware_build_id: NonZeroU32,
     expected_actuator_config_fingerprint: ActuatorConfigFingerprint,
+    expected_controller_session_class: ControllerSessionClass,
     status_timeout: TimeoutNs,
     acquire_timeout: TimeoutNs,
     applied_ack_timeout: TimeoutNs,
@@ -130,12 +139,42 @@ impl ClientConfig {
         stop_recovery: StopRecoveryPolicy,
         zero_acquisition_lease: V2CommandLeaseMs,
     ) -> Self {
+        Self::new_for_session(
+            endpoint,
+            controller_uid,
+            expected_firmware_abi,
+            expected_firmware_build_id,
+            expected_actuator_config_fingerprint,
+            ControllerSessionClass::ProductionExternalInterlocks,
+            status_timeout,
+            acquire_timeout,
+            applied_ack_timeout,
+            stop_recovery,
+            zero_acquisition_lease,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    const fn new_for_session(
+        endpoint: UdpEndpoint,
+        controller_uid: ControllerUid,
+        expected_firmware_abi: NonZeroU16,
+        expected_firmware_build_id: NonZeroU32,
+        expected_actuator_config_fingerprint: ActuatorConfigFingerprint,
+        expected_controller_session_class: ControllerSessionClass,
+        status_timeout: TimeoutNs,
+        acquire_timeout: TimeoutNs,
+        applied_ack_timeout: TimeoutNs,
+        stop_recovery: StopRecoveryPolicy,
+        zero_acquisition_lease: V2CommandLeaseMs,
+    ) -> Self {
         Self {
             endpoint,
             controller_uid,
             expected_firmware_abi,
             expected_firmware_build_id,
             expected_actuator_config_fingerprint,
+            expected_controller_session_class,
             status_timeout,
             acquire_timeout,
             applied_ack_timeout,
@@ -144,7 +183,52 @@ impl ClientConfig {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_for_session(
+        endpoint: UdpEndpoint,
+        controller_uid: ControllerUid,
+        expected_firmware_abi: NonZeroU16,
+        expected_firmware_build_id: NonZeroU32,
+        expected_actuator_config_fingerprint: ActuatorConfigFingerprint,
+        expected_controller_session_class: ControllerSessionClass,
+        status_timeout: TimeoutNs,
+        acquire_timeout: TimeoutNs,
+        applied_ack_timeout: TimeoutNs,
+        stop_recovery: StopRecoveryPolicy,
+        zero_acquisition_lease: V2CommandLeaseMs,
+    ) -> Result<Self, ConfigError> {
+        validate_session_identity(
+            expected_controller_session_class,
+            expected_firmware_abi,
+            expected_firmware_build_id,
+            expected_actuator_config_fingerprint,
+        )?;
+        Ok(Self::new_for_session(
+            endpoint,
+            controller_uid,
+            expected_firmware_abi,
+            expected_firmware_build_id,
+            expected_actuator_config_fingerprint,
+            expected_controller_session_class,
+            status_timeout,
+            acquire_timeout,
+            applied_ack_timeout,
+            stop_recovery,
+            zero_acquisition_lease,
+        ))
+    }
+
     pub fn parse(input: ClientConfigInput<'_>) -> Result<Self, ConfigError> {
+        Self::parse_for_session(input, ControllerSessionClass::ProductionExternalInterlocks)
+    }
+
+    /// Parse the weak textual boundary with one already parsed, explicit
+    /// session class. Candidate identity is cross-checked here so a caller
+    /// cannot label arbitrary firmware as the provisional profile.
+    pub fn parse_for_session(
+        input: ClientConfigInput<'_>,
+        expected_controller_session_class: ControllerSessionClass,
+    ) -> Result<Self, ConfigError> {
         let endpoint = input.command_endpoint.parse()?;
         let controller_uid = ControllerUid::try_new(parse_hex_exact(
             "controller_uid_hex",
@@ -184,12 +268,20 @@ impl ClientConfig {
         )?)
         .map_err(ConfigError::ProtocolDomain)?;
 
-        Ok(Self::new(
+        validate_session_identity(
+            expected_controller_session_class,
+            expected_firmware_abi,
+            expected_firmware_build_id,
+            expected_actuator_config_fingerprint,
+        )?;
+
+        Ok(Self::new_for_session(
             endpoint,
             controller_uid,
             expected_firmware_abi,
             expected_firmware_build_id,
             expected_actuator_config_fingerprint,
+            expected_controller_session_class,
             status_timeout,
             acquire_timeout,
             applied_ack_timeout,
@@ -216,6 +308,10 @@ impl ClientConfig {
 
     pub const fn expected_actuator_config_fingerprint(&self) -> ActuatorConfigFingerprint {
         self.expected_actuator_config_fingerprint
+    }
+
+    pub const fn expected_controller_session_class(&self) -> ControllerSessionClass {
+        self.expected_controller_session_class
     }
 
     pub const fn status_timeout(&self) -> TimeoutNs {
@@ -252,6 +348,64 @@ pub struct ClientConfigInput<'a> {
     pub stop_attempt_timeout_ns: &'a str,
     pub max_stop_recovery_attempts: &'a str,
     pub zero_acquisition_lease_ms: &'a str,
+}
+
+fn validate_session_identity(
+    session_class: ControllerSessionClass,
+    firmware_abi: NonZeroU16,
+    firmware_build_id: NonZeroU32,
+    fingerprint: ActuatorConfigFingerprint,
+) -> Result<(), ConfigError> {
+    let required_abi = u16::from(ROBOT_PROTOCOL_V2);
+    match session_class {
+        ControllerSessionClass::ProductionExternalInterlocks => {
+            if firmware_build_id.get() == OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID
+                || fingerprint.as_bytes() == &OPERATOR_SUPERVISED_FOUR_PWM_FINGERPRINT_BYTES
+            {
+                return Err(ConfigError::CandidateIdentityRequiresCandidateClass);
+            }
+            if firmware_build_id.get() == ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID
+                || fingerprint.as_bytes() == &ATTENDED_WHEEL_ON_COMMISSIONING_FINGERPRINT_BYTES
+            {
+                return Err(ConfigError::CommissioningIdentityRequiresCommissioningClass);
+            }
+        }
+        ControllerSessionClass::OperatorSupervisedFourPwmCandidate => {
+            if firmware_abi.get() != required_abi {
+                return Err(ConfigError::CandidateFirmwareAbiMismatch {
+                    actual: firmware_abi.get(),
+                    required: required_abi,
+                });
+            }
+            if firmware_build_id.get() != OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID {
+                return Err(ConfigError::CandidateFirmwareBuildMismatch {
+                    actual: firmware_build_id.get(),
+                    required: OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID,
+                });
+            }
+            if fingerprint.as_bytes() != &OPERATOR_SUPERVISED_FOUR_PWM_FINGERPRINT_BYTES {
+                return Err(ConfigError::CandidateFingerprintMismatch);
+            }
+        }
+        ControllerSessionClass::AttendedWheelOnCommissioning => {
+            if firmware_abi.get() != required_abi {
+                return Err(ConfigError::CommissioningFirmwareAbiMismatch {
+                    actual: firmware_abi.get(),
+                    required: required_abi,
+                });
+            }
+            if firmware_build_id.get() != ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID {
+                return Err(ConfigError::CommissioningFirmwareBuildMismatch {
+                    actual: firmware_build_id.get(),
+                    required: ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID,
+                });
+            }
+            if fingerprint.as_bytes() != &ATTENDED_WHEEL_ON_COMMISSIONING_FINGERPRINT_BYTES {
+                return Err(ConfigError::CommissioningFingerprintMismatch);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_timeout(field: &'static str, text: &str) -> Result<TimeoutNs, ConfigError> {
@@ -338,6 +492,26 @@ pub enum ConfigError {
         attempts: u8,
         maximum: u8,
     },
+    CandidateFirmwareAbiMismatch {
+        actual: u16,
+        required: u16,
+    },
+    CandidateFirmwareBuildMismatch {
+        actual: u32,
+        required: u32,
+    },
+    CandidateFingerprintMismatch,
+    CandidateIdentityRequiresCandidateClass,
+    CommissioningFirmwareAbiMismatch {
+        actual: u16,
+        required: u16,
+    },
+    CommissioningFirmwareBuildMismatch {
+        actual: u32,
+        required: u32,
+    },
+    CommissioningFingerprintMismatch,
+    CommissioningIdentityRequiresCommissioningClass,
     ProtocolDomain(DomainError),
 }
 
@@ -384,6 +558,34 @@ impl fmt::Display for ConfigError {
             Self::StopRecoveryAttemptsAboveMaximum { attempts, maximum } => write!(
                 formatter,
                 "stop recovery attempt count {attempts} exceeds the bound {maximum}"
+            ),
+            Self::CandidateFirmwareAbiMismatch { actual, required } => write!(
+                formatter,
+                "candidate firmware ABI {actual} does not equal required KRP2 ABI {required}"
+            ),
+            Self::CandidateFirmwareBuildMismatch { actual, required } => write!(
+                formatter,
+                "candidate firmware build {actual:#010x} does not equal {required:#010x}"
+            ),
+            Self::CandidateFingerprintMismatch => formatter.write_str(
+                "candidate actuator fingerprint does not equal KIKO-4PWM-CAND1!",
+            ),
+            Self::CandidateIdentityRequiresCandidateClass => formatter.write_str(
+                "the reserved four-PWM candidate identity requires the explicit operator-supervised session class",
+            ),
+            Self::CommissioningFirmwareAbiMismatch { actual, required } => write!(
+                formatter,
+                "commissioning firmware ABI {actual} does not equal required KRP2 ABI {required}"
+            ),
+            Self::CommissioningFirmwareBuildMismatch { actual, required } => write!(
+                formatter,
+                "commissioning firmware build {actual:#010x} does not equal {required:#010x}"
+            ),
+            Self::CommissioningFingerprintMismatch => formatter.write_str(
+                "commissioning actuator fingerprint does not equal KIKO-WHEELON-CM1",
+            ),
+            Self::CommissioningIdentityRequiresCommissioningClass => formatter.write_str(
+                "the reserved wheel-on commissioning identity requires the explicit attended commissioning session class",
             ),
             Self::ProtocolDomain(source) => write!(formatter, "invalid V2 domain value: {source}"),
         }

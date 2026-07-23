@@ -9,50 +9,74 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use robot_protocol::ControllerUptimeMsWrapping;
+#[cfg(test)]
+use robot_protocol::v2::OPERATOR_SUPERVISED_FOUR_PWM_MAX_COMMAND_STEP_PERCENT;
 use robot_protocol::v2::{
-    AcquireControl, AcquireResult, AcquireResultCode, ActuatorConfigFingerprint, AppliedResult,
-    AppliedResultCode, BeginSession, ControlEpoch, ControllerCapabilities, ControllerFaults,
-    ControllerHello, ControllerReady, ControllerUid, DeadlineRelation, ForceStop, ForceStopReason,
-    Heartbeat, HeartbeatPeriodMs, HostCommand, HostCommandResult, HostCommandResultCode, HostStop,
-    HostStopResult, MAX_RAW_FRAME_BYTES, MaxAbsPwmPercent, Message, MessageKind, NeutralOutput,
-    ObservationalOdometry, OutputState, PhysicalStopSemantics, PwmFrequencyHz, RawFrame,
-    RemainingLeaseMs, RequestId, StatusCode, StatusQuery, StatusReport, StopResultCode,
-    TargetBootId, TimerPwm, UartEncodeError, UartRecord, UartStreamDecoder, UartStreamError,
-    V2CommandSequence, WatchdogNominalPeriodMs, decode_raw_frame,
+    decode_raw_frame, AcquireControl, AcquireResult, AcquireResultCode, ActuatorConfigFingerprint,
+    AppliedResult, AppliedResultCode, BeginSession, ControlEpoch, ControllerCapabilities,
+    ControllerFaults, ControllerHello, ControllerReady, ControllerSessionAdmission,
+    ControllerSessionClass, ControllerUid, DeadlineRelation, ForceStop, ForceStopReason, Heartbeat,
+    HeartbeatPeriodMs, HostCommand, HostCommandResult, HostCommandResultCode, HostStop,
+    HostStopResult, MaxAbsPwmPercent, Message, MessageKind, NeutralOutput, ObservationalOdometry,
+    OutputState, PhysicalStopSemantics, PwmFrequencyHz, RawFrame, RemainingLeaseMs, RequestId,
+    StatusCode, StatusQuery, StatusReport, StopResultCode, TargetBootId, TimerPwm, UartEncodeError,
+    UartRecord, UartStreamDecoder, UartStreamError, V2CommandSequence, WatchdogNominalPeriodMs,
+    MAX_RAW_FRAME_BYTES,
 };
+use robot_protocol::ControllerUptimeMsWrapping;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch, Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_serial::SerialPortBuilderExt;
 
+use crate::config::ControllerServerConfig;
+#[cfg(test)]
 use crate::config::ControllerServerConfigV1;
+use crate::config::CONTROLLER_SERIAL_BAUD_BPS;
 use crate::deadline::{
-    HeartbeatClockSample, TranslatedCommandDeadline, conservative_remaining_lease,
-    translate_command_deadline,
+    conservative_remaining_lease, translate_command_deadline, HeartbeatClockSample,
+    TranslatedCommandDeadline,
 };
 
-const SERIAL_BAUD: u32 = 115_200;
 const ACTOR_MAILBOX_CAPACITY: usize = 32;
-const MAX_UDP_EXCHANGES_IN_FLIGHT: usize = 64;
+const MAX_UDP_ORDINARY_EXCHANGES_IN_FLIGHT: usize = 64;
+const MAX_UDP_PRIORITY_EXCHANGES_IN_FLIGHT: usize = 16;
 const INACTIVE_TIMER_SLEEP: Duration = Duration::from_secs(24 * 60 * 60);
 const UDP_EMISSION_QUANTIZATION_MARGIN_MS: u64 = 1;
+const SERIAL_READ_TURN_BYTES: usize = robot_protocol::v2::MAX_UART_RECORD_BYTES;
+const UART_RECORD_DELIMITER: [u8; 1] = [0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActuationSnapshot {
     pub status: StatusCode,
     pub observed_boot_id: TargetBootId,
     pub control_epoch: Option<ControlEpoch>,
+    pub output: ActuationOutputEvidence,
+    pub last_sequence: Option<V2CommandSequence>,
+}
+
+/// Current controller-output knowledge exposed to telemetry and UI adapters.
+///
+/// Wire compatibility requires concrete placeholder bits in some negative V2
+/// responses. Those bits never enter this API as observations: only a fresh
+/// controller heartbeat can construct [`Self::Observed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActuationOutputEvidence {
+    Unknown,
+    Observed(ObservedActuationOutput),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedActuationOutput {
     pub controller_uptime: ControllerUptimeMsWrapping,
     pub output_state: OutputState,
     pub controller_timer_pwm: TimerPwm,
     pub faults: ControllerFaults,
-    pub last_sequence: Option<V2CommandSequence>,
 }
 
 /// A deliberately small bridge to the legacy HTTP/telemetry state.
@@ -77,12 +101,14 @@ impl ActuationTelemetry for NoopActuationTelemetry {
 #[derive(Clone)]
 pub(crate) struct ActuationHandle {
     requests: mpsc::Sender<ActorRequest>,
+    priority_stop: Arc<PriorityStopCoordinator>,
     shutdown: Arc<ActuationShutdownSignal>,
 }
 
 impl ActuationHandle {
-    /// Submit an already parsed request. `first_received_at` must be the
-    /// original UDP receive instant and is never replaced for retries.
+    /// Submit one typed wire message in tests. `first_received_at` must be the
+    /// original receive instant and is never replaced for retries.
+    #[cfg(test)]
     pub async fn exchange(
         &self,
         source: SocketAddr,
@@ -90,22 +116,54 @@ impl ActuationHandle {
         message: Message,
     ) -> Result<Message, ActuationHandleError> {
         let request = HostRequest::try_from(message)?;
+        self.exchange_timed(source, first_received_at, request)
+            .await
+            .map(|response| response.message)
+    }
+
+    async fn exchange_timed(
+        &self,
+        source: SocketAddr,
+        first_received_at: Instant,
+        request: HostRequest,
+    ) -> Result<TimedActorResponse, ActuationHandleError> {
         if first_received_at > Instant::now() {
             return Err(ActuationHandleError::FutureReceiveInstant);
         }
+        if let HostRequest::Stop(request) = request {
+            return self
+                .priority_stop
+                .request(source, request)
+                .await
+                .map(|result| TimedActorResponse {
+                    message: Message::HostStopResult(result),
+                    calculated_at: Instant::now(),
+                });
+        }
         let (response, receiver) = oneshot::channel();
+        let (calculated_at, calculated_at_receiver) = oneshot::channel();
         self.requests
             .send(ActorRequest {
                 source,
                 first_received_at,
                 request,
-                response,
+                response: ActorResponseSender {
+                    message: response,
+                    calculated_at,
+                },
             })
             .await
             .map_err(|_| ActuationHandleError::ActorStopped)?;
-        receiver
+        let message = receiver
             .await
-            .map_err(|_| ActuationHandleError::ResponseDropped)
+            .map_err(|_| ActuationHandleError::ResponseDropped)?;
+        let calculated_at = calculated_at_receiver
+            .await
+            .map_err(|_| ActuationHandleError::ResponseDropped)?;
+        Ok(TimedActorResponse {
+            message,
+            calculated_at,
+        })
     }
 
     pub(crate) fn shutdown_handle(&self) -> ActuationShutdownHandle {
@@ -122,14 +180,38 @@ impl ActuationHandle {
         message: Message,
     ) -> oneshot::Receiver<Message> {
         let request = HostRequest::try_from(message).expect("supported test request");
+        if let HostRequest::Stop(request) = request {
+            let priority_stop = Arc::clone(&self.priority_stop);
+            let (response, receiver) = oneshot::channel();
+            let cache_revision = match priority_stop.prepare_request(source, request) {
+                PriorityStopRequestAdmission::Immediate(result) => {
+                    let _ = response.send(Message::HostStopResult(result));
+                    return receiver;
+                }
+                PriorityStopRequestAdmission::Pending { cache_revision } => cache_revision,
+            };
+            let pending = priority_stop
+                .latch(cache_revision)
+                .expect("test priority-stop generation is available");
+            tokio::spawn(async move {
+                if let Ok(result) = priority_stop.await_request(source, request, pending).await {
+                    let _ = response.send(Message::HostStopResult(result));
+                }
+            });
+            return receiver;
+        }
         let (response, receiver) = oneshot::channel();
+        let (calculated_at, _calculated_at_receiver) = oneshot::channel();
         if self
             .requests
             .try_send(ActorRequest {
                 source,
                 first_received_at,
                 request,
-                response,
+                response: ActorResponseSender {
+                    message: response,
+                    calculated_at,
+                },
             })
             .is_err()
         {
@@ -221,23 +303,338 @@ impl ActuationShutdownHandle {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PriorityStopEvidence {
+    Exact(HostStopResult),
+    Uncertain(StopResultCode),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PriorityStopCompletion {
+    through_generation: u64,
+    evidence: PriorityStopEvidence,
+}
+
+impl PriorityStopCompletion {
+    const INITIAL: Self = Self {
+        through_generation: 0,
+        evidence: PriorityStopEvidence::Uncertain(StopResultCode::ControllerUnavailable),
+    };
+}
+
+/// Coalesces every concurrently waiting host stop onto one actor-owned
+/// ForceStop transaction.
+///
+/// The actor retains no caller list: callers subscribe to the one bounded
+/// shared completion cell and project the exact/uncertain controller evidence
+/// back onto their own typed request identity.
+#[derive(Debug)]
+struct PriorityStopCoordinator {
+    controller_uid: ControllerUid,
+    requested_generation: AtomicU64,
+    actor_running: AtomicBool,
+    notify: Notify,
+    completion: watch::Sender<PriorityStopCompletion>,
+    cache: Mutex<PriorityStopCache>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CachedPriorityStop {
+    source: SocketAddr,
+    request: HostStop,
+    result: HostStopResult,
+}
+
+#[derive(Debug)]
+struct PriorityStopCache {
+    /// `None` permanently disables caching after the revision domain is
+    /// exhausted instead of permitting an ABA comparison.
+    revision: Option<u64>,
+    entry: Option<CachedPriorityStop>,
+}
+
+impl PriorityStopCache {
+    fn invalidate(&mut self) -> Option<u64> {
+        self.entry = None;
+        self.revision = self.revision.and_then(|revision| revision.checked_add(1));
+        self.revision
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PriorityStopRequestAdmission {
+    Immediate(HostStopResult),
+    Pending { cache_revision: Option<u64> },
+}
+
+enum PreparedPriorityStopRequest {
+    Immediate(HostStopResult),
+    Pending(PendingPriorityStopRequest),
+}
+
+struct PendingPriorityStopRequest {
+    generation: u64,
+    completion: watch::Receiver<PriorityStopCompletion>,
+    cache_revision: Option<u64>,
+}
+
+impl PriorityStopCoordinator {
+    fn new(controller_uid: ControllerUid) -> Self {
+        let (completion, _initial_receiver) = watch::channel(PriorityStopCompletion::INITIAL);
+        Self {
+            controller_uid,
+            requested_generation: AtomicU64::new(0),
+            actor_running: AtomicBool::new(true),
+            notify: Notify::new(),
+            completion,
+            cache: Mutex::new(PriorityStopCache {
+                revision: Some(0),
+                entry: None,
+            }),
+        }
+    }
+
+    async fn request(
+        &self,
+        source: SocketAddr,
+        request: HostStop,
+    ) -> Result<HostStopResult, ActuationHandleError> {
+        let prepared = self.prepare_latched_request(source, request)?;
+        self.await_prepared_request(source, request, prepared).await
+    }
+
+    fn prepare_latched_request(
+        &self,
+        source: SocketAddr,
+        request: HostStop,
+    ) -> Result<PreparedPriorityStopRequest, ActuationHandleError> {
+        match self.prepare_request(source, request) {
+            PriorityStopRequestAdmission::Immediate(result) => {
+                Ok(PreparedPriorityStopRequest::Immediate(result))
+            }
+            PriorityStopRequestAdmission::Pending { cache_revision } => self
+                .latch(cache_revision)
+                .map(PreparedPriorityStopRequest::Pending),
+        }
+    }
+
+    async fn await_prepared_request(
+        &self,
+        source: SocketAddr,
+        request: HostStop,
+        prepared: PreparedPriorityStopRequest,
+    ) -> Result<HostStopResult, ActuationHandleError> {
+        let pending = match prepared {
+            PreparedPriorityStopRequest::Immediate(result) => return Ok(result),
+            PreparedPriorityStopRequest::Pending(pending) => pending,
+        };
+        self.await_request(source, request, pending).await
+    }
+
+    fn prepare_request(
+        &self,
+        source: SocketAddr,
+        request: HostStop,
+    ) -> PriorityStopRequestAdmission {
+        if request.controller_uid != self.controller_uid {
+            return PriorityStopRequestAdmission::Immediate(unproven_stop_result(
+                self.controller_uid,
+                request,
+                StopResultCode::IdentityMismatch,
+            ));
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.actor_running.load(Ordering::Acquire) {
+            return PriorityStopRequestAdmission::Pending {
+                cache_revision: cache.invalidate(),
+            };
+        }
+        if let Some(cached) = cache.entry {
+            if cached.source == source && cached.request == request {
+                return PriorityStopRequestAdmission::Immediate(cached.result);
+            }
+        }
+        PriorityStopRequestAdmission::Pending {
+            cache_revision: cache.invalidate(),
+        }
+    }
+
+    fn latch(
+        &self,
+        cache_revision: Option<u64>,
+    ) -> Result<PendingPriorityStopRequest, ActuationHandleError> {
+        if !self.actor_running.load(Ordering::Acquire) {
+            return Err(ActuationHandleError::ActorStopped);
+        }
+
+        let completion = self.completion.subscribe();
+        let generation = self
+            .requested_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| ActuationHandleError::PriorityStopGenerationExhausted)?
+            + 1;
+        self.notify.notify_waiters();
+        if !self.actor_running.load(Ordering::Acquire) {
+            return Err(ActuationHandleError::ActorStopped);
+        }
+        Ok(PendingPriorityStopRequest {
+            generation,
+            completion,
+            cache_revision,
+        })
+    }
+
+    async fn await_request(
+        &self,
+        source: SocketAddr,
+        request: HostStop,
+        pending: PendingPriorityStopRequest,
+    ) -> Result<HostStopResult, ActuationHandleError> {
+        let PendingPriorityStopRequest {
+            generation,
+            mut completion,
+            cache_revision,
+        } = pending;
+        loop {
+            let observed = *completion.borrow_and_update();
+            if observed.through_generation >= generation {
+                let result = self.project(request, observed.evidence);
+                if matches!(observed.evidence, PriorityStopEvidence::Exact(_)) {
+                    let mut cache = self
+                        .cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if cache_revision.is_some() && cache.revision == cache_revision {
+                        cache.entry = Some(CachedPriorityStop {
+                            source,
+                            request,
+                            result,
+                        });
+                    }
+                }
+                return Ok(result);
+            }
+            completion
+                .changed()
+                .await
+                .map_err(|_| ActuationHandleError::ActorStopped)?;
+        }
+    }
+
+    fn invalidate_cache(&self) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.invalidate();
+    }
+
+    fn project(&self, request: HostStop, evidence: PriorityStopEvidence) -> HostStopResult {
+        match evidence {
+            PriorityStopEvidence::Exact(result)
+                if stop_result_matches_host_request(request, result) =>
+            {
+                HostStopResult {
+                    request_id: request.request_id,
+                    ..result
+                }
+            }
+            PriorityStopEvidence::Exact(result) => HostStopResult {
+                controller_uid: self.controller_uid,
+                observed_boot_id: result.observed_boot_id,
+                request_id: request.request_id,
+                result: StopResultCode::IdentityMismatch,
+                output_state: result.output_state,
+                controller_uptime: result.controller_uptime,
+                faults: result.faults,
+            },
+            PriorityStopEvidence::Uncertain(code) => {
+                unproven_stop_result(self.controller_uid, request, code)
+            }
+        }
+    }
+
+    fn requested_after(&self, completed_generation: u64) -> Option<u64> {
+        let requested = self.requested_generation.load(Ordering::Acquire);
+        (requested > completed_generation).then_some(requested)
+    }
+
+    async fn wait_after(&self, completed_generation: u64) -> u64 {
+        loop {
+            if let Some(requested) = self.requested_after(completed_generation) {
+                return requested;
+            }
+            let notified = self.notify.notified();
+            if let Some(requested) = self.requested_after(completed_generation) {
+                return requested;
+            }
+            notified.await;
+        }
+    }
+
+    fn publish(&self, through_generation: u64, evidence: PriorityStopEvidence) {
+        if self.completion.borrow().through_generation <= through_generation {
+            self.completion.send_replace(PriorityStopCompletion {
+                through_generation,
+                evidence,
+            });
+        }
+    }
+
+    fn actor_stopped(&self) {
+        self.actor_running.store(false, Ordering::Release);
+        self.invalidate_cache();
+        let requested = self.requested_generation.load(Ordering::Acquire);
+        if self.completion.borrow().through_generation < requested {
+            self.publish(
+                requested,
+                PriorityStopEvidence::Uncertain(StopResultCode::ControllerUnavailable),
+            );
+        }
+        self.notify.notify_waiters();
+    }
+}
+
+fn stop_result_matches_host_request(request: HostStop, result: HostStopResult) -> bool {
+    request.controller_uid == result.controller_uid
+        && match request.target_boot_id {
+            TargetBootId::Any => matches!(result.observed_boot_id, TargetBootId::Exact(_)),
+            TargetBootId::Exact(expected) => {
+                result.observed_boot_id == TargetBootId::Exact(expected)
+            }
+        }
+}
+
+fn unproven_stop_result(
+    controller_uid: ControllerUid,
+    request: HostStop,
+    result: StopResultCode,
+) -> HostStopResult {
+    debug_assert!(!result.proves_controller_stop());
+    // Frozen-wire placeholders only. `HostStopResult::output_evidence`
+    // classifies this response as Unknown.
+    HostStopResult {
+        controller_uid,
+        observed_boot_id: request.target_boot_id,
+        request_id: request.request_id,
+        result,
+        output_state: OutputState::Disabled,
+        controller_uptime: ControllerUptimeMsWrapping::new(0),
+        faults: ControllerFaults::NONE,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HostRequest {
     Acquire(AcquireControl),
     Command(HostCommand),
     Stop(HostStop),
     Status(StatusQuery),
-}
-
-impl HostRequest {
-    const fn message(self) -> Message {
-        match self {
-            Self::Acquire(value) => Message::AcquireControl(value),
-            Self::Command(value) => Message::HostCommand(value),
-            Self::Stop(value) => Message::HostStop(value),
-            Self::Status(value) => Message::StatusQuery(value),
-        }
-    }
 }
 
 impl TryFrom<Message> for HostRequest {
@@ -254,17 +651,48 @@ impl TryFrom<Message> for HostRequest {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TimedActorResponse {
+    message: Message,
+    calculated_at: Instant,
+}
+
+struct ActorResponseSender {
+    message: oneshot::Sender<Message>,
+    calculated_at: oneshot::Sender<Instant>,
+}
+
+impl ActorResponseSender {
+    fn send(self, message: Message) -> Result<(), Message> {
+        self.send_calculated_at(message, Instant::now())
+    }
+
+    fn send_calculated_at(self, message: Message, calculated_at: Instant) -> Result<(), Message> {
+        let _ = self.calculated_at.send(calculated_at);
+        self.message.send(message)
+    }
+}
+
 struct ActorRequest {
     source: SocketAddr,
     first_received_at: Instant,
     request: HostRequest,
-    response: oneshot::Sender<Message>,
+    response: ActorResponseSender,
+}
+
+enum ActorWake {
+    Shutdown(ActuationShutdownReason),
+    PriorityStop(u64),
+    Timer,
+    SerialRead(io::Result<usize>),
+    HostRequest(Option<ActorRequest>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActuationHandleError {
     UnsupportedHostMessage(MessageKind),
     FutureReceiveInstant,
+    PriorityStopGenerationExhausted,
     ActorStopped,
     ResponseDropped,
 }
@@ -277,6 +705,9 @@ impl fmt::Display for ActuationHandleError {
             }
             Self::FutureReceiveInstant => {
                 formatter.write_str("host request receive instant is in the future")
+            }
+            Self::PriorityStopGenerationExhausted => {
+                formatter.write_str("priority HostStop generation space is exhausted")
             }
             Self::ActorStopped => formatter.write_str("V2 serial actor is not running"),
             Self::ResponseDropped => {
@@ -328,8 +759,17 @@ impl std::error::Error for ActuationStartError {
 pub enum ActuationActorError {
     SerialEof,
     SerialRead(io::Error),
-    SerialWrite(io::Error),
-    SerialFlush(io::Error),
+    SerialTransmit(SerialTransmitError),
+    ShutdownInterruptedTransmit {
+        interrupted: SerialTransmitError,
+        recovery: Box<ShutdownInterruptedTransmitRecovery>,
+    },
+    ShutdownStopConfirmationTimedOut {
+        maximum_wait: Duration,
+    },
+    ShutdownStopNotConfirmed {
+        result: HostStopResult,
+    },
     Encode(UartEncodeError),
     InternalRequestIdExhausted,
 }
@@ -343,12 +783,22 @@ impl fmt::Display for ActuationActorError {
             Self::SerialRead(source) => {
                 write!(formatter, "controller serial read failed: {source}")
             }
-            Self::SerialWrite(source) => {
-                write!(formatter, "controller serial write failed: {source}")
-            }
-            Self::SerialFlush(source) => {
-                write!(formatter, "controller serial flush failed: {source}")
-            }
+            Self::SerialTransmit(source) => write!(formatter, "{source}"),
+            Self::ShutdownInterruptedTransmit {
+                interrupted,
+                recovery,
+            } => write!(
+                formatter,
+                "{interrupted}; bounded shutdown recovery preserved that uncertainty and reported {recovery}"
+            ),
+            Self::ShutdownStopConfirmationTimedOut { maximum_wait } => write!(
+                formatter,
+                "shutdown ForceStop had no exact controller confirmation within {maximum_wait:?}; physical stop remains uncertain"
+            ),
+            Self::ShutdownStopNotConfirmed { result } => write!(
+                formatter,
+                "shutdown ForceStop returned an exact result that did not prove a clean controller stop: {result:?}"
+            ),
             Self::Encode(source) => {
                 write!(formatter, "cannot encode typed V2 UART record: {source}")
             }
@@ -362,12 +812,174 @@ impl fmt::Display for ActuationActorError {
 impl std::error::Error for ActuationActorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::SerialRead(source) | Self::SerialWrite(source) | Self::SerialFlush(source) => {
-                Some(source)
-            }
+            Self::SerialRead(source) => Some(source),
+            Self::SerialTransmit(source) => Some(source),
+            Self::ShutdownInterruptedTransmit { interrupted, .. } => Some(interrupted),
             Self::Encode(source) => Some(source),
-            Self::SerialEof | Self::InternalRequestIdExhausted => None,
+            Self::SerialEof
+            | Self::ShutdownStopConfirmationTimedOut { .. }
+            | Self::ShutdownStopNotConfirmed { .. }
+            | Self::InternalRequestIdExhausted => None,
         }
+    }
+}
+
+/// Whether a partial UART record was explicitly re-delimited before the
+/// shutdown ForceStop was attempted.
+#[derive(Debug)]
+pub enum SerialResynchronizationOutcome {
+    NotRequired,
+    DelimiterTransmitted,
+    Failed(SerialTransmitError),
+}
+
+/// Exact terminal evidence from the ForceStop half of shutdown recovery.
+///
+/// `Confirmed` requires a matching ForceStop receipt, a stop-proving result,
+/// and a safe output state. Controller fault bits are retained in the result:
+/// a framing fault caused by re-delimiting a partial record must not be
+/// rewritten into a clean-shutdown claim.
+#[derive(Debug)]
+pub enum ShutdownForceStopOutcome {
+    Confirmed(HostStopResult),
+    ExactButUnconfirmed(HostStopResult),
+    Uncertain(Box<ActuationActorError>),
+}
+
+/// Both bounded operations attempted after shutdown interrupted a serial
+/// transmission. The original interrupted transmit remains separately
+/// present in [`ActuationActorError::ShutdownInterruptedTransmit`].
+#[derive(Debug)]
+pub struct ShutdownInterruptedTransmitRecovery {
+    resynchronization: SerialResynchronizationOutcome,
+    force_stop: ShutdownForceStopOutcome,
+}
+
+impl ShutdownInterruptedTransmitRecovery {
+    pub const fn resynchronization(&self) -> &SerialResynchronizationOutcome {
+        &self.resynchronization
+    }
+
+    pub const fn force_stop(&self) -> &ShutdownForceStopOutcome {
+        &self.force_stop
+    }
+}
+
+impl fmt::Display for ShutdownInterruptedTransmitRecovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "resynchronization={:?}, force_stop={:?}",
+            self.resynchronization, self.force_stop
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SerialTransmitPhase {
+    Write,
+    Flush,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SerialTransmitInterruption {
+    DeadlineExceeded,
+    ShutdownRequested,
+    PriorityStopRequested,
+}
+
+#[derive(Debug)]
+pub enum SerialTransmitError {
+    Write {
+        source: io::Error,
+        written_bytes: usize,
+        record_bytes: usize,
+    },
+    Flush {
+        source: io::Error,
+        record_bytes: usize,
+    },
+    Interrupted {
+        phase: SerialTransmitPhase,
+        cause: SerialTransmitInterruption,
+        written_bytes: usize,
+        record_bytes: usize,
+        maximum_duration: Duration,
+    },
+}
+
+impl fmt::Display for SerialTransmitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Write {
+                source,
+                written_bytes,
+                record_bytes,
+            } => write!(
+                formatter,
+                "controller serial write failed after {written_bytes}/{record_bytes} record bytes: {source}; controller receipt and stop state are uncertain"
+            ),
+            Self::Flush {
+                source,
+                record_bytes,
+            } => write!(
+                formatter,
+                "controller serial flush failed after writing all {record_bytes} record bytes: {source}; controller receipt and stop state are uncertain"
+            ),
+            Self::Interrupted {
+                phase,
+                cause,
+                written_bytes,
+                record_bytes,
+                maximum_duration,
+            } => write!(
+                formatter,
+                "controller serial {phase:?} was interrupted by {cause:?} after {written_bytes}/{record_bytes} record bytes (transmit bound {maximum_duration:?}); controller receipt and stop state are uncertain"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SerialTransmitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Write { source, .. } | Self::Flush { source, .. } => Some(source),
+            Self::Interrupted { .. } => None,
+        }
+    }
+}
+
+impl SerialTransmitError {
+    const fn interrupted_by_shutdown(&self) -> bool {
+        matches!(
+            self,
+            Self::Interrupted {
+                cause: SerialTransmitInterruption::ShutdownRequested,
+                ..
+            }
+        )
+    }
+
+    const fn interrupted_by_priority_stop(&self) -> bool {
+        matches!(
+            self,
+            Self::Interrupted {
+                cause: SerialTransmitInterruption::PriorityStopRequested,
+                ..
+            }
+        )
+    }
+
+    const fn left_partial_record(&self) -> bool {
+        matches!(
+            self,
+            Self::Interrupted {
+                phase: SerialTransmitPhase::Write,
+                written_bytes,
+                record_bytes,
+                ..
+            } if *written_bytes > 0 && *written_bytes < *record_bytes
+        )
     }
 }
 
@@ -380,7 +992,7 @@ pub(crate) type StartedActuationActor = (
 );
 
 pub(crate) async fn start_serial_actor(
-    config: ControllerServerConfigV1,
+    config: ControllerServerConfig,
     telemetry: Arc<dyn ActuationTelemetry>,
 ) -> Result<StartedActuationActor, ActuationStartError> {
     let actor_config = ActorConfig::from_server_config(&config)?;
@@ -388,7 +1000,7 @@ pub(crate) async fn start_serial_actor(
         .serial_device()
         .to_str()
         .ok_or(ActuationStartError::NonUtf8SerialDevice)?;
-    let mut port = tokio_serial::new(device, SERIAL_BAUD)
+    let mut port = tokio_serial::new(device, CONTROLLER_SERIAL_BAUD_BPS)
         .open_native_async()
         .map_err(ActuationStartError::OpenSerial)?;
     port.set_exclusive(true)
@@ -406,14 +1018,16 @@ where
 {
     let (requests, receiver) = mpsc::channel(ACTOR_MAILBOX_CAPACITY);
     let shutdown = Arc::new(ActuationShutdownSignal::new());
+    let priority_stop = Arc::new(PriorityStopCoordinator::new(config.controller_uid));
     let handle = ActuationHandle {
         requests,
+        priority_stop: Arc::clone(&priority_stop),
         shutdown: Arc::clone(&shutdown),
     };
     let (startup_ready, startup_ready_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         SerialActor::new(transport, config, telemetry, startup_ready)
-            .run(receiver, shutdown)
+            .run(receiver, priority_stop, shutdown)
             .await
     });
     (handle, startup_ready_rx, task)
@@ -430,7 +1044,7 @@ where
 {
     Ok(spawn_actor(
         transport,
-        ActorConfig::from_server_config(config)?,
+        ActorConfig::from_server_config(&ControllerServerConfig::from(config.clone()))?,
         telemetry,
     ))
 }
@@ -443,6 +1057,8 @@ struct ActorConfig {
     actuator_config_fingerprint: ActuatorConfigFingerprint,
     heartbeat_period: HeartbeatPeriodMs,
     maximum_heartbeat_age: Duration,
+    minimum_host_command_interval: Duration,
+    serial_transmit_timeout: Duration,
     serial_applied_ack_timeout: Duration,
     controller_clock_abs_error_ppm_bound: std::num::NonZeroU32,
     deadline_quantization_margin_ms: std::num::NonZeroU16,
@@ -451,10 +1067,12 @@ struct ActorConfig {
     expected_watchdog_nominal_period: WatchdogNominalPeriodMs,
     expected_neutral_output: NeutralOutput,
     expected_physical_stop_semantics: PhysicalStopSemantics,
+    controller_session_class: ControllerSessionClass,
+    maximum_command_step_percent: Option<u8>,
 }
 
 impl ActorConfig {
-    fn from_server_config(config: &ControllerServerConfigV1) -> Result<Self, ActuationStartError> {
+    fn from_server_config(config: &ControllerServerConfig) -> Result<Self, ActuationStartError> {
         let heartbeat_ms = u16::try_from(config.heartbeat_period().as_millis())
             .map_err(|_| ActuationStartError::InvalidHeartbeatPeriod)?;
         let heartbeat_period = HeartbeatPeriodMs::try_new(heartbeat_ms)
@@ -466,6 +1084,8 @@ impl ActorConfig {
             actuator_config_fingerprint: config.actuator_config_fingerprint(),
             heartbeat_period,
             maximum_heartbeat_age: config.maximum_heartbeat_age(),
+            minimum_host_command_interval: config.minimum_host_command_interval(),
+            serial_transmit_timeout: config.serial_transmit_timeout(),
             serial_applied_ack_timeout: config.serial_applied_ack_timeout(),
             controller_clock_abs_error_ppm_bound: config.controller_clock_abs_error_ppm_bound(),
             deadline_quantization_margin_ms: config.deadline_quantization_margin_ms(),
@@ -474,8 +1094,41 @@ impl ActorConfig {
             expected_watchdog_nominal_period: config.expected_watchdog_nominal_period(),
             expected_neutral_output: config.expected_neutral_output(),
             expected_physical_stop_semantics: config.expected_physical_stop_semantics(),
+            controller_session_class: config.controller_session_class(),
+            maximum_command_step_percent: config.maximum_command_step_percent(),
         })
     }
+
+    const fn expected_session_admission(self) -> ControllerSessionAdmission {
+        match self.controller_session_class {
+            ControllerSessionClass::OperatorSupervisedFourPwmCandidate => {
+                ControllerSessionAdmission::OperatorSupervisedFourPwmCandidate
+            }
+            ControllerSessionClass::AttendedWheelOnCommissioning => {
+                ControllerSessionAdmission::AttendedWheelOnCommissioning
+            }
+            ControllerSessionClass::ProductionExternalInterlocks => {
+                ControllerSessionAdmission::ProductionExternalInterlocks
+            }
+        }
+    }
+}
+
+fn candidate_command_step_is_admitted(
+    previously_applied: TimerPwm,
+    requested: TimerPwm,
+    maximum_step_percent: Option<u8>,
+) -> bool {
+    if requested.is_zero() {
+        return true;
+    }
+    let Some(maximum_step_percent) = maximum_step_percent else {
+        return true;
+    };
+    i16::from(previously_applied.left().get()).abs_diff(i16::from(requested.left().get()))
+        <= u16::from(maximum_step_percent)
+        && i16::from(previously_applied.right().get()).abs_diff(i16::from(requested.right().get()))
+            <= u16::from(maximum_step_percent)
 }
 
 #[derive(Clone, Copy)]
@@ -510,6 +1163,7 @@ struct Owner {
     epoch: ControlEpoch,
     next_sequence: Option<V2CommandSequence>,
     cached: Option<CachedCommand>,
+    last_serial_command_at: Option<Instant>,
 }
 
 struct PendingCommand {
@@ -518,7 +1172,7 @@ struct PendingCommand {
     translated: TranslatedCommandDeadline,
     controller_uptime_reference: ControllerUptimeMsWrapping,
     serial_sent_at: Instant,
-    response: oneshot::Sender<Message>,
+    response: ActorResponseSender,
 }
 
 struct PendingStop {
@@ -526,12 +1180,19 @@ struct PendingStop {
     request: HostStop,
     serial_request_id: RequestId,
     serial_sent_at: Instant,
-    response: oneshot::Sender<Message>,
+    response: ActorResponseSender,
+}
+
+struct PendingPriorityStop {
+    force_stop: ForceStop,
+    covers_through_generation: u64,
+    serial_sent_at: Instant,
 }
 
 enum PendingOperation {
     Command(PendingCommand),
     Stop(PendingStop),
+    PriorityStop(PendingPriorityStop),
 }
 
 #[derive(Clone, Copy)]
@@ -557,6 +1218,10 @@ struct SerialActor<Transport> {
     last_internal_stop: Option<ForceStop>,
     next_internal_request_id: Option<RequestId>,
     faulted: bool,
+    priority_stop: Option<Arc<PriorityStopCoordinator>>,
+    priority_stop_generation: u64,
+    shutdown: Option<Arc<ActuationShutdownSignal>>,
+    shutdown_in_progress: bool,
 }
 
 impl<Transport> SerialActor<Transport>
@@ -585,40 +1250,136 @@ where
             last_internal_stop: None,
             next_internal_request_id: Some(RequestId::new(0)),
             faulted: false,
+            priority_stop: None,
+            priority_stop_generation: 0,
+            shutdown: None,
+            shutdown_in_progress: false,
         }
     }
 
     async fn run(
         &mut self,
         mut requests: mpsc::Receiver<ActorRequest>,
+        priority_stop: Arc<PriorityStopCoordinator>,
         shutdown: Arc<ActuationShutdownSignal>,
     ) -> Result<(), ActuationActorError> {
-        let mut read_buffer = [0_u8; 256];
+        self.priority_stop = Some(Arc::clone(&priority_stop));
+        self.shutdown = Some(Arc::clone(&shutdown));
         self.publish_snapshot(Instant::now());
+        let result = loop {
+            match self
+                .run_until_exit(
+                    &mut requests,
+                    Arc::clone(&priority_stop),
+                    Arc::clone(&shutdown),
+                )
+                .await
+            {
+                Err(ActuationActorError::SerialTransmit(interrupted))
+                    if interrupted.interrupted_by_priority_stop() =>
+                {
+                    if let Err(error) = self
+                        .recover_priority_stop_interrupted_transmit(interrupted)
+                        .await
+                    {
+                        break Err(error);
+                    }
+                }
+                Err(ActuationActorError::SerialTransmit(interrupted))
+                    if interrupted.interrupted_by_shutdown() =>
+                {
+                    let reason = shutdown
+                        .requested_reason()
+                        .unwrap_or(ActuationShutdownReason::SiblingFailure);
+                    break Err(self
+                        .recover_shutdown_interrupted_transmit(interrupted, reason)
+                        .await);
+                }
+                result => break result,
+            }
+        };
+        priority_stop.actor_stopped();
+        result
+    }
+
+    async fn run_until_exit(
+        &mut self,
+        requests: &mut mpsc::Receiver<ActorRequest>,
+        priority_stop: Arc<PriorityStopCoordinator>,
+        shutdown: Arc<ActuationShutdownSignal>,
+    ) -> Result<(), ActuationActorError> {
+        let mut read_buffer = [0_u8; SERIAL_READ_TURN_BYTES];
+        let mut prefer_host_request = false;
 
         loop {
+            if let Some(reason) = shutdown.requested_reason() {
+                return self.handle_shutdown(reason).await;
+            }
+            if let Some(generation) = priority_stop.requested_after(self.priority_stop_generation) {
+                self.handle_priority_stop_generation(generation).await?;
+                continue;
+            }
             let wake_at = self.next_wake_at().unwrap_or_else(|| {
                 Instant::now()
                     .checked_add(INACTIVE_TIMER_SLEEP)
                     .unwrap_or_else(Instant::now)
             });
+            if Instant::now() >= wake_at {
+                self.handle_timer(Instant::now()).await?;
+                continue;
+            }
             let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at));
             tokio::pin!(sleep);
             let owner_shutdown = shutdown.wait();
             tokio::pin!(owner_shutdown);
+            let priority_stop_requested = priority_stop.wait_after(self.priority_stop_generation);
+            tokio::pin!(priority_stop_requested);
 
-            tokio::select! {
-                biased;
-                reason = &mut owner_shutdown => {
-                    self.fail_all_pending(
-                        HostCommandResultCode::ForceStopped,
-                        StopResultCode::ControllerUnavailable,
-                    );
-                    self.issue_internal_stop(reason.force_stop_reason()).await?;
-                    self.clear_authority(true);
-                    return Ok(());
+            let wake = if prefer_host_request {
+                tokio::select! {
+                    biased;
+                    reason = &mut owner_shutdown => ActorWake::Shutdown(reason),
+                    generation = &mut priority_stop_requested => ActorWake::PriorityStop(generation),
+                    _ = &mut sleep => ActorWake::Timer,
+                    request = requests.recv() => ActorWake::HostRequest(request),
+                    read = self.transport.read(&mut read_buffer) => ActorWake::SerialRead(read),
                 }
-                read = self.transport.read(&mut read_buffer) => {
+            } else {
+                tokio::select! {
+                    biased;
+                    reason = &mut owner_shutdown => ActorWake::Shutdown(reason),
+                    generation = &mut priority_stop_requested => ActorWake::PriorityStop(generation),
+                    _ = &mut sleep => ActorWake::Timer,
+                    read = self.transport.read(&mut read_buffer) => ActorWake::SerialRead(read),
+                    request = requests.recv() => ActorWake::HostRequest(request),
+                }
+            };
+
+            match wake {
+                ActorWake::Shutdown(reason) => return self.handle_shutdown(reason).await,
+                ActorWake::PriorityStop(generation) => {
+                    self.handle_priority_stop_generation(generation).await?;
+                    self.publish_snapshot(Instant::now());
+                }
+                ActorWake::Timer => self.handle_timer(Instant::now()).await?,
+                ActorWake::HostRequest(request) => {
+                    prefer_host_request = false;
+                    let Some(request) = request else {
+                        self.fail_all_pending(
+                            HostCommandResultCode::ForceStopped,
+                            StopResultCode::ControllerUnavailable,
+                        );
+                        self.issue_internal_stop(ForceStopReason::TransportFault)
+                            .await?;
+                        self.clear_authority(true);
+                        return Ok(());
+                    };
+                    self.enforce_freshness(Instant::now()).await?;
+                    self.handle_host_request(request).await?;
+                    self.publish_snapshot(Instant::now());
+                }
+                ActorWake::SerialRead(read) => {
+                    prefer_host_request = true;
                     let count = match read {
                         Ok(value) => value,
                         Err(source) => {
@@ -631,7 +1392,7 @@ where
                                 .await
                             {
                                 log::error!(
-                                    "controller serial read failed and the best-effort stop also failed: {stop_error}"
+                                    "controller serial read failed and the bounded stop attempt also failed: {stop_error}"
                                 );
                             }
                             self.clear_authority(true);
@@ -639,13 +1400,16 @@ where
                         }
                     };
                     if count == 0 {
-                        self.fail_all_pending(HostCommandResultCode::ForceStopped, StopResultCode::ControllerUnavailable);
+                        self.fail_all_pending(
+                            HostCommandResultCode::ForceStopped,
+                            StopResultCode::ControllerUnavailable,
+                        );
                         if let Err(stop_error) = self
                             .issue_internal_stop(ForceStopReason::TransportFault)
                             .await
                         {
                             log::error!(
-                                "controller serial EOF prevented a confirmed stop; best-effort stop failed: {stop_error}"
+                                "controller serial EOF prevented a confirmed stop; bounded stop attempt failed: {stop_error}"
                             );
                         }
                         self.clear_authority(true);
@@ -655,25 +1419,16 @@ where
                         if let Some(decoded) = self.decoder.push(byte) {
                             let received_at = Instant::now();
                             match decoded {
-                                Ok(message) => self.handle_serial_message(message, received_at).await?,
-                                Err(error) => self.handle_framing_fault(error).await?,
+                                Ok(message) => {
+                                    self.handle_serial_message(message, received_at).await?
+                                }
+                                Err(error) => {
+                                    self.handle_framing_fault(error).await?;
+                                    break;
+                                }
                             }
                         }
                     }
-                }
-                request = requests.recv() => {
-                    let Some(request) = request else {
-                        self.fail_all_pending(HostCommandResultCode::ForceStopped, StopResultCode::ControllerUnavailable);
-                        self.issue_internal_stop(ForceStopReason::TransportFault).await?;
-                        self.clear_authority(true);
-                        return Ok(());
-                    };
-                    self.enforce_freshness(Instant::now()).await?;
-                    self.handle_host_request(request).await?;
-                    self.publish_snapshot(Instant::now());
-                }
-                _ = &mut sleep => {
-                    self.handle_timer(Instant::now()).await?;
                 }
             }
         }
@@ -684,6 +1439,7 @@ where
             let sent_at = match pending {
                 PendingOperation::Command(value) => value.serial_sent_at,
                 PendingOperation::Stop(value) => value.serial_sent_at,
+                PendingOperation::PriorityStop(value) => value.serial_sent_at,
             };
             sent_at.checked_add(self.config.serial_applied_ack_timeout)
         });
@@ -704,6 +1460,7 @@ where
             let sent_at = match pending {
                 PendingOperation::Command(value) => value.serial_sent_at,
                 PendingOperation::Stop(value) => value.serial_sent_at,
+                PendingOperation::PriorityStop(value) => value.serial_sent_at,
             };
             now.checked_duration_since(sent_at)
                 .is_none_or(|age| age >= self.config.serial_applied_ack_timeout)
@@ -722,6 +1479,10 @@ where
                         self.failed_stop_result(value.request, StopResultCode::StopAckTimeout);
                     let _ = value.response.send(Message::HostStopResult(result));
                 }
+                Some(PendingOperation::PriorityStop(value)) => self.publish_priority_stop(
+                    value.covers_through_generation,
+                    PriorityStopEvidence::Uncertain(StopResultCode::StopAckTimeout),
+                ),
                 None => {}
             }
             self.issue_internal_stop(ForceStopReason::TransportFault)
@@ -780,10 +1541,71 @@ where
                     .await?;
             }
             HostRequest::Status(value) => {
-                let result = self.status_report(value, Instant::now());
-                let _ = request.response.send(Message::StatusReport(result));
+                let calculated_at = Instant::now();
+                let result = self.status_report(value, calculated_at);
+                let _ = request
+                    .response
+                    .send_calculated_at(Message::StatusReport(result), calculated_at);
             }
         }
+        Ok(())
+    }
+
+    async fn handle_priority_stop_generation(
+        &mut self,
+        generation: u64,
+    ) -> Result<(), ActuationActorError> {
+        self.priority_stop_generation = self.priority_stop_generation.max(generation);
+        if let Some(PendingOperation::PriorityStop(pending)) = &mut self.pending {
+            pending.covers_through_generation = pending
+                .covers_through_generation
+                .max(self.priority_stop_generation);
+            return Ok(());
+        }
+
+        self.fail_all_pending(
+            HostCommandResultCode::ForceStopped,
+            StopResultCode::ControllerUnavailable,
+        );
+        self.owner = None;
+        self.heartbeat = None;
+        self.ready = None;
+        self.cached_stop = None;
+
+        let target_boot_id = self.observed_hello.map_or(TargetBootId::Any, |hello| {
+            TargetBootId::Exact(hello.message.boot_id)
+        });
+        let force_stop = ForceStop {
+            controller_uid: self.config.controller_uid,
+            target_boot_id,
+            request_id: match self.allocate_internal_request_id() {
+                Ok(request_id) => request_id,
+                Err(error) => {
+                    self.publish_priority_stop(
+                        self.priority_stop_generation,
+                        PriorityStopEvidence::Uncertain(StopResultCode::ControllerUnavailable),
+                    );
+                    return Err(error);
+                }
+            },
+            reason: ForceStopReason::Operator,
+        };
+        let serial_sent_at = match self.send_serial(Message::ForceStop(force_stop)).await {
+            Ok(sent_at) => sent_at,
+            Err(error) => {
+                self.publish_priority_stop(
+                    self.priority_stop_generation,
+                    PriorityStopEvidence::Uncertain(StopResultCode::ControllerUnavailable),
+                );
+                self.clear_authority(true);
+                return Err(error);
+            }
+        };
+        self.pending = Some(PendingOperation::PriorityStop(PendingPriorityStop {
+            force_stop,
+            covers_through_generation: self.priority_stop_generation,
+            serial_sent_at,
+        }));
         Ok(())
     }
 
@@ -812,7 +1634,7 @@ where
                 && heartbeat
                     .message
                     .readiness
-                    .is_stopped_ready_for_acquisition()
+                    .is_stopped_ready_for_session(self.config.controller_session_class)
                 && matches!(
                     heartbeat
                         .message
@@ -844,6 +1666,7 @@ where
                 epoch,
                 next_sequence: Some(V2CommandSequence::FIRST),
                 cached: None,
+                last_serial_command_at: None,
             });
             (AcquireResultCode::Granted, Some(epoch))
         } else {
@@ -876,9 +1699,12 @@ where
         source: SocketAddr,
         first_received_at: Instant,
         command: HostCommand,
-        response: oneshot::Sender<Message>,
+        response: ActorResponseSender,
     ) -> Result<(), ActuationActorError> {
-        if let Some(PendingOperation::Stop(_)) = &self.pending {
+        if matches!(
+            self.pending,
+            Some(PendingOperation::Stop(_) | PendingOperation::PriorityStop(_))
+        ) {
             let result =
                 self.failed_command_result(command, HostCommandResultCode::RejectedAtServer);
             let _ = response.send(Message::HostCommandResult(result));
@@ -931,8 +1757,10 @@ where
 
         if let Some(cached) = owner.cached {
             if cached.source == source && cached.command == command {
-                let result = cached.duplicate_result_at(Instant::now());
-                let _ = response.send(Message::HostCommandResult(result));
+                let calculated_at = Instant::now();
+                let result = cached.duplicate_result_at(calculated_at);
+                let _ =
+                    response.send_calculated_at(Message::HostCommandResult(result), calculated_at);
                 return Ok(());
             }
             if cached.command.sequence == command.sequence {
@@ -979,6 +1807,22 @@ where
             self.clear_authority(false);
             return Ok(());
         }
+        let previously_applied = owner
+            .cached
+            .map_or(TimerPwm::ZERO, |cached| cached.controller_result.timer_pwm);
+        if !candidate_command_step_is_admitted(
+            previously_applied,
+            command.requested_timer_pwm,
+            self.config.maximum_command_step_percent,
+        ) {
+            let result =
+                self.failed_command_result(command, HostCommandResultCode::RejectedAtServer);
+            let _ = response.send(Message::HostCommandResult(result));
+            self.issue_internal_stop(ForceStopReason::ControllerFault)
+                .await?;
+            self.clear_authority(false);
+            return Ok(());
+        }
 
         let now = Instant::now();
         let Some(heartbeat) = self.heartbeat else {
@@ -993,6 +1837,17 @@ where
             self.issue_internal_stop(ForceStopReason::TransportFault)
                 .await?;
             self.clear_authority(false);
+            return Ok(());
+        }
+        if self.owner.as_ref().is_some_and(|owner| {
+            owner.last_serial_command_at.is_some_and(|last| {
+                now.checked_duration_since(last)
+                    .is_none_or(|elapsed| elapsed < self.config.minimum_host_command_interval)
+            })
+        }) {
+            let result =
+                self.failed_command_result(command, HostCommandResultCode::RejectedAtServer);
+            let _ = response.send(Message::HostCommandResult(result));
             return Ok(());
         }
         let translated = match translate_command_deadline(
@@ -1023,6 +1878,9 @@ where
             expires_at: translated.controller_deadline_exclusive(),
             timer_pwm: command.requested_timer_pwm,
         };
+        // A new application can change physical output, so an older exact
+        // stop receipt is no longer current evidence for a later retry.
+        self.invalidate_stop_cache();
         let serial_sent_at = match self.send_serial(Message::ApplyPwm(apply)).await {
             Ok(value) => value,
             Err(error) => {
@@ -1033,6 +1891,9 @@ where
                 return Err(error);
             }
         };
+        if let Some(owner) = &mut self.owner {
+            owner.last_serial_command_at = Some(serial_sent_at);
+        }
         self.pending = Some(PendingOperation::Command(PendingCommand {
             source,
             command,
@@ -1048,7 +1909,7 @@ where
         &mut self,
         source: SocketAddr,
         request: HostStop,
-        response: oneshot::Sender<Message>,
+        response: ActorResponseSender,
     ) -> Result<(), ActuationActorError> {
         if request.controller_uid != self.config.controller_uid {
             let result = self.failed_stop_result(request, StopResultCode::IdentityMismatch);
@@ -1071,6 +1932,7 @@ where
                 return Ok(());
             }
         }
+        self.invalidate_stop_cache();
 
         if let Some(pending) = self.pending.take() {
             match pending {
@@ -1084,6 +1946,10 @@ where
                         self.failed_stop_result(value.request, StopResultCode::StopAckTimeout);
                     let _ = value.response.send(Message::HostStopResult(result));
                 }
+                PendingOperation::PriorityStop(value) => self.publish_priority_stop(
+                    value.covers_through_generation,
+                    PriorityStopEvidence::Uncertain(StopResultCode::ControllerUnavailable),
+                ),
             }
         }
         self.owner = None;
@@ -1156,6 +2022,12 @@ where
         hello: ControllerHello,
         _received_at: Instant,
     ) -> Result<(), ActuationActorError> {
+        // The firmware emits periodic discovery Hello records while its output
+        // is safe. An exact same-boot repeat carries no newer session or
+        // liveness evidence and must not revoke, renew, or recreate authority.
+        if self.hello.is_some_and(|admitted| admitted.message == hello) {
+            return Ok(());
+        }
         self.fail_all_pending(
             HostCommandResultCode::ControllerRestarted,
             StopResultCode::ControllerUnavailable,
@@ -1203,7 +2075,10 @@ where
             ready.controller_uid == hello.message.controller_uid
                 && ready.boot_id == hello.message.boot_id
                 && ready.capabilities == hello.message.capabilities
-                && ready.capabilities.supports_required_safety()
+                && ready.capabilities.classify_session_admission(
+                    self.config.expected_max_abs_pwm_percent,
+                    self.config.expected_physical_stop_semantics,
+                ) == Ok(self.config.expected_session_admission())
                 && ready.output_state.is_safe()
                 && ready.faults.is_clear()
         });
@@ -1243,30 +2118,12 @@ where
             }
             return Ok(());
         };
-        let before_first_application = self
-            .owner
-            .as_ref()
-            .is_none_or(|owner| owner.cached.is_none());
-        let readiness_exact = if before_first_application {
-            heartbeat.control_epoch.is_none()
-                && heartbeat.last_sequence.is_none()
-                && heartbeat.readiness.is_stopped_ready_for_acquisition()
-                && heartbeat.timer_pwm.is_zero()
-                && heartbeat.output_state.is_safe()
-                && matches!(
-                    heartbeat
-                        .expires_at
-                        .relation_to(heartbeat.controller_uptime),
-                    DeadlineRelation::Expired
-                )
-        } else {
-            heartbeat.control_epoch == Some(ready.message.control_epoch)
-                && heartbeat.last_sequence.is_some()
-                && heartbeat.readiness.is_ready()
-        };
+        if self.heartbeat_is_provably_delayed(heartbeat, ready) {
+            return Ok(());
+        }
         let exact_session = heartbeat.controller_uid == ready.message.controller_uid
             && heartbeat.boot_id == ready.message.boot_id
-            && readiness_exact
+            && self.heartbeat_state_is_exact(heartbeat, ready)
             && heartbeat.faults.is_clear();
         if !exact_session || !self.heartbeat_progresses(heartbeat) {
             self.protocol_fault(ForceStopReason::SessionReset).await?;
@@ -1286,6 +2143,108 @@ where
             let _ = startup_ready.send(());
         }
         Ok(())
+    }
+
+    /// Accept record-priority reordering without turning old telemetry into
+    /// liveness or authority.
+    ///
+    /// Applied-control records may overtake a complete best-effort heartbeat
+    /// which was already queued by the firmware. Ignore only a same-boot
+    /// heartbeat whose controller time and session position are both strictly
+    /// before stronger state already accepted by this actor. Stop/fault paths,
+    /// ambiguous wrapping comparisons, and same/newer contradictions remain
+    /// strict.
+    fn heartbeat_is_provably_delayed(&self, heartbeat: Heartbeat, ready: ReadySession) -> bool {
+        if self.faulted
+            || self.shutdown_in_progress
+            || self.last_internal_stop.is_some()
+            || matches!(
+                self.pending.as_ref(),
+                Some(PendingOperation::Stop(_) | PendingOperation::PriorityStop(_))
+            )
+            || heartbeat.controller_uid != ready.message.controller_uid
+            || heartbeat.boot_id != ready.message.boot_id
+        {
+            return false;
+        }
+
+        let Some(owner) = &self.owner else {
+            return self.cached_stop.is_none()
+                && heartbeat.control_epoch.is_none()
+                && heartbeat.last_sequence.is_none()
+                && controller_time_strictly_precedes(
+                    heartbeat.controller_uptime,
+                    ready.message.controller_uptime,
+                );
+        };
+        let Some(cached) = owner.cached else {
+            return heartbeat.control_epoch.is_none()
+                && heartbeat.last_sequence.is_none()
+                && controller_time_strictly_precedes(
+                    heartbeat.controller_uptime,
+                    ready.message.controller_uptime,
+                );
+        };
+        let state_strictly_precedes = match (heartbeat.control_epoch, heartbeat.last_sequence) {
+            (None, None) => true,
+            (Some(epoch), Some(sequence)) => {
+                epoch == owner.epoch && sequence.get() < cached.command.sequence.get()
+            }
+            _ => false,
+        };
+        state_strictly_precedes
+            && controller_time_strictly_precedes(
+                heartbeat.controller_uptime,
+                cached.controller_result.applied_at,
+            )
+    }
+
+    fn heartbeat_state_is_exact(&self, heartbeat: Heartbeat, ready: ReadySession) -> bool {
+        let before_first_application = self
+            .owner
+            .as_ref()
+            .is_none_or(|owner| owner.cached.is_none())
+            && heartbeat.control_epoch.is_none()
+            && heartbeat.last_sequence.is_none();
+        if before_first_application {
+            return heartbeat.control_epoch.is_none()
+                && heartbeat.last_sequence.is_none()
+                && self.heartbeat_is_stopped(heartbeat);
+        }
+
+        let established_identity = heartbeat.control_epoch == Some(ready.message.control_epoch)
+            && heartbeat.last_sequence.is_some();
+        if !established_identity {
+            return false;
+        }
+        if heartbeat.timer_pwm.is_zero() {
+            self.heartbeat_is_stopped(heartbeat)
+        } else {
+            heartbeat.output_state == OutputState::NonzeroPwm
+                && heartbeat
+                    .readiness
+                    .is_deadline_ready_for_session(self.config.controller_session_class)
+                && matches!(
+                    heartbeat
+                        .expires_at
+                        .relation_to(heartbeat.controller_uptime),
+                    DeadlineRelation::Future { .. }
+                )
+        }
+    }
+
+    fn heartbeat_is_stopped(&self, heartbeat: Heartbeat) -> bool {
+        heartbeat.timer_pwm.is_zero()
+            && heartbeat.output_state.is_safe()
+            && heartbeat
+                .readiness
+                .is_stopped_ready_for_session(self.config.controller_session_class)
+            && matches!(
+                heartbeat
+                    .expires_at
+                    .relation_to(heartbeat.controller_uptime),
+                DeadlineRelation::Expired
+            )
     }
 
     fn heartbeat_progresses(&self, heartbeat: Heartbeat) -> bool {
@@ -1315,18 +2274,27 @@ where
         };
         if let Some(PendingOperation::Command(pending)) = &self.pending {
             if heartbeat.last_sequence == Some(pending.command.sequence) {
-                return heartbeat.timer_pwm == pending.command.requested_timer_pwm
-                    && heartbeat.expires_at == pending.translated.controller_deadline_exclusive();
+                return if pending.command.requested_timer_pwm.is_zero() {
+                    heartbeat.timer_pwm.is_zero() && heartbeat.output_state.is_safe()
+                } else {
+                    heartbeat.timer_pwm == pending.command.requested_timer_pwm
+                        && heartbeat.expires_at
+                            == pending.translated.controller_deadline_exclusive()
+                };
             }
         }
         if let Some(cached) = owner.cached {
             if heartbeat.last_sequence != Some(cached.command.sequence) {
                 return false;
             }
-            if heartbeat.timer_pwm == cached.controller_result.timer_pwm {
-                return heartbeat.expires_at == cached.controller_result.expires_at;
+            if cached.controller_result.timer_pwm.is_zero()
+                && cached.controller_result.output_state.is_safe()
+            {
+                return heartbeat.timer_pwm.is_zero() && heartbeat.output_state.is_safe();
             }
-            return heartbeat.timer_pwm.is_zero() && heartbeat.output_state.is_safe();
+            return heartbeat.timer_pwm == cached.controller_result.timer_pwm
+                && heartbeat.output_state == cached.controller_result.output_state
+                && heartbeat.expires_at == cached.controller_result.expires_at;
         }
         heartbeat.last_sequence.is_none()
             && heartbeat.timer_pwm.is_zero()
@@ -1353,7 +2321,7 @@ where
         };
         let pending = match pending {
             PendingOperation::Command(value) => value,
-            other @ PendingOperation::Stop(_) => {
+            other @ (PendingOperation::Stop(_) | PendingOperation::PriorityStop(_)) => {
                 self.pending = Some(other);
                 return Ok(());
             }
@@ -1366,15 +2334,23 @@ where
             && applied.expires_at == pending.translated.controller_deadline_exclusive();
         let exact = session_exact && command_exact;
         let (result_code, rejection_reason) = applied_result_disposition(applied.result);
-        let applied_shape = result_code.is_some()
-            && applied.timer_pwm == pending.command.requested_timer_pwm
+        let requested_pwm = pending.command.requested_timer_pwm;
+        let application_shape_exact = if requested_pwm.is_zero() {
+            matches!(
+                applied.result,
+                AppliedResultCode::AppliedNew | AppliedResultCode::Stopped
+            ) && applied.output_state.is_safe()
+        } else {
+            applied.result == AppliedResultCode::AppliedNew
+                && applied.output_state == OutputState::NonzeroPwm
+        };
+        let applied_shape = application_shape_exact
+            && applied.timer_pwm == requested_pwm
             && applied.faults.is_clear()
             && applied
                 .applied_at
                 .wrapping_elapsed_since(pending.controller_uptime_reference)
-                < 0x8000_0000
-            && (pending.command.requested_timer_pwm.is_zero()
-                || applied.result != AppliedResultCode::Stopped);
+                < 0x8000_0000;
         if !exact || !applied_shape {
             let code = if exact {
                 HostCommandResultCode::RejectedByController
@@ -1468,7 +2444,7 @@ where
         }
         let _ = pending
             .response
-            .send(Message::HostCommandResult(host_result));
+            .send_calculated_at(Message::HostCommandResult(host_result), received_at);
         Ok(())
     }
 
@@ -1507,6 +2483,31 @@ where
                 let failed =
                     self.failed_stop_result(pending.request, StopResultCode::ControllerFaulted);
                 let _ = pending.response.send(Message::HostStopResult(failed));
+                self.protocol_fault(ForceStopReason::SessionReset).await?;
+                return Ok(());
+            }
+            Some(PendingOperation::PriorityStop(pending)) => {
+                let exact = result.controller_uid == pending.force_stop.controller_uid
+                    && result.request_id == pending.force_stop.request_id
+                    && self.stop_result_boot_matches(pending.force_stop.target_boot_id, result);
+                if exact {
+                    self.publish_priority_stop(
+                        pending.covers_through_generation,
+                        PriorityStopEvidence::Exact(result),
+                    );
+                    self.owner = None;
+                    self.heartbeat = None;
+                    return Ok(());
+                }
+                if self.internal_stop_result_matches(result) {
+                    self.last_internal_stop = None;
+                    self.pending = Some(PendingOperation::PriorityStop(pending));
+                    return Ok(());
+                }
+                self.publish_priority_stop(
+                    pending.covers_through_generation,
+                    PriorityStopEvidence::Uncertain(StopResultCode::ControllerFaulted),
+                );
                 self.protocol_fault(ForceStopReason::SessionReset).await?;
                 return Ok(());
             }
@@ -1560,7 +2561,7 @@ where
             && hello.physical_stop_semantics == self.config.expected_physical_stop_semantics
             && hello.max_abs_pwm_percent == self.config.expected_max_abs_pwm_percent
             && hello.max_abs_pwm_percent.grants_motion_authority()
-            && hello.capabilities.supports_required_safety()
+            && hello.session_admission() == Ok(self.config.expected_session_admission())
             && hello.output_state.is_safe()
     }
 
@@ -1573,22 +2574,33 @@ where
         let bootstrap_stopped = self.owner.as_ref().is_some_and(|owner| {
             (owner.cached.is_none() && command.is_initial_zero_acquisition())
                 || owner.cached.is_some_and(|cached| {
-                    cached.command.sequence == V2CommandSequence::FIRST
-                        && cached.controller_result.timer_pwm.is_zero()
+                    cached.controller_result.timer_pwm.is_zero()
                         && cached.controller_result.output_state.is_safe()
                 })
         });
         let readiness_exact = if bootstrap_stopped {
-            heartbeat.message.control_epoch.is_none()
-                && heartbeat.message.last_sequence.is_none()
-                && heartbeat
-                    .message
-                    .readiness
-                    .is_stopped_ready_for_acquisition()
+            let stopped_identity = self.owner.as_ref().is_some_and(|owner| {
+                owner.cached.map_or_else(
+                    || {
+                        heartbeat.message.control_epoch.is_none()
+                            && heartbeat.message.last_sequence.is_none()
+                    },
+                    |cached| {
+                        (heartbeat.message.control_epoch.is_none()
+                            && heartbeat.message.last_sequence.is_none())
+                            || (heartbeat.message.control_epoch == Some(command.control_epoch)
+                                && heartbeat.message.last_sequence == Some(cached.command.sequence))
+                    },
+                )
+            });
+            stopped_identity && self.heartbeat_is_stopped(heartbeat.message)
         } else {
             heartbeat.message.control_epoch == Some(command.control_epoch)
                 && heartbeat.message.last_sequence.is_some()
-                && heartbeat.message.readiness.is_ready()
+                && heartbeat
+                    .message
+                    .readiness
+                    .is_deadline_ready_for_session(self.config.controller_session_class)
         };
         now.checked_duration_since(heartbeat.received_at)
             .is_some_and(|age| age < self.config.maximum_heartbeat_age)
@@ -1617,17 +2629,211 @@ where
     }
 
     async fn send_serial(&mut self, message: Message) -> Result<Instant, ActuationActorError> {
+        let is_force_stop = matches!(&message, Message::ForceStop(_));
         let record = UartRecord::encode(message).map_err(ActuationActorError::Encode)?;
         let sent_at = Instant::now();
-        self.transport
-            .write_all(record.as_bytes())
-            .await
-            .map_err(ActuationActorError::SerialWrite)?;
-        self.transport
-            .flush()
-            .await
-            .map_err(ActuationActorError::SerialFlush)?;
+        let shutdown = if self.shutdown_in_progress {
+            None
+        } else {
+            self.shutdown.as_deref()
+        };
+        let priority_stop = if self.shutdown_in_progress || is_force_stop {
+            None
+        } else {
+            self.priority_stop
+                .as_deref()
+                .map(|priority_stop| (priority_stop, self.priority_stop_generation))
+        };
+        transmit_serial_record(
+            &mut self.transport,
+            record.as_bytes(),
+            self.config.serial_transmit_timeout,
+            shutdown,
+            priority_stop,
+        )
+        .await
+        .map_err(ActuationActorError::SerialTransmit)?;
         Ok(sent_at)
+    }
+
+    async fn handle_shutdown(
+        &mut self,
+        reason: ActuationShutdownReason,
+    ) -> Result<(), ActuationActorError> {
+        self.shutdown_in_progress = true;
+        self.fail_all_pending(
+            HostCommandResultCode::ForceStopped,
+            StopResultCode::ControllerUnavailable,
+        );
+        self.issue_internal_stop(reason.force_stop_reason()).await?;
+        self.clear_authority(true);
+        let result = self.await_internal_stop_result().await?;
+        if result.result.proves_controller_stop()
+            && result.output_state.is_safe()
+            && result.faults.is_clear()
+        {
+            Ok(())
+        } else {
+            Err(ActuationActorError::ShutdownStopNotConfirmed { result })
+        }
+    }
+
+    async fn recover_priority_stop_interrupted_transmit(
+        &mut self,
+        interrupted: SerialTransmitError,
+    ) -> Result<(), ActuationActorError> {
+        debug_assert!(interrupted.interrupted_by_priority_stop());
+        log::warn!(
+            "priority HostStop interrupted an ordinary controller record; preserving transmit uncertainty and resynchronizing before ForceStop: {interrupted}"
+        );
+        self.fail_all_pending(
+            HostCommandResultCode::ForceStopped,
+            StopResultCode::ControllerUnavailable,
+        );
+
+        if interrupted.left_partial_record() {
+            if let Err(source) = transmit_serial_record(
+                &mut self.transport,
+                &UART_RECORD_DELIMITER,
+                self.config.serial_transmit_timeout,
+                None,
+                None,
+            )
+            .await
+            {
+                if let Some(priority_stop) = &self.priority_stop {
+                    let through_generation = priority_stop
+                        .requested_after(self.priority_stop_generation)
+                        .unwrap_or(self.priority_stop_generation);
+                    priority_stop.publish(
+                        through_generation,
+                        PriorityStopEvidence::Uncertain(StopResultCode::ControllerUnavailable),
+                    );
+                }
+                self.clear_authority(true);
+                return Err(ActuationActorError::SerialTransmit(source));
+            }
+        }
+
+        // Coordinated shutdown remains the terminal owner. The next actor turn
+        // handles it before beginning a host-priority stop transaction.
+        if self
+            .shutdown
+            .as_deref()
+            .and_then(ActuationShutdownSignal::requested_reason)
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let generation = self
+            .priority_stop
+            .as_deref()
+            .and_then(|priority_stop| priority_stop.requested_after(self.priority_stop_generation))
+            .unwrap_or(self.priority_stop_generation);
+        self.handle_priority_stop_generation(generation).await
+    }
+
+    async fn recover_shutdown_interrupted_transmit(
+        &mut self,
+        interrupted: SerialTransmitError,
+        reason: ActuationShutdownReason,
+    ) -> ActuationActorError {
+        debug_assert!(interrupted.interrupted_by_shutdown());
+        self.shutdown_in_progress = true;
+        self.fail_all_pending(
+            HostCommandResultCode::ForceStopped,
+            StopResultCode::ControllerUnavailable,
+        );
+
+        let resynchronization = if interrupted.left_partial_record() {
+            match transmit_serial_record(
+                &mut self.transport,
+                &UART_RECORD_DELIMITER,
+                self.config.serial_transmit_timeout,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(()) => SerialResynchronizationOutcome::DelimiterTransmitted,
+                Err(source) => SerialResynchronizationOutcome::Failed(source),
+            }
+        } else {
+            SerialResynchronizationOutcome::NotRequired
+        };
+
+        let force_stop = match self.issue_internal_stop(reason.force_stop_reason()).await {
+            Ok(()) => {
+                self.clear_authority(true);
+                match self.await_internal_stop_result().await {
+                    Ok(result)
+                        if result.result.proves_controller_stop()
+                            && result.output_state.is_safe() =>
+                    {
+                        ShutdownForceStopOutcome::Confirmed(result)
+                    }
+                    Ok(result) => ShutdownForceStopOutcome::ExactButUnconfirmed(result),
+                    Err(source) => ShutdownForceStopOutcome::Uncertain(Box::new(source)),
+                }
+            }
+            Err(source) => {
+                self.clear_authority(true);
+                ShutdownForceStopOutcome::Uncertain(Box::new(source))
+            }
+        };
+        ActuationActorError::ShutdownInterruptedTransmit {
+            interrupted,
+            recovery: Box::new(ShutdownInterruptedTransmitRecovery {
+                resynchronization,
+                force_stop,
+            }),
+        }
+    }
+
+    async fn await_internal_stop_result(&mut self) -> Result<HostStopResult, ActuationActorError> {
+        let maximum_wait = self.config.serial_applied_ack_timeout;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(maximum_wait)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let mut read_buffer = [0_u8; SERIAL_READ_TURN_BYTES];
+        loop {
+            let count = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(ActuationActorError::ShutdownStopConfirmationTimedOut {
+                        maximum_wait,
+                    });
+                }
+                read = self.transport.read(&mut read_buffer) => {
+                    match read {
+                        Ok(0) => return Err(ActuationActorError::SerialEof),
+                        Ok(count) => count,
+                        Err(source) => return Err(ActuationActorError::SerialRead(source)),
+                    }
+                }
+            };
+            for &byte in &read_buffer[..count] {
+                let Some(decoded) = self.decoder.push(byte) else {
+                    continue;
+                };
+                let message = match decoded {
+                    Ok(message) => message,
+                    Err(error) => {
+                        log::error!(
+                            "framing fault while awaiting shutdown stop confirmation: {error}"
+                        );
+                        continue;
+                    }
+                };
+                if let Message::HostStopResult(result) = message {
+                    if self.internal_stop_result_matches(result) {
+                        self.last_internal_stop = None;
+                        return Ok(result);
+                    }
+                }
+            }
+        }
     }
 
     fn allocate_internal_request_id(&mut self) -> Result<RequestId, ActuationActorError> {
@@ -1660,6 +2866,11 @@ where
         target_boot_id: TargetBootId,
         reason: ForceStopReason,
     ) -> Result<(), ActuationActorError> {
+        // A new controller stop transaction means an older host-correlated
+        // receipt no longer proves the result of a request received now. This
+        // must happen before allocation/transmit so even an uncertain attempt
+        // cannot leave stale evidence available for replay.
+        self.invalidate_stop_cache();
         let stop = ForceStop {
             controller_uid,
             target_boot_id,
@@ -1673,12 +2884,25 @@ where
 
     fn clear_authority(&mut self, clear_session: bool) {
         self.owner = None;
+        if let Some(PendingOperation::PriorityStop(value)) = &self.pending {
+            self.publish_priority_stop(
+                value.covers_through_generation,
+                PriorityStopEvidence::Uncertain(StopResultCode::ControllerUnavailable),
+            );
+        }
         self.pending = None;
         self.heartbeat = None;
         if clear_session {
             self.hello = None;
             self.ready = None;
-            self.cached_stop = None;
+            self.invalidate_stop_cache();
+        }
+    }
+
+    fn invalidate_stop_cache(&mut self) {
+        self.cached_stop = None;
+        if let Some(priority_stop) = &self.priority_stop {
+            priority_stop.invalidate_cache();
         }
     }
 
@@ -1702,6 +2926,12 @@ where
         })
     }
 
+    fn publish_priority_stop(&self, through_generation: u64, evidence: PriorityStopEvidence) {
+        if let Some(priority_stop) = &self.priority_stop {
+            priority_stop.publish(through_generation, evidence);
+        }
+    }
+
     fn fail_all_pending(&mut self, command_code: HostCommandResultCode, stop_code: StopResultCode) {
         let Some(pending) = self.pending.take() else {
             return;
@@ -1715,6 +2945,10 @@ where
                 let result = self.failed_stop_result(value.request, stop_code);
                 let _ = value.response.send(Message::HostStopResult(result));
             }
+            PendingOperation::PriorityStop(value) => self.publish_priority_stop(
+                value.covers_through_generation,
+                PriorityStopEvidence::Uncertain(stop_code),
+            ),
         }
     }
 
@@ -1723,6 +2957,9 @@ where
         command: HostCommand,
         code: HostCommandResultCode,
     ) -> HostCommandResult {
+        // Frozen V2 carries fixed-width output fields even when `code` proves
+        // no controller observation. These are compatibility placeholders;
+        // host/API/UI consumers must use `HostCommandResult::output_evidence`.
         HostCommandResult {
             controller_uid: command.controller_uid,
             boot_id: command.boot_id,
@@ -1742,6 +2979,8 @@ where
     }
 
     fn failed_stop_result(&self, request: HostStop, code: StopResultCode) -> HostStopResult {
+        // As above, a non-confirming stop code makes all concrete output bits
+        // unproven. `HostStopResult::output_evidence` prevents their promotion.
         HostStopResult {
             controller_uid: self.config.controller_uid,
             observed_boot_id: self.observed_hello.map_or(request.target_boot_id, |hello| {
@@ -1862,14 +3101,25 @@ where
             request_id: RequestId::new(0),
         };
         let status = self.status_report(query, now);
+        let output = self
+            .heartbeat
+            .filter(|heartbeat| {
+                now.checked_duration_since(heartbeat.received_at)
+                    .is_some_and(|age| age < self.config.maximum_heartbeat_age)
+            })
+            .map_or(ActuationOutputEvidence::Unknown, |heartbeat| {
+                ActuationOutputEvidence::Observed(ObservedActuationOutput {
+                    controller_uptime: heartbeat.message.controller_uptime,
+                    output_state: heartbeat.message.output_state,
+                    controller_timer_pwm: heartbeat.message.timer_pwm,
+                    faults: heartbeat.message.faults,
+                })
+            });
         ActuationSnapshot {
             status: status.status,
             observed_boot_id: status.observed_boot_id,
             control_epoch: status.control_epoch,
-            controller_uptime: status.controller_uptime,
-            output_state: status.output_state,
-            controller_timer_pwm: status.controller_timer_pwm,
-            faults: status.faults,
+            output,
             last_sequence: self
                 .owner
                 .as_ref()
@@ -1880,6 +3130,187 @@ where
 
     fn publish_snapshot(&self, now: Instant) {
         self.telemetry.update_actuation(self.snapshot(now));
+    }
+}
+
+const fn controller_time_strictly_precedes(
+    candidate: ControllerUptimeMsWrapping,
+    accepted: ControllerUptimeMsWrapping,
+) -> bool {
+    matches!(accepted.wrapping_elapsed_since(candidate), 1..0x8000_0000)
+}
+
+async fn transmit_serial_record<Transport>(
+    transport: &mut Transport,
+    record: &[u8],
+    maximum_duration: Duration,
+    shutdown: Option<&ActuationShutdownSignal>,
+    priority_stop: Option<(&PriorityStopCoordinator, u64)>,
+) -> Result<(), SerialTransmitError>
+where
+    Transport: AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now()
+        .checked_add(maximum_duration)
+        .unwrap_or_else(tokio::time::Instant::now);
+    let mut written_bytes = 0;
+    while written_bytes < record.len() {
+        let write = transport.write(&record[written_bytes..]);
+        tokio::pin!(write);
+        let priority_stop_requested = wait_for_priority_stop(priority_stop);
+        tokio::pin!(priority_stop_requested);
+        let count = match shutdown {
+            Some(shutdown) => {
+                tokio::select! {
+                    biased;
+                    _reason = shutdown.wait() => {
+                        return Err(SerialTransmitError::Interrupted {
+                            phase: SerialTransmitPhase::Write,
+                            cause: SerialTransmitInterruption::ShutdownRequested,
+                            written_bytes,
+                            record_bytes: record.len(),
+                            maximum_duration,
+                        });
+                    }
+                    _generation = &mut priority_stop_requested => {
+                        return Err(SerialTransmitError::Interrupted {
+                            phase: SerialTransmitPhase::Write,
+                            cause: SerialTransmitInterruption::PriorityStopRequested,
+                            written_bytes,
+                            record_bytes: record.len(),
+                            maximum_duration,
+                        });
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return Err(SerialTransmitError::Interrupted {
+                            phase: SerialTransmitPhase::Write,
+                            cause: SerialTransmitInterruption::DeadlineExceeded,
+                            written_bytes,
+                            record_bytes: record.len(),
+                            maximum_duration,
+                        });
+                    }
+                    result = &mut write => result,
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    _generation = &mut priority_stop_requested => {
+                        return Err(SerialTransmitError::Interrupted {
+                            phase: SerialTransmitPhase::Write,
+                            cause: SerialTransmitInterruption::PriorityStopRequested,
+                            written_bytes,
+                            record_bytes: record.len(),
+                            maximum_duration,
+                        });
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return Err(SerialTransmitError::Interrupted {
+                            phase: SerialTransmitPhase::Write,
+                            cause: SerialTransmitInterruption::DeadlineExceeded,
+                            written_bytes,
+                            record_bytes: record.len(),
+                            maximum_duration,
+                        });
+                    }
+                    result = &mut write => result,
+                }
+            }
+        }
+        .map_err(|source| SerialTransmitError::Write {
+            source,
+            written_bytes,
+            record_bytes: record.len(),
+        })?;
+        if count == 0 {
+            return Err(SerialTransmitError::Write {
+                source: io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "serial write returned zero bytes",
+                ),
+                written_bytes,
+                record_bytes: record.len(),
+            });
+        }
+        written_bytes = written_bytes.saturating_add(count);
+    }
+
+    let flush = transport.flush();
+    tokio::pin!(flush);
+    let priority_stop_requested = wait_for_priority_stop(priority_stop);
+    tokio::pin!(priority_stop_requested);
+    let result = match shutdown {
+        Some(shutdown) => {
+            tokio::select! {
+                biased;
+                _reason = shutdown.wait() => {
+                    return Err(SerialTransmitError::Interrupted {
+                        phase: SerialTransmitPhase::Flush,
+                        cause: SerialTransmitInterruption::ShutdownRequested,
+                        written_bytes,
+                        record_bytes: record.len(),
+                        maximum_duration,
+                    });
+                }
+                _generation = &mut priority_stop_requested => {
+                    return Err(SerialTransmitError::Interrupted {
+                        phase: SerialTransmitPhase::Flush,
+                        cause: SerialTransmitInterruption::PriorityStopRequested,
+                        written_bytes,
+                        record_bytes: record.len(),
+                        maximum_duration,
+                    });
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(SerialTransmitError::Interrupted {
+                        phase: SerialTransmitPhase::Flush,
+                        cause: SerialTransmitInterruption::DeadlineExceeded,
+                        written_bytes,
+                        record_bytes: record.len(),
+                        maximum_duration,
+                    });
+                }
+                result = &mut flush => result,
+            }
+        }
+        None => {
+            tokio::select! {
+                biased;
+                _generation = &mut priority_stop_requested => {
+                    return Err(SerialTransmitError::Interrupted {
+                        phase: SerialTransmitPhase::Flush,
+                        cause: SerialTransmitInterruption::PriorityStopRequested,
+                        written_bytes,
+                        record_bytes: record.len(),
+                        maximum_duration,
+                    });
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(SerialTransmitError::Interrupted {
+                        phase: SerialTransmitPhase::Flush,
+                        cause: SerialTransmitInterruption::DeadlineExceeded,
+                        written_bytes,
+                        record_bytes: record.len(),
+                        maximum_duration,
+                    });
+                }
+                result = &mut flush => result,
+            }
+        }
+    };
+    result.map_err(|source| SerialTransmitError::Flush {
+        source,
+        record_bytes: record.len(),
+    })
+}
+
+async fn wait_for_priority_stop(priority_stop: Option<(&PriorityStopCoordinator, u64)>) -> u64 {
+    match priority_stop {
+        Some((priority_stop, completed_generation)) => {
+            priority_stop.wait_after(completed_generation).await
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -1964,23 +3395,6 @@ impl std::error::Error for UdpServiceError {
     }
 }
 
-/// Serve binary V2 datagrams. Each datagram is parsed once and only the four
-/// host request kinds enter the actor. Work is bounded; backpressure reaches
-/// the UDP receive queue rather than creating an unbounded task population.
-/// Keep the loopback V2 endpoint truthful when no controller authority was
-/// configured. Status remains queryable and no request can reach actuation.
-pub async fn unavailable_udp_service(bind: SocketAddr) -> Result<(), UdpServiceError> {
-    udp_service_inner(bind, None).await
-}
-
-async fn udp_service_inner(
-    bind: SocketAddr,
-    handle: Option<ActuationHandle>,
-) -> Result<(), UdpServiceError> {
-    let socket = bind_udp_socket(bind).await?;
-    udp_service_on_socket(socket, handle).await
-}
-
 pub(crate) async fn bind_udp_socket(bind: SocketAddr) -> Result<UdpSocket, UdpServiceError> {
     if !bind.ip().is_loopback() || bind.port() == 0 {
         return Err(UdpServiceError::BindMustBeLoopback(bind));
@@ -1988,6 +3402,7 @@ pub(crate) async fn bind_udp_socket(bind: SocketAddr) -> Result<UdpSocket, UdpSe
     UdpSocket::bind(bind).await.map_err(UdpServiceError::Bind)
 }
 
+#[cfg(test)]
 async fn udp_service_on_socket(
     socket: UdpSocket,
     handle: Option<ActuationHandle>,
@@ -2003,6 +3418,45 @@ pub(crate) async fn udp_service_on_socket_until(
     udp_service_on_socket_inner(socket, Some(handle), Some(shutdown)).await
 }
 
+enum PreparedUdpRequest {
+    Ordinary(HostRequest),
+    PriorityUnavailable(HostStop),
+    PriorityLatched {
+        coordinator: Arc<PriorityStopCoordinator>,
+        request: HostStop,
+        admission: Result<PreparedPriorityStopRequest, ActuationHandleError>,
+    },
+}
+
+impl PreparedUdpRequest {
+    fn new(handle: Option<&ActuationHandle>, request: HostRequest, source: SocketAddr) -> Self {
+        match (handle, request) {
+            (Some(handle), HostRequest::Stop(request)) => Self::PriorityLatched {
+                coordinator: Arc::clone(&handle.priority_stop),
+                request,
+                admission: handle
+                    .priority_stop
+                    .prepare_latched_request(source, request),
+            },
+            (None, HostRequest::Stop(request)) => Self::PriorityUnavailable(request),
+            (_, request) => Self::Ordinary(request),
+        }
+    }
+
+    const fn request(&self) -> HostRequest {
+        match self {
+            Self::Ordinary(request) => *request,
+            Self::PriorityUnavailable(request) | Self::PriorityLatched { request, .. } => {
+                HostRequest::Stop(*request)
+            }
+        }
+    }
+
+    const fn is_priority(&self) -> bool {
+        !matches!(self, Self::Ordinary(_))
+    }
+}
+
 async fn udp_service_on_socket_inner(
     socket: UdpSocket,
     handle: Option<ActuationHandle>,
@@ -2010,22 +3464,14 @@ async fn udp_service_on_socket_inner(
 ) -> Result<(), UdpServiceError> {
     let socket = Arc::new(socket);
     let mut buffer = [0_u8; MAX_RAW_FRAME_BYTES + 1];
-    let mut exchanges = JoinSet::new();
+    let mut ordinary_exchanges = JoinSet::new();
+    let mut priority_exchanges = JoinSet::new();
+    let ordinary_response_slots = Arc::new(Semaphore::new(MAX_UDP_ORDINARY_EXCHANGES_IN_FLIGHT));
+    let priority_response_slots = Arc::new(Semaphore::new(MAX_UDP_PRIORITY_EXCHANGES_IN_FLIGHT));
 
     'serving: loop {
-        while exchanges.len() >= MAX_UDP_EXCHANGES_IN_FLIGHT {
-            tokio::select! {
-                biased;
-                () = wait_for_udp_shutdown(&mut shutdown) => {
-                    break 'serving;
-                }
-                result = exchanges.join_next() => {
-                    if let Some(result) = result {
-                        log_udp_task_result(result);
-                    }
-                }
-            }
-        }
+        drain_completed_udp_exchanges(&mut ordinary_exchanges);
+        drain_completed_udp_exchanges(&mut priority_exchanges);
         let received = tokio::select! {
             biased;
             () = wait_for_udp_shutdown(&mut shutdown) => {
@@ -2049,47 +3495,216 @@ async fn udp_service_on_socket_inner(
                 continue;
             }
         };
+        // Priority admission is synchronous with datagram receipt. Even when
+        // every bounded response slot is occupied, dropping the prepared
+        // waiter below cannot undo the generation already latched for the
+        // serial actor.
+        let prepared_request = PreparedUdpRequest::new(handle.as_ref(), request, source);
+        let priority = prepared_request.is_priority();
+        let response_slot = if priority {
+            Arc::clone(&priority_response_slots).try_acquire_owned()
+        } else {
+            Arc::clone(&ordinary_response_slots).try_acquire_owned()
+        };
+        let response_slot = match response_slot {
+            Ok(response_slot) => response_slot,
+            Err(_) => {
+                let request = prepared_request.request();
+                let response = match prepared_request {
+                    PreparedUdpRequest::PriorityLatched {
+                        admission: Ok(PreparedPriorityStopRequest::Immediate(result)),
+                        ..
+                    } => TimedActorResponse {
+                        message: Message::HostStopResult(result),
+                        calculated_at: Instant::now(),
+                    },
+                    PreparedUdpRequest::PriorityLatched {
+                        admission: Err(error),
+                        ..
+                    } => {
+                        log::error!("V2 priority stop could not be latched for {source}: {error}");
+                        TimedActorResponse {
+                            message: unavailable_response(request),
+                            calculated_at: Instant::now(),
+                        }
+                    }
+                    PreparedUdpRequest::PriorityLatched {
+                        admission: Ok(PreparedPriorityStopRequest::Pending(_)),
+                        ..
+                    }
+                    | PreparedUdpRequest::PriorityUnavailable(_)
+                    | PreparedUdpRequest::Ordinary(_) => TimedActorResponse {
+                        message: unavailable_response(request),
+                        calculated_at: Instant::now(),
+                    },
+                };
+                if let Err(error) =
+                    try_send_udp_response(&socket, source, request, first_received_at, response)
+                {
+                    log::warn!(
+                    "bounded V2 UDP overload response to {source} could not be emitted: {error}"
+                );
+                }
+                continue;
+            }
+        };
+
         let socket = Arc::clone(&socket);
         let handle = handle.clone();
-        exchanges.spawn(async move {
-            let response = match handle {
-                Some(handle) => {
-                    match handle
-                        .exchange(source, first_received_at, request.message())
-                        .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => {
-                            log::error!("V2 serial actor could not answer {source}: {error}");
-                            unavailable_response(request)
+        let exchange = async move {
+            let _response_slot = response_slot;
+            run_udp_exchange(socket, handle, source, first_received_at, prepared_request).await
+        };
+        if priority {
+            priority_exchanges.spawn(exchange);
+        } else {
+            ordinary_exchanges.spawn(exchange);
+        }
+    }
+
+    abort_udp_exchanges(&mut priority_exchanges).await;
+    abort_udp_exchanges(&mut ordinary_exchanges).await;
+    Ok(())
+}
+
+async fn run_udp_exchange(
+    socket: Arc<UdpSocket>,
+    handle: Option<ActuationHandle>,
+    source: SocketAddr,
+    first_received_at: Instant,
+    prepared_request: PreparedUdpRequest,
+) -> Result<(), UdpExchangeError> {
+    let request = prepared_request.request();
+    let response = match prepared_request {
+        PreparedUdpRequest::PriorityLatched {
+            coordinator,
+            request: stop,
+            admission: Ok(prepared),
+        } => {
+            match coordinator
+                .await_prepared_request(source, stop, prepared)
+                .await
+            {
+                Ok(result) => TimedActorResponse {
+                    message: Message::HostStopResult(result),
+                    calculated_at: Instant::now(),
+                },
+                Err(error) => {
+                    log::error!("V2 serial actor could not answer {source}: {error}");
+                    TimedActorResponse {
+                        message: unavailable_response(request),
+                        calculated_at: Instant::now(),
+                    }
+                }
+            }
+        }
+        PreparedUdpRequest::PriorityLatched {
+            admission: Err(error),
+            ..
+        } => {
+            log::error!("V2 priority stop could not be latched for {source}: {error}");
+            TimedActorResponse {
+                message: unavailable_response(request),
+                calculated_at: Instant::now(),
+            }
+        }
+        PreparedUdpRequest::PriorityUnavailable(_) => TimedActorResponse {
+            message: unavailable_response(request),
+            calculated_at: Instant::now(),
+        },
+        PreparedUdpRequest::Ordinary(request) => match handle {
+            Some(handle) => {
+                match handle
+                    .exchange_timed(source, first_received_at, request)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        log::error!("V2 serial actor could not answer {source}: {error}");
+                        TimedActorResponse {
+                            message: unavailable_response(request),
+                            calculated_at: Instant::now(),
                         }
                     }
                 }
-                None => unavailable_response(request),
-            };
-            let (sent, expected) = loop {
-                let emission_response =
-                    response_for_udp_emission(request, first_received_at, response, Instant::now());
-                let frame =
-                    RawFrame::encode(emission_response).map_err(UdpExchangeError::Encode)?;
-                match socket.try_send_to(frame.as_bytes(), source) {
-                    Ok(sent) => break (sent, frame.len()),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        socket.writable().await.map_err(UdpExchangeError::Send)?;
-                    }
-                    Err(error) => return Err(UdpExchangeError::Send(error)),
-                }
-            };
-            if sent != expected {
-                return Err(UdpExchangeError::ShortSend {
-                    expected,
-                    actual: sent,
-                });
             }
-            Ok(())
+            None => TimedActorResponse {
+                message: unavailable_response(request),
+                calculated_at: Instant::now(),
+            },
+        },
+    };
+    send_udp_response(&socket, source, request, first_received_at, response).await
+}
+
+async fn send_udp_response(
+    socket: &UdpSocket,
+    source: SocketAddr,
+    request: HostRequest,
+    first_received_at: Instant,
+    response: TimedActorResponse,
+) -> Result<(), UdpExchangeError> {
+    let frame = udp_response_frame(request, first_received_at, response)?;
+    let (sent, expected) = loop {
+        match socket.try_send_to(frame.as_bytes(), source) {
+            Ok(sent) => break (sent, frame.len()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                socket.writable().await.map_err(UdpExchangeError::Send)?;
+            }
+            Err(error) => return Err(UdpExchangeError::Send(error)),
+        }
+    };
+    if sent != expected {
+        return Err(UdpExchangeError::ShortSend {
+            expected,
+            actual: sent,
         });
     }
+    Ok(())
+}
 
+fn try_send_udp_response(
+    socket: &UdpSocket,
+    source: SocketAddr,
+    request: HostRequest,
+    first_received_at: Instant,
+    response: TimedActorResponse,
+) -> Result<(), UdpExchangeError> {
+    let frame = udp_response_frame(request, first_received_at, response)?;
+    let sent = socket
+        .try_send_to(frame.as_bytes(), source)
+        .map_err(UdpExchangeError::Send)?;
+    if sent != frame.len() {
+        return Err(UdpExchangeError::ShortSend {
+            expected: frame.len(),
+            actual: sent,
+        });
+    }
+    Ok(())
+}
+
+fn udp_response_frame(
+    request: HostRequest,
+    first_received_at: Instant,
+    response: TimedActorResponse,
+) -> Result<RawFrame, UdpExchangeError> {
+    let emission_response = response_for_udp_emission(
+        request,
+        first_received_at,
+        response.message,
+        response.calculated_at,
+        Instant::now(),
+    );
+    RawFrame::encode(emission_response).map_err(UdpExchangeError::Encode)
+}
+
+fn drain_completed_udp_exchanges(exchanges: &mut JoinSet<Result<(), UdpExchangeError>>) {
+    while let Some(result) = exchanges.try_join_next() {
+        log_udp_task_result(result);
+    }
+}
+
+async fn abort_udp_exchanges(exchanges: &mut JoinSet<Result<(), UdpExchangeError>>) {
     exchanges.abort_all();
     while let Some(result) = exchanges.join_next().await {
         match result {
@@ -2097,7 +3712,6 @@ async fn udp_service_on_socket_inner(
             result => log_udp_task_result(result),
         }
     }
-    Ok(())
 }
 
 async fn wait_for_udp_shutdown(shutdown: &mut Option<oneshot::Receiver<()>>) {
@@ -2138,6 +3752,9 @@ fn log_udp_task_result(result: Result<Result<(), UdpExchangeError>, tokio::task:
 }
 
 fn unavailable_response(request: HostRequest) -> Message {
+    // This boundary has no controller observation. Concrete output fields are
+    // frozen-wire placeholders and are deliberately classified as Unknown by
+    // each response type's `output_evidence` method.
     match request {
         HostRequest::Acquire(value) => Message::AcquireResult(AcquireResult {
             controller_uid: value.expected_controller_uid,
@@ -2194,16 +3811,18 @@ fn response_for_udp_emission(
     request: HostRequest,
     first_received_at: Instant,
     response: Message,
+    remaining_lease_calculated_at: Instant,
     emitted_at: Instant,
 ) -> Message {
-    let elapsed_ms = emitted_at
-        .checked_duration_since(first_received_at)
+    let post_calculation_elapsed_ms = emitted_at
+        .checked_duration_since(remaining_lease_calculated_at)
         .map(duration_millis_ceil_saturating)
         .unwrap_or(u64::MAX)
         .saturating_add(UDP_EMISSION_QUANTIZATION_MARGIN_MS);
     match (request, response) {
         (HostRequest::Command(request), Message::HostCommandResult(mut result)) => {
-            let actor_bound = u64::from(result.remaining_lease.get()).saturating_sub(elapsed_ms);
+            let actor_bound =
+                u64::from(result.remaining_lease.get()).saturating_sub(post_calculation_elapsed_ms);
             let server_bound = first_received_at
                 .checked_add(Duration::from_millis(u64::from(request.lease.get())))
                 .and_then(|deadline| deadline.checked_duration_since(emitted_at))
@@ -2213,7 +3832,8 @@ fn response_for_udp_emission(
             Message::HostCommandResult(result)
         }
         (HostRequest::Status(_), Message::StatusReport(mut result)) => {
-            let remaining = u64::from(result.remaining_lease.get()).saturating_sub(elapsed_ms);
+            let remaining =
+                u64::from(result.remaining_lease.get()).saturating_sub(post_calculation_elapsed_ms);
             result.remaining_lease = bounded_remaining_lease(remaining);
             Message::StatusReport(result)
         }
@@ -2230,7 +3850,11 @@ fn bounded_remaining_lease(value: u64) -> RemainingLeaseMs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::num::{NonZeroU16, NonZeroU32};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::task::{Context, Poll};
 
     use robot_command_client::{
         ClientConfig, DisarmedCommandClient, MonotonicInstant, PendingPhysicalCommand,
@@ -2239,11 +3863,151 @@ mod tests {
     use robot_protocol::v2::{
         ApplyPwm, ControllerDeadlineMsWrapping, ControllerReady, ReadinessFlags, V2CommandLeaseMs,
     };
-    use tokio::io::DuplexStream;
+    use tokio::io::{AsyncWrite, DuplexStream};
     use tokio::time::{sleep, timeout};
 
     const IO_TIMEOUT: Duration = Duration::from_millis(250);
     const SHORT_ABSENCE: Duration = Duration::from_millis(5);
+
+    #[derive(Clone, Copy)]
+    enum WriteStep {
+        Bytes(usize),
+        Pending,
+    }
+
+    struct ScriptedWriter {
+        steps: VecDeque<WriteStep>,
+        flush_pending: bool,
+        written: Vec<u8>,
+        observed_bytes: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedWriter {
+        fn new(steps: impl IntoIterator<Item = WriteStep>, flush_pending: bool) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                flush_pending,
+                written: Vec::new(),
+                observed_bytes: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl AsyncWrite for ScriptedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            match self
+                .steps
+                .pop_front()
+                .unwrap_or(WriteStep::Bytes(usize::MAX))
+            {
+                WriteStep::Pending => {
+                    self.steps.push_front(WriteStep::Pending);
+                    Poll::Pending
+                }
+                WriteStep::Bytes(maximum) => {
+                    let count = buffer.len().min(maximum);
+                    self.written.extend_from_slice(&buffer[..count]);
+                    self.observed_bytes
+                        .store(self.written.len(), AtomicOrdering::Release);
+                    Poll::Ready(Ok(count))
+                }
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.flush_pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn serial_transmit_completes_exactly_across_partial_writes() {
+        let mut writer = ScriptedWriter::new(
+            [
+                WriteStep::Bytes(1),
+                WriteStep::Bytes(2),
+                WriteStep::Bytes(3),
+            ],
+            false,
+        );
+        let record = b"partial-record";
+        transmit_serial_record(&mut writer, record, Duration::from_millis(25), None, None)
+            .await
+            .expect("bounded partial writes and flush complete");
+        assert_eq!(writer.written, record);
+    }
+
+    #[tokio::test]
+    async fn serial_transmit_reports_a_delayed_flush_without_hanging() {
+        let mut writer = ScriptedWriter::new([WriteStep::Bytes(usize::MAX)], true);
+        let record = b"complete-before-flush";
+        let error =
+            transmit_serial_record(&mut writer, record, Duration::from_millis(5), None, None)
+                .await
+                .expect_err("a flush that never completes reaches the one transmit deadline");
+        assert!(matches!(
+            error,
+            SerialTransmitError::Interrupted {
+                phase: SerialTransmitPhase::Flush,
+                cause: SerialTransmitInterruption::DeadlineExceeded,
+                written_bytes,
+                record_bytes,
+                ..
+            } if written_bytes == record.len() && record_bytes == record.len()
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_partial_serial_write_with_exact_uncertainty() {
+        let writer = ScriptedWriter::new([WriteStep::Bytes(3), WriteStep::Pending], false);
+        let observed = Arc::clone(&writer.observed_bytes);
+        let shutdown = Arc::new(ActuationShutdownSignal::new());
+        let request_shutdown = Arc::clone(&shutdown);
+        let task = tokio::spawn(async move {
+            let mut writer = writer;
+            transmit_serial_record(
+                &mut writer,
+                b"partially-written-record",
+                Duration::from_secs(1),
+                Some(&shutdown),
+                None,
+            )
+            .await
+        });
+        timeout(Duration::from_millis(50), async {
+            while observed.load(AtomicOrdering::Acquire) != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first partial write occurs");
+        request_shutdown.request(ActuationShutdownReason::Operator);
+        let error = timeout(Duration::from_millis(50), task)
+            .await
+            .expect("shutdown promptly wakes the blocked write")
+            .expect("transmit task joins")
+            .expect_err("partial record cannot become a success");
+        assert!(matches!(
+            error,
+            SerialTransmitError::Interrupted {
+                phase: SerialTransmitPhase::Write,
+                cause: SerialTransmitInterruption::ShutdownRequested,
+                written_bytes: 3,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn controller_rejection_stop_reasons_preserve_the_typed_cause() {
@@ -2315,6 +4079,19 @@ mod tests {
             .expect("known capability bits")
     }
 
+    fn candidate_capabilities() -> ControllerCapabilities {
+        ControllerCapabilities::try_from_bits(
+            ControllerCapabilities::SOFTWARE_GUARD_BITS
+                | ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE,
+        )
+        .expect("canonical candidate capability bits")
+    }
+
+    fn candidate_fingerprint() -> ActuatorConfigFingerprint {
+        ActuatorConfigFingerprint::try_new(*b"KIKO-4PWM-CAND1!")
+            .expect("canonical candidate fingerprint")
+    }
+
     fn readiness() -> ReadinessFlags {
         ReadinessFlags::try_from_bits(ReadinessFlags::READY_BITS).expect("known readiness bits")
     }
@@ -2330,8 +4107,10 @@ mod tests {
             firmware_abi: 2,
             firmware_build_id: 42,
             actuator_config_fingerprint: fingerprint(),
-            heartbeat_period: HeartbeatPeriodMs::try_new(10).expect("heartbeat period"),
+            heartbeat_period: HeartbeatPeriodMs::try_new(20).expect("heartbeat period"),
             maximum_heartbeat_age: Duration::from_millis(80),
+            minimum_host_command_interval: Duration::from_millis(10),
+            serial_transmit_timeout: Duration::from_millis(10),
             serial_applied_ack_timeout: Duration::from_millis(25),
             controller_clock_abs_error_ppm_bound: NonZeroU32::new(1_000).expect("ppm"),
             deadline_quantization_margin_ms: NonZeroU16::new(1).expect("margin"),
@@ -2341,7 +4120,73 @@ mod tests {
                 .expect("watchdog period"),
             expected_neutral_output: NeutralOutput::BothLow,
             expected_physical_stop_semantics: PhysicalStopSemantics::CoastVerified,
+            controller_session_class: ControllerSessionClass::ProductionExternalInterlocks,
+            maximum_command_step_percent: None,
         }
+    }
+
+    fn candidate_actor_config() -> ActorConfig {
+        ActorConfig {
+            controller_uid: uid(),
+            firmware_abi: 2,
+            firmware_build_id: 0x0002_1001,
+            actuator_config_fingerprint: candidate_fingerprint(),
+            heartbeat_period: HeartbeatPeriodMs::try_new(20).expect("heartbeat period"),
+            maximum_heartbeat_age: Duration::from_millis(80),
+            minimum_host_command_interval: Duration::from_millis(10),
+            serial_transmit_timeout: Duration::from_millis(10),
+            serial_applied_ack_timeout: Duration::from_millis(25),
+            controller_clock_abs_error_ppm_bound: NonZeroU32::new(1_000).expect("ppm"),
+            deadline_quantization_margin_ms: NonZeroU16::new(1).expect("margin"),
+            expected_max_abs_pwm_percent: MaxAbsPwmPercent::try_new(30).expect("candidate cap"),
+            expected_pwm_frequency: PwmFrequencyHz::try_new(20_000).expect("PWM frequency"),
+            expected_watchdog_nominal_period: WatchdogNominalPeriodMs::try_new(250)
+                .expect("watchdog period"),
+            expected_neutral_output: NeutralOutput::BothLow,
+            expected_physical_stop_semantics: PhysicalStopSemantics::Unverified,
+            controller_session_class: ControllerSessionClass::OperatorSupervisedFourPwmCandidate,
+            maximum_command_step_percent: Some(
+                OPERATOR_SUPERVISED_FOUR_PWM_MAX_COMMAND_STEP_PERCENT,
+            ),
+        }
+    }
+
+    #[test]
+    fn candidate_server_rechecks_firmware_step_from_last_exact_receipt() {
+        let maximum_step = candidate_actor_config().maximum_command_step_percent;
+        let previous = TimerPwm::try_new(5, -5).expect("bounded previous PWM");
+
+        assert!(candidate_command_step_is_admitted(
+            previous,
+            TimerPwm::try_new(10, -10).expect("bounded exact-boundary PWM"),
+            maximum_step,
+        ));
+        assert!(!candidate_command_step_is_admitted(
+            previous,
+            TimerPwm::try_new(11, -10).expect("bounded excessive PWM"),
+            maximum_step,
+        ));
+        assert!(!candidate_command_step_is_admitted(
+            previous,
+            TimerPwm::try_new(10, -11).expect("bounded excessive PWM"),
+            maximum_step,
+        ));
+        assert!(
+            candidate_command_step_is_admitted(
+                TimerPwm::try_new(30, -30).expect("bounded previous PWM"),
+                TimerPwm::ZERO,
+                maximum_step,
+            ),
+            "full zero must remain the firmware's immediate fail-closed bypass",
+        );
+        assert!(
+            candidate_command_step_is_admitted(
+                previous,
+                TimerPwm::try_new(100, -100).expect("protocol-domain PWM"),
+                None,
+            ),
+            "the production class has no candidate-only step contract",
+        );
     }
 
     fn client_config(endpoint: SocketAddr) -> ClientConfig {
@@ -2382,12 +4227,34 @@ mod tests {
         }
     }
 
-    fn ready(boot_id: robot_protocol::v2::ControllerBootId) -> ControllerReady {
+    fn candidate_hello() -> ControllerHello {
+        ControllerHello {
+            controller_uid: uid(),
+            boot_id: boot(7),
+            firmware_abi: 2,
+            firmware_build_id: 0x0002_1001,
+            capabilities: candidate_capabilities(),
+            max_abs_pwm_percent: MaxAbsPwmPercent::try_new(30).expect("candidate cap"),
+            max_command_lease: V2CommandLeaseMs::try_new(250).expect("lease maximum"),
+            output_state: OutputState::Disabled,
+            actuator_config_fingerprint: candidate_fingerprint(),
+            watchdog_nominal_period: WatchdogNominalPeriodMs::try_new(250)
+                .expect("watchdog period"),
+            pwm_frequency: PwmFrequencyHz::try_new(20_000).expect("PWM frequency"),
+            neutral_output: NeutralOutput::BothLow,
+            physical_stop_semantics: PhysicalStopSemantics::Unverified,
+        }
+    }
+
+    fn ready_at(
+        boot_id: robot_protocol::v2::ControllerBootId,
+        controller_uptime: u32,
+    ) -> ControllerReady {
         ControllerReady {
             controller_uid: uid(),
             boot_id,
             control_epoch: epoch(),
-            controller_uptime: ControllerUptimeMsWrapping::new(1_000),
+            controller_uptime: ControllerUptimeMsWrapping::new(controller_uptime),
             capabilities: capabilities(),
             output_state: OutputState::Disabled,
             faults: ControllerFaults::NONE,
@@ -2395,15 +4262,53 @@ mod tests {
     }
 
     fn zero_heartbeat(boot_id: robot_protocol::v2::ControllerBootId) -> Heartbeat {
+        zero_heartbeat_at(boot_id, 1_000)
+    }
+
+    fn zero_heartbeat_at(
+        boot_id: robot_protocol::v2::ControllerBootId,
+        controller_uptime: u32,
+    ) -> Heartbeat {
         Heartbeat {
             controller_uid: uid(),
             boot_id,
             control_epoch: None,
             last_sequence: None,
-            controller_uptime: ControllerUptimeMsWrapping::new(1_000),
-            expires_at: ControllerDeadlineMsWrapping::new(1_000),
+            controller_uptime: ControllerUptimeMsWrapping::new(controller_uptime),
+            expires_at: ControllerDeadlineMsWrapping::new(controller_uptime),
             timer_pwm: TimerPwm::ZERO,
             output_state: OutputState::ZeroPwm,
+            readiness: stopped_readiness(),
+            faults: ControllerFaults::NONE,
+        }
+    }
+
+    fn no_session_heartbeat(
+        boot_id: robot_protocol::v2::ControllerBootId,
+        controller_uptime: u32,
+    ) -> Heartbeat {
+        Heartbeat {
+            readiness: ReadinessFlags::try_from_bits(ReadinessFlags::WATCHDOG_RUNNING)
+                .expect("no-session watchdog readiness"),
+            ..zero_heartbeat_at(boot_id, controller_uptime)
+        }
+    }
+
+    fn established_stopped_heartbeat(
+        boot_id: robot_protocol::v2::ControllerBootId,
+        control_epoch: ControlEpoch,
+        sequence: V2CommandSequence,
+        uptime: u32,
+    ) -> Heartbeat {
+        Heartbeat {
+            controller_uid: uid(),
+            boot_id,
+            control_epoch: Some(control_epoch),
+            last_sequence: Some(sequence),
+            controller_uptime: ControllerUptimeMsWrapping::new(uptime),
+            expires_at: ControllerDeadlineMsWrapping::new(uptime),
+            timer_pwm: TimerPwm::ZERO,
+            output_state: OutputState::Disabled,
             readiness: stopped_readiness(),
             faults: ControllerFaults::NONE,
         }
@@ -2448,9 +4353,32 @@ mod tests {
             } else {
                 OutputState::NonzeroPwm
             },
-            applied_at: ControllerUptimeMsWrapping::new(1_002),
+            applied_at: ControllerUptimeMsWrapping::new(apply.expires_at.get().wrapping_sub(100)),
             expires_at: apply.expires_at,
             faults: ControllerFaults::NONE,
+        }
+    }
+
+    fn odometry(
+        boot_id: robot_protocol::v2::ControllerBootId,
+        sample: u32,
+    ) -> ObservationalOdometry {
+        let sample_delta = i16::try_from(sample).expect("test samples fit i16");
+        ObservationalOdometry {
+            controller_uid: uid(),
+            boot_id,
+            control_epoch: Some(epoch()),
+            left_estimated_extended_ticks_wrapping:
+                robot_protocol::EstimatedWrappingEncoderTicks::new_wrapping(i64::from(sample)),
+            right_estimated_extended_ticks_wrapping:
+                robot_protocol::EstimatedWrappingEncoderTicks::new_wrapping(-i64::from(sample)),
+            left_sample_delta_ticks_modulo: robot_protocol::ModuloEncoderDeltaTicks::new_modulo(
+                sample_delta,
+            ),
+            right_sample_delta_ticks_modulo: robot_protocol::ModuloEncoderDeltaTicks::new_modulo(
+                -sample_delta,
+            ),
+            controller_uptime: ControllerUptimeMsWrapping::new(1_001_u32.wrapping_add(sample)),
         }
     }
 
@@ -2533,9 +4461,35 @@ mod tests {
 
     impl Harness {
         async fn ready() -> Self {
+            Self::ready_with_serial_capacity(4_096).await
+        }
+
+        async fn ready_with_serial_capacity(serial_capacity: usize) -> Self {
+            let (mut harness, mut startup_ready) =
+                Self::awaiting_startup_heartbeat(serial_capacity, 1_000).await;
+            assert!(
+                timeout(SHORT_ABSENCE, &mut startup_ready).await.is_err(),
+                "ControllerReady without an exact stopped heartbeat is not startup evidence"
+            );
+            harness
+                .controller
+                .send(Message::Heartbeat(zero_heartbeat(harness.boot_id)))
+                .await;
+            timeout(IO_TIMEOUT, startup_ready)
+                .await
+                .expect("startup-ready signal timeout")
+                .expect("actor retains startup-ready sender");
+            harness.wait_until_ready_stopped().await;
+            harness
+        }
+
+        async fn awaiting_startup_heartbeat(
+            serial_capacity: usize,
+            ready_uptime: u32,
+        ) -> (Self, oneshot::Receiver<()>) {
             let boot_id = boot(7);
-            let (actor_stream, controller_stream) = tokio::io::duplex(4_096);
-            let (handle, mut startup_ready, actor) = spawn_actor(
+            let (actor_stream, controller_stream) = tokio::io::duplex(serial_capacity);
+            let (handle, startup_ready, actor) = spawn_actor(
                 actor_stream,
                 actor_config(),
                 Arc::new(NoopActuationTelemetry),
@@ -2556,31 +4510,21 @@ mod tests {
                 .send(Message::HostStopResult(confirmed_stop(stop, boot_id)))
                 .await;
             controller
-                .send(Message::ControllerReady(ready(boot_id)))
+                .send(Message::ControllerReady(ready_at(boot_id, ready_uptime)))
                 .await;
-            assert!(
-                timeout(SHORT_ABSENCE, &mut startup_ready).await.is_err(),
-                "ControllerReady without an exact stopped heartbeat is not startup evidence"
-            );
-            controller
-                .send(Message::Heartbeat(zero_heartbeat(boot_id)))
-                .await;
-            timeout(IO_TIMEOUT, startup_ready)
-                .await
-                .expect("startup-ready signal timeout")
-                .expect("actor retains startup-ready sender");
             let source = "127.0.0.1:41000".parse().expect("source address");
             let shutdown = handle.shutdown_handle();
-            let mut harness = Self {
-                handle,
-                shutdown,
-                controller,
-                actor,
-                source,
-                boot_id,
-            };
-            harness.wait_until_ready_stopped().await;
-            harness
+            (
+                Self {
+                    handle,
+                    shutdown,
+                    controller,
+                    actor,
+                    source,
+                    boot_id,
+                },
+                startup_ready,
+            )
         }
 
         async fn wait_until_ready_stopped(&mut self) {
@@ -2644,7 +4588,7 @@ mod tests {
     async fn receive_apply(controller: &mut FakeController) -> ApplyPwm {
         match controller.receive().await {
             Message::ApplyPwm(value) => value,
-            other => panic!("expected ApplyPwm, got {:?}", other.kind()),
+            other => panic!("expected ApplyPwm, got {other:?}"),
         }
     }
 
@@ -2660,6 +4604,475 @@ mod tests {
             panic!("wrong host-command response")
         };
         result
+    }
+
+    async fn harness_with_cached_zero() -> Harness {
+        let mut harness = Harness::ready().await;
+        harness.acquire().await;
+        let zero = command(harness.boot_id, 0, TimerPwm::ZERO);
+        let exchange = harness.exchange_command(zero);
+        let apply = receive_apply(&mut harness.controller).await;
+        let mut stopped = applied(apply);
+        stopped.result = AppliedResultCode::Stopped;
+        stopped.output_state = OutputState::Disabled;
+        harness
+            .controller
+            .send(Message::AppliedResult(stopped))
+            .await;
+        assert_eq!(
+            command_result(exchange).await.result,
+            HostCommandResultCode::Stopped
+        );
+        harness
+    }
+
+    #[test]
+    fn delayed_controller_time_relation_is_strict_and_wrap_aware() {
+        let at = |value| ControllerUptimeMsWrapping::new(value);
+
+        assert!(controller_time_strictly_precedes(at(999), at(1_000)));
+        assert!(controller_time_strictly_precedes(at(u32::MAX), at(0)));
+        assert!(!controller_time_strictly_precedes(at(1_000), at(1_000)));
+        assert!(!controller_time_strictly_precedes(at(1_001), at(1_000)));
+        assert!(!controller_time_strictly_precedes(at(0x8000_0000), at(0)));
+    }
+
+    #[tokio::test]
+    async fn controller_ready_can_overtake_an_older_no_session_heartbeat() {
+        let (mut harness, mut startup_ready) =
+            Harness::awaiting_startup_heartbeat(4_096, 1_000).await;
+        harness
+            .controller
+            .send(Message::Heartbeat(no_session_heartbeat(
+                harness.boot_id,
+                999,
+            )))
+            .await;
+
+        assert!(
+            timeout(SHORT_ABSENCE, &mut startup_ready).await.is_err(),
+            "a discarded delayed heartbeat must not establish liveness"
+        );
+        harness.controller.assert_no_message().await;
+
+        harness
+            .controller
+            .send(Message::Heartbeat(zero_heartbeat_at(
+                harness.boot_id,
+                1_001,
+            )))
+            .await;
+        timeout(IO_TIMEOUT, startup_ready)
+            .await
+            .expect("current heartbeat startup timeout")
+            .expect("current heartbeat establishes startup");
+        harness.controller.assert_no_message().await;
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn delayed_startup_heartbeat_wraps_but_half_range_is_never_ignored() {
+        let (mut wrapping, startup_ready) = Harness::awaiting_startup_heartbeat(4_096, 0).await;
+        wrapping
+            .controller
+            .send(Message::Heartbeat(no_session_heartbeat(
+                wrapping.boot_id,
+                u32::MAX,
+            )))
+            .await;
+        wrapping.controller.assert_no_message().await;
+        wrapping
+            .controller
+            .send(Message::Heartbeat(zero_heartbeat_at(wrapping.boot_id, 1)))
+            .await;
+        timeout(IO_TIMEOUT, startup_ready)
+            .await
+            .expect("wrapped startup timeout")
+            .expect("wrapped current heartbeat establishes startup");
+        wrapping.abort();
+
+        let (mut ambiguous, _startup_ready) = Harness::awaiting_startup_heartbeat(4_096, 0).await;
+        ambiguous
+            .controller
+            .send(Message::Heartbeat(no_session_heartbeat(
+                ambiguous.boot_id,
+                0x8000_0000,
+            )))
+            .await;
+        assert!(matches!(
+            ambiguous.controller.receive().await,
+            Message::ForceStop(_)
+        ));
+        ambiguous.abort();
+    }
+
+    #[tokio::test]
+    async fn wrong_boot_is_never_discarded_as_delayed_startup_telemetry() {
+        let (mut harness, _startup_ready) = Harness::awaiting_startup_heartbeat(4_096, 1_000).await;
+        harness
+            .controller
+            .send(Message::Heartbeat(no_session_heartbeat(boot(8), 999)))
+            .await;
+        assert!(matches!(
+            harness.controller.receive().await,
+            Message::ForceStop(_)
+        ));
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn periodic_hello_and_applied_result_can_overtake_older_best_effort_heartbeat() {
+        let mut harness = harness_with_cached_zero().await;
+        harness
+            .controller
+            .send(Message::Heartbeat(established_stopped_heartbeat(
+                harness.boot_id,
+                epoch(),
+                V2CommandSequence::FIRST,
+                1_001,
+            )))
+            .await;
+        harness.controller.assert_no_message().await;
+        sleep(Duration::from_millis(11)).await;
+
+        let pwm = TimerPwm::try_new(10, -10).expect("bounded PWM");
+        let moving = command(harness.boot_id, 1, pwm);
+        let exchange = harness.exchange_command(moving);
+        let apply = receive_apply(&mut harness.controller).await;
+        let applied_result = applied(apply);
+        harness
+            .controller
+            .send(Message::AppliedResult(applied_result))
+            .await;
+        assert_eq!(
+            command_result(exchange).await.result,
+            HostCommandResultCode::AppliedNew
+        );
+        harness
+            .controller
+            .send(Message::ControllerHello(hello_with(uid(), harness.boot_id)))
+            .await;
+        harness.controller.assert_no_message().await;
+
+        let delayed_uptime = applied_result.applied_at.get().wrapping_sub(1);
+        harness
+            .controller
+            .send(Message::Heartbeat(established_stopped_heartbeat(
+                harness.boot_id,
+                epoch(),
+                V2CommandSequence::FIRST,
+                delayed_uptime,
+            )))
+            .await;
+        harness.controller.assert_no_message().await;
+
+        let current_uptime = applied_result.applied_at.get().wrapping_add(1);
+        harness
+            .controller
+            .send(Message::Heartbeat(Heartbeat {
+                controller_uid: uid(),
+                boot_id: harness.boot_id,
+                control_epoch: Some(epoch()),
+                last_sequence: Some(V2CommandSequence::new(1)),
+                controller_uptime: ControllerUptimeMsWrapping::new(current_uptime),
+                expires_at: applied_result.expires_at,
+                timer_pwm: pwm,
+                output_state: OutputState::NonzeroPwm,
+                readiness: readiness(),
+                faults: ControllerFaults::NONE,
+            }))
+            .await;
+        harness.controller.assert_no_message().await;
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn periodic_same_boot_hello_preserves_a_stopped_owner_and_sequence() {
+        let mut harness = harness_with_cached_zero().await;
+        harness
+            .controller
+            .send(Message::ControllerHello(hello_with(uid(), harness.boot_id)))
+            .await;
+        harness.controller.assert_no_message().await;
+        harness
+            .controller
+            .send(Message::Heartbeat(established_stopped_heartbeat(
+                harness.boot_id,
+                epoch(),
+                V2CommandSequence::FIRST,
+                1_001,
+            )))
+            .await;
+        harness.controller.assert_no_message().await;
+
+        sleep(Duration::from_millis(11)).await;
+        let next = command(
+            harness.boot_id,
+            1,
+            TimerPwm::try_new(10, -10).expect("bounded PWM"),
+        );
+        let exchange = harness.exchange_command(next);
+        let apply = receive_apply(&mut harness.controller).await;
+        assert_eq!(apply.sequence, V2CommandSequence::new(1));
+        exchange.abort();
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn periodic_same_boot_hello_does_not_cancel_a_pending_command() {
+        let mut harness = harness_with_cached_zero().await;
+        harness
+            .controller
+            .send(Message::Heartbeat(established_stopped_heartbeat(
+                harness.boot_id,
+                epoch(),
+                V2CommandSequence::FIRST,
+                1_001,
+            )))
+            .await;
+        harness.controller.assert_no_message().await;
+        sleep(Duration::from_millis(11)).await;
+
+        let moving = command(
+            harness.boot_id,
+            1,
+            TimerPwm::try_new(10, -10).expect("bounded PWM"),
+        );
+        let mut exchange = harness.exchange_command(moving);
+        let apply = receive_apply(&mut harness.controller).await;
+        harness
+            .controller
+            .send(Message::ControllerHello(hello_with(uid(), harness.boot_id)))
+            .await;
+        assert!(timeout(SHORT_ABSENCE, &mut exchange).await.is_err());
+        harness.controller.assert_no_message().await;
+
+        harness
+            .controller
+            .send(Message::AppliedResult(applied(apply)))
+            .await;
+        assert_eq!(
+            command_result(exchange).await.result,
+            HostCommandResultCode::AppliedNew
+        );
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn periodic_same_boot_hello_preserves_active_authority() {
+        let mut harness = harness_with_cached_zero().await;
+        harness
+            .controller
+            .send(Message::Heartbeat(established_stopped_heartbeat(
+                harness.boot_id,
+                epoch(),
+                V2CommandSequence::FIRST,
+                1_001,
+            )))
+            .await;
+        harness.controller.assert_no_message().await;
+        sleep(Duration::from_millis(11)).await;
+
+        let pwm = TimerPwm::try_new(10, -10).expect("bounded PWM");
+        let moving = command(harness.boot_id, 1, pwm);
+        let exchange = harness.exchange_command(moving);
+        let apply = receive_apply(&mut harness.controller).await;
+        let applied_result = applied(apply);
+        harness
+            .controller
+            .send(Message::AppliedResult(applied_result))
+            .await;
+        assert_eq!(
+            command_result(exchange).await.result,
+            HostCommandResultCode::AppliedNew
+        );
+
+        harness
+            .controller
+            .send(Message::ControllerHello(hello_with(uid(), harness.boot_id)))
+            .await;
+        harness.controller.assert_no_message().await;
+        harness
+            .controller
+            .send(Message::Heartbeat(Heartbeat {
+                controller_uid: uid(),
+                boot_id: harness.boot_id,
+                control_epoch: Some(epoch()),
+                last_sequence: Some(V2CommandSequence::new(1)),
+                controller_uptime: ControllerUptimeMsWrapping::new(
+                    applied_result.applied_at.get().wrapping_add(1),
+                ),
+                expires_at: applied_result.expires_at,
+                timer_pwm: pwm,
+                output_state: OutputState::NonzeroPwm,
+                readiness: readiness(),
+                faults: ControllerFaults::NONE,
+            }))
+            .await;
+        harness.controller.assert_no_message().await;
+
+        sleep(Duration::from_millis(11)).await;
+        let next = command(harness.boot_id, 2, pwm);
+        let exchange = harness.exchange_command(next);
+        let apply = receive_apply(&mut harness.controller).await;
+        assert_eq!(apply.sequence, V2CommandSequence::new(2));
+        exchange.abort();
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn changed_claims_on_the_same_boot_are_not_an_idempotent_hello() {
+        let mut harness = harness_with_cached_zero().await;
+        let mut conflicting = hello_with(uid(), harness.boot_id);
+        conflicting.firmware_build_id = conflicting.firmware_build_id.wrapping_add(1);
+        harness
+            .controller
+            .send(Message::ControllerHello(conflicting))
+            .await;
+        assert!(matches!(
+            harness.controller.receive().await,
+            Message::ForceStop(ForceStop {
+                reason: ForceStopReason::ControllerFault,
+                ..
+            })
+        ));
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn exact_established_stopped_heartbeat_preserves_the_zero_session() {
+        let mut harness = harness_with_cached_zero().await;
+        harness
+            .controller
+            .send(Message::Heartbeat(established_stopped_heartbeat(
+                harness.boot_id,
+                epoch(),
+                V2CommandSequence::FIRST,
+                1_001,
+            )))
+            .await;
+        harness.controller.assert_no_message().await;
+
+        sleep(Duration::from_millis(11)).await;
+        let next = command(
+            harness.boot_id,
+            1,
+            TimerPwm::try_new(10, -10).expect("bounded PWM"),
+        );
+        let exchange = harness.exchange_command(next);
+        let apply = receive_apply(&mut harness.controller).await;
+        assert_eq!(apply.sequence, V2CommandSequence::new(1));
+        assert_eq!(apply.timer_pwm, next.requested_timer_pwm);
+        exchange.abort();
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn stopped_heartbeat_with_wrong_epoch_is_force_stopped() {
+        let mut harness = harness_with_cached_zero().await;
+        let wrong_epoch = ControlEpoch::try_new(epoch().get().wrapping_add(1))
+            .expect("fixture epoch remains nonzero");
+        harness
+            .controller
+            .send(Message::Heartbeat(established_stopped_heartbeat(
+                harness.boot_id,
+                wrong_epoch,
+                V2CommandSequence::FIRST,
+                1_001,
+            )))
+            .await;
+        assert!(matches!(
+            harness.controller.receive().await,
+            Message::ForceStop(_)
+        ));
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn stopped_heartbeat_with_wrong_sequence_is_force_stopped() {
+        let mut harness = harness_with_cached_zero().await;
+        harness
+            .controller
+            .send(Message::Heartbeat(established_stopped_heartbeat(
+                harness.boot_id,
+                epoch(),
+                V2CommandSequence::new(1),
+                1_001,
+            )))
+            .await;
+        assert!(matches!(
+            harness.controller.receive().await,
+            Message::ForceStop(_)
+        ));
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn stopped_heartbeat_from_wrong_boot_session_is_force_stopped() {
+        let mut harness = harness_with_cached_zero().await;
+        harness
+            .controller
+            .send(Message::Heartbeat(established_stopped_heartbeat(
+                boot(8),
+                epoch(),
+                V2CommandSequence::FIRST,
+                1_001,
+            )))
+            .await;
+        assert!(matches!(
+            harness.controller.receive().await,
+            Message::ForceStop(_)
+        ));
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn active_heartbeat_cannot_claim_stopped_readiness() {
+        let mut harness = harness_with_cached_zero().await;
+        harness
+            .controller
+            .send(Message::Heartbeat(established_stopped_heartbeat(
+                harness.boot_id,
+                epoch(),
+                V2CommandSequence::FIRST,
+                1_001,
+            )))
+            .await;
+        harness.controller.assert_no_message().await;
+        sleep(Duration::from_millis(11)).await;
+        let pwm = TimerPwm::try_new(10, -10).expect("bounded PWM");
+        let moving = command(harness.boot_id, 1, pwm);
+        let exchange = harness.exchange_command(moving);
+        let apply = receive_apply(&mut harness.controller).await;
+        harness
+            .controller
+            .send(Message::AppliedResult(applied(apply)))
+            .await;
+        assert_eq!(
+            command_result(exchange).await.result,
+            HostCommandResultCode::AppliedNew
+        );
+
+        let heartbeat = Heartbeat {
+            controller_uid: uid(),
+            boot_id: harness.boot_id,
+            control_epoch: Some(epoch()),
+            last_sequence: Some(V2CommandSequence::new(1)),
+            controller_uptime: ControllerUptimeMsWrapping::new(
+                apply.expires_at.get().wrapping_sub(50),
+            ),
+            expires_at: apply.expires_at,
+            timer_pwm: pwm,
+            output_state: OutputState::NonzeroPwm,
+            readiness: stopped_readiness(),
+            faults: ControllerFaults::NONE,
+        };
+        harness.controller.send(Message::Heartbeat(heartbeat)).await;
+        assert!(matches!(
+            harness.controller.receive().await,
+            Message::ForceStop(_)
+        ));
+        harness.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2681,6 +5094,13 @@ mod tests {
             panic!("priority shutdown must emit ForceStop before queued motion")
         };
         assert_eq!(stop.reason, ForceStopReason::Operator);
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(
+                stop,
+                harness.boot_id,
+            )))
+            .await;
         assert!(
             response.await.is_err(),
             "the queued command must not receive an application result"
@@ -2689,6 +5109,732 @@ mod tests {
             harness.actor.await.expect("actor task join").is_ok(),
             "priority shutdown is a clean actor exit after best-effort stop"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_shutdown_write_without_matching_stop_result_remains_uncertain() {
+        let mut harness = Harness::ready().await;
+        harness.shutdown.request(ActuationShutdownReason::Operator);
+        let Message::ForceStop(_) = harness.controller.receive().await else {
+            panic!("shutdown emits a bounded ForceStop")
+        };
+        let result = timeout(IO_TIMEOUT, harness.actor)
+            .await
+            .expect("actor reaches the stop-confirmation deadline")
+            .expect("actor task joins");
+        assert!(matches!(
+            result,
+            Err(ActuationActorError::ShutdownStopConfirmationTimedOut {
+                maximum_wait
+            }) if maximum_wait == Duration::from_millis(25)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_during_command_write_resynchronizes_then_reports_exact_stop() {
+        let mut harness = Harness::ready_with_serial_capacity(1).await;
+        harness.acquire().await;
+        let response = harness.exchange_command(command(
+            harness.boot_id,
+            0,
+            TimerPwm::try_new(5, -5).expect("bounded first step"),
+        ));
+
+        // Consume exactly one byte of the ApplyPwm record, leaving the
+        // single-byte serial buffer full again before shutdown is requested.
+        // This deterministically interrupts a genuinely partial actor write.
+        let first = harness
+            .controller
+            .stream
+            .read_u8()
+            .await
+            .expect("first partial ApplyPwm byte");
+        assert!(
+            harness.controller.decoder.push(first).is_none(),
+            "one COBS code byte cannot complete an ApplyPwm record"
+        );
+        harness.shutdown.request(ActuationShutdownReason::Operator);
+
+        let mut framing_fault = None;
+        let stop = timeout(IO_TIMEOUT, async {
+            loop {
+                let byte = harness
+                    .controller
+                    .stream
+                    .read_u8()
+                    .await
+                    .expect("recovery serial byte");
+                let Some(decoded) = harness.controller.decoder.push(byte) else {
+                    continue;
+                };
+                match decoded {
+                    Err(source) => framing_fault = Some(source),
+                    Ok(Message::ForceStop(stop)) => break stop,
+                    Ok(other) => panic!(
+                        "partial ApplyPwm must not become a valid message before ForceStop, got {:?}",
+                        other.kind()
+                    ),
+                }
+            }
+        })
+        .await
+        .expect("delimiter and ForceStop remain bounded");
+        assert!(
+            framing_fault.is_some(),
+            "the recovery delimiter must expose the interrupted record as malformed"
+        );
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(
+                stop,
+                harness.boot_id,
+            )))
+            .await;
+
+        let message = response
+            .await
+            .expect("host exchange task")
+            .expect("pending command receives a typed terminal result");
+        assert!(matches!(
+            message,
+            Message::HostCommandResult(HostCommandResult {
+                result: HostCommandResultCode::ForceStopped,
+                ..
+            })
+        ));
+
+        let result = harness.actor.await.expect("actor task joins");
+        let Err(ActuationActorError::ShutdownInterruptedTransmit {
+            interrupted:
+                SerialTransmitError::Interrupted {
+                    phase: SerialTransmitPhase::Write,
+                    cause: SerialTransmitInterruption::ShutdownRequested,
+                    written_bytes,
+                    record_bytes,
+                    ..
+                },
+            recovery,
+        }) = result
+        else {
+            panic!("actor must retain the interrupted transmit and recovery report")
+        };
+        assert!(written_bytes > 0 && written_bytes < record_bytes);
+        assert!(matches!(
+            recovery.as_ref(),
+            ShutdownInterruptedTransmitRecovery {
+                resynchronization: SerialResynchronizationOutcome::DelimiterTransmitted,
+                force_stop: ShutdownForceStopOutcome::Confirmed(_),
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn priority_host_stop_preempts_a_saturated_ordinary_mailbox() {
+        let mut harness = Harness::ready().await;
+        harness.acquire().await;
+        let command_response = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostCommand(command(harness.boot_id, 0, TimerPwm::ZERO)),
+        );
+        let mut queued_status = Vec::new();
+        for request_id in 0..(ACTOR_MAILBOX_CAPACITY - 1) {
+            queued_status.push(harness.handle.enqueue_for_test(
+                harness.source,
+                Instant::now(),
+                Message::StatusQuery(StatusQuery {
+                    expected_controller_uid: uid(),
+                    request_id: RequestId::new(
+                        u32::try_from(request_id).expect("mailbox index fits request ID"),
+                    ),
+                }),
+            ));
+        }
+        let host_stop = HostStop {
+            controller_uid: uid(),
+            target_boot_id: TargetBootId::Exact(harness.boot_id),
+            request_id: RequestId::new(0x5a5a),
+            reason: ForceStopReason::Operator,
+        };
+        let stop_response = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(host_stop),
+        );
+
+        let Message::ForceStop(force_stop) = harness.controller.receive().await else {
+            panic!("latched HostStop must precede every saturated ordinary request")
+        };
+        assert_eq!(force_stop.reason, ForceStopReason::Operator);
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(
+                force_stop,
+                harness.boot_id,
+            )))
+            .await;
+
+        let Message::HostStopResult(result) = timeout(IO_TIMEOUT, stop_response)
+            .await
+            .expect("priority-stop response timeout")
+            .expect("priority-stop response sender")
+        else {
+            panic!("wrong priority-stop response")
+        };
+        assert_eq!(result.request_id, host_stop.request_id);
+        assert_eq!(result.result, StopResultCode::ControllerConfirmed);
+        let Message::HostCommandResult(command_result) = timeout(IO_TIMEOUT, command_response)
+            .await
+            .expect("queued command terminal response timeout")
+            .expect("queued command terminal response sender")
+        else {
+            panic!("wrong queued command response")
+        };
+        assert!(!command_result.result.proves_controller_application());
+        harness.controller.assert_no_message().await;
+        drop(queued_status);
+        harness.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn udp_ingress_latches_host_stop_while_all_ordinary_response_slots_are_occupied() {
+        let (requests, requests_rx) = mpsc::channel(MAX_UDP_ORDINARY_EXCHANGES_IN_FLIGHT);
+        let priority_stop = Arc::new(PriorityStopCoordinator::new(uid()));
+        let handle = ActuationHandle {
+            requests,
+            priority_stop: Arc::clone(&priority_stop),
+            shutdown: Arc::new(ActuationShutdownSignal::new()),
+        };
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind UDP server");
+        let server_address = server_socket.local_addr().expect("server address");
+        let server = tokio::spawn(udp_service_on_socket(server_socket, Some(handle)));
+        let client = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind UDP client");
+
+        for request_id in 0..MAX_UDP_ORDINARY_EXCHANGES_IN_FLIGHT {
+            let request_id = u32::try_from(request_id).expect("bounded request index fits u32");
+            let frame = RawFrame::encode(Message::StatusQuery(StatusQuery {
+                expected_controller_uid: uid(),
+                request_id: RequestId::new(request_id),
+            }))
+            .expect("status request encodes");
+            client
+                .send_to(frame.as_bytes(), server_address)
+                .await
+                .expect("send ordinary request");
+        }
+        timeout(Duration::from_secs(1), async {
+            while requests_rx.len() != MAX_UDP_ORDINARY_EXCHANGES_IN_FLIGHT {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every ordinary response slot becomes occupied");
+
+        let stop = HostStop {
+            controller_uid: uid(),
+            target_boot_id: TargetBootId::Any,
+            request_id: RequestId::new(0x5a5b),
+            reason: ForceStopReason::Operator,
+        };
+        let frame = RawFrame::encode(Message::HostStop(stop)).expect("stop request encodes");
+        client
+            .send_to(frame.as_bytes(), server_address)
+            .await
+            .expect("send priority stop");
+        timeout(IO_TIMEOUT, async {
+            while priority_stop.requested_after(0).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("UDP receive latches HostStop without an ordinary response slot");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_udp_tasks_release_capacity_before_joinset_reaping() {
+        let (requests, mut requests_rx) = mpsc::channel(MAX_UDP_ORDINARY_EXCHANGES_IN_FLIGHT + 1);
+        let priority_stop = Arc::new(PriorityStopCoordinator::new(uid()));
+        let handle = ActuationHandle {
+            requests,
+            priority_stop,
+            shutdown: Arc::new(ActuationShutdownSignal::new()),
+        };
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind UDP server");
+        let server_address = server_socket.local_addr().expect("server address");
+        let server = tokio::spawn(udp_service_on_socket(server_socket, Some(handle)));
+        let client = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind UDP client");
+
+        for request_id in 0..MAX_UDP_ORDINARY_EXCHANGES_IN_FLIGHT {
+            let request_id = u32::try_from(request_id).expect("bounded request index fits u32");
+            let frame = RawFrame::encode(Message::StatusQuery(StatusQuery {
+                expected_controller_uid: uid(),
+                request_id: RequestId::new(request_id),
+            }))
+            .expect("status request encodes");
+            client
+                .send_to(frame.as_bytes(), server_address)
+                .await
+                .expect("send ordinary request");
+        }
+
+        let mut pending = Vec::with_capacity(MAX_UDP_ORDINARY_EXCHANGES_IN_FLIGHT);
+        for _ in 0..MAX_UDP_ORDINARY_EXCHANGES_IN_FLIGHT {
+            pending.push(
+                timeout(IO_TIMEOUT, requests_rx.recv())
+                    .await
+                    .expect("actor request timeout")
+                    .expect("actor request channel remains open"),
+            );
+        }
+        for request in pending {
+            let response = unavailable_response(request.request);
+            request
+                .response
+                .send(response)
+                .expect("test receiver remains alive");
+        }
+
+        let mut receive_buffer = [0_u8; MAX_RAW_FRAME_BYTES];
+        for _ in 0..MAX_UDP_ORDINARY_EXCHANGES_IN_FLIGHT {
+            timeout(IO_TIMEOUT, client.recv_from(&mut receive_buffer))
+                .await
+                .expect("UDP response timeout")
+                .expect("receive UDP response");
+        }
+        tokio::task::yield_now().await;
+
+        let final_query = StatusQuery {
+            expected_controller_uid: uid(),
+            request_id: RequestId::new(0xf00d),
+        };
+        let frame =
+            RawFrame::encode(Message::StatusQuery(final_query)).expect("final query encodes");
+        client
+            .send_to(frame.as_bytes(), server_address)
+            .await
+            .expect("send final ordinary request");
+        let final_request = timeout(IO_TIMEOUT, requests_rx.recv())
+            .await
+            .expect("released response capacity admits the next request")
+            .expect("actor request channel remains open");
+        assert_eq!(final_request.request, HostRequest::Status(final_query));
+        final_request
+            .response
+            .send(unavailable_response(final_request.request))
+            .expect("final test receiver remains alive");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_priority_stops_share_one_transaction_and_keep_request_identity() {
+        let mut harness = Harness::ready().await;
+        let first = HostStop {
+            controller_uid: uid(),
+            target_boot_id: TargetBootId::Any,
+            request_id: RequestId::new(0x1111),
+            reason: ForceStopReason::Operator,
+        };
+        let second = HostStop {
+            request_id: RequestId::new(0x2222),
+            ..first
+        };
+        let first_response = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(first),
+        );
+        let second_response = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(second),
+        );
+
+        let Message::ForceStop(force_stop) = harness.controller.receive().await else {
+            panic!("coalesced priority stop must emit one ForceStop")
+        };
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(
+                force_stop,
+                harness.boot_id,
+            )))
+            .await;
+
+        for (response, expected_request_id) in [
+            (first_response, first.request_id),
+            (second_response, second.request_id),
+        ] {
+            let Message::HostStopResult(result) = timeout(IO_TIMEOUT, response)
+                .await
+                .expect("coalesced stop response timeout")
+                .expect("coalesced stop response sender")
+            else {
+                panic!("wrong coalesced stop response")
+            };
+            assert_eq!(result.request_id, expected_request_id);
+            assert_eq!(result.result, StopResultCode::ControllerConfirmed);
+        }
+        harness.controller.assert_no_message().await;
+        harness.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sequential_duplicate_priority_stop_reuses_the_single_exact_cache_entry() {
+        let mut harness = Harness::ready().await;
+        let request = HostStop {
+            controller_uid: uid(),
+            target_boot_id: TargetBootId::Exact(harness.boot_id),
+            request_id: RequestId::new(0x2a2a),
+            reason: ForceStopReason::Operator,
+        };
+        let first = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(request),
+        );
+        let Message::ForceStop(force_stop) = harness.controller.receive().await else {
+            panic!("first stop must reach the controller")
+        };
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(
+                force_stop,
+                harness.boot_id,
+            )))
+            .await;
+        let first = timeout(IO_TIMEOUT, first)
+            .await
+            .expect("first stop response timeout")
+            .expect("first stop response sender");
+
+        let duplicate = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(request),
+        );
+        let duplicate = timeout(IO_TIMEOUT, duplicate)
+            .await
+            .expect("cached duplicate response timeout")
+            .expect("cached duplicate response sender");
+        assert_eq!(duplicate, first);
+        harness.controller.assert_no_message().await;
+        harness.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn internal_stop_attempt_invalidates_a_prior_priority_stop_receipt() {
+        let mut harness = Harness::ready().await;
+        let request = HostStop {
+            controller_uid: uid(),
+            target_boot_id: TargetBootId::Exact(harness.boot_id),
+            request_id: RequestId::new(0x2a2d),
+            reason: ForceStopReason::Operator,
+        };
+        let first = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(request),
+        );
+        let Message::ForceStop(first_force_stop) = harness.controller.receive().await else {
+            panic!("first stop must reach the controller")
+        };
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(
+                first_force_stop,
+                harness.boot_id,
+            )))
+            .await;
+        timeout(IO_TIMEOUT, first)
+            .await
+            .expect("first stop response timeout")
+            .expect("first stop response sender");
+
+        let nonzero_pwm = TimerPwm::try_new(1, -1).expect("bounded nonzero PWM");
+        harness
+            .controller
+            .send(Message::Heartbeat(Heartbeat {
+                timer_pwm: nonzero_pwm,
+                output_state: OutputState::NonzeroPwm,
+                ..zero_heartbeat_at(harness.boot_id, 1_100)
+            }))
+            .await;
+        let Message::ForceStop(internal_stop) = harness.controller.receive().await else {
+            panic!("post-stop nonzero evidence must cause an internal ForceStop")
+        };
+
+        let duplicate = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(request),
+        );
+        let Message::ForceStop(new_priority_stop) = harness.controller.receive().await else {
+            panic!("stale receipt must not answer a later duplicate")
+        };
+        assert_ne!(new_priority_stop.request_id, internal_stop.request_id);
+        assert_ne!(new_priority_stop.request_id, first_force_stop.request_id);
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(
+                new_priority_stop,
+                harness.boot_id,
+            )))
+            .await;
+        let Message::HostStopResult(result) = timeout(IO_TIMEOUT, duplicate)
+            .await
+            .expect("fresh duplicate stop response timeout")
+            .expect("fresh duplicate stop response sender")
+        else {
+            panic!("wrong fresh duplicate stop response")
+        };
+        assert_eq!(result.request_id, request.request_id);
+        assert_eq!(result.result, StopResultCode::ControllerConfirmed);
+        harness.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_distinct_priority_stop_invalidates_the_previous_duplicate_cache() {
+        let mut harness = Harness::ready().await;
+        let first_request = HostStop {
+            controller_uid: uid(),
+            target_boot_id: TargetBootId::Exact(harness.boot_id),
+            request_id: RequestId::new(0x2a2b),
+            reason: ForceStopReason::Operator,
+        };
+        let first = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(first_request),
+        );
+        let Message::ForceStop(first_force_stop) = harness.controller.receive().await else {
+            panic!("first stop must reach the controller")
+        };
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(
+                first_force_stop,
+                harness.boot_id,
+            )))
+            .await;
+        timeout(IO_TIMEOUT, first)
+            .await
+            .expect("first stop response timeout")
+            .expect("first stop response sender");
+
+        let second_request = HostStop {
+            request_id: RequestId::new(0x2a2c),
+            ..first_request
+        };
+        let mut second = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(second_request),
+        );
+        let Message::ForceStop(second_force_stop) = harness.controller.receive().await else {
+            panic!("distinct stop must begin a new controller transaction")
+        };
+
+        let mut old_duplicate = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(first_request),
+        );
+        assert!(
+            timeout(Duration::from_millis(5), &mut old_duplicate)
+                .await
+                .is_err(),
+            "the old exact cache entry must be invalid as soon as a distinct stop is pending"
+        );
+
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(
+                second_force_stop,
+                harness.boot_id,
+            )))
+            .await;
+        let second = timeout(IO_TIMEOUT, &mut second)
+            .await
+            .expect("second stop response timeout")
+            .expect("second stop response sender");
+        let old_duplicate = timeout(IO_TIMEOUT, &mut old_duplicate)
+            .await
+            .expect("coalesced old-identity response timeout")
+            .expect("coalesced old-identity response sender");
+        let Message::HostStopResult(second) = second else {
+            panic!("wrong second response kind")
+        };
+        let Message::HostStopResult(old_duplicate) = old_duplicate else {
+            panic!("wrong duplicate response kind")
+        };
+        assert_eq!(second.request_id, second_request.request_id);
+        assert_eq!(old_duplicate.request_id, first_request.request_id);
+        assert_eq!(second.result, StopResultCode::ControllerConfirmed);
+        assert_eq!(
+            old_duplicate.result,
+            StopResultCode::ControllerConfirmed,
+            "the in-flight controller evidence is projected onto each caller identity"
+        );
+        harness.controller.assert_no_message().await;
+        harness.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_non_stop_proving_result_preserves_controller_state_without_claiming_stop() {
+        let mut harness = Harness::ready().await;
+        let request = HostStop {
+            controller_uid: uid(),
+            target_boot_id: TargetBootId::Exact(harness.boot_id),
+            request_id: RequestId::new(0x2b2b),
+            reason: ForceStopReason::Operator,
+        };
+        let response = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(request),
+        );
+        let Message::ForceStop(force_stop) = harness.controller.receive().await else {
+            panic!("priority stop must reach the controller")
+        };
+        let observed_faults = ControllerFaults::try_from_bits(ControllerFaults::MOTOR_DRIVER)
+            .expect("known motor-driver fault");
+        harness
+            .controller
+            .send(Message::HostStopResult(HostStopResult {
+                controller_uid: force_stop.controller_uid,
+                observed_boot_id: TargetBootId::Exact(harness.boot_id),
+                request_id: force_stop.request_id,
+                result: StopResultCode::ControllerFaulted,
+                output_state: OutputState::NonzeroPwm,
+                controller_uptime: ControllerUptimeMsWrapping::new(1_234),
+                faults: observed_faults,
+            }))
+            .await;
+
+        let Message::HostStopResult(result) = timeout(IO_TIMEOUT, response)
+            .await
+            .expect("exact non-stop response timeout")
+            .expect("exact non-stop response sender")
+        else {
+            panic!("wrong exact non-stop response")
+        };
+        assert_eq!(result.request_id, request.request_id);
+        assert_eq!(result.result, StopResultCode::ControllerFaulted);
+        assert_eq!(result.output_state, OutputState::NonzeroPwm);
+        assert_eq!(result.controller_uptime.get(), 1_234);
+        assert_eq!(result.faults, observed_faults);
+        assert!(!result.result.proves_controller_stop());
+        assert_eq!(
+            result.output_evidence(),
+            robot_protocol::v2::OutputEvidence::Unknown
+        );
+        harness.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn priority_stop_resynchronizes_a_partial_command_then_continues_with_exact_evidence() {
+        let mut harness = Harness::ready_with_serial_capacity(1).await;
+        harness.acquire().await;
+        let command_response =
+            harness.exchange_command(command(harness.boot_id, 0, TimerPwm::ZERO));
+        let first_byte = harness
+            .controller
+            .stream
+            .read_u8()
+            .await
+            .expect("first partial ApplyPwm byte");
+        assert!(harness.controller.decoder.push(first_byte).is_none());
+
+        let host_stop = HostStop {
+            controller_uid: uid(),
+            target_boot_id: TargetBootId::Exact(harness.boot_id),
+            request_id: RequestId::new(0x3333),
+            reason: ForceStopReason::Operator,
+        };
+        let stop_response = harness.handle.enqueue_for_test(
+            harness.source,
+            Instant::now(),
+            Message::HostStop(host_stop),
+        );
+
+        let mut framing_fault = None;
+        let force_stop = timeout(IO_TIMEOUT, async {
+            loop {
+                let byte = harness
+                    .controller
+                    .stream
+                    .read_u8()
+                    .await
+                    .expect("priority recovery serial byte");
+                let Some(decoded) = harness.controller.decoder.push(byte) else {
+                    continue;
+                };
+                match decoded {
+                    Err(source) => framing_fault = Some(source),
+                    Ok(Message::ForceStop(force_stop)) => break force_stop,
+                    Ok(other) => panic!(
+                        "partial ApplyPwm must not precede priority ForceStop as {:?}",
+                        other.kind()
+                    ),
+                }
+            }
+        })
+        .await
+        .expect("priority delimiter and ForceStop remain bounded");
+        assert!(
+            framing_fault.is_some(),
+            "interrupted partial record is explicitly delimited as malformed"
+        );
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(
+                force_stop,
+                harness.boot_id,
+            )))
+            .await;
+
+        let command_result = command_result(command_response).await;
+        assert_eq!(command_result.result, HostCommandResultCode::ForceStopped);
+        let Message::HostStopResult(stop_result) = timeout(IO_TIMEOUT, stop_response)
+            .await
+            .expect("priority-stop exact response timeout")
+            .expect("priority-stop exact response sender")
+        else {
+            panic!("wrong priority-stop exact response")
+        };
+        assert_eq!(stop_result.request_id, host_stop.request_id);
+        assert_eq!(stop_result.result, StopResultCode::ControllerConfirmed);
+
+        let Message::StatusReport(status) = harness
+            .handle
+            .exchange(
+                harness.source,
+                Instant::now(),
+                Message::StatusQuery(StatusQuery {
+                    expected_controller_uid: uid(),
+                    request_id: RequestId::new(0x4444),
+                }),
+            )
+            .await
+            .expect("actor remains responsive after priority-stop recovery")
+        else {
+            panic!("wrong post-recovery status response")
+        };
+        assert_ne!(status.status, StatusCode::ReadyActive);
+        harness.abort();
     }
 
     #[tokio::test]
@@ -2713,6 +5859,82 @@ mod tests {
         assert_eq!(duplicate.result, HostCommandResultCode::DuplicateCached);
         assert!(duplicate.remaining_lease.get() <= first.remaining_lease.get());
         harness.controller.assert_no_message().await;
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn declared_command_rate_is_enforced_without_delaying_stop_or_consuming_sequence() {
+        let mut harness = Harness::ready().await;
+        harness.acquire().await;
+        let zero = command(harness.boot_id, 0, TimerPwm::ZERO);
+        let zero_exchange = harness.exchange_command(zero);
+        let zero_apply = receive_apply(&mut harness.controller).await;
+        harness
+            .controller
+            .send(Message::AppliedResult(applied(zero_apply)))
+            .await;
+        assert_eq!(
+            command_result(zero_exchange).await.result,
+            HostCommandResultCode::AppliedNew
+        );
+
+        let next = command(
+            harness.boot_id,
+            1,
+            TimerPwm::try_new(10, 10).expect("bounded PWM"),
+        );
+        assert_eq!(
+            command_result(harness.exchange_command(next)).await.result,
+            HostCommandResultCode::RejectedAtServer
+        );
+        harness.controller.assert_no_message().await;
+
+        sleep(Duration::from_millis(11)).await;
+        let retry = harness.exchange_command(next);
+        let apply = receive_apply(&mut harness.controller).await;
+        assert_eq!(apply.sequence, V2CommandSequence::new(1));
+        harness
+            .controller
+            .send(Message::AppliedResult(applied(apply)))
+            .await;
+        assert_eq!(
+            command_result(retry).await.result,
+            HostCommandResultCode::AppliedNew
+        );
+
+        let stop_request = HostStop {
+            controller_uid: uid(),
+            target_boot_id: TargetBootId::Exact(harness.boot_id),
+            request_id: RequestId::new(0xabcdef),
+            reason: ForceStopReason::Operator,
+        };
+        let stop_exchange = tokio::spawn({
+            let handle = harness.handle.clone();
+            let source = harness.source;
+            async move {
+                handle
+                    .exchange(source, Instant::now(), Message::HostStop(stop_request))
+                    .await
+            }
+        });
+        let Message::ForceStop(stop) = harness.controller.receive().await else {
+            panic!("stop bypasses command-rate admission")
+        };
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(
+                stop,
+                harness.boot_id,
+            )))
+            .await;
+        let Message::HostStopResult(stop_result) = stop_exchange
+            .await
+            .expect("stop exchange joins")
+            .expect("stop response")
+        else {
+            panic!("wrong stop response")
+        };
+        assert_eq!(stop_result.result, StopResultCode::ControllerConfirmed);
         harness.abort();
     }
 
@@ -2749,6 +5971,7 @@ mod tests {
         assert_eq!(zero_receipt.sequence(), V2CommandSequence::FIRST);
         assert!(zero_receipt.is_confirmed_zero());
 
+        sleep(Duration::from_millis(11)).await;
         let requested_pwm = TimerPwm::try_new(20, -20).expect("bounded motion PWM");
         let pending = PendingPhysicalCommand::new(
             requested_pwm,
@@ -2829,6 +6052,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_zero_result_cannot_be_claimed_as_a_cached_duplicate() {
+        let mut harness = Harness::ready().await;
+        harness.acquire().await;
+        let command = command(harness.boot_id, 0, TimerPwm::ZERO);
+        let exchange = harness.exchange_command(command);
+        let apply = receive_apply(&mut harness.controller).await;
+        let mut contradictory = applied(apply);
+        contradictory.result = AppliedResultCode::DuplicateCached;
+
+        harness
+            .controller
+            .send(Message::AppliedResult(contradictory))
+            .await;
+
+        assert_eq!(
+            command_result(exchange).await.result,
+            HostCommandResultCode::RejectedByController
+        );
+        assert!(matches!(
+            harness.controller.receive().await,
+            Message::ForceStop(ForceStop {
+                reason: ForceStopReason::ControllerFault,
+                ..
+            })
+        ));
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn nonzero_result_requires_fresh_nonzero_application_shape() {
+        let mut harness = harness_with_cached_zero().await;
+        harness
+            .controller
+            .send(Message::Heartbeat(established_stopped_heartbeat(
+                harness.boot_id,
+                epoch(),
+                V2CommandSequence::FIRST,
+                1_001,
+            )))
+            .await;
+        harness.controller.assert_no_message().await;
+        sleep(Duration::from_millis(11)).await;
+
+        let requested = TimerPwm::try_new(10, -10).expect("bounded PWM");
+        let command = command(harness.boot_id, 1, requested);
+        let exchange = harness.exchange_command(command);
+        let apply = receive_apply(&mut harness.controller).await;
+        let mut contradictory = applied(apply);
+        contradictory.result = AppliedResultCode::Stopped;
+
+        harness
+            .controller
+            .send(Message::AppliedResult(contradictory))
+            .await;
+
+        assert_eq!(
+            command_result(exchange).await.result,
+            HostCommandResultCode::RejectedByController
+        );
+        assert!(matches!(
+            harness.controller.receive().await,
+            Message::ForceStop(ForceStop {
+                reason: ForceStopReason::ControllerFault,
+                ..
+            })
+        ));
+        harness.abort();
+    }
+
+    #[tokio::test]
     async fn dropped_delayed_or_lost_applied_ack_never_becomes_host_success() {
         let mut harness = Harness::ready().await;
         harness.acquire().await;
@@ -2839,6 +6132,58 @@ mod tests {
         let result = command_result(exchange).await;
         assert_eq!(result.result, HostCommandResultCode::AppliedAckTimeout);
         assert_eq!(result.remaining_lease, RemainingLeaseMs::ZERO);
+        assert!(matches!(
+            harness.controller.receive().await,
+            Message::ForceStop(_)
+        ));
+        harness.abort();
+    }
+
+    #[tokio::test]
+    async fn continuously_readable_observational_uart_cannot_starve_host_status_or_ack_timer() {
+        let mut harness = Harness::ready().await;
+        harness.acquire().await;
+        for sample in 1..=24 {
+            harness
+                .controller
+                .send(Message::ObservationalOdometry(odometry(
+                    harness.boot_id,
+                    sample,
+                )))
+                .await;
+        }
+
+        let query = StatusQuery {
+            expected_controller_uid: uid(),
+            request_id: RequestId::new(0x55aa),
+        };
+        let status = timeout(
+            Duration::from_millis(25),
+            harness
+                .handle
+                .exchange(harness.source, Instant::now(), Message::StatusQuery(query)),
+        )
+        .await
+        .expect("bounded alternating turns service the host mailbox")
+        .expect("actor remains live");
+        assert!(matches!(status, Message::StatusReport(_)));
+
+        let command = command(harness.boot_id, 0, TimerPwm::ZERO);
+        let exchange = harness.exchange_command(command);
+        let _apply = receive_apply(&mut harness.controller).await;
+        for sample in 25..=48 {
+            harness
+                .controller
+                .send(Message::ObservationalOdometry(odometry(
+                    harness.boot_id,
+                    sample,
+                )))
+                .await;
+        }
+        let result = timeout(Duration::from_millis(75), command_result(exchange))
+            .await
+            .expect("serial readability cannot starve the applied-ACK deadline");
+        assert_eq!(result.result, HostCommandResultCode::AppliedAckTimeout);
         assert!(matches!(
             harness.controller.receive().await,
             Message::ForceStop(_)
@@ -2883,6 +6228,7 @@ mod tests {
             HostCommandResultCode::AppliedNew
         );
 
+        sleep(Duration::from_millis(11)).await;
         let moving = command(
             harness.boot_id,
             1,
@@ -2945,6 +6291,7 @@ mod tests {
             HostCommandResultCode::AppliedNew
         );
 
+        sleep(Duration::from_millis(11)).await;
         let pwm = TimerPwm::try_new(20, -20).expect("bounded PWM");
         let moving = command(harness.boot_id, 1, pwm);
         let moving_exchange = harness.exchange_command(moving);
@@ -3115,7 +6462,84 @@ mod tests {
     }
 
     #[test]
-    fn udp_emission_shortens_actor_remaining_lifetime_instead_of_renewing_it() {
+    fn telemetry_snapshot_exposes_output_only_from_a_fresh_heartbeat() {
+        let (actor_stream, _controller_stream) = tokio::io::duplex(256);
+        let (startup_ready, _startup_ready_rx) = oneshot::channel();
+        let mut actor = SerialActor::new(
+            actor_stream,
+            actor_config(),
+            Arc::new(NoopActuationTelemetry),
+            startup_ready,
+        );
+        let now = Instant::now();
+        assert_eq!(actor.snapshot(now).output, ActuationOutputEvidence::Unknown);
+
+        let heartbeat = zero_heartbeat(boot(7));
+        actor.heartbeat = Some(TimedHeartbeat {
+            message: heartbeat,
+            received_at: now,
+        });
+        assert_eq!(
+            actor.snapshot(now).output,
+            ActuationOutputEvidence::Observed(ObservedActuationOutput {
+                controller_uptime: heartbeat.controller_uptime,
+                output_state: heartbeat.output_state,
+                controller_timer_pwm: heartbeat.timer_pwm,
+                faults: heartbeat.faults,
+            })
+        );
+
+        let stale_at = now + actor.config.maximum_heartbeat_age;
+        assert_eq!(
+            actor.snapshot(stale_at).output,
+            ActuationOutputEvidence::Unknown
+        );
+    }
+
+    #[test]
+    fn hello_gate_keeps_candidate_and_production_classes_disjoint() {
+        let (candidate_stream, _candidate_peer) = tokio::io::duplex(256);
+        let (candidate_ready, _candidate_ready_rx) = oneshot::channel();
+        let candidate_actor = SerialActor::new(
+            candidate_stream,
+            candidate_actor_config(),
+            Arc::new(NoopActuationTelemetry),
+            candidate_ready,
+        );
+        let candidate = candidate_hello();
+        assert!(candidate_actor.hello_is_exact(candidate));
+        assert!(!candidate_actor.hello_is_exact(hello_with(uid(), boot(7))));
+
+        let (production_stream, _production_peer) = tokio::io::duplex(256);
+        let (production_ready, _production_ready_rx) = oneshot::channel();
+        let production_actor = SerialActor::new(
+            production_stream,
+            actor_config(),
+            Arc::new(NoopActuationTelemetry),
+            production_ready,
+        );
+        assert!(!production_actor.hello_is_exact(candidate));
+
+        for mutate in [
+            |hello: &mut ControllerHello| {
+                hello.capabilities = capabilities();
+            },
+            |hello: &mut ControllerHello| {
+                hello.physical_stop_semantics = PhysicalStopSemantics::CoastVerified;
+            },
+            |hello: &mut ControllerHello| {
+                hello.max_abs_pwm_percent =
+                    MaxAbsPwmPercent::try_new(29).expect("alternate candidate cap");
+            },
+        ] {
+            let mut altered = candidate;
+            mutate(&mut altered);
+            assert!(!candidate_actor.hello_is_exact(altered));
+        }
+    }
+
+    #[test]
+    fn udp_emission_charges_only_time_after_the_actor_remaining_lifetime_calculation() {
         let first_received_at = Instant::now();
         let request = command(boot(7), 0, TimerPwm::ZERO);
         let response = HostCommandResult {
@@ -3137,10 +6561,11 @@ mod tests {
             first_received_at,
             Message::HostCommandResult(response),
             first_received_at + Duration::from_millis(10),
+            first_received_at + Duration::from_millis(14),
         ) else {
             panic!("wrong response kind")
         };
-        assert_eq!(emitted.remaining_lease.get(), 89);
+        assert_eq!(emitted.remaining_lease.get(), 95);
     }
 
     #[tokio::test]

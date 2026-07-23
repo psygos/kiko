@@ -78,9 +78,8 @@ impl fmt::Display for DeadlineTranslationError {
                 formatter,
                 "controller heartbeat is at least {age_ms_at_least} ms old; maximum is {maximum_age_ms} ms"
             ),
-            Self::HeartbeatAtOrAfterServerDeadline => formatter.write_str(
-                "no controller execution window remains after the heartbeat reference",
-            ),
+            Self::HeartbeatAtOrAfterServerDeadline => formatter
+                .write_str("no controller execution window remains after the heartbeat reference"),
             Self::ArithmeticOverflow => {
                 formatter.write_str("controller deadline translation arithmetic overflowed")
             }

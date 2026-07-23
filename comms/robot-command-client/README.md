@@ -5,6 +5,17 @@ make the current V1 acceptance acknowledgement safe for actuation. A wire adapte
 V2 contract: the exact controller UID, reset-unique boot ID, control epoch, controller-enforced
 command lease, and a result emitted only after the STM32 reports the exact timer PWM it applied.
 
+The legacy `ClientConfig::parse` path is production-only and continues to
+require `ControllerCapabilities::REQUIRED_BITS`. The provisional four-PWM
+profile must use `ClientConfig::parse_for_session` with
+`ControllerSessionClass::OperatorSupervisedFourPwmCandidate`. That parser
+requires KRP2 ABI 2, build `0x0002_1001`, fingerprint
+`KIKO-4PWM-CAND1!`, and the acquisition/status evidence must carry the exact
+candidate capability class. Production and candidate capability evidence are
+cross-class rejected. A verified candidate acquisition means only that this
+typed, wheels-off/operator-supervised contract was matched; it is not
+production safety or autonomous-motion evidence.
+
 `DisarmedCommandClient` has no command method. It can become `ArmedCommandClient` only after a V2
 `StatusQuery` proving stopped state, an exact `AcquireControl` identity handshake, and one timely
 sequence-zero applied-zero result. An armed

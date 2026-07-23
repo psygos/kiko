@@ -7,10 +7,11 @@ use robot_command_client::{
 use robot_protocol::ControllerUptimeMsWrapping;
 use robot_protocol::v2::{
     AcquireResult, AcquireResultCode, ActuatorConfigFingerprint, ControlEpoch, ControllerBootId,
-    ControllerCapabilities, ControllerDeadlineMsWrapping, ControllerFaults, ControllerUid,
-    ForceStopReason, HostCommandResult, HostCommandResultCode, HostStopResult, MAX_RAW_FRAME_BYTES,
-    Message, MessageKind, OutputState, RawFrame, RemainingLeaseMs, RequestId, StatusCode,
-    StatusReport, StopResultCode, TargetBootId, TimerPwm, V2CommandLeaseMs, V2CommandSequence,
+    ControllerCapabilities, ControllerDeadlineMsWrapping, ControllerFaults, ControllerSessionClass,
+    ControllerUid, ForceStopReason, HostCommandResult, HostCommandResultCode, HostStopResult,
+    MAX_RAW_FRAME_BYTES, Message, MessageKind, OutputState, RawFrame, RemainingLeaseMs, RequestId,
+    StatusCode, StatusReport, StopResultCode, TargetBootId, TimerPwm, V2CommandLeaseMs,
+    V2CommandSequence,
 };
 use std::net::UdpSocket;
 use std::time::Duration;
@@ -68,6 +69,85 @@ fn input() -> ClientConfigInput<'static> {
 
 fn config() -> ClientConfig {
     ClientConfig::parse(input()).expect("valid fixture client config")
+}
+
+fn candidate_input() -> ClientConfigInput<'static> {
+    ClientConfigInput {
+        expected_firmware_abi: "2",
+        expected_firmware_build_id: "135169",
+        expected_actuator_config_fingerprint_hex: "4b494b4f2d3450574d2d43414e443121",
+        ..input()
+    }
+}
+
+fn candidate_config() -> ClientConfig {
+    ClientConfig::parse_for_session(
+        candidate_input(),
+        ControllerSessionClass::OperatorSupervisedFourPwmCandidate,
+    )
+    .expect("valid candidate client config")
+}
+
+fn candidate_capabilities() -> ControllerCapabilities {
+    ControllerCapabilities::try_from_bits(
+        ControllerCapabilities::SOFTWARE_GUARD_BITS
+            | ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE,
+    )
+    .expect("canonical candidate capabilities")
+}
+
+fn candidate_status_report(request_id: u32) -> Message {
+    Message::StatusReport(StatusReport {
+        controller_uid: uid(),
+        observed_boot_id: TargetBootId::Exact(boot()),
+        request_id: RequestId::new(request_id),
+        status: StatusCode::ReadyStopped,
+        control_epoch: None,
+        controller_uptime: ControllerUptimeMsWrapping::new(1_000),
+        capabilities: candidate_capabilities(),
+        output_state: OutputState::Disabled,
+        controller_timer_pwm: TimerPwm::ZERO,
+        remaining_lease: RemainingLeaseMs::ZERO,
+        faults: ControllerFaults::NONE,
+    })
+}
+
+fn candidate_acquire_result(request_id: u32) -> Message {
+    Message::AcquireResult(AcquireResult {
+        controller_uid: uid(),
+        boot_id: boot(),
+        request_id: RequestId::new(request_id),
+        control_epoch: Some(epoch()),
+        result: AcquireResultCode::Granted,
+        capabilities: candidate_capabilities(),
+        faults: ControllerFaults::NONE,
+        observed_firmware_abi: 2,
+        observed_firmware_build_id: 0x0002_1001,
+        observed_actuator_config_fingerprint: ActuatorConfigFingerprint::try_new(
+            *b"KIKO-4PWM-CAND1!",
+        )
+        .expect("candidate fingerprint"),
+    })
+}
+
+fn candidate_acquisition_steps() -> Vec<FakeStep> {
+    vec![
+        FakeStep::respond(
+            MessageKind::StatusQuery,
+            RESPONSE_DELAY,
+            candidate_status_report(0),
+        ),
+        FakeStep::respond(
+            MessageKind::AcquireControl,
+            RESPONSE_DELAY,
+            candidate_acquire_result(1),
+        ),
+        FakeStep::respond(
+            MessageKind::HostCommand,
+            RESPONSE_DELAY,
+            command_result(0, TimerPwm::ZERO, HostCommandResultCode::AppliedNew),
+        ),
+    ]
 }
 
 fn status_report(request_id: u32) -> Message {
@@ -179,6 +259,91 @@ fn config_parser_rejects_ambiguous_or_unsafe_boundary_values() {
     invalid = input();
     invalid.expected_actuator_config_fingerprint_hex = "00000000000000000000000000000000";
     assert!(ClientConfig::parse(invalid).is_err());
+}
+
+#[test]
+fn candidate_config_and_acquisition_retain_the_explicit_session_class() {
+    let config = candidate_config();
+    assert_eq!(
+        config.expected_controller_session_class(),
+        ControllerSessionClass::OperatorSupervisedFourPwmCandidate
+    );
+    for (field, value) in [
+        ("abi", "3"),
+        ("build", "135170"),
+        ("fingerprint", "22222222222222222222222222222222"),
+    ] {
+        let mut altered = candidate_input();
+        match field {
+            "abi" => altered.expected_firmware_abi = value,
+            "build" => altered.expected_firmware_build_id = value,
+            "fingerprint" => altered.expected_actuator_config_fingerprint_hex = value,
+            _ => unreachable!(),
+        }
+        assert!(
+            ClientConfig::parse_for_session(
+                altered,
+                ControllerSessionClass::OperatorSupervisedFourPwmCandidate,
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        ClientConfig::parse(candidate_input()).is_err(),
+        "reserved candidate identity cannot enter the production parser"
+    );
+
+    let clock = FakeClock::default();
+    let (transport, _) = FakeTransport::scripted(clock.clone(), candidate_acquisition_steps());
+    let client = DisarmedCommandClient::new(transport, clock, config);
+    let (armed, _) = client
+        .acquire_zero()
+        .ok()
+        .expect("candidate zero acquisition");
+    assert_eq!(
+        armed.verified_acquisition().controller_session_class(),
+        ControllerSessionClass::OperatorSupervisedFourPwmCandidate
+    );
+}
+
+#[test]
+fn production_and_candidate_capability_evidence_are_cross_class_rejected() {
+    let clock = FakeClock::default();
+    let (transport, _) = FakeTransport::scripted(
+        clock.clone(),
+        vec![FakeStep::respond(
+            MessageKind::StatusQuery,
+            RESPONSE_DELAY,
+            status_report(0),
+        )],
+    );
+    let failure =
+        match DisarmedCommandClient::new(transport, clock, candidate_config()).acquire_zero() {
+            Ok(_) => panic!("production capabilities cannot admit candidate"),
+            Err(failure) => failure,
+        };
+    assert!(matches!(
+        failure.cause(),
+        FailureCause::Evidence(EvidenceError::SessionClassCapabilitiesMismatch { .. })
+    ));
+
+    let clock = FakeClock::default();
+    let (transport, _) = FakeTransport::scripted(
+        clock.clone(),
+        vec![FakeStep::respond(
+            MessageKind::StatusQuery,
+            RESPONSE_DELAY,
+            candidate_status_report(0),
+        )],
+    );
+    let failure = match DisarmedCommandClient::new(transport, clock, config()).acquire_zero() {
+        Ok(_) => panic!("candidate capabilities cannot admit production"),
+        Err(failure) => failure,
+    };
+    assert!(matches!(
+        failure.cause(),
+        FailureCause::Evidence(EvidenceError::RequiredCapabilitiesMissing(_))
+    ));
 }
 
 #[test]

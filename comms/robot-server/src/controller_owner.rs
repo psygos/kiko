@@ -13,7 +13,7 @@ use crate::actuation_v2::{
     self, ActuationActorError, ActuationShutdownHandle, ActuationShutdownReason,
     ActuationStartError, ActuationTelemetry, NoopActuationTelemetry, UdpServiceError,
 };
-use crate::config::ControllerServerConfigV1;
+use crate::config::ControllerServerConfig;
 
 /// The sole in-process owner of one exact V2 controller and its loopback
 /// command endpoint.
@@ -37,20 +37,27 @@ impl V2ControllerOwner {
     /// Bind `command_bind`, exclusively claim `controller.serial_device()`,
     /// await its configured ready-stopped deadline, and start the two owned
     /// tasks without a secondary telemetry sink.
-    pub async fn start(
-        controller: ControllerServerConfigV1,
+    pub async fn start<Config>(
+        controller: Config,
         command_bind: SocketAddr,
-    ) -> Result<Self, V2ControllerOwnerStartError> {
+    ) -> Result<Self, V2ControllerOwnerStartError>
+    where
+        Config: Into<ControllerServerConfig>,
+    {
         Self::start_with_telemetry(controller, command_bind, Arc::new(NoopActuationTelemetry)).await
     }
 
     /// Equivalent to [`Self::start`], with a prompt non-blocking observer for
     /// controller snapshots and observational odometry.
-    pub async fn start_with_telemetry(
-        controller: ControllerServerConfigV1,
+    pub async fn start_with_telemetry<Config>(
+        controller: Config,
         command_bind: SocketAddr,
         telemetry: Arc<dyn ActuationTelemetry>,
-    ) -> Result<Self, V2ControllerOwnerStartError> {
+    ) -> Result<Self, V2ControllerOwnerStartError>
+    where
+        Config: Into<ControllerServerConfig>,
+    {
+        let controller = controller.into();
         let controller_ready_timeout = controller.controller_ready_timeout();
         let shutdown_timeout = controller.coordinated_shutdown_budget();
         let socket = actuation_v2::bind_udp_socket(command_bind)
@@ -95,7 +102,9 @@ impl V2ControllerOwner {
     }
 
     /// Request an intentional stop and wait at most `timeout` for each task
-    /// to complete its coordinated shutdown.
+    /// to complete its coordinated shutdown. A clean result requires the
+    /// exact controller `HostStopResult`; writing or flushing `ForceStop`
+    /// alone is not reported as confirmed physical stop.
     ///
     /// The actor receives a priority signal before its mailbox is closed, so
     /// requests already queued by aborted UDP exchanges cannot apply after
@@ -503,11 +512,17 @@ impl std::error::Error for V2ControllerOwnerTerminationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ControllerServerConfigV1;
 
     use std::path::Path;
 
     use crate::actuation_v2::NoopActuationTelemetry;
-    use tokio::io::AsyncReadExt;
+    use robot_protocol::v2::{
+        ControllerBootId, HostStopResult, Message, OutputState, StopResultCode, TargetBootId,
+        UartRecord, UartStreamDecoder,
+    };
+    use robot_protocol::ControllerUptimeMsWrapping;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn exact_controller(serial_device: &Path) -> ControllerServerConfigV1 {
         let json = format!(
@@ -522,6 +537,8 @@ mod tests {
                 "controller_ready_timeout_ms": 3000,
                 "heartbeat_period_ms": 20,
                 "maximum_heartbeat_age_ms": 60,
+                "maximum_host_command_rate_hz": 100,
+                "serial_transmit_timeout_ms": 10,
                 "serial_applied_ack_timeout_ms": 30,
                 "controller_clock_abs_error_ppm_bound": 50000,
                 "deadline_quantization_margin_ms": 2,
@@ -566,16 +583,52 @@ mod tests {
         )
     }
 
+    async fn confirm_shutdown_stop(mut controller: tokio::io::DuplexStream) {
+        let mut decoder = UartStreamDecoder::new();
+        loop {
+            let byte = controller.read_u8().await.expect("actor serial byte");
+            let Some(decoded) = decoder.push(byte) else {
+                continue;
+            };
+            let Message::ForceStop(stop) = decoded.expect("actor emits valid KRP2") else {
+                continue;
+            };
+            let observed_boot_id = match stop.target_boot_id {
+                TargetBootId::Exact(boot_id) => TargetBootId::Exact(boot_id),
+                TargetBootId::Any => TargetBootId::Exact(
+                    ControllerBootId::try_new(1).expect("nonzero synthetic observed boot"),
+                ),
+            };
+            let response = UartRecord::encode(Message::HostStopResult(HostStopResult {
+                controller_uid: stop.controller_uid,
+                observed_boot_id,
+                request_id: stop.request_id,
+                result: StopResultCode::ControllerConfirmed,
+                output_state: OutputState::Disabled,
+                controller_uptime: ControllerUptimeMsWrapping::new(1),
+                faults: robot_protocol::v2::ControllerFaults::NONE,
+            }))
+            .expect("stop result encodes");
+            controller
+                .write_all(response.as_bytes())
+                .await
+                .expect("stop result write");
+            return;
+        }
+    }
+
     #[tokio::test]
     async fn explicit_shutdown_joins_both_owned_tasks_and_releases_udp() {
-        let (owner, _controller) = fake_owner().await;
+        let (owner, controller) = fake_owner().await;
         let command_address = owner.command_address();
         assert!(std::net::UdpSocket::bind(command_address).is_err());
+        let confirmation = tokio::spawn(confirm_shutdown_stop(controller));
 
         owner
             .shutdown(Duration::from_millis(250))
             .await
             .expect("both owner tasks shut down cleanly");
+        confirmation.await.expect("confirmation task joins");
 
         let rebound =
             std::net::UdpSocket::bind(command_address).expect("shutdown released UDP ownership");
@@ -584,10 +637,11 @@ mod tests {
 
     #[tokio::test]
     async fn supervised_explicit_shutdown_joins_both_owned_tasks_and_releases_udp() {
-        let (owner, _controller) = fake_owner().await;
+        let (owner, controller) = fake_owner().await;
         let command_address = owner.command_address();
         let (request_shutdown, shutdown) = oneshot::channel();
         let task = tokio::spawn(owner.run_until_shutdown(shutdown, Duration::from_millis(250)));
+        let confirmation = tokio::spawn(confirm_shutdown_stop(controller));
 
         request_shutdown
             .send(())
@@ -595,6 +649,7 @@ mod tests {
         task.await
             .expect("supervision task joins")
             .expect("both owner tasks shut down cleanly");
+        confirmation.await.expect("confirmation task joins");
 
         let rebound =
             std::net::UdpSocket::bind(command_address).expect("shutdown released UDP ownership");
@@ -625,19 +680,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_serial_shutdown_is_aborted_joined_and_reported_without_detaching() {
+    async fn blocked_serial_shutdown_hits_typed_transmit_deadline_and_never_detaches() {
         let (owner, mut controller) = fake_owner_with_serial_capacity(1).await;
         let command_address = owner.command_address();
 
         let error = owner
             .shutdown(Duration::from_millis(25))
             .await
-            .expect_err("blocked best-effort stop must hit the shutdown bound");
+            .expect_err("blocked stop must hit the parsed serial-transmit bound");
         assert_eq!(
             error.trigger(),
             V2ControllerOwnerExitTrigger::ExplicitShutdown
         );
-        assert!(matches!(error.actuation(), ActuationTaskOutcome::TimedOut));
+        assert!(matches!(
+            error.actuation(),
+            ActuationTaskOutcome::Failed(ActuationActorError::SerialTransmit(
+                crate::actuation_v2::SerialTransmitError::Interrupted {
+                    phase: crate::actuation_v2::SerialTransmitPhase::Write,
+                    cause: crate::actuation_v2::SerialTransmitInterruption::DeadlineExceeded,
+                    ..
+                }
+            ))
+        ));
         assert!(matches!(error.udp(), UdpTaskOutcome::Clean));
 
         let mut serial_tail = Vec::new();
@@ -646,7 +710,7 @@ mod tests {
             controller.read_to_end(&mut serial_tail),
         )
         .await
-        .expect("aborted actor released its serial transport")
+        .expect("failed actor released its serial transport")
         .expect("read fake serial EOF");
         let rebound =
             std::net::UdpSocket::bind(command_address).expect("timeout released UDP ownership");

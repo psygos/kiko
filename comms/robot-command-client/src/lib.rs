@@ -15,6 +15,7 @@ pub use client::{
 };
 pub use config::{
     ClientConfig, ClientConfigInput, ConfigError, MAX_IO_TIMEOUT_NS, MAX_STOP_RECOVERY_ATTEMPTS,
+    OPERATOR_SUPERVISED_FOUR_PWM_FINGERPRINT_BYTES, OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID,
     StopRecoveryPolicy, TimeoutNs, UdpEndpoint,
 };
 pub use domain::{
@@ -22,8 +23,8 @@ pub use domain::{
     PendingPhysicalCommand, VerifiedControllerAcquisition,
 };
 pub use robot_protocol::v2::{
-    ActuatorConfigFingerprint, ControlEpoch, ControllerBootId, ControllerUid, TimerPwm,
-    V2CommandLeaseMs, V2CommandSequence,
+    ActuatorConfigFingerprint, ControlEpoch, ControllerBootId, ControllerSessionClass,
+    ControllerUid, TimerPwm, V2CommandLeaseMs, V2CommandSequence,
 };
 pub use transport::{
     MonotonicClock, RobotProtocolV2CodecError, RobotProtocolV2WireAdapter, SystemMonotonicClock,

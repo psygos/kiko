@@ -13,6 +13,20 @@ wheels-off-motor-commissioning = []
 # Motion-capable hardware profiles must enable this and provide the link-time
 # `kiko_external_boot_id` symbol from a reviewed per-boot identity source.
 external-boot-identity = []
+# Uses a deployment-provisioned, append-only journal in the final 128 KiB
+# STM32F446 flash sector. The linked firmware image never occupies that sector.
+flash-boot-journal = []
+# Builds the explicitly provisional, operator-supervised KRP2 profile for the
+# currently evidenced PA0/PA1 + PB4/PB5 four-PWM topology. The firmware binary
+# refuses this feature unless `flash-boot-journal` is also selected.
+operator-supervised-four-pwm-candidate = []
+# Builds the separately identified, attended wheel-on commissioning profile.
+# It remains physical-stop-unverified, is capped at 20%, and requires the
+# deployment-provisioned append-only boot journal.
+attended-wheel-on-commissioning = []
+# Host-only generator for a fresh, readback-verifiable sector image. This
+# feature is never part of an STM32 firmware build.
+boot-journal-tool = []
 
 [[bin]]
 name = "embedded"
@@ -23,6 +37,11 @@ required-features = ["firmware"]
 name = "kiko-motor-commission"
 path = "src/motor_commission.rs"
 required-features = ["wheels-off-motor-commissioning"]
+
+[[bin]]
+name = "kiko-boot-journal-image"
+path = "src/boot_journal_image.rs"
+required-features = ["boot-journal-tool"]
 
 [dependencies]
 robot-protocol = { path = "../comms/robot-protocol" }
@@ -37,7 +56,9 @@ stm32f4xx-hal = { version = "0.20", features = ["stm32f446"] }
 [target.'cfg(not(target_arch = "arm"))'.dependencies]
 clap = { version = "4.5.28", features = ["derive"] }
 getrandom = { version = "0.3", features = ["std"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 tokio = { version = "1.35", features = ["io-util", "macros", "rt", "time"] }
 tokio-serial = "5.4"
 

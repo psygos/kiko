@@ -8,12 +8,26 @@
 use core::num::{NonZeroU8, NonZeroU32};
 
 use robot_protocol::{
-    ControllerUptimeMsWrapping, PwmPercent,
-    v2::{ActuatorConfigFingerprint, ControllerDeadlineMsWrapping, DeadlineRelation},
+    ControllerUptimeMsWrapping, PwmPercent, PwmPercentError,
+    v2::{
+        ATTENDED_WHEEL_ON_COMMISSIONING_MAX_COMMAND_STEP_PERCENT, ActuatorConfigFingerprint,
+        ControllerDeadlineMsWrapping, DeadlineRelation,
+        MAX_ATTENDED_WHEEL_ON_COMMISSIONING_PWM_PERCENT,
+        MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT,
+        OPERATOR_SUPERVISED_FOUR_PWM_MAX_COMMAND_STEP_PERCENT,
+    },
 };
 
 pub const MAX_UNAMBIGUOUS_WRAPPING_TICKS: u32 = (1_u32 << 31) - 1;
 pub const MAX_PWM_STEP_PERCENT: u8 = 200;
+/// Per-command delta bound for the provisional four-PWM profile.
+///
+/// This is intentionally a command-step limit, not an experimentally measured
+/// PWM-per-second, wheel-acceleration, or velocity bound.
+pub const PROVISIONAL_FOUR_PWM_MAX_COMMAND_STEP_PERCENT: u8 =
+    OPERATOR_SUPERVISED_FOUR_PWM_MAX_COMMAND_STEP_PERCENT;
+pub const ATTENDED_WHEEL_ON_MAX_COMMAND_STEP_PERCENT: u8 =
+    ATTENDED_WHEEL_ON_COMMISSIONING_MAX_COMMAND_STEP_PERCENT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DurationMs(NonZeroU32);
@@ -315,6 +329,18 @@ pub enum ActuatorEnvelope {
         right: PwmRange,
         maximum_step: PwmStepLimit,
     },
+    OperatorSupervisedFourPwmCandidate {
+        fingerprint: ActuatorConfigFingerprint,
+        left: PwmRange,
+        right: PwmRange,
+        maximum_step: PwmStepLimit,
+    },
+    AttendedWheelOnCommissioning {
+        fingerprint: ActuatorConfigFingerprint,
+        left: PwmRange,
+        right: PwmRange,
+        maximum_step: PwmStepLimit,
+    },
 }
 
 impl ActuatorEnvelope {
@@ -343,8 +369,18 @@ impl ActuatorEnvelope {
     pub const fn fingerprint(self) -> Option<ActuatorConfigFingerprint> {
         match self {
             Self::Unvalidated => None,
-            Self::Validated { fingerprint, .. } => Some(fingerprint),
+            Self::Validated { fingerprint, .. }
+            | Self::OperatorSupervisedFourPwmCandidate { fingerprint, .. }
+            | Self::AttendedWheelOnCommissioning { fingerprint, .. } => Some(fingerprint),
         }
+    }
+
+    pub const fn is_operator_supervised_four_pwm_candidate(self) -> bool {
+        matches!(self, Self::OperatorSupervisedFourPwmCandidate { .. })
+    }
+
+    pub const fn is_attended_wheel_on_commissioning(self) -> bool {
+        matches!(self, Self::AttendedWheelOnCommissioning { .. })
     }
 
     /// Validate a requested transition without clamping.  An explicit stop
@@ -357,14 +393,28 @@ impl ActuatorEnvelope {
         if requested.is_stop() {
             return Ok(());
         }
-        let Self::Validated {
-            left,
-            right,
-            maximum_step,
-            ..
-        } = self
-        else {
-            return Err(MotionEnvelopeError::MotionDisabledUntilValidated);
+        let (left, right, maximum_step) = match self {
+            Self::Validated {
+                left,
+                right,
+                maximum_step,
+                ..
+            }
+            | Self::OperatorSupervisedFourPwmCandidate {
+                left,
+                right,
+                maximum_step,
+                ..
+            }
+            | Self::AttendedWheelOnCommissioning {
+                left,
+                right,
+                maximum_step,
+                ..
+            } => (left, right, maximum_step),
+            Self::Unvalidated => {
+                return Err(MotionEnvelopeError::MotionDisabledUntilValidated);
+            }
         };
 
         if !left.contains(requested.left()) {
@@ -397,6 +447,100 @@ impl ActuatorEnvelope {
             });
         }
         Ok(())
+    }
+}
+
+/// Exact, bounded command envelope for the explicitly provisional PA0/PA1 +
+/// PB4/PB5 profile.
+///
+/// The type proves only the software command domain: symmetric ±30% timer
+/// duty and a 5 percentage-point maximum change per accepted nonzero command.
+/// It makes no wheel sign, minimum useful duty, velocity, torque, or physical
+/// stop claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProvisionalBoundedFourPwmEnvelope(ActuatorEnvelope);
+
+impl ProvisionalBoundedFourPwmEnvelope {
+    pub fn try_new(
+        fingerprint: ActuatorConfigFingerprint,
+    ) -> Result<Self, ProvisionalFourPwmEnvelopeError> {
+        let maximum = PwmPercent::try_new(
+            i8::try_from(MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT)
+                .map_err(|_| ProvisionalFourPwmEnvelopeError::ProtocolCapNotRepresentable)?,
+        )
+        .map_err(ProvisionalFourPwmEnvelopeError::ProtocolCap)?;
+        let minimum = PwmPercent::try_new(-maximum.get())
+            .map_err(ProvisionalFourPwmEnvelopeError::ProtocolCap)?;
+        let left =
+            PwmRange::try_new(minimum, maximum).map_err(ProvisionalFourPwmEnvelopeError::Left)?;
+        let right =
+            PwmRange::try_new(minimum, maximum).map_err(ProvisionalFourPwmEnvelopeError::Right)?;
+        let maximum_step = PwmStepLimit::try_new(
+            PROVISIONAL_FOUR_PWM_MAX_COMMAND_STEP_PERCENT,
+            PROVISIONAL_FOUR_PWM_MAX_COMMAND_STEP_PERCENT,
+        )
+        .map_err(ProvisionalFourPwmEnvelopeError::Step)?;
+        Ok(Self(ActuatorEnvelope::OperatorSupervisedFourPwmCandidate {
+            fingerprint,
+            left,
+            right,
+            maximum_step,
+        }))
+    }
+
+    pub const fn into_actuator_envelope(self) -> ActuatorEnvelope {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvisionalFourPwmEnvelopeError {
+    ProtocolCapNotRepresentable,
+    ProtocolCap(PwmPercentError),
+    Left(PwmRangeError),
+    Right(PwmRangeError),
+    Step(PwmStepLimitError),
+}
+
+/// Exact electrical command envelope for the separately identified attended
+/// wheel-on commissioning image.
+///
+/// It shares the evidenced four-PWM timer topology with the wheels-off
+/// candidate while narrowing the admitted range to ±20%. It does not claim a
+/// wheel sign, useful duty, velocity, acceleration, or physical stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttendedWheelOnFourPwmEnvelope(ActuatorEnvelope);
+
+impl AttendedWheelOnFourPwmEnvelope {
+    pub fn try_new(
+        fingerprint: ActuatorConfigFingerprint,
+    ) -> Result<Self, ProvisionalFourPwmEnvelopeError> {
+        let maximum = PwmPercent::try_new(
+            i8::try_from(MAX_ATTENDED_WHEEL_ON_COMMISSIONING_PWM_PERCENT)
+                .map_err(|_| ProvisionalFourPwmEnvelopeError::ProtocolCapNotRepresentable)?,
+        )
+        .map_err(ProvisionalFourPwmEnvelopeError::ProtocolCap)?;
+        let minimum = PwmPercent::try_new(-maximum.get())
+            .map_err(ProvisionalFourPwmEnvelopeError::ProtocolCap)?;
+        let left =
+            PwmRange::try_new(minimum, maximum).map_err(ProvisionalFourPwmEnvelopeError::Left)?;
+        let right =
+            PwmRange::try_new(minimum, maximum).map_err(ProvisionalFourPwmEnvelopeError::Right)?;
+        let maximum_step = PwmStepLimit::try_new(
+            ATTENDED_WHEEL_ON_MAX_COMMAND_STEP_PERCENT,
+            ATTENDED_WHEEL_ON_MAX_COMMAND_STEP_PERCENT,
+        )
+        .map_err(ProvisionalFourPwmEnvelopeError::Step)?;
+        Ok(Self(ActuatorEnvelope::AttendedWheelOnCommissioning {
+            fingerprint,
+            left,
+            right,
+            maximum_step,
+        }))
+    }
+
+    pub const fn into_actuator_envelope(self) -> ActuatorEnvelope {
+        self.0
     }
 }
 
@@ -718,6 +862,71 @@ mod tests {
             envelope.validate_transition(pair(50, 40), PwmPair::STOP),
             Ok(())
         );
+    }
+
+    #[test]
+    fn provisional_four_pwm_envelope_exhaustively_enforces_cap_and_command_step() {
+        let fingerprint =
+            ActuatorConfigFingerprint::try_new(*b"KIKO-4PWM-CAND1!").expect("fingerprint");
+        let envelope = ProvisionalBoundedFourPwmEnvelope::try_new(fingerprint)
+            .expect("canonical constants form an envelope")
+            .into_actuator_envelope();
+        assert!(envelope.is_operator_supervised_four_pwm_candidate());
+        assert_eq!(envelope.fingerprint(), Some(fingerprint));
+        assert_eq!(
+            envelope.physical_stop_semantics(),
+            PhysicalStopSemantics::Unverified
+        );
+
+        let cap = i8::try_from(MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT)
+            .expect("protocol cap fits i8");
+        for current in -cap..=cap {
+            assert_eq!(
+                envelope.validate_transition(pair(current, -current), PwmPair::STOP),
+                Ok(()),
+                "zero must bypass cap and command-step checks"
+            );
+            for requested in -100..=100 {
+                let left_result =
+                    envelope.validate_transition(pair(current, 0), pair(requested, 0));
+                let right_result =
+                    envelope.validate_transition(pair(0, current), pair(0, requested));
+                let expected = requested == 0
+                    || ((-cap..=cap).contains(&requested)
+                        && current.abs_diff(requested)
+                            <= PROVISIONAL_FOUR_PWM_MAX_COMMAND_STEP_PERCENT);
+                assert_eq!(
+                    left_result.is_ok(),
+                    expected,
+                    "left current={current}, requested={requested}"
+                );
+                assert_eq!(
+                    right_result.is_ok(),
+                    expected,
+                    "right current={current}, requested={requested}"
+                );
+            }
+        }
+
+        for requested_left in -100..=100 {
+            for requested_right in -100..=100 {
+                let requested = pair(requested_left, requested_right);
+                let expected = requested.is_stop()
+                    || ((-cap..=cap).contains(&requested_left)
+                        && (-cap..=cap).contains(&requested_right)
+                        && requested_left.unsigned_abs()
+                            <= PROVISIONAL_FOUR_PWM_MAX_COMMAND_STEP_PERCENT
+                        && requested_right.unsigned_abs()
+                            <= PROVISIONAL_FOUR_PWM_MAX_COMMAND_STEP_PERCENT);
+                assert_eq!(
+                    envelope
+                        .validate_transition(PwmPair::STOP, requested)
+                        .is_ok(),
+                    expected,
+                    "stopped request=({requested_left},{requested_right})"
+                );
+            }
+        }
     }
 
     #[test]

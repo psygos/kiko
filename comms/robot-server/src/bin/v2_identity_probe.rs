@@ -277,6 +277,7 @@ async fn observe_hello(cli: &Cli) -> Result<ControllerHello, ProbeError> {
                 | Message::AppliedResult(_)
                 | Message::Heartbeat(_)
                 | Message::ObservationalOdometry(_)
+                | Message::TransportDiagnosticReport(_)
                 | Message::HostStopResult(_) => {}
                 Message::AcquireControl(_)
                 | Message::HostCommand(_)
@@ -285,6 +286,7 @@ async fn observe_hello(cli: &Cli) -> Result<ControllerHello, ProbeError> {
                 | Message::BeginSession(_)
                 | Message::ApplyPwm(_)
                 | Message::ForceStop(_)
+                | Message::TransportDiagnosticProbe(_)
                 | Message::AcquireResult(_)
                 | Message::HostCommandResult(_)
                 | Message::StatusReport(_) => {

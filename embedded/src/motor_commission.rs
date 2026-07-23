@@ -3375,14 +3375,8 @@ mod tests {
         assert_eq!(Recipe::BothForward10S.watchdog_period_ms(), 15_500);
         assert_eq!(Recipe::LeftBreakaway30Pct500Ms.watchdog_period_ms(), 1_500);
         assert_eq!(Recipe::RightBreakaway30Pct500Ms.watchdog_period_ms(), 1_500);
-        assert!(
-            BOTH_FORWARD_WATCHDOG_CONFIG_MS * LSI_NOMINAL_KHZ / LSI_MAX_KHZ
-                >= BOTH_FORWARD_DURATION_MS + WATCHDOG_BACKSTOP_MARGIN_MS
-        );
-        assert!(
-            BREAKAWAY_WATCHDOG_CONFIG_MS * LSI_NOMINAL_KHZ / LSI_MAX_KHZ
-                >= BREAKAWAY_DURATION_MS + WATCHDOG_BACKSTOP_MARGIN_MS
-        );
+        // The two minimum-margin inequalities are compile-time assertions next
+        // to these constants; keep the exact modeled breakaway margin visible.
         assert_eq!(
             BREAKAWAY_WATCHDOG_CONFIG_MS * LSI_NOMINAL_KHZ / LSI_MAX_KHZ - BREAKAWAY_DURATION_MS,
             521
