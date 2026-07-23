@@ -60,6 +60,16 @@
       "blocking": false
     }
   },
+  "occupancy": {
+    "resolution_m": ${OCCUPANCY_RESOLUTION_M},
+    "lower_x_m": ${OCCUPANCY_LOWER_X_M},
+    "lower_y_m": ${OCCUPANCY_LOWER_Y_M},
+    "width_cells": ${OCCUPANCY_WIDTH_CELLS},
+    "height_cells": ${OCCUPANCY_HEIGHT_CELLS},
+    "maximum_cells": ${OCCUPANCY_MAXIMUM_CELLS},
+    "maximum_keyframes": ${OCCUPANCY_MAXIMUM_KEYFRAMES},
+    "snapshot_every_keyframes": ${OCCUPANCY_SNAPSHOT_EVERY_KEYFRAMES}
+  },
   "inference": {
     "onnx_runtime_library_asset": {
       "relative_path": "${ONNX_RUNTIME_LIBRARY_RELATIVE_PATH}",

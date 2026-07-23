@@ -19,12 +19,18 @@ A qualified deployment must:
    robot-server configuration and physical-actuation configuration;
 6. use the exact OAK stream dimensions and rates selected during wheels-off
    qualification;
-7. select inference backends only as requested providers. A selection is not
+7. set every `occupancy` field from the reviewed global-map resource envelope.
+   This section owns only grid extent, maximum retained evidence, and snapshot
+   cadence. The exact `navigation-shadow-v1.json` owns the level
+   optical-world/camera-height transform, runtime rectified-left depth camera
+   and intrinsics, height/depth ranges, and sampling block; do not duplicate
+   or override them with environment variables;
+8. select inference backends only as requested providers. A selection is not
    a claim of availability, compatibility, latency, throughput, or speedup;
-8. size state quotas from available storage and enforce them before writes;
-9. install the rendered document as
+9. size state quotas from available storage and enforce them before writes;
+10. install the rendered document as
    `/opt/kiko/deployment/nano-agent-launch-v1.json`; and
-10. start `kiko-nano-agent.service` manually for qualification. The supplied
+11. start `kiko-nano-agent.service` manually for qualification. The supplied
     service has no `[Install]` section and therefore is not automatically
     enabled at boot.
 

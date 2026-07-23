@@ -9,7 +9,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::Path;
 
 use kiko_device_inventory::{
@@ -28,6 +28,9 @@ use super::{
     MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
 };
 use crate::InferenceBackend;
+use crate::dense::occupancy::OccupancyGridGeometry;
+use crate::dense::occupancy_runtime::OccupancySnapshotCadence;
+use crate::live_runtime::{LiveOccupancyHostPolicy, LiveOccupancyHostPolicyError};
 
 /// The only supported production Nano launch-document schema.
 pub const NANO_AGENT_LAUNCH_V1: u32 = 1;
@@ -54,6 +57,13 @@ pub const MAX_RERUN_DECIMATION: u32 = 10_000;
 pub const MAX_RERUN_MEMORY_BYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
 pub const MAX_RERUN_FLUSH_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_NANO_STATE_BYTES: u64 = 1_099_511_627_776;
+pub const MIN_NANO_OCCUPANCY_RESOLUTION_M: f64 = 0.001;
+pub const MAX_NANO_OCCUPANCY_RESOLUTION_M: f64 = 10.0;
+pub const MAX_NANO_OCCUPANCY_ABS_LOWER_BOUND_M: f64 = 100_000.0;
+pub const MAX_NANO_OCCUPANCY_AXIS_CELLS: u32 = 100_000;
+pub const MAX_NANO_OCCUPANCY_CELLS: usize = 16_000_000;
+pub const MAX_NANO_OCCUPANCY_KEYFRAMES: usize = 1_000_000;
+pub const MAX_NANO_OCCUPANCY_SNAPSHOT_CADENCE: usize = 1_000_000;
 
 const SHA256_HEX_BYTES: usize = 64;
 const MAX_PLANT_ARTIFACT_ID_BYTES: usize = 64;
@@ -319,6 +329,41 @@ impl NanoOakStreamGraph {
     }
 }
 
+/// Global occupancy resource policy selected by the launch document.
+///
+/// This deliberately does not duplicate projection or obstacle semantics. The
+/// exact parsed [`crate::navigation::ShadowNavigationConfigV1`] owns
+/// `world_to_occupancy` (including the declared level
+/// optical-world/camera-height transform), the runtime depth
+/// camera/intrinsics, height and depth ranges, and sampling block. The fixed
+/// integer evidence model remains executable code. This launch component owns
+/// only global extent, retained-evidence capacity, and publication cadence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NanoLaunchOccupancy {
+    host_policy: LiveOccupancyHostPolicy,
+}
+
+impl NanoLaunchOccupancy {
+    pub const fn geometry(&self) -> OccupancyGridGeometry {
+        self.host_policy.geometry()
+    }
+
+    pub const fn maximum_keyframes(&self) -> usize {
+        self.host_policy.maximum_keyframes().get()
+    }
+
+    pub const fn snapshot_cadence(&self) -> OccupancySnapshotCadence {
+        self.host_policy.snapshot_cadence()
+    }
+
+    /// Domain policy consumed directly by the production live-runtime
+    /// preparation boundary after the shadow document has been parsed with the
+    /// admitted runtime depth camera.
+    pub const fn host_policy(&self) -> LiveOccupancyHostPolicy {
+        self.host_policy
+    }
+}
+
 /// Requested inference provider. This is a configuration choice, not evidence
 /// that the provider is installed, compatible, faster, or selected at runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,7 +503,7 @@ impl NanoLaunchStorage {
 }
 
 /// Fully parsed production launch document.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NanoAgentLaunchV1 {
     agent_policy: NanoLaunchAssetBinding,
     navigation_shadow_config: NanoLaunchAssetBinding,
@@ -466,6 +511,7 @@ pub struct NanoAgentLaunchV1 {
     controller_server: NanoLaunchControllerServer,
     plant_artifact: NanoLaunchPlantArtifact,
     oak: NanoOakStreamGraph,
+    occupancy: NanoLaunchOccupancy,
     inference: NanoLaunchInference,
     rerun: NanoLaunchRerun,
     storage: NanoLaunchStorage,
@@ -505,6 +551,7 @@ impl NanoAgentLaunchV1 {
         let controller_server = parse_controller_server(dto.controller_server)?;
         let plant_artifact = parse_plant_artifact(dto.plant_artifact)?;
         let oak = parse_oak(dto.oak)?;
+        let occupancy = parse_occupancy(dto.occupancy)?;
         let inference = parse_inference(dto.inference)?;
         let rerun = parse_rerun(dto.rerun)?;
         let storage = parse_storage(dto.storage)?;
@@ -516,6 +563,7 @@ impl NanoAgentLaunchV1 {
             controller_server,
             plant_artifact,
             oak,
+            occupancy,
             inference,
             rerun,
             storage,
@@ -546,6 +594,10 @@ impl NanoAgentLaunchV1 {
 
     pub const fn oak(&self) -> &NanoOakStreamGraph {
         &self.oak
+    }
+
+    pub const fn occupancy(&self) -> &NanoLaunchOccupancy {
+        &self.occupancy
     }
 
     pub const fn inference(&self) -> &NanoLaunchInference {
@@ -723,6 +775,21 @@ pub enum NanoAgentLaunchParseError {
         minimum: u64,
         maximum: u64,
     },
+    OccupancyResolutionOutOfRange {
+        resolution_m: f64,
+        minimum_m: f64,
+        maximum_m: f64,
+    },
+    OccupancyLowerBoundOutOfRange {
+        axis: usize,
+        value_m: f64,
+        maximum_absolute_m: f64,
+    },
+    OccupancyCountNotRepresentable {
+        field: &'static str,
+        value: u64,
+    },
+    OccupancyHostPolicy(LiveOccupancyHostPolicyError),
     OakStereoDepthContractMismatch,
     OakDeviceConfig(DeviceConfigError),
     UnsupportedInferenceBackend {
@@ -764,6 +831,7 @@ impl std::error::Error for NanoAgentLaunchParseError {
             Self::InvalidAssetSha256 { source, .. } => Some(source),
             Self::InvalidSocket { source, .. } => Some(source),
             Self::OakDeviceConfig(source) => Some(source),
+            Self::OccupancyHostPolicy(source) => Some(source),
             _ => None,
         }
     }
@@ -799,6 +867,7 @@ struct NanoAgentLaunchV1Dto {
     controller_server: NanoLaunchControllerServerDto,
     plant_artifact: NanoLaunchPlantArtifactDto,
     oak: NanoOakStreamGraphDto,
+    occupancy: NanoLaunchOccupancyDto,
     inference: NanoLaunchInferenceDto,
     rerun: NanoLaunchRerunDto,
     storage: NanoLaunchStorageDto,
@@ -876,6 +945,19 @@ struct NanoOakImuStreamDto {
 struct NanoOakQueueDto {
     size: u32,
     blocking: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NanoLaunchOccupancyDto {
+    resolution_m: f64,
+    lower_x_m: f64,
+    lower_y_m: f64,
+    width_cells: u32,
+    height_cells: u32,
+    maximum_cells: u64,
+    maximum_keyframes: u64,
+    snapshot_every_keyframes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1023,6 +1105,67 @@ fn parse_oak(dto: NanoOakStreamGraphDto) -> Result<NanoOakStreamGraph, NanoAgent
     Ok(graph)
 }
 
+fn parse_occupancy(
+    dto: NanoLaunchOccupancyDto,
+) -> Result<NanoLaunchOccupancy, NanoAgentLaunchParseError> {
+    if !dto.resolution_m.is_finite()
+        || dto.resolution_m < MIN_NANO_OCCUPANCY_RESOLUTION_M
+        || dto.resolution_m > MAX_NANO_OCCUPANCY_RESOLUTION_M
+    {
+        return Err(NanoAgentLaunchParseError::OccupancyResolutionOutOfRange {
+            resolution_m: dto.resolution_m,
+            minimum_m: MIN_NANO_OCCUPANCY_RESOLUTION_M,
+            maximum_m: MAX_NANO_OCCUPANCY_RESOLUTION_M,
+        });
+    }
+    for (axis, value_m) in [dto.lower_x_m, dto.lower_y_m].into_iter().enumerate() {
+        if !value_m.is_finite() || value_m.abs() > MAX_NANO_OCCUPANCY_ABS_LOWER_BOUND_M {
+            return Err(NanoAgentLaunchParseError::OccupancyLowerBoundOutOfRange {
+                axis,
+                value_m,
+                maximum_absolute_m: MAX_NANO_OCCUPANCY_ABS_LOWER_BOUND_M,
+            });
+        }
+    }
+    let width_cells = bounded_nonzero_u32(
+        "occupancy.width_cells",
+        dto.width_cells,
+        MAX_NANO_OCCUPANCY_AXIS_CELLS,
+    )?;
+    let height_cells = bounded_nonzero_u32(
+        "occupancy.height_cells",
+        dto.height_cells,
+        MAX_NANO_OCCUPANCY_AXIS_CELLS,
+    )?;
+    let maximum_cells = bounded_nonzero_usize(
+        "occupancy.maximum_cells",
+        dto.maximum_cells,
+        MAX_NANO_OCCUPANCY_CELLS,
+    )?;
+    let maximum_keyframes = bounded_nonzero_usize(
+        "occupancy.maximum_keyframes",
+        dto.maximum_keyframes,
+        MAX_NANO_OCCUPANCY_KEYFRAMES,
+    )?;
+    let snapshot_every_keyframes = bounded_nonzero_usize(
+        "occupancy.snapshot_every_keyframes",
+        dto.snapshot_every_keyframes,
+        MAX_NANO_OCCUPANCY_SNAPSHOT_CADENCE,
+    )?;
+    let host_policy = LiveOccupancyHostPolicy::try_new(
+        dto.resolution_m,
+        dto.lower_x_m,
+        dto.lower_y_m,
+        width_cells.get(),
+        height_cells.get(),
+        maximum_cells.get(),
+        maximum_keyframes.get(),
+        snapshot_every_keyframes.get(),
+    )
+    .map_err(NanoAgentLaunchParseError::OccupancyHostPolicy)?;
+    Ok(NanoLaunchOccupancy { host_policy })
+}
+
 fn parse_image_stream(
     field: &'static str,
     width_px: u32,
@@ -1034,6 +1177,24 @@ fn parse_image_stream(
         height_px: bounded_nonzero_u32(field, height_px, MAX_OAK_IMAGE_HEIGHT_PX)?,
         fps: bounded_nonzero_u32(field, fps, MAX_OAK_FRAME_RATE_HZ)?,
     })
+}
+
+fn bounded_nonzero_usize(
+    field: &'static str,
+    value: u64,
+    maximum: usize,
+) -> Result<NonZeroUsize, NanoAgentLaunchParseError> {
+    let converted = usize::try_from(value)
+        .map_err(|_| NanoAgentLaunchParseError::OccupancyCountNotRepresentable { field, value })?;
+    if converted == 0 || converted > maximum {
+        return Err(NanoAgentLaunchParseError::NumericOutOfRange {
+            field,
+            value,
+            minimum: 1,
+            maximum: u64::try_from(maximum).expect("Linux and macOS usize resource bounds fit u64"),
+        });
+    }
+    Ok(NonZeroUsize::new(converted).expect("nonzero checked above"))
 }
 
 fn parse_inference(
@@ -1377,6 +1538,16 @@ mod tests {
                 "imu": {"rate_hz": 400},
                 "queue": {"size": 8, "blocking": false}
             },
+            "occupancy": {
+                "resolution_m": 0.05,
+                "lower_x_m": -10.0,
+                "lower_y_m": -5.0,
+                "width_cells": 400,
+                "height_cells": 400,
+                "maximum_cells": 4_000_000,
+                "maximum_keyframes": 300,
+                "snapshot_every_keyframes": 5
+            },
             "inference": {
                 "onnx_runtime_library_asset": asset(
                     "runtime/libonnxruntime.so",
@@ -1436,6 +1607,14 @@ mod tests {
         assert_eq!(
             launch.controller_server().command_udp_endpoint(),
             "127.0.0.1:8080".parse().expect("valid socket")
+        );
+        assert_eq!(launch.occupancy().geometry().resolution_m(), 0.05);
+        assert_eq!(launch.occupancy().geometry().lower_bound_m(), [-10.0, -5.0]);
+        assert_eq!(launch.occupancy().maximum_keyframes(), 300);
+        assert_eq!(launch.occupancy().snapshot_cadence().get(), 5);
+        assert_eq!(
+            launch.occupancy().host_policy().geometry(),
+            launch.occupancy().geometry()
         );
     }
 
@@ -1551,6 +1730,62 @@ mod tests {
             parse(&blocking),
             Err(NanoAgentLaunchParseError::NonblockingOakQueueRequired)
         ));
+    }
+
+    #[test]
+    fn occupancy_host_resources_are_mandatory_finite_bounded_and_coherent() {
+        let mut missing = valid_value();
+        missing
+            .as_object_mut()
+            .expect("top-level fixture object")
+            .remove("occupancy");
+        assert!(matches!(
+            parse(&missing),
+            Err(NanoAgentLaunchParseError::JsonDecode(_))
+        ));
+
+        let mut resolution = valid_value();
+        resolution["occupancy"]["resolution_m"] = json!(MAX_NANO_OCCUPANCY_RESOLUTION_M + 1.0);
+        assert!(matches!(
+            parse(&resolution),
+            Err(NanoAgentLaunchParseError::OccupancyResolutionOutOfRange { .. })
+        ));
+
+        let mut lower_bound = valid_value();
+        lower_bound["occupancy"]["lower_x_m"] = json!(MAX_NANO_OCCUPANCY_ABS_LOWER_BOUND_M + 1.0);
+        assert!(matches!(
+            parse(&lower_bound),
+            Err(NanoAgentLaunchParseError::OccupancyLowerBoundOutOfRange { axis: 0, .. })
+        ));
+
+        let mut undersized_maximum = valid_value();
+        undersized_maximum["occupancy"]["maximum_cells"] = json!(100);
+        assert!(matches!(
+            parse(&undersized_maximum),
+            Err(NanoAgentLaunchParseError::OccupancyHostPolicy(
+                LiveOccupancyHostPolicyError::Geometry(_)
+            ))
+        ));
+
+        for (field, maximum) in [
+            (
+                "maximum_keyframes",
+                u64::try_from(MAX_NANO_OCCUPANCY_KEYFRAMES)
+                    .expect("host resource maximum fits u64"),
+            ),
+            (
+                "snapshot_every_keyframes",
+                u64::try_from(MAX_NANO_OCCUPANCY_SNAPSHOT_CADENCE)
+                    .expect("host resource maximum fits u64"),
+            ),
+        ] {
+            let mut excessive = valid_value();
+            excessive["occupancy"][field] = json!(maximum + 1);
+            assert!(matches!(
+                parse(&excessive),
+                Err(NanoAgentLaunchParseError::NumericOutOfRange { .. })
+            ));
+        }
     }
 
     #[test]

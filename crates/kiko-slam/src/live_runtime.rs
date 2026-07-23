@@ -191,8 +191,8 @@ impl LoadedLiveNavigationRequest {
 ///
 /// Every field is already a domain type, so a loaded enabled request cannot
 /// retain syntactically valid but semantically invalid occupancy policy.
-#[derive(Clone, Copy, Debug)]
-struct LiveOccupancyHostPolicy {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LiveOccupancyHostPolicy {
     geometry: OccupancyGridGeometry,
     evidence: OccupancyEvidenceModel,
     maximum_keyframes: NonZeroUsize,
@@ -200,6 +200,64 @@ struct LiveOccupancyHostPolicy {
 }
 
 impl LiveOccupancyHostPolicy {
+    /// Parse the host-owned global-map resource envelope exactly once.
+    ///
+    /// Projection, camera, height/depth eligibility, and sampling remain in
+    /// the exact shadow-navigation document. This type owns only global grid
+    /// extent, retained evidence capacity, and publication cadence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        resolution_m: f64,
+        lower_x_m: f64,
+        lower_y_m: f64,
+        width_cells: u32,
+        height_cells: u32,
+        maximum_cells: usize,
+        maximum_keyframes: usize,
+        snapshot_every_keyframes: usize,
+    ) -> Result<Self, LiveOccupancyHostPolicyError> {
+        let geometry = OccupancyGridGeometry::try_new(
+            resolution_m,
+            [lower_x_m, lower_y_m],
+            width_cells,
+            height_cells,
+            maximum_cells,
+        )
+        .map_err(LiveOccupancyHostPolicyError::Geometry)?;
+        let evidence = OccupancyEvidenceModel::try_new(-1, 3, -2, 2)
+            .expect("fixed live occupancy evidence model is valid");
+        let maximum_keyframes = parse_live_occupancy_maximum_keyframes(
+            maximum_keyframes,
+            evidence,
+        )
+        .map_err(LiveOccupancyHostPolicyError::MaximumKeyframes)?;
+        let snapshot_cadence =
+            OccupancySnapshotCadence::try_new(snapshot_every_keyframes)
+                .map_err(LiveOccupancyHostPolicyError::SnapshotCadence)?;
+        Ok(Self {
+            geometry,
+            evidence,
+            maximum_keyframes,
+            snapshot_cadence,
+        })
+    }
+
+    pub const fn geometry(self) -> OccupancyGridGeometry {
+        self.geometry
+    }
+
+    pub const fn evidence(self) -> OccupancyEvidenceModel {
+        self.evidence
+    }
+
+    pub const fn maximum_keyframes(self) -> NonZeroUsize {
+        self.maximum_keyframes
+    }
+
+    pub const fn snapshot_cadence(self) -> OccupancySnapshotCadence {
+        self.snapshot_cadence
+    }
+
     fn load_from_environment() -> Result<Self, LiveNavigationLoadError> {
         let resolution_m = env_f64("KIKO_OCCUPANCY_RESOLUTION_M")?.unwrap_or(0.05);
         let lower_x_m = env_f64("KIKO_OCCUPANCY_LOWER_X_M")?.unwrap_or(-10.0);
@@ -210,24 +268,44 @@ impl LiveOccupancyHostPolicy {
         let maximum_keyframes = env_usize("KIKO_OCCUPANCY_MAX_KEYFRAMES")?.unwrap_or(300);
         let snapshot_cadence = env_usize("KIKO_OCCUPANCY_RERUN_EVERY_KEYFRAMES")?.unwrap_or(5);
 
-        let geometry = OccupancyGridGeometry::try_new(
+        Self::try_new(
             resolution_m,
-            [lower_x_m, lower_y_m],
+            lower_x_m,
+            lower_y_m,
             width,
             height,
             maximum_cells,
-        )?;
-        let evidence = OccupancyEvidenceModel::try_new(-1, 3, -2, 2)
-            .expect("fixed live occupancy evidence model is valid");
-        let maximum_keyframes =
-            parse_live_occupancy_maximum_keyframes(maximum_keyframes, evidence)?;
-        let snapshot_cadence = OccupancySnapshotCadence::try_new(snapshot_cadence)?;
-        Ok(Self {
-            geometry,
-            evidence,
             maximum_keyframes,
             snapshot_cadence,
-        })
+        )
+        .map_err(LiveNavigationLoadError::OccupancyHostPolicy)
+    }
+}
+
+#[derive(Debug)]
+pub enum LiveOccupancyHostPolicyError {
+    Geometry(OccupancyGridGeometryError),
+    MaximumKeyframes(OccupancyConfigError),
+    SnapshotCadence(OccupancySnapshotCadenceError),
+}
+
+impl std::fmt::Display for LiveOccupancyHostPolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Geometry(source) => source.fmt(formatter),
+            Self::MaximumKeyframes(source) => source.fmt(formatter),
+            Self::SnapshotCadence(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for LiveOccupancyHostPolicyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Geometry(source) => Some(source),
+            Self::MaximumKeyframes(source) => Some(source),
+            Self::SnapshotCadence(source) => Some(source),
+        }
     }
 }
 
@@ -311,6 +389,7 @@ impl std::error::Error for LiveNavigationBoundaryError {}
 pub enum LiveNavigationLoadError {
     Config(LiveNavigationConfigReadError),
     Environment(EnvError),
+    OccupancyHostPolicy(LiveOccupancyHostPolicyError),
     OccupancyCadence(OccupancySnapshotCadenceError),
     OccupancyGeometry(OccupancyGridGeometryError),
     OccupancyConfig(OccupancyConfigError),
@@ -322,6 +401,7 @@ impl std::fmt::Display for LiveNavigationLoadError {
         match self {
             Self::Config(source) => source.fmt(formatter),
             Self::Environment(source) => source.fmt(formatter),
+            Self::OccupancyHostPolicy(source) => source.fmt(formatter),
             Self::OccupancyCadence(source) => source.fmt(formatter),
             Self::OccupancyGeometry(source) => source.fmt(formatter),
             Self::OccupancyConfig(source) => source.fmt(formatter),
@@ -337,6 +417,7 @@ impl std::error::Error for LiveNavigationLoadError {
         match self {
             Self::Config(source) => Some(source),
             Self::Environment(source) => Some(source),
+            Self::OccupancyHostPolicy(source) => Some(source),
             Self::OccupancyCadence(source) => Some(source),
             Self::OccupancyGeometry(source) => Some(source),
             Self::OccupancyConfig(source) => Some(source),
@@ -674,9 +755,6 @@ pub fn prepare_live_navigation_runtime(
     let occupancy_host_policy = occupancy_host_policy
         .expect("loaded enabled navigation always owns parsed occupancy host policy");
     let parsed = ShadowNavigationConfigV1::parse_json(&bytes, runtime_depth_camera)?;
-    let occupancy_config =
-        build_navigation_occupancy_runtime_config(&parsed, occupancy_host_policy)?;
-    let parts = parsed.into_runtime_parts();
     #[cfg(feature = "actuation")]
     let actuation = match actuation {
         LiveActuationRequest::ShadowOnly => None,
@@ -687,21 +765,70 @@ pub fn prepare_live_navigation_runtime(
                 &actuation_bytes,
                 &exact_robot_id,
                 &bytes,
-                parts.mpc_solver.model(),
-                parts.solver_budget,
-                parts.control_period,
+                parsed.mpc_solver().model(),
+                parsed.solver_budget(),
+                parsed.control_period(),
             )?)
         }
     };
     #[cfg(not(feature = "actuation"))]
     debug_assert!(matches!(actuation, LiveActuationRequest::ShadowOnly));
 
+    assemble_live_navigation_runtime(
+        parsed,
+        goal,
+        dataset_path,
+        occupancy_host_policy,
+        device_session,
+        #[cfg(feature = "actuation")]
+        actuation,
+    )
+    .map(Some)
+}
+
+/// Allocate live navigation from a shadow policy which was already parsed
+/// against this device session's exact depth-camera model.
+///
+/// This is the production seam: strict launch loading owns the bytes,
+/// production admission owns the physical driver, and this function therefore
+/// neither reopens a path nor reparses the navigation/actuation documents. The
+/// returned runtime is shadow-only internally; the sole production motion
+/// owner receives its already-admitted driver through a separate type.
+pub fn prepare_live_navigation_runtime_from_parsed(
+    parsed: ShadowNavigationConfigV1,
+    goal: Option<NavigationGoalArg>,
+    dataset_path: PathBuf,
+    occupancy_host_policy: LiveOccupancyHostPolicy,
+    device_session: DeviceSessionId,
+) -> Result<PreparedLiveNavigationRuntime, LiveNavigationPreparationError> {
+    assemble_live_navigation_runtime(
+        parsed,
+        goal,
+        dataset_path,
+        occupancy_host_policy,
+        device_session,
+        #[cfg(feature = "actuation")]
+        None,
+    )
+}
+
+fn assemble_live_navigation_runtime(
+    parsed: ShadowNavigationConfigV1,
+    goal: Option<NavigationGoalArg>,
+    dataset_path: PathBuf,
+    occupancy_host_policy: LiveOccupancyHostPolicy,
+    device_session: DeviceSessionId,
+    #[cfg(feature = "actuation")] actuation: Option<NavigationActuationConfigV1>,
+) -> Result<PreparedLiveNavigationRuntime, LiveNavigationPreparationError> {
+    let occupancy_config =
+        build_navigation_occupancy_runtime_config(&parsed, occupancy_host_policy)?;
+    let parts = parsed.into_runtime_parts();
     let mpc_config = parts.mpc_solver.config();
     let odometry = PlanarOdometry::new(parts.odometry);
     let local_costmap = LocalCostmap::try_new(parts.local_costmap, device_session)?;
     let reference_builder = PathReferenceBuilderV1::new(parts.path_reference);
     let safety = ShadowSafetySupervisor::try_new(parts.mpc_solver, parts.shadow_command)?;
-    Ok(Some(PreparedLiveNavigationRuntime {
+    Ok(PreparedLiveNavigationRuntime {
         goal,
         dataset_path,
         control_period: parts.control_period,
@@ -716,7 +843,7 @@ pub fn prepare_live_navigation_runtime(
         safety,
         #[cfg(feature = "actuation")]
         actuation,
-    }))
+    })
 }
 
 /// Build the global dense map from the already-parsed navigation contract.
@@ -764,7 +891,7 @@ mod tests {
     use super::{
         LiveActuationRequest, LiveNavigationBoundaryError, LiveNavigationConfigReadError,
         LiveNavigationLoadError, LiveNavigationPrerequisiteError, LiveNavigationPrerequisites,
-        LiveNavigationRequest,
+        LiveNavigationRequest, LiveOccupancyHostPolicy, LiveOccupancyHostPolicyError,
     };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -841,6 +968,49 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn occupancy_host_resources_parse_once_and_preserve_metric_geometry() {
+        let policy =
+            LiveOccupancyHostPolicy::try_new(0.05, -10.0, -5.0, 400, 300, 120_000, 300, 5)
+                .expect("bounded host occupancy policy");
+
+        let geometry = policy.geometry();
+        assert_eq!(geometry.resolution_m(), 0.05);
+        assert_eq!(geometry.lower_bound_m(), [-10.0, -5.0]);
+        assert_eq!((geometry.width(), geometry.height()), (400, 300));
+        assert_eq!(policy.maximum_keyframes().get(), 300);
+        assert_eq!(policy.snapshot_cadence().get(), 5);
+    }
+
+    #[test]
+    fn occupancy_host_resources_reject_each_unrepresentable_state() {
+        assert!(matches!(
+            LiveOccupancyHostPolicy::try_new(
+                f64::NAN,
+                -10.0,
+                -5.0,
+                400,
+                300,
+                120_000,
+                300,
+                5,
+            ),
+            Err(LiveOccupancyHostPolicyError::Geometry(_))
+        ));
+        assert!(matches!(
+            LiveOccupancyHostPolicy::try_new(
+                0.05, -10.0, -5.0, 400, 300, 120_000, 0, 5,
+            ),
+            Err(LiveOccupancyHostPolicyError::MaximumKeyframes(_))
+        ));
+        assert!(matches!(
+            LiveOccupancyHostPolicy::try_new(
+                0.05, -10.0, -5.0, 400, 300, 120_000, 300, 0,
+            ),
+            Err(LiveOccupancyHostPolicyError::SnapshotCadence(_))
+        ));
     }
 
     #[test]
