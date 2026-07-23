@@ -58,6 +58,7 @@ pub enum RuntimeStage {
     EnableTorque,
     VerifyFirstStoppedPosition,
     VerifySecondStoppedPosition,
+    HealthReadTelemetry,
     ReturnReadTelemetry,
     ReturnWriteWaypoint,
 }
@@ -312,6 +313,204 @@ impl From<FreshHeadTelemetrySet> for HeadTelemetrySetEvidence {
             samples: set.samples(),
             received_at: set.received_at(),
             admitted_at: set.admitted_at(),
+        }
+    }
+}
+
+/// One stopped, status-zero observation of an exact expected joint whose
+/// position remains inside the actor's admitted natural-hold tolerance.
+///
+/// Values other than position and the moving flag remain deliberately raw in
+/// [`FullTelemetry`]; this evidence does not invent physical units for them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadHealthJointEvidence {
+    joint: HeadJoint,
+    target: PositionTicks,
+    absolute_difference_ticks: u16,
+    response: ResponseEvidence<FullTelemetry>,
+}
+
+impl HeadHealthJointEvidence {
+    pub const fn joint(&self) -> HeadJoint {
+        self.joint
+    }
+
+    pub const fn target(&self) -> PositionTicks {
+        self.target
+    }
+
+    pub const fn absolute_difference_ticks(&self) -> u16 {
+        self.absolute_difference_ticks
+    }
+
+    /// Exact parsed telemetry, including raw speed, load, voltage,
+    /// temperature, current, status, and otherwise unqualified registers.
+    pub const fn telemetry(&self) -> &FullTelemetry {
+        self.response.value()
+    }
+
+    pub const fn response(&self) -> &ResponseEvidence<FullTelemetry> {
+        &self.response
+    }
+}
+
+/// A complete canonical bow/curl/yaw/roll health observation made while the
+/// actor retained exclusive ownership of the servo bus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedHeadHealthEvidence {
+    started_at: MonotonicTime,
+    completed_at: MonotonicTime,
+    natural_hold_target: HeadPose,
+    tolerance: PositionAgreementTicks,
+    joints: [HeadHealthJointEvidence; 4],
+}
+
+impl VerifiedHeadHealthEvidence {
+    pub const fn started_at(&self) -> MonotonicTime {
+        self.started_at
+    }
+
+    pub const fn completed_at(&self) -> MonotonicTime {
+        self.completed_at
+    }
+
+    pub const fn natural_hold_target(&self) -> HeadPose {
+        self.natural_hold_target
+    }
+
+    pub const fn tolerance(&self) -> PositionAgreementTicks {
+        self.tolerance
+    }
+
+    /// Evidence in the exact canonical order defined by [`HeadJoint::ALL`].
+    pub const fn joints(&self) -> &[HeadHealthJointEvidence; 4] {
+        &self.joints
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HeadHealthClockBoundary {
+    RequestWriteCompleted { joint: HeadJoint },
+    ResponseReceived { joint: HeadJoint },
+    CheckCompleted,
+}
+
+/// Exact reason a bounded natural-hold health observation was not admitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadHealthFailure {
+    Cancelled {
+        cause: CancellationCause,
+        stage: RuntimeStage,
+        joint: HeadJoint,
+    },
+    TelemetryRead {
+        joint: HeadJoint,
+        source: RequestError,
+    },
+    ClockRegression {
+        boundary: HeadHealthClockBoundary,
+        previous: MonotonicTime,
+        observed: MonotonicTime,
+        current_response: Option<Box<ResponseEvidence<FullTelemetry>>>,
+    },
+    DeviceStatus {
+        joint: HeadJoint,
+        raw: u8,
+        response: ResponseEvidence<FullTelemetry>,
+    },
+    Moving {
+        joint: HeadJoint,
+        position: PositionTicks,
+        response: ResponseEvidence<FullTelemetry>,
+    },
+    PositionMismatch {
+        joint: HeadJoint,
+        target: PositionTicks,
+        actual: PositionTicks,
+        absolute_difference_ticks: u16,
+        tolerance: PositionAgreementTicks,
+        response: ResponseEvidence<FullTelemetry>,
+    },
+}
+
+impl fmt::Display for HeadHealthFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "natural-hold health observation failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for HeadHealthFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TelemetryRead { source, .. } => Some(source),
+            Self::Cancelled { .. }
+            | Self::ClockRegression { .. }
+            | Self::DeviceStatus { .. }
+            | Self::Moving { .. }
+            | Self::PositionMismatch { .. } => None,
+        }
+    }
+}
+
+/// Lossless accepted prefix plus the exact failure for one health check.
+///
+/// An observation which fails status, moving, or position admission is kept
+/// in the corresponding [`HeadHealthFailure`] variant rather than being
+/// mislabeled as part of the accepted prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadHealthObservationError {
+    started_at: MonotonicTime,
+    accepted_prefix: [Option<HeadHealthJointEvidence>; 4],
+    failure: HeadHealthFailure,
+}
+
+impl HeadHealthObservationError {
+    pub const fn started_at(&self) -> MonotonicTime {
+        self.started_at
+    }
+
+    pub const fn accepted_prefix(&self) -> &[Option<HeadHealthJointEvidence>; 4] {
+        &self.accepted_prefix
+    }
+
+    pub const fn failure(&self) -> &HeadHealthFailure {
+        &self.failure
+    }
+}
+
+impl fmt::Display for HeadHealthObservationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.failure.fmt(formatter)
+    }
+}
+
+impl std::error::Error for HeadHealthObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.failure)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadHealthCheckError {
+    CommandBeforeStartup,
+    CommandAlreadyInProgress,
+    Observation(Box<HeadHealthObservationError>),
+}
+
+impl fmt::Display for HeadHealthCheckError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "head health check failed: {self:?}")
+    }
+}
+
+impl std::error::Error for HeadHealthCheckError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Observation(source) => Some(source.as_ref()),
+            Self::CommandBeforeStartup | Self::CommandAlreadyInProgress => None,
         }
     }
 }
@@ -852,6 +1051,9 @@ impl ActorExit {
 }
 
 enum HeadCommand {
+    CheckHealth {
+        response: oneshot::Sender<Result<VerifiedHeadHealthEvidence, HeadHealthCheckError>>,
+    },
     ReturnToTarget {
         response: oneshot::Sender<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
     },
@@ -867,6 +1069,20 @@ pub struct HeadActorHandle {
 }
 
 impl HeadActorHandle {
+    /// Observe all four joints without relinquishing the actor's exclusive bus
+    /// ownership or changing any torque/goal register.
+    pub async fn check_health(&self) -> Result<VerifiedHeadHealthEvidence, HeadHealthRequestError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::CheckHealth { response })
+            .await
+            .map_err(|_| HeadHealthRequestError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| HeadHealthRequestError::ActorStoppedBeforeReporting)?
+            .map_err(|source| HeadHealthRequestError::Check { source })
+    }
+
     pub async fn shutdown(self) -> Result<TorqueDisableReport, ShutdownError> {
         let (response, result) = oneshot::channel();
         self.commands
@@ -925,6 +1141,28 @@ impl fmt::Display for HeadCommandError {
 }
 
 impl std::error::Error for HeadCommandError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadHealthRequestError {
+    ActorAlreadyStopped,
+    ActorStoppedBeforeReporting,
+    Check { source: HeadHealthCheckError },
+}
+
+impl fmt::Display for HeadHealthRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "head health request failed: {self:?}")
+    }
+}
+
+impl std::error::Error for HeadHealthRequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Check { source } => Some(source),
+            Self::ActorAlreadyStopped | Self::ActorStoppedBeforeReporting => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShutdownError {
@@ -1287,6 +1525,12 @@ where
                             control.shutdown_response = Some(response);
                             ActorTermination::StartupFaultWithShutdownRequested
                         }
+                        Ok(HeadCommand::CheckHealth { response }) => {
+                            let _requester_present = response
+                                .send(Err(HeadHealthCheckError::CommandBeforeStartup))
+                                .is_ok();
+                            ActorTermination::StartupFault
+                        }
                         Ok(HeadCommand::ReturnToTarget { response }) => {
                             let _requester_present = response
                                 .send(Err(HeadReturnError::CommandBeforeStartup))
@@ -1337,6 +1581,16 @@ where
                 Some(HeadCommand::Shutdown { response }) => {
                     control.shutdown_response = Some(response);
                     return ActorTermination::RequestedShutdown;
+                }
+                Some(HeadCommand::CheckHealth { response }) => {
+                    let result = self
+                        .observe_natural_hold_health(start_pose, commands, control)
+                        .await
+                        .map_err(|source| HeadHealthCheckError::Observation(Box::new(source)));
+                    let _requester_present = response.send(result).is_ok();
+                    if let Some(termination) = control.termination.clone() {
+                        return termination;
+                    }
                 }
                 Some(HeadCommand::ReturnToTarget { response }) => {
                     if head_return.is_some() {
@@ -1986,6 +2240,12 @@ where
                     .is_ok();
                 Ok(())
             }
+            Ok(HeadCommand::CheckHealth { response }) => {
+                let _requester_present = response
+                    .send(Err(HeadHealthCheckError::CommandAlreadyInProgress))
+                    .is_ok();
+                Ok(())
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 control.termination = Some(ActorTermination::HandleDropped);
                 Err(HeadReturnError::Cancelled {
@@ -1993,6 +2253,182 @@ where
                     stage,
                     joint,
                     waypoint_writes: Vec::new(),
+                })
+            }
+            Err(mpsc::error::TryRecvError::Empty) => Ok(()),
+        }
+    }
+
+    async fn observe_natural_hold_health(
+        &mut self,
+        natural_hold_target: HeadPose,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<VerifiedHeadHealthEvidence, HeadHealthObservationError> {
+        let started_at = self.clock.now();
+        let tolerance = self.config.readback_tolerance();
+        let mut accepted_prefix: [Option<HeadHealthJointEvidence>; 4] =
+            std::array::from_fn(|_| None);
+        let mut previous_at = started_at;
+
+        for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+            if let Err(failure) = self.check_health_control(commands, control, joint) {
+                return Err(HeadHealthObservationError {
+                    started_at,
+                    accepted_prefix,
+                    failure,
+                });
+            }
+
+            let request = build_full_telemetry_read(joint.servo_id());
+            let response = match self.read_telemetry(joint, &request).await {
+                Ok(response) => response,
+                Err(source) => {
+                    return Err(HeadHealthObservationError {
+                        started_at,
+                        accepted_prefix,
+                        failure: HeadHealthFailure::TelemetryRead { joint, source },
+                    });
+                }
+            };
+
+            let write_completed_at = response.request_write().completed_at();
+            if write_completed_at < previous_at {
+                return Err(HeadHealthObservationError {
+                    started_at,
+                    accepted_prefix,
+                    failure: HeadHealthFailure::ClockRegression {
+                        boundary: HeadHealthClockBoundary::RequestWriteCompleted { joint },
+                        previous: previous_at,
+                        observed: write_completed_at,
+                        current_response: Some(Box::new(response)),
+                    },
+                });
+            }
+            let received_at = response.received_at();
+            if received_at < write_completed_at {
+                return Err(HeadHealthObservationError {
+                    started_at,
+                    accepted_prefix,
+                    failure: HeadHealthFailure::ClockRegression {
+                        boundary: HeadHealthClockBoundary::ResponseReceived { joint },
+                        previous: write_completed_at,
+                        observed: received_at,
+                        current_response: Some(Box::new(response)),
+                    },
+                });
+            }
+
+            let telemetry = *response.value();
+            if telemetry.device_status_raw() != 0 {
+                return Err(HeadHealthObservationError {
+                    started_at,
+                    accepted_prefix,
+                    failure: HeadHealthFailure::DeviceStatus {
+                        joint,
+                        raw: telemetry.device_status_raw(),
+                        response,
+                    },
+                });
+            }
+            if telemetry.is_moving() {
+                return Err(HeadHealthObservationError {
+                    started_at,
+                    accepted_prefix,
+                    failure: HeadHealthFailure::Moving {
+                        joint,
+                        position: telemetry.position(),
+                        response,
+                    },
+                });
+            }
+
+            let target = natural_hold_target.position(joint);
+            let absolute_difference_ticks = target.get().abs_diff(telemetry.position().get());
+            if absolute_difference_ticks > tolerance.get() {
+                return Err(HeadHealthObservationError {
+                    started_at,
+                    accepted_prefix,
+                    failure: HeadHealthFailure::PositionMismatch {
+                        joint,
+                        target,
+                        actual: telemetry.position(),
+                        absolute_difference_ticks,
+                        tolerance,
+                        response,
+                    },
+                });
+            }
+
+            accepted_prefix[index] = Some(HeadHealthJointEvidence {
+                joint,
+                target,
+                absolute_difference_ticks,
+                response,
+            });
+            previous_at = received_at;
+        }
+
+        let completed_at = self.clock.now();
+        if completed_at < previous_at {
+            return Err(HeadHealthObservationError {
+                started_at,
+                accepted_prefix,
+                failure: HeadHealthFailure::ClockRegression {
+                    boundary: HeadHealthClockBoundary::CheckCompleted,
+                    previous: previous_at,
+                    observed: completed_at,
+                    current_response: None,
+                },
+            });
+        }
+
+        let joints = accepted_prefix.map(|evidence| {
+            evidence.expect("all four canonical joints were admitted on the success path")
+        });
+        Ok(VerifiedHeadHealthEvidence {
+            started_at,
+            completed_at,
+            natural_hold_target,
+            tolerance,
+            joints,
+        })
+    }
+
+    fn check_health_control(
+        &self,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+        joint: HeadJoint,
+    ) -> Result<(), HeadHealthFailure> {
+        match commands.try_recv() {
+            Ok(HeadCommand::Shutdown { response }) => {
+                control.termination = Some(ActorTermination::RequestedShutdown);
+                control.shutdown_response = Some(response);
+                Err(HeadHealthFailure::Cancelled {
+                    cause: CancellationCause::RequestedShutdown,
+                    stage: RuntimeStage::HealthReadTelemetry,
+                    joint,
+                })
+            }
+            Ok(HeadCommand::CheckHealth { response }) => {
+                let _requester_present = response
+                    .send(Err(HeadHealthCheckError::CommandAlreadyInProgress))
+                    .is_ok();
+                Ok(())
+            }
+            Ok(HeadCommand::ReturnToTarget { response }) => {
+                let _requester_present = response
+                    .send(Err(HeadReturnError::CommandAlreadyInProgress))
+                    .is_ok();
+                Ok(())
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                control.termination = Some(ActorTermination::HandleDropped);
+                Err(HeadHealthFailure::Cancelled {
+                    cause: CancellationCause::HandleDropped,
+                    stage: RuntimeStage::HealthReadTelemetry,
+                    joint,
                 })
             }
             Err(mpsc::error::TryRecvError::Empty) => Ok(()),
@@ -2469,6 +2905,12 @@ where
                     .is_ok();
                 Ok(())
             }
+            Ok(HeadCommand::CheckHealth { response }) => {
+                let _requester_present = response
+                    .send(Err(HeadHealthCheckError::CommandBeforeStartup))
+                    .is_ok();
+                Ok(())
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 control.termination = Some(ActorTermination::HandleDropped);
                 Err(HeadRuntimeError::Cancelled {
@@ -2608,6 +3050,10 @@ mod tests {
     #[derive(Clone, Debug)]
     enum ReadAction {
         Bytes(Vec<u8>),
+        SetClockAndBytes {
+            milliseconds: u64,
+            bytes: Vec<u8>,
+        },
         Eof,
         Failure(TransportFailure),
         GatedFailure {
@@ -2686,6 +3132,13 @@ mod tests {
                 }
                 match self.reads.pop_front() {
                     Some(ReadAction::Bytes(chunk)) => self.pending.extend(chunk),
+                    Some(ReadAction::SetClockAndBytes {
+                        milliseconds,
+                        bytes,
+                    }) => {
+                        self.clock.set_milliseconds(milliseconds);
+                        self.pending.extend(bytes);
+                    }
                     Some(ReadAction::Eof) | None => return Ok(0),
                     Some(ReadAction::Failure(source)) => return Err(source),
                     Some(ReadAction::GatedFailure {
@@ -2759,11 +3212,30 @@ mod tests {
         moving: bool,
         device_status_raw: u8,
     ) -> Vec<u8> {
+        telemetry_response_with_raw(joint, position, moving, device_status_raw, [0; 13])
+    }
+
+    fn telemetry_response_with_raw(
+        joint: HeadJoint,
+        position: u16,
+        moving: bool,
+        device_status_raw: u8,
+        remaining_raw: [u8; 13],
+    ) -> Vec<u8> {
         let mut telemetry = [0_u8; 15];
         telemetry[..2].copy_from_slice(&position.to_le_bytes());
+        telemetry[2..].copy_from_slice(&remaining_raw);
         telemetry[9] = device_status_raw;
         telemetry[10] = u8::from(moving);
         status(joint.servo_id(), &telemetry)
+    }
+
+    fn health_reads(positions: [u16; 4]) -> Vec<ReadAction> {
+        HeadJoint::ALL
+            .into_iter()
+            .zip(positions)
+            .map(|(joint, position)| ReadAction::Bytes(telemetry_response(joint, position)))
+            .collect()
     }
 
     fn successful_reads() -> Vec<ReadAction> {
@@ -2919,6 +3391,15 @@ mod tests {
         (error, exit, shared)
     }
 
+    fn health_observation_error(error: HeadHealthRequestError) -> Box<HeadHealthObservationError> {
+        match error {
+            HeadHealthRequestError::Check {
+                source: HeadHealthCheckError::Observation(observation),
+            } => observation,
+            other => panic!("expected health observation error, got {other:#?}"),
+        }
+    }
+
     #[tokio::test]
     async fn startup_holds_only_observed_pose_and_shutdown_disables_every_joint() {
         let (handle, receipt, task, shared) = spawn_fake(successful_reads(), valid_config(1));
@@ -3003,6 +3484,417 @@ mod tests {
                 .iter()
                 .all(|write| write[5..=6] == [40, 0])
         );
+    }
+
+    #[tokio::test]
+    async fn health_check_retains_all_raw_values_identity_order_and_timing() {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        for (index, (joint, position)) in HeadJoint::ALL.into_iter().zip(positions).enumerate() {
+            let speed = 100_u16 + u16::try_from(index).expect("small test index");
+            let load = 200_u16 + u16::try_from(index).expect("small test index");
+            let registers = 300_u16 + u16::try_from(index).expect("small test index");
+            let current = 400_u16 + u16::try_from(index).expect("small test index");
+            let mut remaining_raw = [0_u8; 13];
+            remaining_raw[0..2].copy_from_slice(&speed.to_le_bytes());
+            remaining_raw[2..4].copy_from_slice(&load.to_le_bytes());
+            remaining_raw[4] = 90 + u8::try_from(index).expect("small test index");
+            remaining_raw[5] = 40 + u8::try_from(index).expect("small test index");
+            remaining_raw[6] = 10 + u8::try_from(index).expect("small test index");
+            remaining_raw[9..11].copy_from_slice(&registers.to_le_bytes());
+            remaining_raw[11..13].copy_from_slice(&current.to_le_bytes());
+            reads.push(ReadAction::Bytes(telemetry_response_with_raw(
+                joint,
+                position,
+                false,
+                0,
+                remaining_raw,
+            )));
+        }
+        let (handle, receipt, task, _) = spawn_fake(reads, valid_config(1));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+
+        let evidence = handle.check_health().await.expect("verified health");
+        assert_eq!(
+            evidence
+                .natural_hold_target()
+                .positions()
+                .map(PositionTicks::get),
+            positions
+        );
+        assert_eq!(evidence.tolerance().get(), 20);
+        assert!(evidence.started_at() <= evidence.completed_at());
+        for (index, (joint, sample)) in HeadJoint::ALL
+            .into_iter()
+            .zip(evidence.joints())
+            .enumerate()
+        {
+            assert_eq!(sample.joint(), joint);
+            assert_eq!(sample.telemetry().id(), joint.servo_id());
+            assert_eq!(sample.target().get(), positions[index]);
+            assert_eq!(sample.absolute_difference_ticks(), 0);
+            assert!(!sample.telemetry().is_moving());
+            assert_eq!(sample.telemetry().device_status_raw(), 0);
+            assert_eq!(
+                sample.telemetry().speed_raw(),
+                100 + u16::try_from(index).expect("small test index")
+            );
+            assert_eq!(
+                sample.telemetry().load_raw(),
+                200 + u16::try_from(index).expect("small test index")
+            );
+            assert_eq!(
+                sample.telemetry().voltage_raw(),
+                90 + u8::try_from(index).expect("small test index")
+            );
+            assert_eq!(
+                sample.telemetry().temperature_raw(),
+                40 + u8::try_from(index).expect("small test index")
+            );
+            assert_eq!(
+                sample.telemetry().async_write_flag_raw(),
+                10 + u8::try_from(index).expect("small test index")
+            );
+            assert_eq!(
+                sample.telemetry().registers_67_68_raw(),
+                300 + u16::try_from(index).expect("small test index")
+            );
+            assert_eq!(
+                sample.telemetry().current_raw(),
+                400 + u16::try_from(index).expect("small test index")
+            );
+            assert!(
+                sample.response().request_write().completed_at() <= sample.response().received_at()
+            );
+        }
+        assert!(
+            evidence
+                .joints()
+                .windows(2)
+                .all(|pair| pair[0].response().received_at()
+                    <= pair[1].response().request_write().completed_at())
+        );
+        assert!(
+            evidence
+                .joints()
+                .last()
+                .expect("four joints")
+                .response()
+                .received_at()
+                <= evidence.completed_at()
+        );
+
+        handle.shutdown().await.expect("shutdown");
+        task.join().await.expect("actor task");
+    }
+
+    #[tokio::test]
+    async fn health_check_rejects_position_outside_natural_hold_tolerance() {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads.push(ReadAction::Bytes(telemetry_response(
+            HeadJoint::Bow,
+            positions[0] + 21,
+        )));
+        reads.extend(health_reads(positions));
+        let (handle, receipt, task, _) = spawn_fake(reads, valid_config(1));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+
+        let error = handle
+            .check_health()
+            .await
+            .expect_err("21 ticks exceeds the admitted 20-tick tolerance");
+        let HeadHealthRequestError::Check {
+            source: HeadHealthCheckError::Observation(observation),
+        } = error
+        else {
+            panic!("expected typed position-admission failure");
+        };
+        assert!(observation.accepted_prefix().iter().all(Option::is_none));
+        assert!(matches!(
+            observation.failure(),
+            HeadHealthFailure::PositionMismatch {
+                joint: HeadJoint::Bow,
+                target,
+                actual,
+                absolute_difference_ticks: 21,
+                tolerance,
+                response,
+            } if target.get() == positions[0]
+                && actual.get() == positions[0] + 21
+                && tolerance.get() == 20
+                && response.value().position() == *actual
+        ));
+
+        handle
+            .check_health()
+            .await
+            .expect("a rejected observation does not destroy the bus owner");
+        handle.shutdown().await.expect("shutdown");
+        task.join().await.expect("actor task");
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_moving_and_device_status_without_conflation() {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut moving_reads = successful_reads();
+        moving_reads.push(ReadAction::Bytes(telemetry_response_with_moving(
+            HeadJoint::Bow,
+            positions[0],
+            true,
+        )));
+        let (moving_handle, receipt, moving_task, _) = spawn_fake(moving_reads, valid_config(1));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+        let moving = moving_handle
+            .check_health()
+            .await
+            .expect_err("moving sample is not a stopped hold");
+        let moving = health_observation_error(moving);
+        assert!(matches!(
+            moving.failure(),
+            HeadHealthFailure::Moving {
+                joint: HeadJoint::Bow,
+                position,
+                ..
+            } if position.get() == positions[0]
+        ));
+        moving_handle.shutdown().await.expect("shutdown");
+        moving_task.join().await.expect("actor task");
+
+        let mut status_reads = successful_reads();
+        status_reads.push(ReadAction::Bytes(telemetry_response_with_status(
+            HeadJoint::Bow,
+            positions[0],
+            false,
+            7,
+        )));
+        let (status_handle, receipt, status_task, _) = spawn_fake(status_reads, valid_config(1));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+        let status = status_handle
+            .check_health()
+            .await
+            .expect_err("nonzero device status is not healthy");
+        let status = health_observation_error(status);
+        assert!(matches!(
+            status.failure(),
+            HeadHealthFailure::DeviceStatus {
+                joint: HeadJoint::Bow,
+                raw: 7,
+                response,
+            } if response.value().position().get() == positions[0]
+        ));
+        status_handle.shutdown().await.expect("shutdown");
+        status_task.join().await.expect("actor task");
+    }
+
+    #[tokio::test]
+    async fn health_transport_failure_is_exact_and_the_actor_can_be_queried_again() {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads.push(ReadAction::Failure(TransportFailure::timed_out(
+            TransportOperation::Read,
+            0,
+        )));
+        reads.extend(health_reads(positions));
+        let (handle, receipt, task, _) = spawn_fake(reads, valid_config(1));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+
+        let failure = handle
+            .check_health()
+            .await
+            .expect_err("scripted read timeout");
+        let failure = health_observation_error(failure);
+        assert!(matches!(
+            failure.failure(),
+            HeadHealthFailure::TelemetryRead {
+                joint: HeadJoint::Bow,
+                source: RequestError::ResponseFrame(FrameReadError::Transport {
+                    source,
+                    buffered_bytes: 0,
+                    ..
+                }),
+            } if source.kind() == TransportFailureKind::TimedOut
+                && source.operation() == TransportOperation::Read
+        ));
+        handle
+            .check_health()
+            .await
+            .expect("transport failure is not swallowed and does not end ownership");
+
+        handle.shutdown().await.expect("shutdown");
+        task.join().await.expect("actor task");
+    }
+
+    #[tokio::test]
+    async fn health_check_rejects_a_response_outside_canonical_identity_order() {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads.push(ReadAction::Bytes(telemetry_response(
+            HeadJoint::Curl,
+            positions[1],
+        )));
+        let (handle, receipt, task, _) = spawn_fake(reads, valid_config(1));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+
+        let failure = handle
+            .check_health()
+            .await
+            .expect_err("Curl response cannot satisfy the expected Bow request");
+        let failure = health_observation_error(failure);
+        assert!(matches!(
+            failure.failure(),
+            HeadHealthFailure::TelemetryRead {
+                joint: HeadJoint::Bow,
+                source: RequestError::Telemetry(
+                    TelemetryParseError::Response(ResponseParseError::ServoIdMismatch {
+                        expected,
+                        actual,
+                    })
+                ),
+            } if *expected == HeadJoint::Bow.servo_id()
+                && *actual == HeadJoint::Curl.servo_id().get()
+        ));
+
+        handle.shutdown().await.expect("shutdown");
+        task.join().await.expect("actor task");
+    }
+
+    #[tokio::test]
+    async fn cancelled_health_receiver_does_not_disable_torque_or_end_the_actor() {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads.extend(health_reads(positions));
+        reads.extend(health_reads(positions));
+        let (handle, receipt, task, shared) = spawn_fake(reads, valid_config(1));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+
+        let (response, cancelled_receiver) = oneshot::channel();
+        handle
+            .commands
+            .send(HeadCommand::CheckHealth { response })
+            .await
+            .expect("queue health request");
+        drop(cancelled_receiver);
+        loop {
+            if shared.lock().expect("fake state").writes.len() >= 36 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        handle
+            .check_health()
+            .await
+            .expect("actor remains usable after the query receiver disappears");
+        {
+            let shared = shared.lock().expect("fake state");
+            assert_eq!(shared.writes.len(), 40);
+            assert!(
+                shared.writes[32..40]
+                    .iter()
+                    .all(|write| write[4..=6] == [2, 56, 15]),
+                "health requests are read-only and receiver cancellation adds no disable write"
+            );
+        }
+
+        handle.shutdown().await.expect("shutdown");
+        task.join().await.expect("actor task");
+    }
+
+    #[tokio::test]
+    async fn repeated_health_checks_each_read_a_fresh_complete_set() {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads.extend(health_reads(positions));
+        reads.extend(health_reads(positions));
+        let (handle, receipt, task, shared) = spawn_fake(reads, valid_config(1));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+
+        let first = handle.check_health().await.expect("first health set");
+        let second = handle.check_health().await.expect("second health set");
+        assert!(first.completed_at() <= second.started_at());
+        assert!(
+            first
+                .joints()
+                .iter()
+                .chain(second.joints())
+                .all(|joint| joint.telemetry().device_status_raw() == 0
+                    && !joint.telemetry().is_moving())
+        );
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 40);
+
+        handle.shutdown().await.expect("shutdown");
+        task.join().await.expect("actor task");
+    }
+
+    #[tokio::test]
+    async fn health_clock_regression_is_a_typed_framing_failure() {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads.push(ReadAction::SetClockAndBytes {
+            milliseconds: 0,
+            bytes: telemetry_response(HeadJoint::Bow, positions[0]),
+        });
+        let (handle, receipt, task, _) = spawn_fake(reads, valid_config(1));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+
+        let error = handle
+            .check_health()
+            .await
+            .expect_err("scripted clock moved backwards after the response read");
+        let observation = health_observation_error(error);
+        assert!(
+            matches!(
+                observation.failure(),
+                HeadHealthFailure::TelemetryRead {
+                    joint: HeadJoint::Bow,
+                    source: RequestError::ResponseFrame(FrameReadError::NonMonotonicClock {
+                        previous,
+                        actual,
+                    }),
+                } if actual < previous
+            ),
+            "unexpected health clock error: {observation:#?}"
+        );
+
+        handle.shutdown().await.expect("shutdown");
+        task.join().await.expect("actor task");
     }
 
     #[tokio::test]

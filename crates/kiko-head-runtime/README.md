@@ -132,7 +132,21 @@ after every return fault, including an owner-retaining fault; it does not turn
 an unsupervised recovery write into a long hold. A successful return remains
 actively held only until SIGINT, SIGTERM, the configured hold duration, handle
 loss, or an actor fault initiates that same cleanup. This bounded hold performs
-no periodic health telemetry and is explicitly not a production supervisor.
+no autonomous health polling and is explicitly not a production supervisor.
+
+The natural-hold `HeadActorHandle` does expose a repeatable, read-only
+`check_health` request for a production supervisor to poll. Each successful
+request retains exact bow/curl/yaw/roll telemetry and monotonic request,
+receive, and whole-check timing. The actor admits success only when every
+response has the expected identity, telemetry device status is zero, the
+moving flag reports stopped, and position remains inside the same parsed
+readback tolerance around the actor's admitted natural-hold target. Speed,
+load, voltage, temperature, current, and unqualified registers remain raw;
+this crate assigns them no physical units or policy thresholds. Transport,
+framing, protocol, clock, status, moving, and position failures remain
+distinct typed outcomes with the accepted joint prefix. A failed or
+caller-cancelled health receipt does not itself change goals or torque and
+does not release the actor's exclusive bus ownership.
 
 One actor admits at most one return attempt. A second request during motion is
 reported as `CommandAlreadyInProgress`; a request after the recorded attempt is
@@ -207,6 +221,13 @@ goal, speed, torque-limit, or torque-switch registers. Therefore this evidence
 does **not** claim those register writes were acknowledged or independently
 read back.
 
+`VerifiedHeadHealthEvidence` is narrower: it proves one later, complete,
+identity-ordered status-zero stopped telemetry pass remained inside the
+startup hold target tolerance. It retains every raw telemetry field and
+timing observation, but still cannot claim that goal, torque, or torque-limit
+registers were read back. Repeated calls perform repeated physical reads; the
+runtime does not substitute cached startup evidence.
+
 Return success is `VerifiedHeadReturnEvidence`: it retains the startup-hold
 pose, the two fresh command-time telemetry sets and their monotonic receive
 times, the fresh command-time start pose, exact reviewed target, every complete
@@ -267,9 +288,15 @@ four-joint shutdown after disable failures. The return controller suite also
 covers 50-tick non-crossing waypoints, consecutive stopped completion, travel
 admission, full-set status precedence, corridor/direction/no-progress/motion
 deadlines, clock regression, final-sample disagreement, and the narrow fault
-classes allowed to attempt a recovery write. Focused aarch64 software-only runs
-on the Nano passed 17 protocol tests, 41 runtime library tests, and 8
-commissioning-binary tests after this hardening slice.
+classes allowed to attempt a recovery write. The health-check cases cover raw
+field retention, canonical identity order, status and moving precedence,
+target drift, transport and clock faults, repeated fresh reads, and a dropped
+request receiver without an implicit torque write.
+
+The current macOS host software-only run passed 49 runtime library tests and 8
+commissioning-binary tests. A prior aarch64 software-only Nano run, before the
+health seam existed, passed 17 protocol tests, 41 runtime library tests, and 8
+commissioning-binary tests. No later Nano result is inferred from the host run.
 
 Run the host checks with:
 
