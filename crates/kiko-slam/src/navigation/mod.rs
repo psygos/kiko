@@ -45,6 +45,8 @@ mod nano_accessory_worker;
 mod nano_agent_launch;
 #[cfg(all(feature = "nano-agent", unix))]
 mod nano_bootstrap;
+#[cfg(all(feature = "nano-agent", unix))]
+mod nano_map_persistence;
 #[cfg(all(
     feature = "agent-runtime",
     feature = "actuation",
@@ -232,6 +234,8 @@ pub use nano_accessory_worker::{
 pub use nano_agent_launch::*;
 #[cfg(all(feature = "nano-agent", unix))]
 pub use nano_bootstrap::*;
+#[cfg(all(feature = "nano-agent", unix))]
+pub use nano_map_persistence::*;
 #[cfg(all(
     feature = "agent-runtime",
     feature = "actuation",
