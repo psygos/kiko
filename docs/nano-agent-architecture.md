@@ -9,15 +9,20 @@ evidence.
 
 The deployed system has these ownership boundaries:
 
-- `robot-server` is the sole owner of the configured STM32 serial device. It
-  exposes only the typed KRP2 V2 loopback service and reports exact applied
-  results; legacy packets cannot reach the V2 actuator.
+- `kiko-slam nano-agent` retains the sole in-process owner of the configured
+  STM32 serial device and its typed KRP2 V2 loopback service. It reports exact
+  applied results and joins that owner during shutdown; legacy packets cannot
+  reach the V2 actuator. The former standalone `robot-server` systemd unit and
+  split wheels-off executable have been removed; an older installed copy must
+  not run beside production or qualification.
 - the Kiko agent is the sole owner of the exact configured OAK MXID. It fans
   borrowed or bounded observations to SLAM, local occupancy, expression, and
   Rerun without allowing a second camera pipeline to compete for frames.
 - one head actor exclusively owns the exact configured Waveshare adapter. No
-  motion is possible until read-only inventory and redundant position reads
-  succeed for exactly servos 1 through 4.
+  head motion is possible until the head/eye policy is bound to the parsed
+  manifest and finite read-only identity plus redundant position reads succeed
+  for exactly servos 1 through 4. Production adopts that fresh pose without
+  first torque-disabling the neck; prior torque state remains unknown.
 - one eye actor exclusively owns the exact configured eye UID. It uses the
   versioned KEP2 session protocol; a USB path or VID/PID alone is not identity.
 - one supervisor owns lifecycle and motion authority. Commissioning, manual
@@ -30,24 +35,47 @@ enabling motion.
 
 ## Startup sequence
 
-Every cold boot starts unarmed and follows this order:
+Every cold boot starts with no base owner and follows this order:
 
-1. Parse one bounded, versioned robot manifest. Resolve only exact persistent
-   device identities; never choose the first matching serial port or camera.
-2. Inventory the OAK, STM32, eye controller, head adapter, and four head servos.
-   Compare observed boot/build/config identities with the manifest.
-3. Establish device-clock epochs and measure freshness. A restart or timestamp
+1. Load and parse the bounded launch assets and versioned robot manifest once.
+   The canonical calibration artifact is launch-, policy-, manifest-, path-,
+   and digest-bound before hardware access. Bind the expected head/eye policy
+   to exact persistent identities; never choose the first matching serial port
+   or camera.
+2. Complete finite read-only eye, adapter, and four-servo probes. The probe
+   sessions close before the single production accessory owner opens either
+   serial device.
+3. Start the production accessory owner before opening OAK or starting the
+   STM32 owner. The head owner first
+   observes each joint twice, admits the complete pose inside the exact policy
+   window and freshness budget, writes that same pose with bounded speed and
+   torque limits, enables or refreshes torque, and verifies two stopped
+   readbacks before any natural-pose transition. It performs no pre-observation
+   torque-disable.
+4. Open only the exact OAK MXID, require SuperSpeed, and bit-exactly bind its
+   observed rectified stereo geometry to the retained calibration artifact.
+   Require the artifact's raw IMU and tracking-camera-to-base values to equal
+   the parsed navigation configuration and its three calibration IDs to equal
+   the production actuation approval. Continuously reject a terminal accessory
+   fault while waiting for the first stereo pair.
+5. Start the exact STM32 owner in a stopped state, acquire an acknowledged
+   applied zero, and compare the complete observed OAK/STM32/accessory/artifact
+   inventory with the manifest. No base motion authority exists during the
+   earlier head return.
+6. Establish device-clock epochs and measure freshness. A restart or timestamp
    regression creates a new epoch and invalidates prior authority.
-4. Keep the base at a confirmed applied zero. Lock each head joint at its
-   redundantly read present position before any natural-pose transition.
-5. Load only calibration and plant artifacts whose content identities match the
-   manifest. Parsing proves agreement, not physical truth.
-6. Start RGB, stereo, metric rectified-left depth, IMU, online SLAM, occupancy,
+7. Start RGB, stereo, metric rectified-left depth, IMU, online SLAM, occupancy,
    expression, and Rerun streams. Occupancy readiness requires a localized pose
    and a fresh aligned depth integration; a file that merely parses is not a
    live-map readiness claim.
-7. Enter `Disarmed`. An explicit arm request can select exactly one authority
+8. Enter `Disarmed`. An explicit arm request can select exactly one authority
    only after the supervisor receives a fresh identity-bound applied zero.
+
+After the accessory owner is ready, a later bootstrap failure first stops and
+joins any base owner, closes OAK when it was opened, and only then requests eye
+release plus head serial-ownership release. The head release sends no torque
+switch write and therefore preserves the last admitted goal, but it does not
+prove that physical torque remains present.
 
 Startup does not automatically perform motion-based plant identification or
 servo sign discovery. Those are supervised commissioning operations with
@@ -96,17 +124,102 @@ The geometric occupancy grid is not learned. Fresh local depth can react to a
 moving person as a dynamic obstacle, but it does not classify or predict the
 person. Unknown, occluded, stale, or out-of-range space remains blocked.
 
-Map persistence is a versioned, checksummed, bounded artifact written by atomic
-replacement. Occupancy reload accelerates visualization and planning but does
-not itself prove localization. Sparse-map/relocalization state must be rebuilt
-from or bound to the corresponding recorded SLAM dataset before motion.
+Map persistence is a versioned, checksummed, bounded occupancy artifact written
+by atomic replacement. In production, **Finalize map & stop** is always a
+terminal checkpoint, not a live snapshot button: it closes capture,
+drains inference and occupancy in causal order, stops the controller, finalizes
+and synchronizes the navigation journal, reads it back to derive the final
+accepted map epoch/revision, and requires that identity to exactly equal the
+retained occupancy before finalizing the session manifest. It writes and quota-verifies the
+final occupancy once at the configured staging path, moves that exact inode
+without replacement into the session as `occupancy.kmap`, then atomically replaces
+`navigation/selected-warm-start-v1.json`. That selection names one direct-child
+session and records the exact manifest and occupancy byte lengths, SHA-256
+digests, map epoch, and final revision. A failed pre-publication checkpoint
+does not select the incomplete session.
+
+The direct socket gives this terminal transaction its own parsed five-minute
+deadline; ordinary commands keep their shorter deadline. The main/worker
+dataset handoff and finalization acknowledgement use the remaining time from
+that same absolute boundary. For browser-originated requests, the loopback HTTP
+owner stays available through the final response record and for a bounded
+two-second polling grace (or until that exact record is observed), then shuts
+down.
+
+Warm start ignores an unselected mutable session and resolves only that
+selection. It retains the selected session, manifest, and occupancy descriptors;
+the occupancy parser and manifest parser each digest the exact bytes consumed
+from that handle rather than reopening a previously hashed pathname. It checks
+those selected digests before replay and again before binding the replay result.
+Before processing stereo payloads,
+it streams the manifest-bound fixed-record navigation journal in constant
+memory under its 1,048,576-record format cap. The final journal epoch must
+contain an accepted global map, and that event's epoch and revision must equal
+the atomic selection; a later empty epoch or any mismatch fails closed.
+Historical frame IDs use a disjoint reserved namespace; replay requires exact
+rectified-left depth geometry and must reconstruct occupancy bytes that match
+the persisted artifact. That match publishes the map as `lost`, never
+`localized`. Only a fresh OAK frame that produces the tracker's typed
+multi-frame relocalization success, good tracking health, and a current pose
+on the same advancing map lineage opens the localization gate.
+
+The content claim is deliberately narrow: the selection cryptographically
+binds `manifest.json` and `occupancy.kmap`; it is not a whole-directory payload
+tree digest. `DatasetReader` still validates manifest-defined payload
+structure, identities, and lengths, and exact reconstructed occupancy is
+required, but arbitrary payload bytes—including navigation journal records—are
+not independently content-addressed. Journal records are structurally parsed
+and order-checked before their final map identity is accepted. The selection
+read is capped at 4 KiB, terminal manifest hashing at 64 MiB, and
+selected-occupancy hashing at 256 MiB (with the produced artifact's exact
+encoded length used during publication). No terminal hashing step walks the
+complete quota-bounded dataset payload tree.
+
+The retained handles close pathname replacement between selection hashing and
+manifest/occupancy parsing. They do not make the generic `DatasetReader`
+payload tree immutable: metadata, calibration, frame, depth, IMU, and sidecar
+payload opens remain path-based, and those payload bytes are not selected
+digests. An active same-UID process that can mutate the service-owned dataset
+during replay is therefore outside this checkpoint's integrity claim. Nano
+operation must give the runtime exclusive ownership of its private state tree;
+a future whole-dataset descriptor-relative/content-addressed reader is required
+before claiming resistance to that actor.
+
+The launch storage policy separates map persistence from navigation-dataset
+retention. The exact encoded map snapshot cannot exceed
+`maximum_map_snapshot_bytes`, and atomic replacement must leave at least
+`minimum_free_bytes_after_map_save` available. Dataset payloads, sidecars, IMU,
+journal, and manifest share independent cumulative logical-byte and
+regular-file ceilings; journal records also have an independent count ceiling.
+Every dataset-owned write must preserve the configured descriptor-relative
+free-space floor. Logical byte totals are exact file lengths, not a claim about
+fragment-rounded physical allocation. The file ceiling is currently capped at
+65,536 because finalization builds one bounded monolithic manifest. Longer
+sessions require a reviewed chunked-manifest format rather than a larger
+launch value. The launch record ceiling cannot exceed the journal format's
+existing 1,048,576-record hard bound.
+
+Open-ended capture cannot consume
+`navigation_dataset_terminal_reserve_bytes`. Admission requires that reserve
+to be below the dataset logical-byte maximum and at least the
+4096-byte-fragment-rounded sum of the configured map ceiling, bounded 64 MiB
+manifest, and 4 KiB warm-selection ceiling. Final occupancy and selection
+remain map-persistence artifacts: their bytes are not adopted by the dataset
+logical-byte counter, while the withheld reserve protects their terminal
+allocation. Descriptor retention closes path replacement at quota checks, but
+concurrent external writes can still race a reservation; exact post-write
+verification must report a violated floor or identity rather than claim safe
+publication. Startup evidence and total state-root usage have no aggregate
+byte-limit claim.
 
 ## Expression and head behavior
 
 The RGB expression path samples an already-owned OAK frame. It produces
-deterministic scene-motion/person intentions with explicit frame identity and
-freshness, mixes semantic reactions, and sends bounded KEP2 eye intentions.
-Stale RGB or a failed eye session returns the eyes to firmware fallback.
+deterministic scene-motion intentions with explicit frame identity and
+freshness, mixes bounded reactions, and sends KEP2 eye intentions. No
+person/face detector is wired into this path yet, so the current runtime does
+not claim semantic human tracking. Stale RGB or a failed eye session returns
+the eyes to firmware fallback.
 
 The default head intention is always `NaturalHold`. RGB does not directly map
 to servo ticks. An optional, explicitly configured camera-to-neutral-head
@@ -118,17 +231,90 @@ behavior, voltage/temperature
 limits, process-kill behavior, and safe natural-pose approach have been
 qualified on this assembly.
 
+The production start window is the exact per-joint union of the evidenced Fable
+return-start envelope and the reviewed natural target plus/minus its 20-tick
+readback tolerance:
+`[2135..2227,2525..2592,2842..2963,2856..2922]`. Policy parsing rejects a
+window which excludes any part of the reviewed hold envelope or widens beyond
+the evidenced union. The production head handle has no torque-disable
+operation. A terminal health/accessory fault stops the base/eye path but keeps
+the head owner and hold alive. A startup fault closes ownership without
+altering or claiming the prior servo state. Return faults, handle loss, and
+ordinary process or systemd shutdown preserve the last admitted goal while
+eventually releasing serial ownership without a torque-switch write. That is
+not torque readback: power loss, servo protection, or another bus owner can
+still release the neck. Intentional torque release remains a separately
+supported commissioning action.
+
 ## Rerun and control adapters
 
-Rerun is the shared diagnostic view for RGB, stereo, pose, map, local costmap,
-frontiers, selected goal, path, MPC rollout, applied controller receipt,
-supervisor state, expression source, and head/eye health. Every item is logged
-on its real device or host timeline with explicit transforms. Rerun is not a
-safety authority or complete decision ledger.
+Rerun is the shared high-bandwidth diagnostic view for decimated RGB, stereo,
+depth, pose, occupancy map, local costmap, selected goal, global path, MPC
+rollout, control-tick timing, and exact applied-controller evidence. RGB is
+copied only after strict BGR8 layout admission into a capacity-one,
+drop-oldest diagnostic queue; that copy cannot feed SLAM, expression, control,
+or safety. Capture-derived items use their device timeline and navigation
+items use their explicit host/tick timelines and frame transforms. Rerun does
+not currently publish the accessory health snapshot, semantic expression
+source, frontier candidate set, or complete supervisor state; those must not
+be inferred from the images. Rerun is not a safety authority or complete
+decision ledger.
 
 The pinned Rerun SDK is output-only. A click adapter therefore submits the same
 typed `(map_epoch, revision, x_m, y_m)` command through the local control API;
 the agent never pretends Rerun supplied a callback it does not provide.
+
+The loopback operator console and agent API share that one typed ingress and
+the same downstream request sequence. The browser opens a per-session
+capability only after the operator supplies the mode-`0600` per-boot
+capability; neither secret appears in a URL or browser storage. Arrow/WASD and
+buttons stream admitted SI velocity intentions through a monotonic server
+deadman. Blur, page hide, network loss, key release, and manual release reduce
+manual authority toward an exact applied zero; opening a replacement session
+does not itself revoke the current owner. Autonomous authority deliberately
+continues across browser or client loss until completion, its configured
+runtime bound, a safety fault, or an explicit global stop from any authenticated
+session. Manual, map-only, frontier, and revision-bound point-goal requests use
+the same arbitrator. A process-lifetime software safety stop has priority over
+queued work and cannot be reset remotely, but it is explicitly not the
+independent physical emergency stop.
+
+The console renders only typed map metadata/cells, composed map-frame pose,
+goal, global path, MPC rollout, requested actuation, exact STM32 applied
+receipt, stop certainty, health, and timing that the live owners publish. Head
+health is refreshed from complete four-joint transactions, eye health requires
+at least one acknowledged RGB-derived expression after startup, and OAK health
+does not become ready until visual, depth, and IMU inputs have each been
+admitted. Ready is not an ever-seen latch: the projection requires recent
+activity from all three streams and the coordinator's at-now odometry and
+depth-aligned local-costmap freshness gates. A closed stream faults it. The
+same typed coordinator readiness check rejects new manual, frontier, and point
+authority from both the browser and agent API before any authority is granted;
+periodic control retains its independent stricter stop-on-stale checks. The
+console never opens the OAK or STM32 and never labels an accepted request as
+applied.
+The configured `100 mm/s` and `500 mrad/s` browser steps are requested
+body-frame magnitudes inside the admitted manual envelope, not physical speed
+measurements.
+
+## Service shutdown guard
+
+`kiko-nano-agent.service` uses `TimeoutStopSec=420` as an operational kill
+guard, not as proof that graceful cleanup always completes. The parsed hard
+maxima cover a 120-second Rerun flush, at most 150 seconds for an in-flight eye
+intent followed by eye release/cleanup, and at most 1.2 seconds for coordinated
+controller-task collection. Production head ownership release performs no
+protocol write. These bounded phases total at most 271.2 seconds when treated
+sequentially.
+
+The remaining margin is not a derived guarantee. Inference, dense-map,
+navigation, visualization, and control-socket thread joins; dataset
+finalization, abort, and filesystem synchronization; OAK `Device::close()`; and
+native or operating-system I/O have no common outer application deadline.
+Reaching the systemd timeout can interrupt durable-state cleanup and cannot
+prove controller stop, eye release, head torque state, or OAK closure. Do not
+lower the guard or describe it as a graceful-shutdown bound until those phases
+have typed deadlines and measured termination evidence.
 
 ## Cold-boot acceptance
 
@@ -137,8 +323,9 @@ injection, that:
 
 1. exact inventory succeeds and every wrong/missing/rebooted identity fails;
 2. the robot remains unarmed and at confirmed applied zero through startup;
-3. the head locks at present pose and never approaches natural after a failed
-   telemetry or approval gate;
+3. the head adopts and verifies the present pose without a torque-disable gap;
+   failed telemetry or approval gates issue no motion or cleanup torque write
+   and never approach natural;
 4. RGB motion produces an expiring eye intention and stale RGB falls back;
 5. online SLAM produces a localized, checksummed occupancy artifact;
 6. manual, explore, and point-goal authorities cannot overlap;
@@ -148,6 +335,18 @@ injection, that:
    the declared map/frame identities; and
 9. camera loss, stale depth, localization loss, controller reset, serial loss,
    process cancellation, and clock faults all require or confirm zero.
+
+Run the bounded offline component suite with:
+
+```bash
+tools/nano-cold-boot-fault-acceptance.sh
+```
+
+The exact case-to-contract mapping and the deliberately unproven physical
+claims are recorded in `docs/nano-cold-boot-fault-acceptance.md`. A passing
+software run is required evidence, but is not a Nano cold-power, hardware
+watchdog, physical stop, camera, SLAM-accuracy, MPC-tracking, or performance
+result.
 
 Physical acceptance additionally requires the assembled devices to be visible
 on the Nano and an independent emergency stop. The read-only inventory on

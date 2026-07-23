@@ -86,6 +86,17 @@ controller lease. These are software bounds, not a measured human-avoidance
 reaction time. Camera, inference, scheduling, serial, motor, and braking
 latencies still require end-to-end physical measurement.
 
+The controller manifest also declares the maximum host command rate and one
+bounded serial-transmit duration. The server enforces that rate for `ApplyPwm`
+without delaying `HostStop`, checks the exact 8N1 record budget against
+115200 bit/s in each full-duplex direction, and applies one deadline across
+partial serial writes and flush. A transmit interruption records its phase and
+written-byte count but cannot prove whether the controller received a partial
+or complete record. Coordinated owner shutdown is clean only after the exact
+safe `HostStopResult`; a completed write alone remains uncertain. The
+calculation and still-unmeasured WCET/hardware gates are recorded in
+`docs/stm32-streaming-qualification.md`.
+
 ## Identity and integrity
 
 Arm-capable traffic uses V2 fixed binary frames with explicit little-endian
@@ -118,6 +129,25 @@ motion-disabled profile. A reviewed motion profile must supply per-boot
 identity/entropy externally; a device UID, timer value, or fixed token is not a
 substitute for session uniqueness.
 
+The repository now also provides a provisioned flash-journal identity source.
+The firmware linker reserves STM32F446 sector 7
+(`0x08060000..0x0807ffff`) outside the executable image. The host-only
+`kiko-boot-journal-image` tool creates a new, mode-`0600`, 128 KiB sector image
+with one CSPRNG-generated nonzero provisioning seed. Deployment must flash and
+read back all 131,072 bytes and compare SHA-256 before selecting the
+`flash-boot-journal` firmware feature.
+
+Each journal-enabled boot programs and rereads one 16-byte counter record
+before serial or motor admission. A valid counter equals its one-based physical
+slot, so an interrupted or later-corrupted programmed slot is burned rather
+than allowing its identity to be reused. Any programmed record after an erased
+gap, a malformed header, a nonmatching record, a failed program/readback, or a
+full journal fails startup with outputs disabled. The firmware never erases the
+journal automatically. There are 8,190 bounded boot slots per provisioning;
+explicit maintenance must create a new random provisioning seed after any
+sector erase. This is reset-identity evidence, not authentication, motor
+authority, or physical safety evidence.
+
 ## Motor output contract
 
 Nonzero output is representable only while armed, fault-free, in-envelope, and
@@ -146,6 +176,17 @@ controller UID, firmware/build/config identities, plant dataset and fit claims,
 calibration IDs, deadlines, and the operator's maximum uncommanded-motion
 limit. The live controller handshake must match it exactly.
 
+Navigation-actuation schema V2 has two intentionally different plant
+bindings. `plant_dataset_content_id` is the canonical
+`sha256:<64-lowercase-hex>` identity of the exact evidence-dataset artifact
+named by the plant model. `plant_artifact_sha256_hex` is the 64-digit lowercase
+SHA-256 of the exact serialized plant-model artifact selected by the device
+manifest. The parser represents them as different domain types, rejects the
+ambiguous V1 schema, and rejects a V2 document that reuses the dataset digest
+as the artifact digest. A commissioning proposal supplies candidate values
+only; separate evidence review, physical approval, manifest rebind, and normal
+production admission are still required.
+
 Motion must remain disabled until hardware work establishes at least:
 
 - canonical left/right and forward/reverse wiring and signs;
@@ -168,7 +209,8 @@ The authoritative runtime status is the typed V2 `StatusQuery`/`StatusReport`
 path. Rerun records the host's exact applied receipts and the reported
 remaining lease at server emission for diagnosis, but it does not observe wheel
 motion and is not physical evidence.
-`robot-server` now runs only the typed V2 controller owner by default. The
-obsolete HTTP/camera service requires the explicit `--legacy-http-camera`
-opt-in; it remains disconnected from V2 telemetry and must never be used to
-infer controller state. The Nano controller-owner unit does not enable it.
+The standalone `robot-server` process and its unrelated HTTP/camera state
+store have been removed. The package now supplies only the typed controller
+owner used inside `kiko-slam` plus bounded identity/transport qualification
+tools. The unified loopback console observes the in-process owner's exact
+evidence and never opens a second controller or camera.

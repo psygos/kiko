@@ -389,10 +389,13 @@ Important committed documents:
 - `docs/actuation-safety-contract.md`
 - `docs/core-hardening-evidence-2026-07-17.md`
 
-The `configs/nano-wheels-off-example` directory is intentionally non-launchable:
-it contains `REPLACE`, `DEAD`, placeholder artifacts, and descending head bounds.
-Do not broaden those sentinels into permissive values. Construct a qualified
-deployment directory from observed identities and content hashes instead.
+The former `configs/nano-wheels-off-example` parser fixture was intentionally
+non-launchable and has since been removed. Its reviewed head bounds, gaze
+geometry, candidate-controller identity, and fail-closed behavior now live in
+the strict renderer inputs under `configs/nano-agent-template` and
+`configs/nano-wheels-off-qualification-template`. Construct a fresh immutable
+bundle from observed identities and content hashes; do not turn a template
+sentinel into evidence.
 
 ## Uncommitted software handoff
 

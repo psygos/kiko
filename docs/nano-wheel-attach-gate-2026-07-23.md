@@ -36,7 +36,29 @@ Observed on `makerspace@192.168.50.2` at
 - OAK MXID `19443010F1B43A2E00` was present at Linux USB path
   `platform-3610000.usb-usb-0:2.3`, but negotiated only `480M` on the USB2
   tree. The separate SuperSpeed root/hub was present at `10000M` with no OAK
-  below it.
+  below it. The running Fable prototype explicitly requests
+  `dai.UsbSpeed.HIGH`, so that observation does **not** by itself prove a bad
+  cable, port, or SuperSpeed negotiation failure.
+
+A subsequent read-only check during the same boot, at
+`2026-07-23T18:01:40+05:30`, found:
+
+- the same guardian and face-follow child still owned the OAK, head adapter,
+  and eye controller; no canonical Kiko or robot-server owner was running;
+- the Fable source at `kiko_face_follow.py:408` explicitly opened the exact
+  OAK with `dai.UsbSpeed.HIGH`;
+- the STM32 serial path had no process owner, but the canonical zero-write
+  `v2_identity_probe` failed with
+  `Decode(OversizedRecord { maximum: 73 })`. A prior bounded capture that
+  transmitted no bytes observed recurring legacy ASCII `ODO,...` records.
+  The current image is therefore not an admitted KRP2 controller. Zero-valued
+  legacy telemetry is not a typed applied-zero receipt;
+- the pre-flash STM32 backup was present on both development Mac and Nano.
+  Each location contained two byte-identical 524,288-byte main-flash reads
+  with SHA-256
+  `8e8f658e5ee65b2eca3ca8de7cb045ea2b08dbf3ec82d70b654fe6fa02bec7dc`
+  and a 16-byte option-byte read with SHA-256
+  `d292558017cf9ca0a2e40e262a5c1daa4b305ccf084ce06128133d282f905115`.
 
 These observations prove current presence and observed ownership only. They do
 not prove current servo temperature, head torque state, STM32 control identity,
@@ -45,15 +67,31 @@ behavior.
 
 ## Required before asking for wheels
 
+- [ ] Complete the attended, manual-only candidate run in
+      `docs/nano-wheels-off-qualification.md` from an immutable rendered
+      bundle. That run qualifies only the lifted raw-PWM streaming path and
+      common live stack; it does not satisfy wheel-ground plant, sign,
+      velocity, braking, or production external-interlock evidence.
 - [ ] Freeze an immutable, reviewable source revision and deployment bundle.
 - [ ] Build the exact source natively on the Nano with the pinned DepthAI and
       ONNX Runtime libraries; record source and binary identities.
-- [ ] Move the OAK to a SuperSpeed path and admit the exact MXID, transport
-      speed, RGB, stereo, rectified-left depth, and IMU graph.
+- [ ] Have the canonical owner request SuperSpeed for the exact OAK, read back
+      the negotiated transport, and admit RGB, stereo, rectified-left depth,
+      and IMU from the one graph. Request a physical port/cable move only if
+      that canonical SuperSpeed attempt fails; the Fable prototype's forced
+      High-Speed mode is not such a failure.
 - [ ] Perform a coordinated handoff from the Fable guardian. Never start a
       second OAK, head, or eye owner and never use a broad process kill.
 - [ ] Start one least-privilege production lifecycle, including the sole typed
       STM32 owner.
+- [ ] Restore and exactly identify a canonical KRP2 image. Do not treat the
+      present legacy ASCII controller or the checked-in motion-disabled
+      `KIKO-NO-ACT-V1!!` profile as production motion authority.
+- [ ] Before granting nonzero motion authority, bind a separately reviewed
+      hardware profile that proves the installed left/right channel signs,
+      maximum output, default-off external driver-enable gate, driver-fault
+      input, reset/brownout behavior, and physical stop semantics. The
+      historical finite 30 percent shaft pulses do not prove these properties.
 - [ ] Admit the exact manifest, artifacts, OAK, STM32 session, KEP2 eye
       identity, head adapter, and servos 1 through 4.
 - [ ] Establish a confirmed applied base zero and remain explicitly disarmed.
@@ -63,8 +101,23 @@ behavior.
 - [ ] Produce current RGB-derived eye behavior through the same OAK owner.
 - [ ] Produce live stereo/IMU SLAM, localized rectified-left depth occupancy,
       and diagnostic Rerun/status output.
+- [ ] Serve one loopback-only operator/agent control gateway. It must own the
+      sole downstream request sequence, arbitrate manual and autonomous modes
+      through the same live owner, display only exact applied-controller
+      evidence, and expose live pose, occupancy, goal, path, MPC rollout, and
+      timing without opening a second camera or motor connection.
+- [ ] Prove the software safety-stop path is priority-latched across client
+      reconnects, produces or truthfully fails to produce an exact applied
+      zero, and cannot be confused with the still-required independent
+      physical emergency stop.
 - [ ] Prove typed arm/disarm and manual deadman command streaming against fake
       and loopback transports, including exact applied receipts.
+- [ ] With the motion-disabled KRP2 profile, run the real STM32 transport
+      qualifier at and above the intended production command cadence. Record
+      exact sequence loss/reordering, host send lateness, round-trip and
+      controller-service timing, queue depth, wire rate, identity changes, and
+      safe output/fault state. Do not claim the rebuilt stream is faster until
+      this reproducible measurement exists.
 - [ ] With the wheels physically absent and the area/head supported, run the
       bounded production fault matrix: camera loss, stale depth, localization
       loss, controller reset/serial loss, client disconnect, command expiry,
@@ -73,6 +126,13 @@ behavior.
 - [ ] With the wheels still absent and separate operator approval, establish
       left/right body-sign conventions through bounded low-output production
       commands. This is sign evidence, not a velocity model.
+- [ ] Before manual startup, install the exact enablement-only systemd
+      drop-in, mint and re-verify the offline install marker, and prove the
+      base unit refuses a missing or changed marker. After every live
+      wheels-off item above is reviewed, enable the already-gated unit and
+      repeat the cold-boot admission check. The marker binds installed bytes;
+      it is not a substitute for any live item in this checklist. Follow
+      `docs/nano-qualified-deployment.md`.
 
 ## Work after wheels are attached
 

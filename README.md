@@ -18,8 +18,9 @@ kiko/
 │   ├── kiko-slam/    # SLAM, visual odometry, feature detection
 │   └── oak-sys/      # OAK-D camera FFI bindings
 ├── comms/
-│   ├── robot-server/ # Communication hub (UDP, Serial, HTTP)
-│   └── desktop-client/ # Tauri control UI
+│   ├── robot-protocol/       # Typed KRP2 wire and domain contract
+│   ├── robot-command-client/ # Linear acknowledged command client
+│   └── robot-server/         # Sole serial/UDP controller owner
 └── embedded/         # STM32F446 firmware
 ```
 
@@ -42,6 +43,16 @@ Live match visualization (requires OAK-D + Rerun viewer):
 ```
 cargo run -p kiko-slam --features record -- live
 ```
+
+The robot deployment uses one integrated `kiko-slam nano-agent` owner. Its
+loopback-only operator console and agent API share the same typed authority
+arbiter; there is no separate desktop PWM client or standalone motor server.
+See [Nano agent architecture](docs/nano-agent-architecture.md),
+[qualified deployment](docs/nano-qualified-deployment.md), and the
+[wheels-off acceptance gate](docs/nano-wheel-attach-gate-2026-07-23.md).
+The current verified scope and the deliberately closed production-motion gate
+are recorded in the
+[2026-07-24 integration acceptance report](docs/nano-integration-acceptance-2026-07-24.md).
 
 Run the encoderless host navigator in transport-free shadow mode while recording its exact sensor
 payloads and coordinator admissions:

@@ -25,6 +25,23 @@ jobs:
       - name: Check workspace formatting
         run: cargo fmt --all -- --check
 
+      - name: Check operator-console JavaScript
+        run: |
+          node --check crates/kiko-slam/src/operator-console/view-model.js
+          node --check crates/kiko-slam/src/operator-console/app.js
+
+      - name: Check standalone KEP2 eye firmware formatting
+        run: >-
+          cargo fmt --manifest-path firmware/eyes-kep2/Cargo.toml
+          -- --check
+
+      - name: Clippy standalone KEP2 eye firmware host logic
+        run: >-
+          cargo clippy --locked
+          --manifest-path firmware/eyes-kep2/Cargo.toml
+          --all-targets
+          -- -D warnings
+
       - name: Clippy robot protocol
         run: >-
           cargo clippy --locked -p robot-protocol --all-features --all-targets
@@ -39,23 +56,81 @@ jobs:
       - name: Clippy robot server
         run: cargo clippy --locked -p robot-server --all-targets -- -D warnings
 
-      - name: Clippy desktop client
-        run: >-
-          cargo clippy --locked -p robot-control-client --all-targets
-          -- -D warnings
-
       - name: Clippy embedded pure logic
         run: cargo clippy --locked -p embedded --lib --tests -- -D warnings
 
-      - name: Clippy Kiko SLAM host code
-        # `record` requires a native DepthAI SDK and remains outside portable
-        # host CI.
+      - name: Clippy minimal Kiko SLAM library and tests
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
         run: >-
-          cargo clippy --locked -p kiko-slam --features actuation --all-targets
+          cargo clippy --locked -p kiko-slam
+          --no-default-features
+          --lib --tests
           -- -D warnings
 
-      - name: Clippy KEP2 eye runtime and commissioning probe
-        run: cargo clippy --locked -p kiko-eye-runtime --all-targets -- -D warnings
+      - name: Clippy boot-journal provisioning tool
+        run: >-
+          cargo clippy --locked -p embedded
+          --features boot-journal-tool
+          --bin kiko-boot-journal-image
+          -- -D warnings
+
+      - name: Clippy Kiko Nano support crates
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo clippy --locked --no-deps
+          -p kiko-base-commissioning
+          -p kiko-device-inventory
+          -p kiko-expression-core
+          -p kiko-expression-runtime
+          -p kiko-eye-protocol
+          -p kiko-eye-runtime
+          -p kiko-head-protocol
+          -p kiko-head-runtime
+          -p kiko-nano-bundle-renderer
+          -p kiko-nano-deployment-gate
+          -p kiko-supervisor-core
+          --all-targets
+          -- -D warnings
+
+      - name: Clippy exact production Kiko Nano graph
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo clippy --locked -p kiko-slam
+          --features nano-agent
+          --all-targets
+          -- -D warnings
+
+      - name: Clippy exact attended wheels-off qualification graph
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo clippy --locked -p kiko-slam
+          --features nano-wheels-off-qualification
+          --all-targets
+          -- -D warnings
+
+      - name: Clippy exact attended wheel-on commissioning graph
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo clippy --locked -p kiko-slam
+          --features nano-base-commissioning
+          --all-targets
+          -- -D warnings
+
+      - name: Clippy complete attended auxiliary feature union
+        # This is compile/test coverage only. Production artifacts are built
+        # with the exact `nano-agent` feature set checked separately above.
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo clippy --locked -p kiko-slam
+          --features nano-agent,nano-wheels-off-qualification,nano-base-commissioning
+          --all-targets
+          -- -D warnings
 
   host-tests:
     name: Host Tests (macOS)
@@ -78,23 +153,87 @@ jobs:
       - name: Test robot server
         run: cargo test --locked -p robot-server
 
-      - name: Test desktop client
-        run: cargo test --locked -p robot-control-client
-
       - name: Test embedded pure logic
         run: cargo test --locked -p embedded --lib
 
-      - name: Test Kiko SLAM host code
-        # Exercise the opt-in host actuation boundary without enabling
-        # DepthAI-backed recording.
-        run: cargo test --locked -p kiko-slam --features actuation
+      - name: Test boot-journal provisioning tool
+        run: >-
+          cargo test --locked -p embedded
+          --features boot-journal-tool
+          --bin kiko-boot-journal-image
 
-      - name: Test KEP2 eye runtime and commissioning probe
-        run: cargo test --locked -p kiko-eye-runtime --all-targets
+      - name: Test operator-console view model
+        run: node --test crates/kiko-slam/src/operator-console/view-model.test.js
+
+      - name: Test standalone KEP2 eye firmware host logic
+        run: >-
+          cargo test --locked
+          --manifest-path firmware/eyes-kep2/Cargo.toml
+
+      - name: Test Kiko Nano support crates
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo test --locked
+          -p kiko-base-commissioning
+          -p kiko-device-inventory
+          -p kiko-expression-core
+          -p kiko-expression-runtime
+          -p kiko-eye-protocol
+          -p kiko-eye-runtime
+          -p kiko-head-protocol
+          -p kiko-head-runtime
+          -p kiko-nano-bundle-renderer
+          -p kiko-nano-deployment-gate
+          -p kiko-supervisor-core
+
+      - name: Verify exact production command surface
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: |
+          production_help="$(
+            cargo run --locked -p kiko-slam --features nano-agent \
+              --bin kiko-slam -- --help
+          )"
+          printf '%s\n' "${production_help}"
+          if ! grep -Fq "nano-agent" <<<"${production_help}"; then
+            echo "exact production build did not expose the production command" >&2
+            exit 1
+          fi
+          if grep -Fq "nano-wheels-off-qualification" <<<"${production_help}"; then
+            echo "exact production build exposed the attended qualification command" >&2
+            exit 1
+          fi
+          if grep -Fq "nano-base-commission" <<<"${production_help}"; then
+            echo "exact production build exposed the attended commissioning command" >&2
+            exit 1
+          fi
+
+      - name: Test exact attended wheel-on commissioning graph
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo test --locked -p kiko-slam
+          --features nano-base-commissioning
+
+      - name: Test complete Kiko Nano host graph
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo test --locked -p kiko-slam
+          --features nano-agent,nano-wheels-off-qualification,nano-base-commissioning
+
+      - name: Run offline Nano cold-boot and fault acceptance
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: tools/nano-cold-boot-fault-acceptance.sh
 
   linux-aarch64-check:
     name: Portable Host Compile (Linux aarch64)
     runs-on: ubuntu-latest
+    env:
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
     steps:
       - uses: actions/checkout@v4
 
@@ -103,6 +242,13 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
 
+      - name: Install Linux aarch64 C toolchain
+        # Rerun's Rust graph reaches `ring`, whose build script compiles
+        # target-specific C/assembly even under `cargo check`.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gcc-aarch64-linux-gnu
+
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -110,14 +256,72 @@ jobs:
 
       - name: Compile portable host crates for Linux aarch64
         # `cargo check` proves target compilation only; it does not execute
-        # aarch64 code.
+        # aarch64 code. The native bridge check-only mode proves Rust target
+        # closure without pretending an SDK or camera was exercised.
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
         run: >-
           cargo check --locked --target aarch64-unknown-linux-gnu
-          --all-features --all-targets
+          --all-targets
           -p robot-protocol
           -p robot-command-client
           -p robot-server
+          -p kiko-base-commissioning
+          -p kiko-device-inventory
+          -p kiko-expression-core
+          -p kiko-expression-runtime
+          -p kiko-eye-protocol
           -p kiko-eye-runtime
+          -p kiko-head-protocol
+          -p kiko-head-runtime
+          -p kiko-nano-bundle-renderer
+          -p kiko-nano-deployment-gate
+          -p kiko-supervisor-core
+
+      - name: Compile boot-journal provisioning tool for Linux aarch64
+        run: >-
+          cargo check --locked --target aarch64-unknown-linux-gnu
+          -p embedded
+          --features boot-journal-tool
+          --bin kiko-boot-journal-image
+
+      - name: Compile exact production Nano graph for Linux aarch64
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo check --locked --target aarch64-unknown-linux-gnu
+          -p kiko-slam
+          --features nano-agent
+          --all-targets
+
+      - name: Compile exact attended qualification graph for Linux aarch64
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo check --locked --target aarch64-unknown-linux-gnu
+          -p kiko-slam
+          --features nano-wheels-off-qualification
+          --all-targets
+
+      - name: Compile exact attended wheel-on commissioning graph for Linux aarch64
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo check --locked --target aarch64-unknown-linux-gnu
+          -p kiko-slam
+          --features nano-base-commissioning
+          --all-targets
+
+      - name: Compile complete attended auxiliary union for Linux aarch64
+        # Compile-only coverage; this feature union is never a production
+        # deployment artifact.
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo check --locked --target aarch64-unknown-linux-gnu
+          -p kiko-slam
+          --features nano-agent,nano-wheels-off-qualification,nano-base-commissioning
+          --all-targets
 
   embedded-firmware:
     name: STM32 Firmware Build (thumbv7em-none-eabihf)
@@ -129,7 +333,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
-          targets: thumbv7em-none-eabihf
+          targets: thumbv7em-none-eabihf,thumbv8m.main-none-eabihf
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -153,3 +357,73 @@ jobs:
           cargo build --locked --release -p embedded --features firmware
           --bin embedded
           --target thumbv7em-none-eabihf
+
+      - name: Clippy attended four-PWM candidate firmware
+        run: >-
+          cargo clippy --locked -p embedded
+          --features firmware,flash-boot-journal,operator-supervised-four-pwm-candidate
+          --bin embedded
+          --target thumbv7em-none-eabihf -- -D warnings
+
+      - name: Build attended four-PWM candidate firmware
+        run: >-
+          cargo build --locked --release -p embedded
+          --features firmware,flash-boot-journal,operator-supervised-four-pwm-candidate
+          --bin embedded
+          --target thumbv7em-none-eabihf
+
+      - name: Clippy distinct attended wheel-on commissioning firmware
+        run: >-
+          cargo clippy --locked -p embedded
+          --features firmware,flash-boot-journal,attended-wheel-on-commissioning
+          --bin embedded
+          --target thumbv7em-none-eabihf -- -D warnings
+
+      - name: Build distinct attended wheel-on commissioning firmware
+        run: >-
+          cargo build --locked --release -p embedded
+          --features firmware,flash-boot-journal,attended-wheel-on-commissioning
+          --bin embedded
+          --target thumbv7em-none-eabihf
+
+      - name: Build standalone KEP2 RP2350 eye firmware
+        # This fixed provisioning is intentionally non-deployable compile
+        # evidence. CI never publishes this artifact; a physical release must
+        # use a fresh byte identity and the reviewed panel polarity.
+        env:
+          KIKO_EYE_FIRMWARE_BUILD_ID_HEX: c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1
+          KIKO_EYE_RIGHT_X_SIGN: "1"
+        run: >-
+          cargo build --locked --release
+          --manifest-path firmware/eyes-kep2/Cargo.toml
+          --target thumbv8m.main-none-eabihf
+          --features rp2350
+          --bin kiko-eyes-kep2-rp2350
+
+      - name: Reject unsafe motion-firmware feature combinations
+        shell: bash
+        run: |
+          expect_compile_failure() {
+            local feature_set="$1"
+            if cargo check --locked -p embedded \
+              --features "${feature_set}" \
+              --bin embedded \
+              --target thumbv7em-none-eabihf
+            then
+              echo "unsafe feature set compiled successfully: ${feature_set}" >&2
+              exit 1
+            fi
+          }
+
+          expect_compile_failure \
+            "firmware,operator-supervised-four-pwm-candidate"
+          expect_compile_failure \
+            "firmware,external-boot-identity,flash-boot-journal"
+          expect_compile_failure \
+            "firmware,external-boot-identity,flash-boot-journal,operator-supervised-four-pwm-candidate"
+          expect_compile_failure \
+            "firmware,attended-wheel-on-commissioning"
+          expect_compile_failure \
+            "firmware,external-boot-identity,flash-boot-journal,attended-wheel-on-commissioning"
+          expect_compile_failure \
+            "firmware,flash-boot-journal,operator-supervised-four-pwm-candidate,attended-wheel-on-commissioning"

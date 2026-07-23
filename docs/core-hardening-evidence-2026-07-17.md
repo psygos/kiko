@@ -7,7 +7,9 @@
 - Requested base: `27d63e7b91fd1b1903b37233a13e2efc083f6f3c`
 - Occupancy code benchmarked at: `d7146e9faf28ed0280a98fb4341c77e8b7765ef4`
 - Benchmark worktree state: clean
-- Workspace topology audited: `kiko-slam`, `oak-sys`, `robot-protocol`, `robot-server`, `robot-control-client`, and `embedded`
+- Workspace topology audited at that revision: `kiko-slam`, `oak-sys`,
+  `robot-protocol`, `robot-server`, the now-retired direct
+  `robot-control-client`, and `embedded`.
 
 The new 2D map is deterministic geometric occupancy derived from calibrated depth. It is not a
 learned occupancy network. It keeps the existing SLAM architecture and consumes authoritative
@@ -197,7 +199,9 @@ not an RSS measurement or timing claim.
   discovery tests: 2/2 passed; generated CXX header and source were byte-identical to the prior
   bridge artifacts.
 - Typed comms contract: `robot-protocol` 10/10, `robot-server` 14/14, and
-  `robot-control-client` 6/6 tests passed.
+  the since-retired direct `robot-control-client` 6/6 tests passed. It was
+  removed after the integrated loopback operator/agent console became the sole
+  production control ingress.
 - `cargo check --locked -p embedded --target thumbv7em-none-eabihf`: passed.
 - `cargo fmt --all -- --check`, `git diff --check`, and the unchanged `Cargo.lock` check passed.
 - The occupancy traversal suite includes a 200,000-case randomized DDA/reference regression with

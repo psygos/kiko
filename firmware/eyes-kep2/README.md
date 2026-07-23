@@ -115,8 +115,11 @@ cargo build --manifest-path firmware/eyes-kep2/Cargo.toml \
 The ELF is
 `firmware/eyes-kep2/target/thumbv8m.main-none-eabihf/release/kiko-eyes-kep2-rp2350`.
 Conversion to UF2 may use `picotool uf2 convert ... --family rp2350-arm-s`, but
-this implementation did not convert, flash, or run an image on physical
-hardware.
+the build command itself neither converts nor flashes an image. The separate
+[`FABLE-NANO-HANDOFF-2026-07-21.md`](../../docs/FABLE-NANO-HANDOFF-2026-07-21.md)
+records the exact earlier UF2 identity and the operator-observed physical KEP2
+sequence. Rebuilding this source does not inherit that physical evidence or
+permit reuse of the earlier firmware build ID.
 
 ## Evidence boundary before deployment
 
