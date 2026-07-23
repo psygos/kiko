@@ -6,9 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use kiko_device_inventory::{
     ArtifactFileBindingInput, ArtifactFileBindingParseError, ArtifactFileBindingSet,
-    ArtifactHashError, ArtifactKind, CalibrationBundleHashError, InventoryParseError,
-    MAX_ARTIFACT_FILE_BYTES, MAX_MANIFEST_JSON_BYTES, ManifestJsonError, ManifestLoadError,
-    hash_manifest_artifacts, load_expected_manifest_v1_file, load_expected_manifest_v1_from_slice,
+    ArtifactHashError, ArtifactKind, ArtifactRelativePath, CalibrationBundleHashError,
+    DeploymentAssetByteLimit, InventoryParseError, MAX_ARTIFACT_FILE_BYTES,
+    MAX_MANIFEST_JSON_BYTES, ManifestJsonError, ManifestLoadError, hash_manifest_artifacts,
+    hash_manifest_artifacts_reusing_loaded_asset, load_deployment_asset,
+    load_expected_manifest_v1_file, load_expected_manifest_v1_from_slice,
+    load_expected_manifest_v2_from_slice,
 };
 use robot_protocol::v2::{ControllerCapabilities, VERSION as ROBOT_PROTOCOL_VERSION};
 use serde_json::json;
@@ -95,6 +98,22 @@ fn bindings() -> Vec<ArtifactFileBindingInput> {
     ]
 }
 
+fn candidate_manifest_json(calibration: &[u8], plant: &[u8]) -> Vec<u8> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&manifest_json(calibration, plant)).expect("V1 fixture");
+    value["schema_version"] = json!(2);
+    value["stm32"]["firmware_build_id"] = json!(0x0002_1001_u32);
+    value["stm32"]["hardware_profile_fingerprint"] = json!(b"KIKO-4PWM-CAND1!".as_slice());
+    value["stm32"]["capabilities_bits"] = json!(
+        ControllerCapabilities::SOFTWARE_GUARD_BITS
+            | ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE
+    );
+    value["stm32"]["controller_session_class"] = json!("operator_supervised_four_pwm_candidate");
+    value["stm32"]["expected_max_abs_pwm_percent"] = json!(30);
+    value["stm32"]["expected_physical_stop_semantics"] = json!("unverified");
+    serde_json::to_vec(&value).expect("candidate manifest fixture")
+}
+
 fn parsed_bindings() -> ArtifactFileBindingSet {
     ArtifactFileBindingSet::parse(bindings()).expect("valid artifact binding fixture")
 }
@@ -133,6 +152,39 @@ fn slice_and_file_load_once_through_the_existing_domain_dto() {
         load_expected_manifest_v1_from_slice(&pretty).expect("reformatted valid manifest");
     assert_eq!(reformatted.manifest(), loaded.manifest());
     assert_ne!(reformatted.content_sha256(), loaded.content_sha256());
+}
+
+#[test]
+fn candidate_manifest_json_requires_the_explicit_schema_v2_class() {
+    let json = candidate_manifest_json(b"calibration", b"plant");
+    let loaded = load_expected_manifest_v2_from_slice(&json).expect("candidate manifest");
+    assert_eq!(loaded.json_bytes(), json.len());
+    assert_eq!(loaded.content_sha256().as_bytes(), &sha256(&json));
+    assert_eq!(
+        loaded.manifest().as_inventory().stm32().firmware_build_id(),
+        0x0002_1001
+    );
+
+    let mut missing: serde_json::Value = serde_json::from_slice(&json).expect("fixture");
+    missing["stm32"]
+        .as_object_mut()
+        .expect("STM32")
+        .remove("controller_session_class");
+    assert!(
+        load_expected_manifest_v2_from_slice(
+            &serde_json::to_vec(&missing).expect("missing fixture")
+        )
+        .is_err()
+    );
+
+    let mut trailing = json;
+    trailing.extend_from_slice(b" null");
+    assert!(matches!(
+        load_expected_manifest_v2_from_slice(&trailing),
+        Err(ManifestLoadError::Json(
+            ManifestJsonError::TrailingData { .. }
+        ))
+    ));
 }
 
 #[test]
@@ -304,6 +356,44 @@ fn hashes_exact_manifest_bindings_and_exposes_changed_content() {
     assert_eq!(
         plant_identity.to_observed_digest_dto().sha256,
         *plant_identity.observed_sha256()
+    );
+}
+
+#[test]
+fn retained_launch_asset_is_not_reopened_during_manifest_hashing() {
+    let calibration = b"camera calibration v3";
+    let plant = b"drive plant v4";
+    let manifest = load_expected_manifest_v1_from_slice(&manifest_json(calibration, plant))
+        .expect("manifest")
+        .into_manifest();
+    let temp = TempDirectory::new();
+    let artifact_root = temp.path().join("artifacts");
+    write_artifacts(&artifact_root, calibration, plant);
+    let loaded_plant = load_deployment_asset(
+        temp.path(),
+        ArtifactRelativePath::parse("artifacts/plant/main.bin".to_owned()).expect("asset path"),
+        DeploymentAssetByteLimit::try_new(1_024).expect("asset bound"),
+    )
+    .expect("retained plant");
+
+    fs::remove_file(artifact_root.join("plant/main.bin"))
+        .expect("remove launch pathname after retaining bytes");
+    let hashes = hash_manifest_artifacts_reusing_loaded_asset(
+        &manifest,
+        temp.path(),
+        &artifact_root,
+        parsed_bindings(),
+        &loaded_plant,
+    )
+    .expect("retained plant plus live calibration hash");
+    assert!(hashes.all_content_matches_manifest());
+    assert_eq!(
+        hashes
+            .iter()
+            .find(|entry| entry.kind() == ArtifactKind::Plant)
+            .expect("plant identity")
+            .bytes_hashed(),
+        u64::try_from(plant.len()).expect("test length fits u64")
     );
 }
 

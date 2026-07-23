@@ -11,8 +11,8 @@ use crate::secure_fs::{
     open_beneath_nofollow,
 };
 use crate::{
-    ArtifactDigestDto, ArtifactId, ArtifactKind, DeviceInventoryManifestV1, MAX_ARTIFACTS,
-    MAX_CALIBRATION_ARTIFACTS, MAX_PLANT_ARTIFACTS,
+    ArtifactDigestDto, ArtifactId, ArtifactKind, DeviceInventoryManifestV1, LoadedDeploymentAsset,
+    MAX_ARTIFACTS, MAX_CALIBRATION_ARTIFACTS, MAX_PLANT_ARTIFACTS,
 };
 
 pub const MAX_ARTIFACT_FILE_BYTES: u64 = 128 * 1_024 * 1_024;
@@ -435,7 +435,52 @@ impl ManifestArtifactHashes {
 pub fn hash_manifest_artifacts(
     manifest: &DeviceInventoryManifestV1,
     artifact_root: &Path,
+    bindings: ArtifactFileBindingSet,
+) -> Result<ManifestArtifactHashes, ArtifactHashError> {
+    hash_manifest_artifacts_inner(manifest, artifact_root, bindings, None)
+}
+
+/// Hash every manifest artifact while reusing one exact deployment asset
+/// snapshot already retained by an enclosing launch boundary.
+///
+/// `preloaded_asset` is accepted only when its deployment-relative path is
+/// exactly one policy binding beneath `artifact_root`. Its retained digest and
+/// length are used directly, so the launch-bound file is neither reopened nor
+/// read a second time. Every other binding retains the same no-follow hashing
+/// behavior as [`hash_manifest_artifacts`].
+pub fn hash_manifest_artifacts_reusing_loaded_asset(
+    manifest: &DeviceInventoryManifestV1,
+    deployment_root: &Path,
+    artifact_root: &Path,
+    bindings: ArtifactFileBindingSet,
+    preloaded_asset: &LoadedDeploymentAsset,
+) -> Result<ManifestArtifactHashes, ArtifactHashError> {
+    validate_root_path(deployment_root)?;
+    let artifact_root_relative = artifact_root.strip_prefix(deployment_root).map_err(|_| {
+        ArtifactHashError::ArtifactRootOutsideDeployment {
+            deployment_root: deployment_root.to_path_buf(),
+            artifact_root: artifact_root.to_path_buf(),
+        }
+    })?;
+    if artifact_root_relative.is_absolute() {
+        return Err(ArtifactHashError::ArtifactRootOutsideDeployment {
+            deployment_root: deployment_root.to_path_buf(),
+            artifact_root: artifact_root.to_path_buf(),
+        });
+    }
+    hash_manifest_artifacts_inner(
+        manifest,
+        artifact_root,
+        bindings,
+        Some((artifact_root_relative, preloaded_asset)),
+    )
+}
+
+fn hash_manifest_artifacts_inner(
+    manifest: &DeviceInventoryManifestV1,
+    artifact_root: &Path,
     mut bindings: ArtifactFileBindingSet,
+    preloaded: Option<(&Path, &LoadedDeploymentAsset)>,
 ) -> Result<ManifestArtifactHashes, ArtifactHashError> {
     if bindings.len() != manifest.artifacts().len() {
         return Err(ArtifactHashError::BindingCountMismatch {
@@ -457,6 +502,19 @@ pub fn hash_manifest_artifacts(
             });
         }
     }
+    let preloaded_binding_index = preloaded
+        .map(|(artifact_root_relative, asset)| {
+            bindings
+                .iter()
+                .position(|binding| {
+                    artifact_root_relative.join(binding.relative_path().as_path())
+                        == asset.relative_path().as_path()
+                })
+                .ok_or_else(|| ArtifactHashError::PreloadedArtifactNotBound {
+                    relative_path: asset.relative_path().clone(),
+                })
+        })
+        .transpose()?;
     validate_root_path(artifact_root)?;
     let root =
         open_absolute_nofollow(artifact_root, OpenedPathKind::Directory).map_err(|source| {
@@ -483,41 +541,48 @@ pub fn hash_manifest_artifacts(
         let binding = bindings.entries[binding_index]
             .as_ref()
             .expect("matching manifest binding is initialized");
-        let descriptor =
-            open_beneath_nofollow(&root, binding.relative_path.as_path()).map_err(|source| {
-                ArtifactHashError::OpenArtifact {
+        let (observed_sha256, bytes_hashed) = if preloaded_binding_index == Some(binding_index) {
+            let (_, asset) = preloaded.expect("preloaded index exists only with an asset");
+            (
+                *asset.content_sha256().as_bytes(),
+                u64::try_from(asset.byte_len())
+                    .expect("Linux and macOS deployment asset lengths fit u64"),
+            )
+        } else {
+            let descriptor = open_beneath_nofollow(&root, binding.relative_path.as_path())
+                .map_err(|source| ArtifactHashError::OpenArtifact {
                     kind: binding.kind,
                     artifact_id: binding.artifact_id,
                     relative_path: binding.relative_path.clone(),
                     source,
-                }
-            })?;
-        let mut file = File::from(descriptor);
-        let metadata = file
-            .metadata()
-            .map_err(|source| ArtifactHashError::Metadata {
-                kind: binding.kind,
-                artifact_id: binding.artifact_id,
-                relative_path: binding.relative_path.clone(),
-                source,
-            })?;
-        if !metadata.is_file() {
-            return Err(ArtifactHashError::NotRegularFile {
-                kind: binding.kind,
-                artifact_id: binding.artifact_id,
-                relative_path: binding.relative_path.clone(),
-            });
-        }
-        if metadata.len() > MAX_ARTIFACT_FILE_BYTES {
-            return Err(ArtifactHashError::ArtifactTooLarge {
-                kind: binding.kind,
-                artifact_id: binding.artifact_id,
-                relative_path: binding.relative_path.clone(),
-                actual_bytes: metadata.len(),
-                maximum_bytes: MAX_ARTIFACT_FILE_BYTES,
-            });
-        }
-        let (observed_sha256, bytes_hashed) = hash_file(&mut file, binding, metadata.len())?;
+                })?;
+            let mut file = File::from(descriptor);
+            let metadata = file
+                .metadata()
+                .map_err(|source| ArtifactHashError::Metadata {
+                    kind: binding.kind,
+                    artifact_id: binding.artifact_id,
+                    relative_path: binding.relative_path.clone(),
+                    source,
+                })?;
+            if !metadata.is_file() {
+                return Err(ArtifactHashError::NotRegularFile {
+                    kind: binding.kind,
+                    artifact_id: binding.artifact_id,
+                    relative_path: binding.relative_path.clone(),
+                });
+            }
+            if metadata.len() > MAX_ARTIFACT_FILE_BYTES {
+                return Err(ArtifactHashError::ArtifactTooLarge {
+                    kind: binding.kind,
+                    artifact_id: binding.artifact_id,
+                    relative_path: binding.relative_path.clone(),
+                    actual_bytes: metadata.len(),
+                    maximum_bytes: MAX_ARTIFACT_FILE_BYTES,
+                });
+            }
+            hash_file(&mut file, binding, metadata.len())?
+        };
         let binding = bindings.entries[binding_index]
             .take()
             .expect("matching manifest binding is consumed once");
@@ -624,6 +689,13 @@ pub enum ArtifactHashError {
     NonCanonicalRootPath {
         path: PathBuf,
     },
+    ArtifactRootOutsideDeployment {
+        deployment_root: PathBuf,
+        artifact_root: PathBuf,
+    },
+    PreloadedArtifactNotBound {
+        relative_path: ArtifactRelativePath,
+    },
     OpenRoot {
         path: PathBuf,
         source: SecureOpenError,
@@ -687,6 +759,8 @@ impl std::error::Error for ArtifactHashError {
             | Self::RootNotAbsolute { .. }
             | Self::RootPathTooLong { .. }
             | Self::NonCanonicalRootPath { .. }
+            | Self::ArtifactRootOutsideDeployment { .. }
+            | Self::PreloadedArtifactNotBound { .. }
             | Self::NotRegularFile { .. }
             | Self::ArtifactTooLarge { .. }
             | Self::FileLengthChanged { .. } => None,

@@ -20,6 +20,20 @@ absent from a physical build. If either is declared, its complete contract is
 required. An observed report may omit any device or artifact so that absence is
 represented as a mismatch rather than replaced with a fallback.
 
+V1 remains production-only: its expected STM32 must carry the complete
+external-interlock capability set. Schema V2 is a separate, explicit parser
+for the operator-supervised four-PWM qualification profile. Its STM32 object
+must declare `controller_session_class:
+"operator_supervised_four_pwm_candidate"`, KRP2 ABI 2, build
+`0x0002_1001`, fingerprint `KIKO-4PWM-CAND1!`, the exact candidate
+capability bit plus all software guards and no production-interlock or
+diagnostic bits, unverified physical stop semantics, and a nonzero PWM cap no
+greater than 30%. The parsed STM32 retains its derived safety class and exact
+inventory comparison reports a class mismatch independently of capability
+bits. This schema is qualification evidence only; it does not assert external
+interlocks, verified stopping, calibrated signs, velocity, or autonomous
+motion safety.
+
 The parser rejects:
 
 - unknown schema versions, empty, zero, malformed, or oversized identities;
@@ -114,6 +128,12 @@ deserializes directly into `DeviceInventoryManifestV1Dto`, rejects duplicate
 fields, unknown fields at every DTO level, malformed values, and trailing JSON,
 then calls `DeviceInventoryManifestV1::parse`. That existing parser remains the
 only admission path into the manifest domain.
+
+`load_expected_manifest_v2_from_slice` applies the same byte bound, duplicate
+field, unknown field, and trailing-data rules to the explicit V2 candidate
+DTO, then calls `DeviceInventoryManifestV2::parse`. It intentionally has no
+schema fallback. Nano startup should pass bytes already obtained through
+`LoadedDeploymentAsset`, preserving its no-follow deployment-file boundary.
 
 `load_expected_manifest_v1_file` applies the same parser after opening one
 absolute, canonical path without following a symlink in any component. It

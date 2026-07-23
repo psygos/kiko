@@ -11,7 +11,11 @@ use sha2::{Digest, Sha256};
 use crate::secure_fs::{
     OpenedPathKind, SecureOpenError, is_canonical_absolute_path, open_absolute_nofollow,
 };
-use crate::{DeviceInventoryManifestV1, DeviceInventoryManifestV1Dto, InventoryParseError};
+use crate::{
+    DeviceInventoryManifestV1, DeviceInventoryManifestV1Dto, DeviceInventoryManifestV2,
+    DeviceInventoryManifestV2Dto, DeviceInventoryManifestV3, DeviceInventoryManifestV3Dto,
+    InventoryParseError,
+};
 
 pub const MAX_MANIFEST_JSON_BYTES: usize = 64 * 1_024;
 pub const MAX_MANIFEST_PATH_BYTES: usize = 1_024;
@@ -22,6 +26,20 @@ pub struct LoadedExpectedManifestV1 {
     json_bytes: usize,
     content_sha256: ManifestContentSha256,
     source_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct LoadedExpectedManifestV2 {
+    manifest: DeviceInventoryManifestV2,
+    json_bytes: usize,
+    content_sha256: ManifestContentSha256,
+}
+
+#[derive(Debug)]
+pub struct LoadedExpectedManifestV3 {
+    manifest: DeviceInventoryManifestV3,
+    json_bytes: usize,
+    content_sha256: ManifestContentSha256,
 }
 
 /// SHA-256 identity of the exact admitted JSON bytes.
@@ -64,6 +82,42 @@ impl LoadedExpectedManifestV1 {
     }
 }
 
+impl LoadedExpectedManifestV2 {
+    pub const fn manifest(&self) -> &DeviceInventoryManifestV2 {
+        &self.manifest
+    }
+
+    pub const fn json_bytes(&self) -> usize {
+        self.json_bytes
+    }
+
+    pub const fn content_sha256(&self) -> ManifestContentSha256 {
+        self.content_sha256
+    }
+
+    pub fn into_manifest(self) -> DeviceInventoryManifestV2 {
+        self.manifest
+    }
+}
+
+impl LoadedExpectedManifestV3 {
+    pub const fn manifest(&self) -> &DeviceInventoryManifestV3 {
+        &self.manifest
+    }
+
+    pub const fn json_bytes(&self) -> usize {
+        self.json_bytes
+    }
+
+    pub const fn content_sha256(&self) -> ManifestContentSha256 {
+        self.content_sha256
+    }
+
+    pub fn into_manifest(self) -> DeviceInventoryManifestV3 {
+        self.manifest
+    }
+}
+
 pub fn load_expected_manifest_v1_from_slice(
     json: &[u8],
 ) -> Result<LoadedExpectedManifestV1, ManifestLoadError> {
@@ -86,6 +140,61 @@ pub fn load_expected_manifest_v1_from_slice(
         json_bytes: json.len(),
         content_sha256: ManifestContentSha256(Sha256::digest(json).into()),
         source_path: None,
+    })
+}
+
+/// Parse one bounded schema-V2 candidate manifest. File ownership and
+/// no-follow policy remain the caller's responsibility; Nano startup already
+/// satisfies that boundary by passing bytes from a `LoadedDeploymentAsset`.
+pub fn load_expected_manifest_v2_from_slice(
+    json: &[u8],
+) -> Result<LoadedExpectedManifestV2, ManifestLoadError> {
+    if json.len() > MAX_MANIFEST_JSON_BYTES {
+        return Err(ManifestLoadError::JsonTooLarge {
+            actual_bytes: host_usize_to_u64(json.len()),
+            maximum_bytes: host_usize_to_u64(MAX_MANIFEST_JSON_BYTES),
+        });
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(json);
+    let dto = DeviceInventoryManifestV2Dto::deserialize(&mut deserializer)
+        .map_err(|source| ManifestLoadError::Json(ManifestJsonError::Decode { source }))?;
+    deserializer
+        .end()
+        .map_err(|source| ManifestLoadError::Json(ManifestJsonError::TrailingData { source }))?;
+    let manifest = DeviceInventoryManifestV2::parse(dto)
+        .map_err(|source| ManifestLoadError::Domain { source })?;
+    Ok(LoadedExpectedManifestV2 {
+        manifest,
+        json_bytes: json.len(),
+        content_sha256: ManifestContentSha256(Sha256::digest(json).into()),
+    })
+}
+
+/// Parse one bounded schema-V3 attended wheel-on commissioning manifest.
+///
+/// File ownership and no-follow policy remain the caller's responsibility;
+/// Nano startup passes bytes from one already loaded deployment asset.
+pub fn load_expected_manifest_v3_from_slice(
+    json: &[u8],
+) -> Result<LoadedExpectedManifestV3, ManifestLoadError> {
+    if json.len() > MAX_MANIFEST_JSON_BYTES {
+        return Err(ManifestLoadError::JsonTooLarge {
+            actual_bytes: host_usize_to_u64(json.len()),
+            maximum_bytes: host_usize_to_u64(MAX_MANIFEST_JSON_BYTES),
+        });
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(json);
+    let dto = DeviceInventoryManifestV3Dto::deserialize(&mut deserializer)
+        .map_err(|source| ManifestLoadError::Json(ManifestJsonError::Decode { source }))?;
+    deserializer
+        .end()
+        .map_err(|source| ManifestLoadError::Json(ManifestJsonError::TrailingData { source }))?;
+    let manifest = DeviceInventoryManifestV3::parse(dto)
+        .map_err(|source| ManifestLoadError::Domain { source })?;
+    Ok(LoadedExpectedManifestV3 {
+        manifest,
+        json_bytes: json.len(),
+        content_sha256: ManifestContentSha256(Sha256::digest(json).into()),
     })
 }
 

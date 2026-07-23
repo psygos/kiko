@@ -2,8 +2,16 @@ use core::num::{NonZeroU16, NonZeroU32};
 
 use kiko_eye_protocol::{Capabilities as EyeCapabilities, DeviceUid, FirmwareBuildId};
 use kiko_head_protocol::{HeadJoint, ServoId};
+pub use robot_protocol::v2::{
+    ATTENDED_WHEEL_ON_COMMISSIONING_FINGERPRINT_BYTES,
+    ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID,
+    OPERATOR_SUPERVISED_FOUR_PWM_FINGERPRINT_BYTES, OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID,
+};
 use robot_protocol::v2::{
-    ActuatorConfigFingerprint, ControllerCapabilities, ControllerUid, VERSION as ROBOT_PROTOCOL_V2,
+    ActuatorConfigFingerprint, ControllerCapabilities, ControllerSafetyClass,
+    ControllerSessionClass, ControllerUid, MAX_ATTENDED_WHEEL_ON_COMMISSIONING_PWM_PERCENT,
+    MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT, MaxAbsPwmPercent, PhysicalStopSemantics,
+    VERSION as ROBOT_PROTOCOL_V2,
 };
 use serde::Deserialize;
 
@@ -14,6 +22,8 @@ use crate::{
 };
 
 pub const DEVICE_INVENTORY_MANIFEST_V1: u32 = 1;
+pub const DEVICE_INVENTORY_MANIFEST_V2: u32 = 2;
+pub const DEVICE_INVENTORY_MANIFEST_V3: u32 = 3;
 pub const REQUIRED_EYE_CAPABILITY_BITS: u32 = EyeCapabilities::KNOWN_BITS;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -36,6 +46,53 @@ pub struct Stm32ManifestV1Dto {
     pub firmware_build_id: u32,
     pub hardware_profile_fingerprint: [u8; 16],
     pub capabilities_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerSessionClassV2Dto {
+    OperatorSupervisedFourPwmCandidate,
+    AttendedWheelOnCommissioning,
+    ProductionExternalInterlocks,
+}
+
+impl From<ControllerSessionClassV2Dto> for ControllerSessionClass {
+    fn from(value: ControllerSessionClassV2Dto) -> Self {
+        match value {
+            ControllerSessionClassV2Dto::OperatorSupervisedFourPwmCandidate => {
+                Self::OperatorSupervisedFourPwmCandidate
+            }
+            ControllerSessionClassV2Dto::AttendedWheelOnCommissioning => {
+                Self::AttendedWheelOnCommissioning
+            }
+            ControllerSessionClassV2Dto::ProductionExternalInterlocks => {
+                Self::ProductionExternalInterlocks
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Stm32ManifestV2Dto {
+    pub serial_by_id_path: String,
+    pub control_endpoint_identity: String,
+    pub controller_uid: [u8; 12],
+    pub firmware_abi: u16,
+    pub firmware_build_id: u32,
+    pub hardware_profile_fingerprint: [u8; 16],
+    pub capabilities_bits: u32,
+    pub controller_session_class: ControllerSessionClassV2Dto,
+    pub expected_max_abs_pwm_percent: u8,
+    pub expected_physical_stop_semantics: PhysicalStopSemanticsV2Dto,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalStopSemanticsV2Dto {
+    Unverified,
+    CoastVerified,
+    BrakeVerified,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -79,6 +136,34 @@ pub struct DeviceInventoryManifestV1Dto {
     pub plant_artifacts: Vec<ArtifactDigestDto>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceInventoryManifestV2Dto {
+    pub schema_version: u32,
+    pub robot_id: String,
+    pub oak: OakManifestV1Dto,
+    pub stm32: Stm32ManifestV2Dto,
+    pub head: Option<HeadManifestV1Dto>,
+    pub eye: Option<EyeManifestV1Dto>,
+    pub calibration_artifacts: Vec<ArtifactDigestDto>,
+    pub plant_artifacts: Vec<ArtifactDigestDto>,
+}
+
+/// Schema-V3 expectation document for the distinct attended wheel-on
+/// commissioning controller class.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceInventoryManifestV3Dto {
+    pub schema_version: u32,
+    pub robot_id: String,
+    pub oak: OakManifestV1Dto,
+    pub stm32: Stm32ManifestV2Dto,
+    pub head: Option<HeadManifestV1Dto>,
+    pub eye: Option<EyeManifestV1Dto>,
+    pub calibration_artifacts: Vec<ArtifactDigestDto>,
+    pub plant_artifacts: Vec<ArtifactDigestDto>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceInventoryManifestV1 {
     robot_id: RobotId,
@@ -89,6 +174,25 @@ pub struct DeviceInventoryManifestV1 {
     artifacts: ArtifactSet,
 }
 
+/// Schema-V2 expected inventory for the explicit operator-supervised
+/// four-PWM qualification profile. The inner inventory retains the parsed
+/// safety class used by exact comparison.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceInventoryManifestV2 {
+    inventory: DeviceInventoryManifestV1,
+    controller_session_class: ControllerSessionClass,
+    expected_max_abs_pwm_percent: MaxAbsPwmPercent,
+    expected_physical_stop_semantics: PhysicalStopSemantics,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceInventoryManifestV3 {
+    inventory: DeviceInventoryManifestV1,
+    controller_session_class: ControllerSessionClass,
+    expected_max_abs_pwm_percent: MaxAbsPwmPercent,
+    expected_physical_stop_semantics: PhysicalStopSemantics,
+}
+
 impl DeviceInventoryManifestV1 {
     pub fn parse(dto: DeviceInventoryManifestV1Dto) -> Result<Self, InventoryParseError> {
         if dto.schema_version != DEVICE_INVENTORY_MANIFEST_V1 {
@@ -97,30 +201,16 @@ impl DeviceInventoryManifestV1 {
                 supported: DEVICE_INVENTORY_MANIFEST_V1,
             });
         }
-        let robot_id =
-            RobotId::parse(dto.robot_id).map_err(|source| InventoryParseError::InvalidText {
-                field: TextField::RobotId,
-                source,
-            })?;
-        let oak = parse_oak(dto.oak)?;
         let stm32 = parse_expected_stm32(dto.stm32)?;
-        let head = dto.head.map(parse_expected_head).transpose()?;
-        let eye = dto.eye.map(parse_expected_eye).transpose()?;
-        ensure_unique_physical_paths(
-            stm32.serial_path(),
-            head.as_ref().map(HeadExpectedIdentity::serial_path),
-            eye.as_ref().map(EyeStaticIdentity::serial_path),
-        )?;
-        let artifacts =
-            ArtifactSet::parse_expected(dto.calibration_artifacts, dto.plant_artifacts)?;
-        Ok(Self {
-            robot_id,
-            oak,
+        parse_expected_inventory(
+            dto.robot_id,
+            dto.oak,
             stm32,
-            head,
-            eye,
-            artifacts,
-        })
+            dto.head,
+            dto.eye,
+            dto.calibration_artifacts,
+            dto.plant_artifacts,
+        )
     }
 
     pub fn robot_id(&self) -> &RobotId {
@@ -146,6 +236,137 @@ impl DeviceInventoryManifestV1 {
     pub fn artifacts(&self) -> &ArtifactSet {
         &self.artifacts
     }
+}
+
+impl DeviceInventoryManifestV2 {
+    pub fn parse(dto: DeviceInventoryManifestV2Dto) -> Result<Self, InventoryParseError> {
+        if dto.schema_version != DEVICE_INVENTORY_MANIFEST_V2 {
+            return Err(InventoryParseError::UnsupportedManifestSchema {
+                actual: dto.schema_version,
+                supported: DEVICE_INVENTORY_MANIFEST_V2,
+            });
+        }
+        let expected_max_abs_pwm_percent = dto.stm32.expected_max_abs_pwm_percent;
+        let stm32 = parse_expected_stm32_v2(dto.stm32)?;
+        let inventory = parse_expected_inventory(
+            dto.robot_id,
+            dto.oak,
+            stm32,
+            dto.head,
+            dto.eye,
+            dto.calibration_artifacts,
+            dto.plant_artifacts,
+        )?;
+        Ok(Self {
+            inventory,
+            controller_session_class: ControllerSessionClass::OperatorSupervisedFourPwmCandidate,
+            expected_max_abs_pwm_percent: MaxAbsPwmPercent::try_new(expected_max_abs_pwm_percent)
+                .expect("candidate parser proved the nonzero protocol PWM domain"),
+            expected_physical_stop_semantics: PhysicalStopSemantics::Unverified,
+        })
+    }
+
+    pub const fn as_inventory(&self) -> &DeviceInventoryManifestV1 {
+        &self.inventory
+    }
+
+    pub fn into_inventory(self) -> DeviceInventoryManifestV1 {
+        self.inventory
+    }
+
+    pub const fn controller_session_class(&self) -> ControllerSessionClass {
+        self.controller_session_class
+    }
+
+    pub const fn expected_max_abs_pwm_percent(&self) -> MaxAbsPwmPercent {
+        self.expected_max_abs_pwm_percent
+    }
+
+    pub const fn expected_physical_stop_semantics(&self) -> PhysicalStopSemantics {
+        self.expected_physical_stop_semantics
+    }
+}
+
+impl DeviceInventoryManifestV3 {
+    pub fn parse(dto: DeviceInventoryManifestV3Dto) -> Result<Self, InventoryParseError> {
+        if dto.schema_version != DEVICE_INVENTORY_MANIFEST_V3 {
+            return Err(InventoryParseError::UnsupportedManifestSchema {
+                actual: dto.schema_version,
+                supported: DEVICE_INVENTORY_MANIFEST_V3,
+            });
+        }
+        let expected_max_abs_pwm_percent = dto.stm32.expected_max_abs_pwm_percent;
+        let stm32 = parse_expected_stm32_v3(dto.stm32)?;
+        let inventory = parse_expected_inventory(
+            dto.robot_id,
+            dto.oak,
+            stm32,
+            dto.head,
+            dto.eye,
+            dto.calibration_artifacts,
+            dto.plant_artifacts,
+        )?;
+        Ok(Self {
+            inventory,
+            controller_session_class: ControllerSessionClass::AttendedWheelOnCommissioning,
+            expected_max_abs_pwm_percent: MaxAbsPwmPercent::try_new(expected_max_abs_pwm_percent)
+                .expect("commissioning parser proved the nonzero protocol PWM domain"),
+            expected_physical_stop_semantics: PhysicalStopSemantics::Unverified,
+        })
+    }
+
+    pub const fn as_inventory(&self) -> &DeviceInventoryManifestV1 {
+        &self.inventory
+    }
+
+    pub fn into_inventory(self) -> DeviceInventoryManifestV1 {
+        self.inventory
+    }
+
+    pub const fn controller_session_class(&self) -> ControllerSessionClass {
+        self.controller_session_class
+    }
+
+    pub const fn expected_max_abs_pwm_percent(&self) -> MaxAbsPwmPercent {
+        self.expected_max_abs_pwm_percent
+    }
+
+    pub const fn expected_physical_stop_semantics(&self) -> PhysicalStopSemantics {
+        self.expected_physical_stop_semantics
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_expected_inventory(
+    robot_id: String,
+    oak: OakManifestV1Dto,
+    stm32: Stm32StaticIdentity,
+    head: Option<HeadManifestV1Dto>,
+    eye: Option<EyeManifestV1Dto>,
+    calibration_artifacts: Vec<ArtifactDigestDto>,
+    plant_artifacts: Vec<ArtifactDigestDto>,
+) -> Result<DeviceInventoryManifestV1, InventoryParseError> {
+    let robot_id = RobotId::parse(robot_id).map_err(|source| InventoryParseError::InvalidText {
+        field: TextField::RobotId,
+        source,
+    })?;
+    let oak = parse_oak(oak)?;
+    let head = head.map(parse_expected_head).transpose()?;
+    let eye = eye.map(parse_expected_eye).transpose()?;
+    ensure_unique_physical_paths(
+        stm32.serial_path(),
+        head.as_ref().map(HeadExpectedIdentity::serial_path),
+        eye.as_ref().map(EyeStaticIdentity::serial_path),
+    )?;
+    let artifacts = ArtifactSet::parse_expected(calibration_artifacts, plant_artifacts)?;
+    Ok(DeviceInventoryManifestV1 {
+        robot_id,
+        oak,
+        stm32,
+        head,
+        eye,
+        artifacts,
+    })
 }
 
 pub(crate) fn parse_oak(dto: OakManifestV1Dto) -> Result<OakIdentity, InventoryParseError> {
@@ -254,6 +475,124 @@ fn parse_expected_stm32(
         return Err(InventoryParseError::MissingControllerSafetyCapabilities {
             actual_bits: parsed.capabilities().bits(),
             required_bits: ControllerCapabilities::REQUIRED_BITS,
+        });
+    }
+    if parsed.firmware_build_id() == OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID
+        || parsed.hardware_profile().as_bytes() == &OPERATOR_SUPERVISED_FOUR_PWM_FINGERPRINT_BYTES
+    {
+        return Err(InventoryParseError::CandidateIdentityRequiresManifestV2);
+    }
+    if parsed.firmware_build_id() == ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID
+        || parsed.hardware_profile().as_bytes()
+            == &ATTENDED_WHEEL_ON_COMMISSIONING_FINGERPRINT_BYTES
+    {
+        return Err(InventoryParseError::CommissioningIdentityRequiresManifestV3);
+    }
+    Ok(parsed)
+}
+
+fn parse_expected_stm32_v3(
+    dto: Stm32ManifestV2Dto,
+) -> Result<Stm32StaticIdentity, InventoryParseError> {
+    let declared_class = ControllerSessionClass::from(dto.controller_session_class);
+    if declared_class != ControllerSessionClass::AttendedWheelOnCommissioning {
+        return Err(InventoryParseError::UnsupportedControllerSessionClass {
+            actual: declared_class,
+        });
+    }
+    if dto.expected_physical_stop_semantics != PhysicalStopSemanticsV2Dto::Unverified {
+        return Err(InventoryParseError::CommissioningRequiresUnverifiedStop);
+    }
+    if dto.expected_max_abs_pwm_percent != MAX_ATTENDED_WHEEL_ON_COMMISSIONING_PWM_PERCENT {
+        return Err(InventoryParseError::CommissioningPwmCapMismatch {
+            actual: dto.expected_max_abs_pwm_percent,
+            required: MAX_ATTENDED_WHEEL_ON_COMMISSIONING_PWM_PERCENT,
+        });
+    }
+    if dto.firmware_build_id != ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID {
+        return Err(InventoryParseError::CommissioningFirmwareBuildMismatch {
+            actual: dto.firmware_build_id,
+            required: ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID,
+        });
+    }
+    if dto.hardware_profile_fingerprint != ATTENDED_WHEEL_ON_COMMISSIONING_FINGERPRINT_BYTES {
+        return Err(InventoryParseError::CommissioningHardwareProfileMismatch);
+    }
+    let parsed = parse_stm32_static(
+        dto.serial_by_id_path,
+        dto.control_endpoint_identity,
+        dto.controller_uid,
+        dto.firmware_abi,
+        dto.firmware_build_id,
+        dto.hardware_profile_fingerprint,
+        dto.capabilities_bits,
+    )?;
+    let required_abi = u16::from(ROBOT_PROTOCOL_V2);
+    if parsed.firmware_abi() != required_abi {
+        return Err(InventoryParseError::Stm32FirmwareAbiContractMismatch {
+            actual: parsed.firmware_abi(),
+            required: required_abi,
+        });
+    }
+    if parsed.safety_class() != ControllerSafetyClass::AttendedWheelOnCommissioning {
+        return Err(InventoryParseError::ControllerSessionClassMismatch {
+            declared: declared_class,
+            actual: parsed.safety_class(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_expected_stm32_v2(
+    dto: Stm32ManifestV2Dto,
+) -> Result<Stm32StaticIdentity, InventoryParseError> {
+    let declared_class = ControllerSessionClass::from(dto.controller_session_class);
+    if declared_class != ControllerSessionClass::OperatorSupervisedFourPwmCandidate {
+        return Err(InventoryParseError::UnsupportedControllerSessionClass {
+            actual: declared_class,
+        });
+    }
+    if dto.expected_physical_stop_semantics != PhysicalStopSemanticsV2Dto::Unverified {
+        return Err(InventoryParseError::CandidateRequiresUnverifiedStop);
+    }
+    if !(1..=MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT)
+        .contains(&dto.expected_max_abs_pwm_percent)
+    {
+        return Err(InventoryParseError::CandidatePwmCapOutOfRange {
+            actual: dto.expected_max_abs_pwm_percent,
+            minimum: 1,
+            maximum: MAX_OPERATOR_SUPERVISED_FOUR_PWM_PWM_PERCENT,
+        });
+    }
+    if dto.firmware_build_id != OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID {
+        return Err(InventoryParseError::CandidateFirmwareBuildMismatch {
+            actual: dto.firmware_build_id,
+            required: OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID,
+        });
+    }
+    if dto.hardware_profile_fingerprint != OPERATOR_SUPERVISED_FOUR_PWM_FINGERPRINT_BYTES {
+        return Err(InventoryParseError::CandidateHardwareProfileMismatch);
+    }
+    let parsed = parse_stm32_static(
+        dto.serial_by_id_path,
+        dto.control_endpoint_identity,
+        dto.controller_uid,
+        dto.firmware_abi,
+        dto.firmware_build_id,
+        dto.hardware_profile_fingerprint,
+        dto.capabilities_bits,
+    )?;
+    let required_abi = u16::from(ROBOT_PROTOCOL_V2);
+    if parsed.firmware_abi() != required_abi {
+        return Err(InventoryParseError::Stm32FirmwareAbiContractMismatch {
+            actual: parsed.firmware_abi(),
+            required: required_abi,
+        });
+    }
+    if parsed.safety_class() != ControllerSafetyClass::OperatorSupervisedFourPwmCandidate {
+        return Err(InventoryParseError::ControllerSessionClassMismatch {
+            declared: declared_class,
+            actual: parsed.safety_class(),
         });
     }
     Ok(parsed)

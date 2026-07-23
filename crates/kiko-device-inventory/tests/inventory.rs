@@ -1,16 +1,20 @@
 use kiko_device_inventory::{
-    ArtifactDigestDto, ArtifactKind, BoundedTextError, DEVICE_INVENTORY_MANIFEST_V1,
-    DeviceInventoryManifestV1, DeviceInventoryManifestV1Dto, DeviceRole, EyeManifestV1Dto,
-    HeadManifestV1Dto, InventoryComparison, InventoryMismatch, InventoryParseError,
-    MAX_ARTIFACT_ID_BYTES, MAX_BUILD_PROVENANCE_BYTES, MAX_CALIBRATION_ARTIFACTS,
-    MAX_CONTROL_ENDPOINT_ID_BYTES, MAX_INVENTORY_MISMATCHES, MAX_OAK_MXID_BYTES,
-    MAX_OBSERVED_HEAD_SERVOS, MAX_PLANT_ARTIFACTS, MAX_ROBOT_ID_BYTES, MAX_SERIAL_BY_ID_PATH_BYTES,
-    OBSERVED_DEVICE_INVENTORY_V1, OakManifestV1Dto, ObservedDeviceInventoryV1,
-    ObservedDeviceInventoryV1Dto, ObservedEyeV1Dto, ObservedHeadV1Dto, ObservedOakV1Dto,
-    ObservedStm32V1Dto, Stm32ManifestV1Dto, TextField, admit_exact_inventory,
+    ArtifactDigestDto, ArtifactKind, BoundedTextError, ControllerSessionClassV2Dto,
+    DEVICE_INVENTORY_MANIFEST_V1, DEVICE_INVENTORY_MANIFEST_V2, DeviceInventoryManifestV1,
+    DeviceInventoryManifestV1Dto, DeviceInventoryManifestV2, DeviceInventoryManifestV2Dto,
+    DeviceRole, EyeManifestV1Dto, HeadManifestV1Dto, InventoryComparison, InventoryMismatch,
+    InventoryParseError, MAX_ARTIFACT_ID_BYTES, MAX_BUILD_PROVENANCE_BYTES,
+    MAX_CALIBRATION_ARTIFACTS, MAX_CONTROL_ENDPOINT_ID_BYTES, MAX_INVENTORY_MISMATCHES,
+    MAX_OAK_MXID_BYTES, MAX_OBSERVED_HEAD_SERVOS, MAX_PLANT_ARTIFACTS, MAX_ROBOT_ID_BYTES,
+    MAX_SERIAL_BY_ID_PATH_BYTES, OBSERVED_DEVICE_INVENTORY_V1, OakManifestV1Dto,
+    ObservedDeviceInventoryV1, ObservedDeviceInventoryV1Dto, ObservedEyeV1Dto, ObservedHeadV1Dto,
+    ObservedOakV1Dto, ObservedStm32V1Dto, PhysicalStopSemanticsV2Dto, Stm32ManifestV1Dto,
+    Stm32ManifestV2Dto, TextField, admit_exact_inventory,
 };
 use kiko_head_protocol::HeadJoint;
-use robot_protocol::v2::{ControllerCapabilities, VERSION as ROBOT_PROTOCOL_VERSION};
+use robot_protocol::v2::{
+    ControllerCapabilities, ControllerSafetyClass, VERSION as ROBOT_PROTOCOL_VERSION,
+};
 
 fn digest(artifact_id: impl Into<String>, byte: u8) -> ArtifactDigestDto {
     assert_ne!(byte, 0);
@@ -131,6 +135,45 @@ fn manifest_dto() -> DeviceInventoryManifestV1Dto {
     }
 }
 
+fn candidate_manifest_dto() -> DeviceInventoryManifestV2Dto {
+    let production = manifest_dto();
+    let stm32 = production.stm32;
+    DeviceInventoryManifestV2Dto {
+        schema_version: DEVICE_INVENTORY_MANIFEST_V2,
+        robot_id: production.robot_id,
+        oak: production.oak,
+        stm32: Stm32ManifestV2Dto {
+            serial_by_id_path: stm32.serial_by_id_path,
+            control_endpoint_identity: stm32.control_endpoint_identity,
+            controller_uid: stm32.controller_uid,
+            firmware_abi: u16::from(ROBOT_PROTOCOL_VERSION),
+            firmware_build_id: 0x0002_1001,
+            hardware_profile_fingerprint: *b"KIKO-4PWM-CAND1!",
+            capabilities_bits: ControllerCapabilities::SOFTWARE_GUARD_BITS
+                | ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE,
+            controller_session_class:
+                ControllerSessionClassV2Dto::OperatorSupervisedFourPwmCandidate,
+            expected_max_abs_pwm_percent: 30,
+            expected_physical_stop_semantics: PhysicalStopSemanticsV2Dto::Unverified,
+        },
+        head: production.head,
+        eye: production.eye,
+        calibration_artifacts: production.calibration_artifacts,
+        plant_artifacts: production.plant_artifacts,
+    }
+}
+
+fn candidate_observed_dto() -> ObservedDeviceInventoryV1Dto {
+    let mut observed = observed_dto();
+    let stm32 = observed.stm32.as_mut().expect("STM32");
+    stm32.firmware_abi = u16::from(ROBOT_PROTOCOL_VERSION);
+    stm32.firmware_build_id = 0x0002_1001;
+    stm32.hardware_profile_fingerprint = *b"KIKO-4PWM-CAND1!";
+    stm32.capabilities_bits = ControllerCapabilities::SOFTWARE_GUARD_BITS
+        | ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE;
+    observed
+}
+
 fn observed_dto() -> ObservedDeviceInventoryV1Dto {
     ObservedDeviceInventoryV1Dto {
         schema_version: OBSERVED_DEVICE_INVENTORY_V1,
@@ -165,6 +208,70 @@ fn exact_inventory_matches_without_substitution() {
     assert_eq!(comparison.iter().count(), 0);
     assert_eq!(observed.stm32().expect("STM32").boot_id().get(), 71);
     assert_eq!(observed.eye().expect("eye").boot_id().get(), 81);
+}
+
+#[test]
+fn schema_v2_candidate_manifest_carries_and_compares_the_explicit_safety_class() {
+    let expected =
+        DeviceInventoryManifestV2::parse(candidate_manifest_dto()).expect("candidate manifest");
+    let observed =
+        ObservedDeviceInventoryV1::parse(candidate_observed_dto()).expect("candidate observation");
+    assert_eq!(
+        expected.as_inventory().stm32().safety_class(),
+        ControllerSafetyClass::OperatorSupervisedFourPwmCandidate
+    );
+    assert!(
+        InventoryComparison::compare(expected.as_inventory(), &observed).is_exact_match(),
+        "candidate class and exact capability evidence match"
+    );
+
+    let production_observed =
+        ObservedDeviceInventoryV1::parse(observed_dto()).expect("production observation");
+    let comparison = InventoryComparison::compare(expected.as_inventory(), &production_observed);
+    assert!(comparison.iter().any(|mismatch| matches!(
+        mismatch,
+        InventoryMismatch::Stm32SafetyClass {
+            expected: ControllerSafetyClass::OperatorSupervisedFourPwmCandidate,
+            observed: ControllerSafetyClass::ProductionExternalInterlocks,
+        }
+    )));
+}
+
+#[test]
+fn candidate_manifest_rejects_every_cross_class_or_identity_substitution() {
+    let mut v1_candidate = manifest_dto();
+    v1_candidate.stm32.firmware_build_id = 0x0002_1001;
+    v1_candidate.stm32.hardware_profile_fingerprint = *b"KIKO-4PWM-CAND1!";
+    v1_candidate.stm32.capabilities_bits = ControllerCapabilities::SOFTWARE_GUARD_BITS
+        | ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE;
+    assert!(matches!(
+        DeviceInventoryManifestV1::parse(v1_candidate),
+        Err(InventoryParseError::MissingControllerSafetyCapabilities { .. })
+    ));
+
+    for mutation in 0..7 {
+        let mut dto = candidate_manifest_dto();
+        match mutation {
+            0 => {
+                dto.stm32.controller_session_class =
+                    ControllerSessionClassV2Dto::ProductionExternalInterlocks;
+            }
+            1 => dto.stm32.firmware_abi += 1,
+            2 => dto.stm32.firmware_build_id += 1,
+            3 => dto.stm32.hardware_profile_fingerprint = [0x12; 16],
+            4 => dto.stm32.capabilities_bits = ControllerCapabilities::REQUIRED_BITS,
+            5 => {
+                dto.stm32.expected_physical_stop_semantics =
+                    PhysicalStopSemanticsV2Dto::CoastVerified;
+            }
+            6 => dto.stm32.expected_max_abs_pwm_percent = 31,
+            _ => unreachable!(),
+        }
+        assert!(
+            DeviceInventoryManifestV2::parse(dto).is_err(),
+            "candidate mutation {mutation} must reject"
+        );
+    }
 }
 
 #[test]
@@ -855,7 +962,7 @@ fn every_scalar_fault_is_accumulated_in_stable_order() {
 
     let comparison = InventoryComparison::compare(&expected, &observed);
     let mismatches = comparison.iter().collect::<Vec<_>>();
-    assert_eq!(mismatches.len(), 23);
+    assert_eq!(mismatches.len(), 24);
     assert!(matches!(mismatches[0], InventoryMismatch::RobotId { .. }));
     assert!(matches!(mismatches[1], InventoryMismatch::OakMxid { .. }));
     assert!(matches!(
@@ -904,42 +1011,46 @@ fn every_scalar_fault_is_accumulated_in_stable_order() {
     ));
     assert!(matches!(
         mismatches[13],
-        InventoryMismatch::HeadSerialPath { .. }
+        InventoryMismatch::Stm32SafetyClass { .. }
     ));
     assert!(matches!(
         mismatches[14],
-        InventoryMismatch::HeadBaudRate { .. }
+        InventoryMismatch::HeadSerialPath { .. }
     ));
     assert!(matches!(
         mismatches[15],
-        InventoryMismatch::HeadDtrState { .. }
+        InventoryMismatch::HeadBaudRate { .. }
     ));
     assert!(matches!(
         mismatches[16],
-        InventoryMismatch::HeadRtsState { .. }
+        InventoryMismatch::HeadDtrState { .. }
     ));
     assert!(matches!(
         mismatches[17],
-        InventoryMismatch::HeadServoIds { .. }
+        InventoryMismatch::HeadRtsState { .. }
     ));
     assert!(matches!(
         mismatches[18],
-        InventoryMismatch::EyeSerialPath { .. }
+        InventoryMismatch::HeadServoIds { .. }
     ));
     assert!(matches!(
         mismatches[19],
-        InventoryMismatch::EyeProtocolVersion { .. }
+        InventoryMismatch::EyeSerialPath { .. }
     ));
     assert!(matches!(
         mismatches[20],
-        InventoryMismatch::EyeDeviceUid { .. }
+        InventoryMismatch::EyeProtocolVersion { .. }
     ));
     assert!(matches!(
         mismatches[21],
-        InventoryMismatch::EyeFirmwareBuildId { .. }
+        InventoryMismatch::EyeDeviceUid { .. }
     ));
     assert!(matches!(
         mismatches[22],
+        InventoryMismatch::EyeFirmwareBuildId { .. }
+    ));
+    assert!(matches!(
+        mismatches[23],
         InventoryMismatch::EyeCapabilities { .. }
     ));
 }
@@ -1015,7 +1126,7 @@ fn comparison_capacity_is_the_tight_reachable_bound() {
     let comparison = InventoryComparison::compare(&expected, &observed);
     assert_eq!(comparison.len(), MAX_INVENTORY_MISMATCHES);
     assert_eq!(comparison.iter().count(), MAX_INVENTORY_MISMATCHES);
-    assert!(comparison.iter().take(23).all(|mismatch| !matches!(
+    assert!(comparison.iter().take(24).all(|mismatch| !matches!(
         mismatch,
         InventoryMismatch::MissingArtifact { .. }
             | InventoryMismatch::ArtifactDigest { .. }
@@ -1024,14 +1135,14 @@ fn comparison_capacity_is_the_tight_reachable_bound() {
     assert!(
         comparison
             .iter()
-            .skip(23)
+            .skip(24)
             .take(12)
             .all(|mismatch| matches!(mismatch, InventoryMismatch::MissingArtifact { .. }))
     );
     assert!(
         comparison
             .iter()
-            .skip(35)
+            .skip(36)
             .all(|mismatch| matches!(mismatch, InventoryMismatch::UnexpectedArtifact { .. }))
     );
 }

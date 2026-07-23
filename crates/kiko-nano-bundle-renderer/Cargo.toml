@@ -1,0 +1,25 @@
+[package]
+name = "kiko-nano-bundle-renderer"
+version = "0.1.0"
+edition = "2024"
+description = "Offline, content-addressed Nano deployment bundle renderer"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+clap = { version = "4.5.28", features = ["derive"] }
+kiko-expression-core = { path = "../kiko-expression-core" }
+kiko-expression-runtime = { path = "../kiko-expression-runtime" }
+libc = "0.2"
+robot-protocol = { path = "../../comms/robot-protocol" }
+robot-server = { path = "../../comms/robot-server" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[dev-dependencies]
+kiko-device-inventory = { path = "../kiko-device-inventory" }
+kiko-slam = { path = "../kiko-slam", features = ["nano-wheels-off-qualification"] }
+tempfile = "3.16"
+
+[lints]
+workspace = true

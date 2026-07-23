@@ -5,7 +5,9 @@ use kiko_eye_protocol::{
     FirmwareBuildId as EyeFirmwareBuildId,
 };
 use kiko_head_protocol::ServoId;
-use robot_protocol::v2::{ActuatorConfigFingerprint, ControllerCapabilities, ControllerUid};
+use robot_protocol::v2::{
+    ActuatorConfigFingerprint, ControllerCapabilities, ControllerSafetyClass, ControllerUid,
+};
 
 use crate::{
     ArtifactId, ArtifactKind, BuildProvenance, ControlEndpointIdentity, DeviceInventoryManifestV1,
@@ -19,7 +21,7 @@ use crate::{
 /// There are 23 scalar/device fields and at most two mismatch entries for each
 /// artifact slot (one missing expected artifact and one unexpected observed
 /// artifact).
-pub const MAX_INVENTORY_MISMATCHES: usize = 23 + 2 * MAX_ARTIFACTS;
+pub const MAX_INVENTORY_MISMATCHES: usize = 24 + 2 * MAX_ARTIFACTS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InventoryMismatch<'inventory> {
@@ -76,6 +78,10 @@ pub enum InventoryMismatch<'inventory> {
     Stm32Capabilities {
         expected: ControllerCapabilities,
         observed: ControllerCapabilities,
+    },
+    Stm32SafetyClass {
+        expected: ControllerSafetyClass,
+        observed: ControllerSafetyClass,
     },
     MissingHead,
     UnexpectedHead,
@@ -495,6 +501,12 @@ fn compare_stm32<'inventory>(
         output.push(InventoryMismatch::Stm32Capabilities {
             expected: expected.capabilities(),
             observed: observed.capabilities(),
+        });
+    }
+    if expected.safety_class() != observed.safety_class() {
+        output.push(InventoryMismatch::Stm32SafetyClass {
+            expected: expected.safety_class(),
+            observed: observed.safety_class(),
         });
     }
 }

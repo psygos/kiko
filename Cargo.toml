@@ -9,14 +9,14 @@ members = [
   "crates/kiko-eye-runtime",
   "crates/kiko-head-protocol",
   "crates/kiko-head-runtime",
+  "crates/kiko-nano-bundle-renderer",
+  "crates/kiko-nano-deployment-gate",
   "crates/kiko-supervisor-core",
-  "crates/kiko-wheels-off-attest",
   "crates/kiko-slam",
   "crates/oak-sys",
   "comms/robot-protocol",
   "comms/robot-command-client",
   "comms/robot-server",
-  "comms/desktop-client/src-tauri",
   "embedded",
 ]
 default-members = ["crates/kiko-slam"]

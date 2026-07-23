@@ -25,6 +25,7 @@ mod secure_fs;
 use core::fmt;
 
 use kiko_head_protocol::{HeadJoint, ServoId};
+use robot_protocol::v2::{ControllerSafetyClass, ControllerSessionClass};
 
 pub use artifact::{
     ArtifactDigest, ArtifactDigestDto, ArtifactKind, ArtifactSet, MAX_ARTIFACTS,
@@ -37,6 +38,7 @@ pub use artifact_io::{
     ArtifactRelativePathError, CalibrationBundleHashError, ExactCalibrationBundleSha256,
     MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_PATH_COMPONENTS, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
     MAX_ARTIFACT_ROOT_PATH_BYTES, ManifestArtifactHashes, hash_manifest_artifacts,
+    hash_manifest_artifacts_reusing_loaded_asset,
 };
 #[cfg(unix)]
 pub use asset_io::{
@@ -55,15 +57,21 @@ pub use compare::{
     MAX_INVENTORY_MISMATCHES, admit_exact_inventory,
 };
 pub use manifest::{
-    DEVICE_INVENTORY_MANIFEST_V1, DeviceInventoryManifestV1, DeviceInventoryManifestV1Dto,
-    EyeManifestV1Dto, HeadManifestV1Dto, OakManifestV1Dto, REQUIRED_EYE_CAPABILITY_BITS,
-    Stm32ManifestV1Dto,
+    ATTENDED_WHEEL_ON_COMMISSIONING_FINGERPRINT_BYTES,
+    ATTENDED_WHEEL_ON_COMMISSIONING_FIRMWARE_BUILD_ID, ControllerSessionClassV2Dto,
+    DEVICE_INVENTORY_MANIFEST_V1, DEVICE_INVENTORY_MANIFEST_V2, DEVICE_INVENTORY_MANIFEST_V3,
+    DeviceInventoryManifestV1, DeviceInventoryManifestV1Dto, DeviceInventoryManifestV2,
+    DeviceInventoryManifestV2Dto, DeviceInventoryManifestV3, DeviceInventoryManifestV3Dto,
+    EyeManifestV1Dto, HeadManifestV1Dto, OPERATOR_SUPERVISED_FOUR_PWM_FINGERPRINT_BYTES,
+    OPERATOR_SUPERVISED_FOUR_PWM_FIRMWARE_BUILD_ID, OakManifestV1Dto, PhysicalStopSemanticsV2Dto,
+    REQUIRED_EYE_CAPABILITY_BITS, Stm32ManifestV1Dto, Stm32ManifestV2Dto,
 };
 #[cfg(unix)]
 pub use manifest_io::{
-    FileKind, LoadedExpectedManifestV1, MAX_MANIFEST_JSON_BYTES, MAX_MANIFEST_PATH_BYTES,
-    ManifestContentSha256, ManifestJsonError, ManifestLoadError, load_expected_manifest_v1_file,
-    load_expected_manifest_v1_from_slice,
+    FileKind, LoadedExpectedManifestV1, LoadedExpectedManifestV2, LoadedExpectedManifestV3,
+    MAX_MANIFEST_JSON_BYTES, MAX_MANIFEST_PATH_BYTES, ManifestContentSha256, ManifestJsonError,
+    ManifestLoadError, load_expected_manifest_v1_file, load_expected_manifest_v1_from_slice,
+    load_expected_manifest_v2_from_slice, load_expected_manifest_v3_from_slice,
 };
 pub use model::{
     DeviceRole, EyeStaticIdentity, HeadExpectedIdentity, MAX_OBSERVED_HEAD_SERVOS, OakIdentity,
@@ -117,6 +125,36 @@ pub enum InventoryParseError {
         actual_bits: u32,
         required_bits: u32,
     },
+    UnsupportedControllerSessionClass {
+        actual: ControllerSessionClass,
+    },
+    ControllerSessionClassMismatch {
+        declared: ControllerSessionClass,
+        actual: ControllerSafetyClass,
+    },
+    CandidateFirmwareBuildMismatch {
+        actual: u32,
+        required: u32,
+    },
+    CandidateHardwareProfileMismatch,
+    CandidateRequiresUnverifiedStop,
+    CandidatePwmCapOutOfRange {
+        actual: u8,
+        minimum: u8,
+        maximum: u8,
+    },
+    CandidateIdentityRequiresManifestV2,
+    CommissioningFirmwareBuildMismatch {
+        actual: u32,
+        required: u32,
+    },
+    CommissioningHardwareProfileMismatch,
+    CommissioningRequiresUnverifiedStop,
+    CommissioningPwmCapMismatch {
+        actual: u8,
+        required: u8,
+    },
+    CommissioningIdentityRequiresManifestV3,
     InvalidHeadServoId {
         index: usize,
         source: kiko_head_protocol::FrameBuildError,

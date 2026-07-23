@@ -6,7 +6,8 @@ use kiko_eye_protocol::{
 };
 use kiko_head_protocol::ServoId;
 use robot_protocol::v2::{
-    ActuatorConfigFingerprint, ControllerBootId, ControllerCapabilities, ControllerUid,
+    ActuatorConfigFingerprint, ControllerBootId, ControllerCapabilities, ControllerSafetyClass,
+    ControllerUid,
 };
 
 use crate::{BuildProvenance, ControlEndpointIdentity, OakMxid, PersistentSerialPath};
@@ -84,6 +85,7 @@ pub struct Stm32StaticIdentity {
     firmware_build_id: NonZeroU32,
     hardware_profile: ActuatorConfigFingerprint,
     capabilities: ControllerCapabilities,
+    safety_class: ControllerSafetyClass,
 }
 
 impl Stm32StaticIdentity {
@@ -96,6 +98,7 @@ impl Stm32StaticIdentity {
         hardware_profile: ActuatorConfigFingerprint,
         capabilities: ControllerCapabilities,
     ) -> Self {
+        let safety_class = capabilities.safety_class();
         Self {
             serial_path,
             control_endpoint,
@@ -104,6 +107,7 @@ impl Stm32StaticIdentity {
             firmware_build_id,
             hardware_profile,
             capabilities,
+            safety_class,
         }
     }
 
@@ -133,6 +137,10 @@ impl Stm32StaticIdentity {
 
     pub fn capabilities(&self) -> ControllerCapabilities {
         self.capabilities
+    }
+
+    pub const fn safety_class(&self) -> ControllerSafetyClass {
+        self.safety_class
     }
 }
 
