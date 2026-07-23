@@ -208,6 +208,24 @@ pub enum PhysicalStopSemantics {
     Unverified,
 }
 
+/// Compile-time contract for optional wheel-observation hardware.
+///
+/// `QuadratureEncoderTimers` means only that a reviewed target adapter
+/// configured the two timer inputs. It is not evidence that encoders are
+/// installed, calibrated, or physically responding. Kiko's canonical
+/// encoderless profile uses [`Self::Absent`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservationalOdometryContract {
+    Absent,
+    QuadratureEncoderTimers,
+}
+
+impl ObservationalOdometryContract {
+    pub const fn configures_quadrature_inputs(self) -> bool {
+        matches!(self, Self::QuadratureEncoderTimers)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PwmRange {
     min: PwmPercent,
@@ -664,6 +682,10 @@ mod tests {
         assert_eq!(
             envelope.physical_stop_semantics(),
             PhysicalStopSemantics::Unverified
+        );
+        assert!(!ObservationalOdometryContract::Absent.configures_quadrature_inputs());
+        assert!(
+            ObservationalOdometryContract::QuadratureEncoderTimers.configures_quadrature_inputs()
         );
     }
 

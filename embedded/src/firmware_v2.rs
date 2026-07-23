@@ -25,7 +25,7 @@ use embedded::{
     encoder_wraps_with_pending_direction_assumption,
     motor::{
         ActuatorEnvelope, DriveOutput, DurationMs, MotorDirective, MotorTiming,
-        MotorTransitionPhase, PwmPair, WheelDrive,
+        MotorTransitionPhase, ObservationalOdometryContract, PwmPair, WheelDrive,
     },
     watchdog_gate::{CompletedLoopSafety, LoopIteration, WatchdogDecision, WatchdogGate},
 };
@@ -92,6 +92,7 @@ struct CompiledActuatorProfile {
     neutral_output: NeutralOutput,
     physical_stop_semantics: PhysicalStopSemantics,
     per_boot_identity_is_session_unique: bool,
+    observational_odometry: ObservationalOdometryContract,
 }
 
 impl CompiledActuatorProfile {
@@ -111,6 +112,7 @@ impl CompiledActuatorProfile {
             neutral_output: NeutralOutput::BothLow,
             physical_stop_semantics: PhysicalStopSemantics::Unverified,
             per_boot_identity_is_session_unique,
+            observational_odometry: ObservationalOdometryContract::Absent,
         })
     }
 
@@ -531,14 +533,19 @@ fn main() -> ! {
         fatal_reset();
     };
 
-    let _left_encoder_pin_a = gpioa.pa8.into_alternate::<1>();
-    let _left_encoder_pin_b = gpioa.pa9.into_alternate::<1>();
-    let _right_encoder_pin_a = gpiob.pb6.into_alternate::<2>();
-    let _right_encoder_pin_b = gpiob.pb7.into_alternate::<2>();
-    configure_encoder_tim1(dp.TIM1);
-    configure_encoder_tim4(dp.TIM4);
+    let quadrature_inputs_configured = profile
+        .observational_odometry
+        .configures_quadrature_inputs();
+    if quadrature_inputs_configured {
+        let _left_encoder_pin_a = gpioa.pa8.into_alternate::<1>();
+        let _left_encoder_pin_b = gpioa.pa9.into_alternate::<1>();
+        let _right_encoder_pin_a = gpiob.pb6.into_alternate::<2>();
+        let _right_encoder_pin_b = gpiob.pb7.into_alternate::<2>();
+        configure_encoder_tim1(dp.TIM1);
+        configure_encoder_tim4(dp.TIM4);
+    }
     configure_deadline_timer(dp.TIM5, &clocks);
-    enable_interrupts(&mut cp.NVIC);
+    enable_interrupts(&mut cp.NVIC, quadrature_inputs_configured);
 
     let mut decoder = UartStreamDecoder::new();
     let mut session: Option<ControlSession> = None;
@@ -646,7 +653,9 @@ fn main() -> ! {
         }
 
         let now = controller_uptime();
-        if now.wrapping_elapsed_since(last_odometry_sample) >= ODOMETRY_SAMPLE_PERIOD_MS {
+        if quadrature_inputs_configured
+            && now.wrapping_elapsed_since(last_odometry_sample) >= ODOMETRY_SAMPLE_PERIOD_MS
+        {
             last_odometry_sample = now;
             latest_odometry = Some(sample_odometry(
                 now,
@@ -1897,17 +1906,19 @@ fn read_controller_uid() -> Option<ControllerUid> {
 }
 
 #[allow(unsafe_code)]
-fn enable_interrupts(nvic: &mut NVIC) {
+fn enable_interrupts(nvic: &mut NVIC, quadrature_inputs_configured: bool) {
     // SAFETY: every peripheral and shared state is fully initialized before
     // these interrupt lines are prioritized and unmasked.
     unsafe {
         nvic.set_priority(pac::Interrupt::TIM5, 0);
-        nvic.set_priority(pac::Interrupt::TIM1_UP_TIM10, 1);
-        nvic.set_priority(pac::Interrupt::TIM4, 1);
         nvic.set_priority(pac::Interrupt::USART2, 2);
         NVIC::unmask(pac::Interrupt::TIM5);
-        NVIC::unmask(pac::Interrupt::TIM1_UP_TIM10);
-        NVIC::unmask(pac::Interrupt::TIM4);
+        if quadrature_inputs_configured {
+            nvic.set_priority(pac::Interrupt::TIM1_UP_TIM10, 1);
+            nvic.set_priority(pac::Interrupt::TIM4, 1);
+            NVIC::unmask(pac::Interrupt::TIM1_UP_TIM10);
+            NVIC::unmask(pac::Interrupt::TIM4);
+        }
         NVIC::unmask(pac::Interrupt::USART2);
     }
 }
