@@ -6,7 +6,8 @@
 
 use std::fmt;
 
-use kiko_supervisor_core::AuthorityLeaseId;
+use kiko_supervisor_core::{AuthorityLeaseId, SupervisorAction};
+use robot_protocol::v2::HostCommandResult;
 
 use super::{
     AgentControlClaimedRequest, AgentControlClockError, AgentControlCommandV1,
@@ -44,6 +45,49 @@ impl AgentControlDispatcher {
         &mut self.manual
     }
 
+    /// Return the sole owner's conservative lifecycle/status projection.
+    pub fn control_status(&self, map: AgentMapStateV1) -> AgentControlStatusV1 {
+        self.manual.control_status(map)
+    }
+
+    /// Begin explicit arming through the sole manual/lifecycle owner.
+    pub fn begin_arm(
+        &mut self,
+        now: crate::HostMonotonicTimestamp,
+    ) -> Result<SupervisorAction, AgentManualControlError> {
+        self.manual.begin_arm(now)
+    }
+
+    /// Complete the arming zero gate with exact applied controller evidence.
+    pub fn complete_arm_with_applied_zero(
+        &mut self,
+        result: HostCommandResult,
+        observed_at: crate::HostMonotonicTimestamp,
+        now: crate::HostMonotonicTimestamp,
+    ) -> Result<SupervisorAction, AgentManualControlError> {
+        self.manual
+            .complete_arm_with_applied_zero(result, observed_at, now)
+    }
+
+    /// Begin explicit disarming through the sole manual/lifecycle owner.
+    pub fn begin_disarm(
+        &mut self,
+        now: crate::HostMonotonicTimestamp,
+    ) -> Result<SupervisorAction, AgentManualControlError> {
+        self.manual.begin_disarm(now)
+    }
+
+    /// Complete the disarming zero gate with exact applied controller evidence.
+    pub fn complete_disarm_with_applied_zero(
+        &mut self,
+        result: HostCommandResult,
+        observed_at: crate::HostMonotonicTimestamp,
+        now: crate::HostMonotonicTimestamp,
+    ) -> Result<SupervisorAction, AgentManualControlError> {
+        self.manual
+            .complete_disarm_with_applied_zero(result, observed_at, now)
+    }
+
     /// Claim and route at most one parsed request. No transition occurs before
     /// the claim rendezvous succeeds. The observation timestamp is sampled
     /// from the socket's shared host-clock origin only after that successful
@@ -53,17 +97,9 @@ impl AgentControlDispatcher {
         &mut self,
         map: AgentMapStateV1,
     ) -> Result<AgentDispatchOutcome, AgentControlDispatcherError> {
-        let dispatch = match self.receiver.try_recv() {
-            Ok(dispatch) => dispatch,
-            Err(AgentControlRuntimeReceiveError::Empty) => return Ok(AgentDispatchOutcome::Idle),
-            Err(source) => return Err(AgentControlDispatcherError::Receive(source)),
-        };
-        let claimed = match dispatch.claim() {
-            Ok(claimed) => claimed,
-            Err(AgentControlDispatchResponseError::ClientUnavailable) => {
-                return Ok(AgentDispatchOutcome::ClientUnavailableBeforeClaim);
-            }
-            Err(source) => return Err(AgentControlDispatcherError::Response(source)),
+        let claimed = match self.try_claim_one()? {
+            ClaimedDispatch::None(outcome) => return Ok(outcome),
+            ClaimedDispatch::Claimed(claimed) => claimed,
         };
         let observed_at = match self.clock.try_now() {
             Ok(observed_at) => observed_at,
@@ -76,15 +112,65 @@ impl AgentControlDispatcher {
                 };
             }
         };
+        self.dispatch_claimed(map, claimed, observed_at)
+    }
+
+    /// Claim and route one request using an observation sampled by the sole
+    /// outer live owner.
+    ///
+    /// The caller must sample `observed_at` from the same monotonic epoch as
+    /// the socket receipt timestamp, immediately before this call. This
+    /// variant exists so lifecycle, coordinator, MPC, and dispatcher decisions
+    /// can use one injected clock in deterministic production-owner tests.
+    pub(crate) fn try_dispatch_one_at(
+        &mut self,
+        map: AgentMapStateV1,
+        observed_at: crate::HostMonotonicTimestamp,
+    ) -> Result<AgentDispatchOutcome, AgentControlDispatcherError> {
+        let claimed = match self.try_claim_one()? {
+            ClaimedDispatch::None(outcome) => return Ok(outcome),
+            ClaimedDispatch::Claimed(claimed) => claimed,
+        };
+        self.dispatch_claimed(map, claimed, observed_at)
+    }
+
+    fn try_claim_one(&self) -> Result<ClaimedDispatch, AgentControlDispatcherError> {
+        let dispatch = match self.receiver.try_recv() {
+            Ok(dispatch) => dispatch,
+            Err(AgentControlRuntimeReceiveError::Empty) => {
+                return Ok(ClaimedDispatch::None(AgentDispatchOutcome::Idle));
+            }
+            Err(source) => return Err(AgentControlDispatcherError::Receive(source)),
+        };
+        match dispatch.claim() {
+            Ok(claimed) => Ok(ClaimedDispatch::Claimed(claimed)),
+            Err(AgentControlDispatchResponseError::ClientUnavailable) => Ok(ClaimedDispatch::None(
+                AgentDispatchOutcome::ClientUnavailableBeforeClaim,
+            )),
+            Err(source) => Err(AgentControlDispatcherError::Response(source)),
+        }
+    }
+
+    fn dispatch_claimed(
+        &mut self,
+        map: AgentMapStateV1,
+        claimed: AgentControlClaimedRequest,
+        observed_at: crate::HostMonotonicTimestamp,
+    ) -> Result<AgentDispatchOutcome, AgentControlDispatcherError> {
         let request = claimed.request();
         match request.command() {
             AgentControlCommandV1::QueryStatus => {
-                let status = self.manual.authority().control_status(map);
+                let status = self.control_status(map);
                 claimed
                     .respond_status(status)
                     .map_err(AgentControlDispatcherError::Response)?;
                 Ok(AgentDispatchOutcome::RepliedStatus { status })
             }
+            AgentControlCommandV1::Arm => Ok(AgentDispatchOutcome::ArmRequested { claimed }),
+            AgentControlCommandV1::Disarm => Ok(AgentDispatchOutcome::DisarmRequested {
+                manual: self.manual.global_stop_requirement(),
+                claimed,
+            }),
             AgentControlCommandV1::BeginManual => match self.manual.begin_manual(observed_at) {
                 Ok(transition) => Ok(AgentDispatchOutcome::BeginManual {
                     claimed,
@@ -157,12 +243,29 @@ impl AgentControlDispatcher {
     }
 }
 
+enum ClaimedDispatch {
+    None(AgentDispatchOutcome),
+    Claimed(AgentControlClaimedRequest),
+}
+
 #[derive(Debug)]
 pub enum AgentDispatchOutcome {
     Idle,
     ClientUnavailableBeforeClaim,
     RepliedStatus {
         status: AgentControlStatusV1,
+    },
+    /// Claimed explicit arm request. Dispatch does not cross the supervisor's
+    /// mandatory fresh-zero gate or claim that hardware is ready.
+    ArmRequested {
+        claimed: AgentControlClaimedRequest,
+    },
+    /// Claimed explicit disarm request. The runtime must satisfy every active
+    /// mode's stop obligation and admit the resulting exact zero before it can
+    /// report completion.
+    DisarmRequested {
+        claimed: AgentControlClaimedRequest,
+        manual: AgentManualGlobalStopRequirement,
     },
     RejectedManual {
         code: AgentControlRejectionCodeV1,
@@ -292,7 +395,7 @@ mod tests {
         }
     }
 
-    fn ready() -> AgentAuthoritySupervisor {
+    fn disarmed() -> AgentAuthoritySupervisor {
         let config = SupervisorConfig::new(duration(10_000_000_000), duration(5_000_000_000))
             .expect("supervisor config");
         let mut authority =
@@ -315,6 +418,11 @@ mod tests {
                 .unwrap(),
             SupervisorAction::Disarmed
         );
+        authority
+    }
+
+    fn ready() -> AgentAuthoritySupervisor {
+        let mut authority = disarmed();
         assert_eq!(
             authority.arm(at(BASE_NS + 3)).unwrap(),
             SupervisorAction::BaseZeroRequired {
@@ -376,6 +484,110 @@ mod tests {
             AgentManualControlCore::new(ready(), Some(policy())),
         );
         (sender, dispatcher, clock)
+    }
+
+    fn disarmed_fixture() -> (
+        super::super::AgentControlRuntimeSender,
+        AgentControlDispatcher,
+        AgentControlMonotonicOrigin,
+    ) {
+        let (sender, receiver) = agent_control_runtime_queue(
+            AgentControlRuntimeQueueCapacity::try_new(8).expect("queue capacity"),
+        );
+        let clock = AgentControlMonotonicOrigin::new(Instant::now(), at(BASE_NS + 5));
+        let dispatcher = AgentControlDispatcher::new(
+            receiver,
+            clock,
+            AgentManualControlCore::new(disarmed(), Some(policy())),
+        );
+        (sender, dispatcher, clock)
+    }
+
+    #[test]
+    fn arm_and_disarm_route_claims_then_cross_only_exact_lifecycle_zero_gates() {
+        let (sender, mut dispatcher, clock) = disarmed_fixture();
+        let mut parser = AgentControlRequestParser::new();
+
+        let arm_peer = enqueue_agent_control_test_request(
+            &sender,
+            request(&mut parser, 1, json!({"kind": "arm"})),
+            clock.try_now().expect("arm receipt stamp"),
+        );
+        let AgentDispatchOutcome::ArmRequested { claimed } = dispatcher
+            .try_dispatch_one(AgentMapStateV1::UNAVAILABLE)
+            .expect("dispatch arm")
+        else {
+            panic!("arm outcome")
+        };
+        assert_eq!(
+            dispatcher.begin_arm(at(BASE_NS + 6)).expect("begin arm"),
+            SupervisorAction::BaseZeroRequired {
+                reason: StopReason::Arming,
+            }
+        );
+        assert_eq!(
+            dispatcher
+                .complete_arm_with_applied_zero(host_zero(0), at(BASE_NS + 7), at(BASE_NS + 7),)
+                .expect("complete arm"),
+            SupervisorAction::ReadyStopped
+        );
+        claimed.respond_completed().expect("arm response");
+        assert!(matches!(
+            arm_peer.join().expect("arm peer"),
+            Some(response)
+                if matches!(
+                    response.response(),
+                    AgentControlResponseKindV1::Accepted {
+                        command: super::super::AgentControlCommandKindV1::Arm,
+                        completion: AgentControlCompletionV1::Completed,
+                    }
+                )
+        ));
+
+        let disarm_peer = enqueue_agent_control_test_request(
+            &sender,
+            request(&mut parser, 2, json!({"kind": "disarm"})),
+            clock.try_now().expect("disarm receipt stamp"),
+        );
+        let AgentDispatchOutcome::DisarmRequested { claimed, manual } = dispatcher
+            .try_dispatch_one(AgentMapStateV1::UNAVAILABLE)
+            .expect("dispatch disarm")
+        else {
+            panic!("disarm outcome")
+        };
+        assert_eq!(manual, AgentManualGlobalStopRequirement::NoManualTransition);
+        assert_eq!(
+            dispatcher
+                .begin_disarm(at(BASE_NS + 8))
+                .expect("begin disarm"),
+            SupervisorAction::BaseZeroRequired {
+                reason: StopReason::ExplicitDisarm,
+            }
+        );
+        assert_eq!(
+            dispatcher
+                .complete_disarm_with_applied_zero(host_zero(1), at(BASE_NS + 9), at(BASE_NS + 9),)
+                .expect("complete disarm"),
+            SupervisorAction::Disarmed
+        );
+        claimed.respond_completed().expect("disarm response");
+        assert!(matches!(
+            disarm_peer.join().expect("disarm peer"),
+            Some(response)
+                if matches!(
+                    response.response(),
+                    AgentControlResponseKindV1::Accepted {
+                        command: super::super::AgentControlCommandKindV1::Disarm,
+                        completion: AgentControlCompletionV1::Completed,
+                    }
+                )
+        ));
+        assert_eq!(
+            dispatcher
+                .control_status(AgentMapStateV1::UNAVAILABLE)
+                .runtime(),
+            super::super::AgentRuntimeStateV1::Disarmed
+        );
     }
 
     #[test]

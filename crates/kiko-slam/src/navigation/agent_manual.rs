@@ -9,7 +9,7 @@
 use std::fmt;
 
 use kiko_supervisor_core::{
-    AuthorityDuration, AuthorityLease, AuthorityLeaseId, AuthorityMode, FaultKind,
+    AuthorityDuration, AuthorityLease, AuthorityLeaseId, AuthorityMode, FaultKind, StopReason,
     SupervisorAction, SupervisorState, SupervisorStateKind,
 };
 use robot_command_client::{EvidenceError, FailureCause, LatchedStopKnowledge};
@@ -18,9 +18,9 @@ use robot_protocol::v2::HostCommandResult;
 use super::actuation::{LiveActuationError, LocalRejectionStop, PhysicalDecisionError};
 use super::mpc::BoundedId;
 use super::{
-    AgentAuthorityError, AgentAuthoritySupervisor, AgentManualStopV1, AgentManualVelocityV1,
-    ManualDriveConfigV1, ManualDriveCore, ManualDriveOutput, ManualDriveStopCause,
-    PlantBoundNanoManualControlApiConfig,
+    AgentAuthorityError, AgentAuthoritySupervisor, AgentControlStatusV1, AgentManualStopV1,
+    AgentManualVelocityV1, AgentMapStateV1, ManualDriveConfigV1, ManualDriveCore,
+    ManualDriveOutput, ManualDriveStopCause, PlantBoundNanoManualControlApiConfig,
 };
 use crate::HostMonotonicTimestamp;
 
@@ -107,6 +107,115 @@ impl AgentManualControlCore {
 
     pub const fn authority(&self) -> &AgentAuthoritySupervisor {
         &self.authority
+    }
+
+    /// Conservatively project the process-wide lifecycle and this owner's
+    /// retained manual state into the public status schema.
+    pub fn control_status(&self, map: AgentMapStateV1) -> AgentControlStatusV1 {
+        self.authority.control_status(map)
+    }
+
+    /// Begin explicit lifecycle arming without exposing mutable supervisor
+    /// access. Success is only the mandatory fresh-zero obligation.
+    pub fn begin_arm(
+        &mut self,
+        now: HostMonotonicTimestamp,
+    ) -> Result<SupervisorAction, AgentManualControlError> {
+        if !matches!(self.lifecycle, ManualLifecycle::Inactive) {
+            return Err(AgentManualControlError::ModeConflict);
+        }
+        let action = self
+            .authority
+            .arm(now)
+            .map_err(AgentManualControlError::Authority)?;
+        match action {
+            SupervisorAction::BaseZeroRequired {
+                reason: StopReason::Arming,
+            } => Ok(action),
+            action => Err(AgentManualControlError::UnexpectedSupervisorAction {
+                operation: "begin explicit arm",
+                action,
+            }),
+        }
+    }
+
+    /// Complete explicit arming only with a newly applied exact zero receipt.
+    pub fn complete_arm_with_applied_zero(
+        &mut self,
+        result: HostCommandResult,
+        observed_at: HostMonotonicTimestamp,
+        now: HostMonotonicTimestamp,
+    ) -> Result<SupervisorAction, AgentManualControlError> {
+        self.require_lifecycle_zero("complete explicit arm", StopReason::Arming)?;
+        let action = match self.authority.admit_applied_zero(result, observed_at, now) {
+            Ok(action) => action,
+            Err(source) => return Err(self.pending_authority_error(source)),
+        };
+        match action {
+            SupervisorAction::ReadyStopped => Ok(action),
+            action => Err(AgentManualControlError::UnexpectedSupervisorAction {
+                operation: "complete explicit arm",
+                action,
+            }),
+        }
+    }
+
+    /// Begin explicit lifecycle disarming without exposing mutable supervisor
+    /// access. An active manual core is destroyed before the supervisor enters
+    /// its fresh-zero gate, preventing a cached command from being resumed.
+    ///
+    /// A manual transition already waiting for a different zero must be
+    /// completed or faulted first; replacing that continuation would make its
+    /// exact stop obligation ambiguous.
+    pub fn begin_disarm(
+        &mut self,
+        now: HostMonotonicTimestamp,
+    ) -> Result<SupervisorAction, AgentManualControlError> {
+        if matches!(
+            self.lifecycle,
+            ManualLifecycle::AwaitingBeginZero
+                | ManualLifecycle::AwaitingCancelledBeginZero
+                | ManualLifecycle::AwaitingReleaseZero { .. }
+        ) {
+            return Err(AgentManualControlError::ModeConflict);
+        }
+        self.lifecycle = ManualLifecycle::Inactive;
+        let action = self
+            .authority
+            .disarm(now)
+            .map_err(AgentManualControlError::Authority)?;
+        match action {
+            SupervisorAction::Disarmed
+            | SupervisorAction::BaseZeroRequired {
+                reason: StopReason::ExplicitDisarm,
+            } => Ok(action),
+            action => Err(AgentManualControlError::UnexpectedSupervisorAction {
+                operation: "begin explicit disarm",
+                action,
+            }),
+        }
+    }
+
+    /// Complete explicit disarming only with a newly applied exact zero
+    /// receipt produced after the disarm request.
+    pub fn complete_disarm_with_applied_zero(
+        &mut self,
+        result: HostCommandResult,
+        observed_at: HostMonotonicTimestamp,
+        now: HostMonotonicTimestamp,
+    ) -> Result<SupervisorAction, AgentManualControlError> {
+        self.require_lifecycle_zero("complete explicit disarm", StopReason::ExplicitDisarm)?;
+        let action = match self.authority.admit_applied_zero(result, observed_at, now) {
+            Ok(action) => action,
+            Err(source) => return Err(self.pending_authority_error(source)),
+        };
+        match action {
+            SupervisorAction::Disarmed => Ok(action),
+            action => Err(AgentManualControlError::UnexpectedSupervisorAction {
+                operation: "complete explicit disarm",
+                action,
+            }),
+        }
     }
 
     pub fn active_lease(&self) -> Option<AuthorityLease> {
@@ -439,6 +548,25 @@ impl AgentManualControlCore {
             self.lifecycle = ManualLifecycle::Inactive;
         }
         AgentManualControlError::Authority(source)
+    }
+
+    fn require_lifecycle_zero(
+        &self,
+        operation: &'static str,
+        expected: StopReason,
+    ) -> Result<(), AgentManualControlError> {
+        if !matches!(self.lifecycle, ManualLifecycle::Inactive) {
+            return Err(AgentManualControlError::ModeConflict);
+        }
+        let actual = self.authority.pending_obligation();
+        if actual != (SupervisorAction::BaseZeroRequired { reason: expected }) {
+            return Err(AgentManualControlError::LifecycleZeroObligationMismatch {
+                operation,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
     }
 
     fn ingest(
@@ -836,6 +964,11 @@ pub enum AgentManualControlError {
     NoPendingBegin,
     NoPendingCancelledBegin,
     NoPendingRelease,
+    LifecycleZeroObligationMismatch {
+        operation: &'static str,
+        expected: StopReason,
+        actual: SupervisorAction,
+    },
     PendingAuthorityExpired,
     ManualClockFault {
         cause: ManualDriveStopCause<AuthorityLeaseId>,
@@ -940,7 +1073,7 @@ mod tests {
         }
     }
 
-    fn ready() -> AgentAuthoritySupervisor {
+    fn disarmed() -> AgentAuthoritySupervisor {
         let config = SupervisorConfig::new(duration(1_000), duration(100)).unwrap();
         let mut authority = AgentAuthoritySupervisor::new(
             config,
@@ -962,6 +1095,11 @@ mod tests {
             authority.admit_readiness(readiness, at(102)).unwrap(),
             SupervisorAction::Disarmed
         );
+        authority
+    }
+
+    fn ready() -> AgentAuthoritySupervisor {
+        let mut authority = disarmed();
         assert_eq!(
             authority.arm(at(103)).unwrap(),
             SupervisorAction::BaseZeroRequired {
@@ -975,6 +1113,62 @@ mod tests {
             SupervisorAction::ReadyStopped
         );
         authority
+    }
+
+    #[test]
+    fn explicit_arm_and_disarm_each_require_their_own_fresh_exact_zero() {
+        let mut control = AgentManualControlCore::new(disarmed(), Some(policy()));
+
+        assert_eq!(
+            control.begin_arm(at(103)).expect("begin arm"),
+            SupervisorAction::BaseZeroRequired {
+                reason: StopReason::Arming,
+            }
+        );
+        assert!(matches!(
+            control.authority().state(),
+            SupervisorState::AwaitingZero {
+                reason: StopReason::Arming,
+                ..
+            }
+        ));
+        assert_eq!(
+            control
+                .complete_arm_with_applied_zero(host_zero(0), at(104), at(104))
+                .expect("complete arm"),
+            SupervisorAction::ReadyStopped
+        );
+        assert!(matches!(
+            control.authority().state(),
+            SupervisorState::ReadyStopped { .. }
+        ));
+
+        assert_eq!(
+            control.begin_disarm(at(105)).expect("begin disarm"),
+            SupervisorAction::BaseZeroRequired {
+                reason: StopReason::ExplicitDisarm,
+            }
+        );
+        assert!(matches!(
+            control.complete_arm_with_applied_zero(host_zero(1), at(106), at(106)),
+            Err(AgentManualControlError::LifecycleZeroObligationMismatch {
+                operation: "complete explicit arm",
+                expected: StopReason::Arming,
+                actual: SupervisorAction::BaseZeroRequired {
+                    reason: StopReason::ExplicitDisarm,
+                },
+            })
+        ));
+        assert_eq!(
+            control
+                .complete_disarm_with_applied_zero(host_zero(1), at(106), at(106))
+                .expect("complete disarm"),
+            SupervisorAction::Disarmed
+        );
+        assert!(matches!(
+            control.authority().state(),
+            SupervisorState::Disarmed { .. }
+        ));
     }
 
     fn ready_near_timestamp_limit() -> AgentAuthoritySupervisor {

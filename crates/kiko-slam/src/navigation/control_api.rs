@@ -83,6 +83,8 @@ impl AgentControlRequestV1 {
 #[serde(rename_all = "snake_case")]
 pub enum AgentControlCommandKindV1 {
     QueryStatus,
+    Arm,
+    Disarm,
     MapOnly,
     Stop,
     BeginManual,
@@ -96,15 +98,20 @@ pub enum AgentControlCommandKindV1 {
 
 /// Parsed command intents accepted by the protocol boundary.
 ///
-/// `Stop` is the global explicit stop/release intent. `BeginManual` is the
-/// only request which may acquire manual authority; velocity traffic can never
-/// acquire it implicitly. `ManualStop` is an ordered manual-drive command and
-/// retains its manual sequence. `SaveMap` deliberately carries no path: the
-/// runtime must use its preconfigured, bounded persistence destination rather
-/// than accepting filesystem authority through this protocol.
+/// `Arm` and `Disarm` are explicit lifecycle intents; parsing either one does
+/// not prove a fresh-zero barrier, change authority, or touch hardware. `Stop`
+/// is the global explicit stop/release intent while remaining distinct from a
+/// request to disarm. `BeginManual` may acquire manual authority only after
+/// separate runtime admission; velocity traffic can never acquire it
+/// implicitly. `ManualStop` is an ordered manual-drive command and retains its
+/// manual sequence. `SaveMap` deliberately carries no path: the runtime must
+/// use its preconfigured, bounded persistence destination rather than
+/// accepting filesystem authority through this protocol.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AgentControlCommandV1 {
     QueryStatus,
+    Arm,
+    Disarm,
     MapOnly,
     Stop,
     BeginManual,
@@ -121,6 +128,8 @@ impl AgentControlCommandV1 {
     pub const fn kind(self) -> AgentControlCommandKindV1 {
         match self {
             Self::QueryStatus => AgentControlCommandKindV1::QueryStatus,
+            Self::Arm => AgentControlCommandKindV1::Arm,
+            Self::Disarm => AgentControlCommandKindV1::Disarm,
             Self::MapOnly => AgentControlCommandKindV1::MapOnly,
             Self::Stop => AgentControlCommandKindV1::Stop,
             Self::BeginManual => AgentControlCommandKindV1::BeginManual,
@@ -452,6 +461,8 @@ struct AgentControlRequestV1Dto {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum AgentControlCommandV1Dto {
     QueryStatus {},
+    Arm {},
+    Disarm {},
     MapOnly {},
     Stop {},
     BeginManual {},
@@ -481,6 +492,8 @@ impl AgentControlCommandV1Dto {
     ) -> Result<AgentControlCommandV1, AgentControlRequestParseError> {
         match self {
             Self::QueryStatus {} => Ok(AgentControlCommandV1::QueryStatus),
+            Self::Arm {} => Ok(AgentControlCommandV1::Arm),
+            Self::Disarm {} => Ok(AgentControlCommandV1::Disarm),
             Self::MapOnly {} => Ok(AgentControlCommandV1::MapOnly),
             Self::Stop {} => Ok(AgentControlCommandV1::Stop),
             Self::BeginManual {} => Ok(AgentControlCommandV1::BeginManual),
@@ -790,6 +803,8 @@ mod tests {
     fn parses_every_v1_command_and_preserves_existing_domain_types() {
         let commands = [
             json!({"kind": "query_status"}),
+            json!({"kind": "arm"}),
+            json!({"kind": "disarm"}),
             json!({"kind": "map_only"}),
             json!({"kind": "stop"}),
             json!({"kind": "begin_manual"}),
@@ -813,6 +828,8 @@ mod tests {
         ];
         let expected = [
             AgentControlCommandKindV1::QueryStatus,
+            AgentControlCommandKindV1::Arm,
+            AgentControlCommandKindV1::Disarm,
             AgentControlCommandKindV1::MapOnly,
             AgentControlCommandKindV1::Stop,
             AgentControlCommandKindV1::BeginManual,
@@ -835,7 +852,7 @@ mod tests {
 
         let selected = parser
             .parse_next(&request(
-                11,
+                13,
                 json!({
                     "kind": "select_map_point",
                     "map_epoch_id": 11,
@@ -851,6 +868,49 @@ mod tests {
         assert_eq!(selected.map_epoch_id().as_u64(), 11);
         assert_eq!(selected.displayed_revision(), 91);
         assert_eq!(selected.point().as_array(), [3.0, -4.0]);
+    }
+
+    #[test]
+    fn arm_and_disarm_have_exact_zero_payload_wire_forms() {
+        let mut parser = AgentControlRequestParser::new();
+        let arm = parser
+            .parse_next(&request(1, json!({"kind": "arm"})))
+            .expect("exact arm intent");
+        assert_eq!(arm.command(), AgentControlCommandV1::Arm);
+        assert_eq!(arm.command().kind(), AgentControlCommandKindV1::Arm);
+
+        let disarm = parser
+            .parse_next(&request(2, json!({"kind": "disarm"})))
+            .expect("exact disarm intent");
+        assert_eq!(disarm.command(), AgentControlCommandV1::Disarm);
+        assert_eq!(disarm.command().kind(), AgentControlCommandKindV1::Disarm);
+
+        for (request, kind, expected, request_id) in [
+            (arm, AgentControlCommandKindV1::Arm, "arm", 1),
+            (disarm, AgentControlCommandKindV1::Disarm, "disarm", 2),
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialize lifecycle command kind"),
+                json!(expected)
+            );
+            assert_eq!(
+                serde_json::to_value(AgentControlResponseV1::accepted(
+                    request.request_id(),
+                    kind,
+                    AgentControlCompletionV1::Completed,
+                ))
+                .expect("serialize lifecycle response"),
+                json!({
+                    "schema_version": AGENT_CONTROL_SCHEMA_V1,
+                    "request_id": request_id,
+                    "response": {
+                        "kind": "accepted",
+                        "command": expected,
+                        "completion": "completed"
+                    }
+                })
+            );
+        }
     }
 
     #[test]
@@ -974,6 +1034,8 @@ mod tests {
         let cases: &[&[u8]] = &[
             br#"{"schema_version":1,"request_id":1,"command":{"kind":"query_status"},"extra":0}"#,
             br#"{"schema_version":1,"request_id":1,"command":{"kind":"stop","extra":0}}"#,
+            br#"{"schema_version":1,"request_id":1,"command":{"kind":"arm","extra":0}}"#,
+            br#"{"schema_version":1,"request_id":1,"command":{"kind":"disarm","reason":"operator"}}"#,
             br#"{"schema_version":1,"request_id":1,"command":{"kind":"unknown"}}"#,
             br#"{"schema_version":1,"request_id":1}"#,
             br#"{"schema_version":1,"schema_version":1,"request_id":1,"command":{"kind":"stop"}}"#,
