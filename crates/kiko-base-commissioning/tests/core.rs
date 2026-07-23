@@ -175,6 +175,34 @@ fn recovery_is_deterministic_and_holds_across_unequal_parameter_grid() {
 }
 
 #[test]
+fn lease_refresh_sequences_do_not_erase_held_pwm_transitions() {
+    let config = PlantFitConfigV1::parse(fit_config_dto()).expect("fit config");
+    let mut dto = synthetic_dataset_dto(0.009, 0.31, 0.011, 0.57);
+    for (index, sample) in dto.samples.iter_mut().enumerate() {
+        sample.applied_command_sequence =
+            u64::try_from(index + 1).expect("bounded synthetic sample index");
+    }
+    let dataset = IdentificationDatasetV1::parse(dto, config).expect("refreshed sequence dataset");
+    let fit = fit_first_order_plant(&dataset, config)
+        .expect("unchanged PWM remains a usable transition across lease refreshes");
+    assert!((fit.left().velocity_gain_mps_per_pwm_percent() - 0.009).abs() < 1.0e-8);
+    assert!((fit.right().velocity_gain_mps_per_pwm_percent() - 0.011).abs() < 1.0e-8);
+}
+
+#[test]
+fn signed_motor_gain_is_fitted_when_wiring_sign_is_not_predeclared() {
+    let mut config_dto = fit_config_dto();
+    config_dto.require_positive_velocity_gain = false;
+    let config = PlantFitConfigV1::parse(config_dto).expect("signed-gain fit config");
+    let dataset =
+        IdentificationDatasetV1::parse(synthetic_dataset_dto(-0.009, 0.31, 0.011, 0.57), config)
+            .expect("signed-gain synthetic dataset");
+    let fit = fit_first_order_plant(&dataset, config).expect("signed-gain fit");
+    assert!((fit.left().velocity_gain_mps_per_pwm_percent() + 0.009).abs() < 1.0e-8);
+    assert!((fit.right().velocity_gain_mps_per_pwm_percent() - 0.011).abs() < 1.0e-8);
+}
+
+#[test]
 fn support_envelope_does_not_invent_unobserved_zero_velocity() {
     let left_gain = 0.009;
     let left_tau_s = 0.31;
@@ -372,6 +400,30 @@ fn commissioning_config() -> CommissioningConfigV1 {
     .expect("commissioning config")
 }
 
+fn attended_template_commissioning_config() -> CommissioningConfigV1 {
+    CommissioningConfigV1::parse(CommissioningConfigV1Dto {
+        schema_version: BASE_IDENTIFICATION_V1,
+        expected_controller_session_id: "commissioning-controller-session".to_owned(),
+        expected_visual_velocity_source_id: "oak-slam-body-velocity-v1".to_owned(),
+        expected_imu_calibration_id: "imu-calibration".to_owned(),
+        symmetric_pwm_percent: 15,
+        spin_pwm_percent: 15,
+        max_abs_pwm_percent: 20,
+        excitation_duration_ns: 2_000_000_000,
+        zero_dwell_duration_ns: 1_000_000_000,
+        application_timeout_ns: 100_000_000,
+        max_visual_age_ns: 100_000_000,
+        max_imu_age_ns: 100_000_000,
+        max_controller_age_ns: 120_000_000,
+        max_abs_stationary_forward_velocity_mps: 0.02,
+        max_abs_stationary_yaw_rate_rad_s: 0.05,
+        max_total_duration_ns: 90_000_000_000,
+        cycles: 4,
+        max_excitation_steps: 16,
+    })
+    .expect("attended commissioning template")
+}
+
 fn evidence(
     config: CommissioningConfigV1,
     observed_at_ns: u64,
@@ -396,6 +448,58 @@ fn evidence(
         config,
     )
     .expect("evidence")
+}
+
+#[test]
+fn attended_template_has_a_sample_budget_at_the_slowest_admitted_cadence() {
+    const MAXIMUM_SAMPLE_GAP_NS: u64 = 100_000_000;
+    const MINIMUM_REQUIRED_SAMPLES: u32 = 500;
+    const MAXIMUM_ALLOWED_SAMPLES: u32 = 3_000;
+
+    let config = attended_template_commissioning_config();
+    let mut controller = CommissioningController::new(config);
+    let mut observed_at_ns = 0_u64;
+    let mut sequence = 1_u64;
+    let mut applied = (0_i8, 0_i8);
+    let mut sample_count = 0_u32;
+
+    loop {
+        sample_count += 1;
+        let action = controller.advance(
+            MonotonicTimestampNs::from_nanos(observed_at_ns),
+            CommissioningEvidence::parse(
+                CommissioningEvidenceV1Dto {
+                    controller_session_id: "commissioning-controller-session".to_owned(),
+                    visual_velocity_source_id: "oak-slam-body-velocity-v1".to_owned(),
+                    imu_calibration_id: "imu-calibration".to_owned(),
+                    controller_observed_at_ns: observed_at_ns,
+                    visual_observed_at_ns: observed_at_ns,
+                    imu_observed_at_ns: observed_at_ns,
+                    applied_command_sequence: sequence,
+                    applied_left_pwm_percent: applied.0,
+                    applied_right_pwm_percent: applied.1,
+                    visual_forward_velocity_mps: 0.0,
+                    calibrated_imu_yaw_rate_rad_s: 0.0,
+                },
+                config,
+            )
+            .expect("bounded attended evidence"),
+            Cancellation::Continue,
+        );
+        assert!(!matches!(action.state(), CommissioningState::Aborted(_)));
+        let required = action.required_pwm();
+        applied = (required.left().get(), required.right().get());
+        if action.state() == CommissioningState::Completed {
+            break;
+        }
+        observed_at_ns += MAXIMUM_SAMPLE_GAP_NS;
+        sequence += 1;
+    }
+
+    assert_eq!(sample_count, 523);
+    assert!(sample_count >= MINIMUM_REQUIRED_SAMPLES);
+    assert!(sample_count <= MAXIMUM_ALLOWED_SAMPLES);
+    assert!(observed_at_ns < config.max_total_duration_ns().get());
 }
 
 #[test]

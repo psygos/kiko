@@ -12,6 +12,8 @@ const MAX_CYCLES: u8 = 16;
 const MAX_EXCITATION_STEPS: u16 = MAX_CYCLES as u16 * STEPS_PER_CYCLE;
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct CommissioningConfigV1Dto {
     pub schema_version: u32,
     pub expected_controller_session_id: String,
@@ -213,8 +215,44 @@ impl CommissioningConfigV1 {
         self.max_abs_pwm_percent
     }
 
+    pub fn symmetric_pwm_percent(self) -> NonZeroU8 {
+        self.symmetric_pwm_percent
+    }
+
+    pub fn spin_pwm_percent(self) -> NonZeroU8 {
+        self.spin_pwm_percent
+    }
+
+    pub fn excitation_duration_ns(self) -> NonZeroU64 {
+        self.excitation_duration_ns
+    }
+
+    pub fn zero_dwell_duration_ns(self) -> NonZeroU64 {
+        self.zero_dwell_duration_ns
+    }
+
+    pub fn application_timeout_ns(self) -> NonZeroU64 {
+        self.application_timeout_ns
+    }
+
+    pub fn max_total_duration_ns(self) -> NonZeroU64 {
+        self.max_total_duration_ns
+    }
+
     pub fn cycles(self) -> NonZeroU8 {
         self.cycles
+    }
+
+    pub fn expected_controller_session_id(self) -> BoundedId {
+        self.expected_controller_session_id
+    }
+
+    pub fn expected_visual_velocity_source_id(self) -> BoundedId {
+        self.expected_visual_velocity_source_id
+    }
+
+    pub fn expected_imu_calibration_id(self) -> BoundedId {
+        self.expected_imu_calibration_id
     }
 }
 
@@ -267,6 +305,8 @@ impl std::error::Error for CommissioningConfigParseError {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct CommissioningEvidenceV1Dto {
     pub controller_session_id: String,
     pub visual_velocity_source_id: String,
@@ -366,6 +406,22 @@ impl CommissioningEvidence {
     pub fn calibrated_imu_yaw_rate_rad_s(self) -> f64 {
         self.calibrated_imu_yaw_rate_rad_s
     }
+
+    pub fn controller_observed_at(self) -> MonotonicTimestampNs {
+        self.controller_observed_at
+    }
+
+    pub fn visual_observed_at(self) -> MonotonicTimestampNs {
+        self.visual_observed_at
+    }
+
+    pub fn imu_observed_at(self) -> MonotonicTimestampNs {
+        self.imu_observed_at
+    }
+
+    pub fn applied_command_sequence(self) -> u64 {
+        self.applied_command_sequence
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -439,6 +495,10 @@ impl CanonicalPwmCommand {
 
     pub fn is_zero(self) -> bool {
         self == Self::ZERO
+    }
+
+    pub const fn zero() -> Self {
+        Self::ZERO
     }
 }
 

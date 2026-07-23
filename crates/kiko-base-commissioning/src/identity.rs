@@ -14,7 +14,7 @@ impl BoundedId {
         Self::parse_str(field, &value)
     }
 
-    pub(crate) fn parse_str(field: &'static str, value: &str) -> Result<Self, IdentifierError> {
+    pub fn parse_str(field: &'static str, value: &str) -> Result<Self, IdentifierError> {
         if value.is_empty()
             || value.len() > MAX_ID_BYTES
             || !value.bytes().all(|byte| {

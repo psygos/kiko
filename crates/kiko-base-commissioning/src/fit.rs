@@ -483,14 +483,16 @@ fn prepare_transitions(
                 wheel: None,
                 stage: NumericalStage::TransitionPeriod,
             })?;
-        let dt_s = std::time::Duration::from_nanos(delta_ns).as_secs_f64();
-        if !dt_s.is_finite() || dt_s <= 0.0 {
+        if delta_ns == 0 {
             return Err(FitError::NumericalFailure {
                 wheel: None,
                 stage: NumericalStage::TransitionPeriod,
             });
         }
-        if dt_s < config.min_sample_period_s || dt_s > config.max_sample_period_s {
+        let dt_s = std::time::Duration::from_nanos(delta_ns).as_secs_f64();
+        if delta_ns < config.min_sample_period_ns.get()
+            || delta_ns > config.max_sample_period_ns.get()
+        {
             return Err(FitError::SamplePeriodOutsideConfiguredRange {
                 interval_start_index: index,
                 actual_s: dt_s,
@@ -502,7 +504,7 @@ fn prepare_transitions(
         minimum_sample_period_s = minimum_sample_period_s.min(dt_s);
         maximum_sample_period_s = maximum_sample_period_s.max(dt_s);
 
-        if current.applied_command_sequence != previous.applied_command_sequence {
+        if current.applied_pwm != previous.applied_pwm {
             support.command_changes += 1;
             command_segment_ordinal += 1;
             continue;

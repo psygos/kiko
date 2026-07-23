@@ -1,6 +1,6 @@
 use std::collections::TryReserveError;
 use std::fmt;
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use robot_protocol::{AppliedPwm, AppliedPwmError};
 
@@ -13,6 +13,8 @@ const ABSOLUTE_MAX_SAMPLES: u32 = 1_000_000;
 /// Weak configuration DTO. Call [`PlantFitConfigV1::parse`] exactly once at
 /// the configuration boundary and retain the resulting domain value.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct PlantFitConfigV1Dto {
     pub schema_version: u32,
     pub expected_robot_id: String,
@@ -62,6 +64,8 @@ pub struct PlantFitConfigV1 {
     pub(crate) wheelbase_m: f64,
     pub(crate) min_sample_period_s: f64,
     pub(crate) max_sample_period_s: f64,
+    pub(crate) min_sample_period_ns: NonZeroU64,
+    pub(crate) max_sample_period_ns: NonZeroU64,
     pub(crate) max_sample_period_ratio: f64,
     pub(crate) max_abs_observed_forward_velocity_mps: f64,
     pub(crate) max_abs_observed_yaw_rate_rad_s: f64,
@@ -124,6 +128,18 @@ impl PlantFitConfigV1 {
                 max_field: "max_sample_period_s",
                 max: dto.max_sample_period_s,
             });
+        }
+        let min_sample_period_ns =
+            sample_period_nanoseconds("min_sample_period_s", dto.min_sample_period_s, true)?;
+        let max_sample_period_ns =
+            sample_period_nanoseconds("max_sample_period_s", dto.max_sample_period_s, false)?;
+        if min_sample_period_ns > max_sample_period_ns {
+            return Err(
+                PlantFitConfigParseError::NoRepresentableSamplePeriodNanoseconds {
+                    minimum_s: dto.min_sample_period_s,
+                    maximum_s: dto.max_sample_period_s,
+                },
+            );
         }
         require_finite("max_sample_period_ratio", dto.max_sample_period_ratio)?;
         if dto.max_sample_period_ratio < 1.0 {
@@ -292,6 +308,8 @@ impl PlantFitConfigV1 {
             wheelbase_m: dto.wheelbase_m,
             min_sample_period_s: dto.min_sample_period_s,
             max_sample_period_s: dto.max_sample_period_s,
+            min_sample_period_ns,
+            max_sample_period_ns,
             max_sample_period_ratio: dto.max_sample_period_ratio,
             max_abs_observed_forward_velocity_mps: dto.max_abs_observed_forward_velocity_mps,
             max_abs_observed_yaw_rate_rad_s: dto.max_abs_observed_yaw_rate_rad_s,
@@ -326,12 +344,53 @@ impl PlantFitConfigV1 {
         })
     }
 
+    /// Maximum number of observations admitted by this exact fit policy.
+    ///
+    /// Live collectors use this bound before journaling or retaining a new
+    /// observation so an over-rate source cannot construct a dataset that the
+    /// same parsed policy would later reject.
+    pub const fn max_samples(self) -> NonZeroU32 {
+        self.max_samples
+    }
+
+    /// Smallest representable timestamp interval accepted by this policy.
+    ///
+    /// This is the ceiling of the configured seconds value in the dataset's
+    /// integer-nanosecond timestamp domain.
+    pub const fn min_sample_period_ns(self) -> NonZeroU64 {
+        self.min_sample_period_ns
+    }
+
+    /// Largest representable timestamp interval accepted by this policy.
+    ///
+    /// This is the floor of the configured seconds value in the dataset's
+    /// integer-nanosecond timestamp domain.
+    pub const fn max_sample_period_ns(self) -> NonZeroU64 {
+        self.max_sample_period_ns
+    }
+
     pub fn wheelbase_m(self) -> f64 {
         self.wheelbase_m
     }
 
     pub fn expected_robot_id(self) -> BoundedId {
         self.expected_robot_id
+    }
+
+    pub fn expected_controller_session_id(self) -> BoundedId {
+        self.expected_controller_session_id
+    }
+
+    pub fn expected_visual_velocity_source_id(self) -> BoundedId {
+        self.expected_visual_velocity_source_id
+    }
+
+    pub fn expected_imu_calibration_id(self) -> BoundedId {
+        self.expected_imu_calibration_id
+    }
+
+    pub fn wheelbase_calibration_id(self) -> BoundedId {
+        self.wheelbase_calibration_id
     }
 }
 
@@ -367,6 +426,14 @@ pub enum PlantFitConfigParseError {
         min: u64,
         max: u64,
     },
+    SamplePeriodNanosecondsOutOfRange {
+        field: &'static str,
+        value_s: f64,
+    },
+    NoRepresentableSamplePeriodNanoseconds {
+        minimum_s: f64,
+        maximum_s: f64,
+    },
 }
 
 impl fmt::Display for PlantFitConfigParseError {
@@ -385,6 +452,8 @@ impl std::error::Error for PlantFitConfigParseError {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct IdentificationDatasetV1Dto {
     pub schema_version: u32,
     pub dataset_content_id: String,
@@ -399,6 +468,8 @@ pub struct IdentificationDatasetV1Dto {
 /// One already time-aligned observation. `applied_command_sequence` is the
 /// controller result identity, not a locally requested command identity.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct IdentificationSampleV1Dto {
     pub observed_at_ns: u64,
     pub applied_command_sequence: u64,
@@ -712,6 +783,36 @@ fn require_positive(field: &'static str, value: f64) -> Result<(), PlantFitConfi
     }
 }
 
+fn sample_period_nanoseconds(
+    field: &'static str,
+    seconds: f64,
+    round_up: bool,
+) -> Result<NonZeroU64, PlantFitConfigParseError> {
+    let scaled = seconds * 1_000_000_000.0;
+    let integral = if round_up {
+        scaled.ceil()
+    } else {
+        scaled.floor()
+    };
+    // `u64::MAX as f64` rounds to the exclusive upper bound 2^64. Requiring
+    // strict inequality keeps the subsequent cast unambiguous and prevents
+    // saturating float-to-integer conversion from silently changing policy.
+    if !integral.is_finite() || integral < 1.0 || integral >= u64::MAX as f64 {
+        return Err(
+            PlantFitConfigParseError::SamplePeriodNanosecondsOutOfRange {
+                field,
+                value_s: seconds,
+            },
+        );
+    }
+    NonZeroU64::new(integral as u64).ok_or(
+        PlantFitConfigParseError::SamplePeriodNanosecondsOutOfRange {
+            field,
+            value_s: seconds,
+        },
+    )
+}
+
 fn require_sample_finite(
     index: usize,
     field: &'static str,
@@ -741,6 +842,35 @@ mod tests {
                 requested_samples: usize::MAX,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn sample_period_bounds_round_inward_in_the_timestamp_domain() {
+        assert_eq!(
+            sample_period_nanoseconds("minimum", 0.049_000_000_1, true)
+                .expect("representable minimum")
+                .get(),
+            49_000_001
+        );
+        assert_eq!(
+            sample_period_nanoseconds("maximum", 0.050_999_999_9, false)
+                .expect("representable maximum")
+                .get(),
+            50_999_999
+        );
+    }
+
+    #[test]
+    fn sub_nanosecond_maximum_has_no_representable_timestamp_interval() {
+        assert!(matches!(
+            sample_period_nanoseconds("maximum", 0.000_000_000_5, false),
+            Err(
+                PlantFitConfigParseError::SamplePeriodNanosecondsOutOfRange {
+                    field: "maximum",
+                    ..
+                }
+            )
         ));
     }
 }
