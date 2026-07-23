@@ -43,8 +43,21 @@ mod nano_accessory_worker;
     unix
 ))]
 mod nano_agent_launch;
+#[cfg(all(feature = "nano-base-commissioning", unix))]
+pub mod nano_base_commissioning;
+#[cfg(all(feature = "nano-base-commissioning", unix))]
+pub mod nano_base_commissioning_bootstrap;
+#[cfg(all(feature = "nano-base-commissioning", unix))]
+pub mod nano_base_commissioning_live;
 #[cfg(all(feature = "nano-agent", unix))]
 mod nano_bootstrap;
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "record",
+    unix
+))]
+mod nano_calibration_artifact;
 #[cfg(all(feature = "nano-agent", unix))]
 mod nano_map_persistence;
 #[cfg(all(
@@ -54,6 +67,8 @@ mod nano_map_persistence;
     unix
 ))]
 mod nano_observed_inventory;
+#[cfg(all(feature = "nano-agent", unix))]
+mod nano_operator_console_service;
 #[cfg(all(
     feature = "agent-runtime",
     feature = "actuation",
@@ -63,28 +78,58 @@ mod nano_observed_inventory;
 mod nano_production_admission;
 #[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
 mod nano_startup;
+#[cfg(all(feature = "nano-agent", unix))]
+mod nano_state_quota;
+#[cfg(all(feature = "nano-agent", unix))]
+mod nano_warm_start;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+mod nano_wheels_off_qualification_bootstrap;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+mod nano_wheels_off_qualification_launch;
 mod odometry;
+#[cfg(feature = "operator-console")]
+mod operator_console;
+#[cfg(feature = "operator-console")]
+mod operator_console_http;
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "operator-console",
+    unix
+))]
+mod operator_console_runtime;
 mod reference;
 mod safety;
 mod shadow_command;
 mod shadow_config;
-#[cfg(all(feature = "nano-bench", unix))]
-mod wheels_off_bench;
-#[cfg(all(feature = "nano-bench", unix))]
-mod zero_hold_keeper;
-#[cfg(all(feature = "nano-bench", unix))]
-mod zero_only_config;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+mod wheels_off_candidate_actuation;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+mod wheels_off_qualification_console;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+mod wheels_off_qualification_http;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+mod wheels_off_qualification_runtime;
+
+/// Shared hard cell bound for production Nano occupancy and frontier
+/// allocations. Keeping one definition prevents the selector from admitting
+/// a larger grid than the launch boundary can construct.
+#[cfg(all(feature = "agent-runtime", unix))]
+pub const MAX_NANO_OCCUPANCY_CELLS: usize = 16_000_000;
 
 #[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
 pub use actuation_admission::{
-    ActuationAdmissionError, AdmittedNavigationActuationConfigV1, AdmittedPlantArtifactIdentity,
-    ArtifactContentMismatch, PlantDatasetContentDigestMismatch,
+    ActuationAdmissionError, AdmittedNavigationActuationConfigV1,
+    AdmittedNavigationActuationConfigV2, AdmittedPlantArtifactIdentity, ArtifactContentMismatch,
+    ConfiguredPlantArtifactDigestMismatch,
 };
 #[cfg(feature = "actuation")]
 pub use actuation_config::{
     ActuationConfigParseError, ActuatorConfigFingerprint, ControllerUid,
     MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES, NAVIGATION_ACTUATION_CONFIG_V1,
-    NavigationActuationConfigV1, NavigationConfigSha256, OperatorClaimedPhysicalApprovalV1,
+    NAVIGATION_ACTUATION_CONFIG_V2, NavigationActuationConfigV1, NavigationActuationConfigV2,
+    NavigationConfigSha256, OperatorClaimedPhysicalApprovalV1, PlantArtifactContentSha256,
+    PlantEvidenceDatasetContentId,
 };
 #[cfg(all(feature = "agent-runtime", unix))]
 pub use agent_config::*;
@@ -94,10 +139,12 @@ pub use agent_dispatch::{
 };
 #[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
 pub use agent_manual::{
+    AgentAutonomousAuthority, AgentAutonomousControlError, AgentAutonomousMode,
     AgentControllerStopKnowledge, AgentLiveActuationDisposition, AgentLiveActuationFault,
     AgentLiveActuationFaultKind, AgentManualControlCore, AgentManualControlError,
     AgentManualGlobalStopRequirement, AgentManualRuntimePolicy, BeginManualTransition,
-    ManualControlTick, classify_live_actuation_error,
+    ManualControlTick, PendingAgentAutonomousGrant, PendingAgentAutonomousStop,
+    classify_live_actuation_error,
 };
 #[cfg(feature = "agent-runtime")]
 pub use authority::{AgentAuthorityError, AgentAuthoritySupervisor};
@@ -110,6 +157,13 @@ pub use control_api::{
     AgentMapStateV1, AgentOperatingModeV1, AgentRuntimeStateV1,
     MAX_AGENT_CONTROL_REQUEST_JSON_BYTES,
 };
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "operator-console",
+    unix
+))]
+pub use control_socket::AgentControlTypedIngress;
 #[cfg(unix)]
 pub use control_socket::{
     AgentControlAcceptedRequest, AgentControlClaimedRequest, AgentControlClockError,
@@ -177,16 +231,18 @@ pub use ingress::{
     NavigationIngressWriteError, NavigationIngressWriteStage, NavigationIngressWriter,
     NavigationMapEpochCoordinator, NavigationRecordingId, NavigationRecordingIdError,
     NavigationReplayClock, NavigationReplayClockError, PendingVisualAttemptIngress,
-    RecordedImuReport, RecordedMapEpochId, RecordedMapEpochIdError, ReplayMapEpochBinding,
-    VisualAttemptIngress, VisualAttemptOutcome,
+    QualificationAppliedStepIngress, RecordedImuReport, RecordedMapEpochId,
+    RecordedMapEpochIdError, ReplayMapEpochBinding, VisualAttemptIngress, VisualAttemptOutcome,
 };
 #[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
 pub use live_motion_owner::{
-    LiveMotionActuationFaultEvidence, LiveMotionActuationPort, LiveMotionApplied,
-    LiveMotionAppliedReceipt, LiveMotionCompletedSafetyAction, LiveMotionFaultLatch,
-    LiveMotionOperationError, LiveMotionOwner, LiveMotionOwnerError, LiveMotionOwnerOutcome,
-    LiveMotionOwnerTerminalReport, LiveMotionPortTickError, LiveMotionTerminalActuationPort,
-    LiveMotionTerminalStop,
+    LiveLifecycleZeroApplied, LiveLifecycleZeroReason, LiveMotionActuationFaultEvidence,
+    LiveMotionActuationPort, LiveMotionApplied, LiveMotionAppliedReceipt, LiveMotionAuthorityState,
+    LiveMotionAuthorityStateError, LiveMotionCompletedSafetyAction, LiveMotionFaultLatch,
+    LiveMotionMapAdmissionError, LiveMotionOperationError, LiveMotionOwner, LiveMotionOwnerError,
+    LiveMotionOwnerOutcome, LiveMotionOwnerTerminalParts, LiveMotionOwnerTerminalReport,
+    LiveMotionPortTickError, LiveMotionTerminalActuationPort, LiveMotionTerminalStop,
+    LivePhysicalStateEvent,
 };
 #[cfg(feature = "actuation")]
 pub use live_mpc_control::{LiveAppliedMpcTick, LiveMpcControlDriver, LiveMpcControlError};
@@ -216,9 +272,10 @@ pub use manual_reference::{
 };
 #[cfg(all(feature = "agent-runtime", feature = "record", unix))]
 pub use nano_accessory_worker::{
-    MAX_NANO_ACCESSORY_HEALTH_PERIOD, NanoAccessoryFaultWaitError, NanoAccessoryFrameStats,
-    NanoAccessoryFrameSubmitOutcome, NanoAccessoryHealthPeriod, NanoAccessoryHealthPeriodError,
-    NanoAccessoryHealthStatusError, NanoAccessoryReadyEvidence, NanoAccessoryRgbIngress,
+    MAX_NANO_ACCESSORY_HEALTH_PERIOD, NanoAccessoryComponentHealth, NanoAccessoryFaultWaitError,
+    NanoAccessoryFrameStats, NanoAccessoryFrameSubmitOutcome, NanoAccessoryHealthObserver,
+    NanoAccessoryHealthPeriod, NanoAccessoryHealthPeriodError, NanoAccessoryHealthStatusError,
+    NanoAccessoryReadyEvidence, NanoAccessoryRgbIngress, NanoAccessoryRuntimeHealth,
     NanoAccessoryShutdownEvidence, NanoAccessoryTerminalFault, NanoAccessoryWorker,
     NanoAccessoryWorkerConfig, NanoAccessoryWorkerConfigError, NanoAccessoryWorkerExit,
     NanoAccessoryWorkerJoinError, NanoAccessoryWorkerStartError, NanoEyeActorStartupError,
@@ -234,6 +291,17 @@ pub use nano_accessory_worker::{
 pub use nano_agent_launch::*;
 #[cfg(all(feature = "nano-agent", unix))]
 pub use nano_bootstrap::*;
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "record",
+    unix
+))]
+pub use nano_calibration_artifact::{
+    MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES, NANO_CALIBRATION_ARTIFACT_V1,
+    NanoCalibrationArtifactParseError, NanoCalibrationArtifactV1, NanoCalibrationBindingError,
+    NanoCalibrationId, NanoCalibrationIdField, NanoCalibrationOakMxid, NanoCalibrationStereoSide,
+};
 #[cfg(all(feature = "nano-agent", unix))]
 pub use nano_map_persistence::*;
 #[cfg(all(
@@ -247,6 +315,8 @@ pub use nano_observed_inventory::{
     NanoObservedInventoryEvidenceError, NanoObservedInventoryEvidenceKind,
     ProductionObservedDeviceInventoryV1,
 };
+#[cfg(all(feature = "nano-agent", unix))]
+pub use nano_operator_console_service::*;
 #[cfg(all(
     feature = "agent-runtime",
     feature = "actuation",
@@ -263,6 +333,14 @@ pub use nano_startup::{
     AdmittedNanoStartup, DisarmedNanoStartup, DisarmedNanoStartupParts, NanoStartupAdmissionError,
     NanoStartupArtifactError, NanoStartupSupervisorError, NanoStartupSupervisorStage,
 };
+#[cfg(all(feature = "nano-agent", unix))]
+pub use nano_state_quota::*;
+#[cfg(all(feature = "nano-agent", unix))]
+pub use nano_warm_start::*;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+pub use nano_wheels_off_qualification_bootstrap::*;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+pub use nano_wheels_off_qualification_launch::*;
 pub use odometry::{
     BaseAcceleration, BaseAngularVelocity, CalibratedQuantity, CalibrationMatrix,
     CalibrationVector, DurationParameter, ImuCalibrationProvenance, ImuUpdate, OdomPlanarTwist,
@@ -273,6 +351,17 @@ pub use odometry::{
     ReanchorReason, ScalarParameter, TimeAlignedOdomPose, TimeAlignment, TranslationIntegration,
     VisualCaptureProvenance,
 };
+#[cfg(feature = "operator-console")]
+pub use operator_console::*;
+#[cfg(feature = "operator-console")]
+pub use operator_console_http::*;
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "operator-console",
+    unix
+))]
+pub use operator_console_runtime::*;
 pub use reference::{
     EpochPathMismatchV1, FORWARD_MOST_NEAREST_SEGMENT_V1, MAX_PATH_REFERENCE_POINTS,
     MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S, MAX_SUPPORTED_PATH_LENGTH_M,
@@ -297,17 +386,22 @@ pub use shadow_config::{
     MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES, SHADOW_NAVIGATION_CONFIG_V1,
     ShadowNavigationConfigParseError, ShadowNavigationConfigV1, ShadowNavigationRuntimePartsV1,
 };
-#[cfg(all(feature = "nano-bench", unix))]
-pub use wheels_off_bench::*;
-#[cfg(all(feature = "nano-bench", unix))]
-pub use zero_hold_keeper::{
-    FreshZeroEvidence, ZeroHoldKeeper, ZeroHoldKeeperStartError, ZeroHoldLatchedError,
-    ZeroHoldRequestError, ZeroHoldStatus, ZeroHoldTerminalError, ZeroHoldTerminalReport,
-    ZeroHoldTimingError,
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+pub use wheels_off_candidate_actuation::{
+    AdmittedCandidatePwm, AdmittedCandidatePwmTarget, AdmittedWheelsOffCandidateController,
+    CandidateActuationSessionError, CandidateActuationSessionStartError,
+    CandidateCadenceOverflowStop, CandidateMpcBindingError, CandidatePwmAdmissionError,
+    CandidatePwmRequest, CandidateRuntimeServiceIntervalError,
+    MAX_WHEELS_OFF_CANDIDATE_POLICY_JSON_BYTES, OperatorClaimedWheelsOffAttestation,
+    StoppedWheelsOffCandidateController, WHEELS_OFF_CANDIDATE_POLICY_V1,
+    WheelsOffCandidateActuationSession, WheelsOffCandidateAttestationError,
+    WheelsOffCandidateControllerBinding, WheelsOffCandidateControllerBindingError,
+    WheelsOffCandidateLimits, WheelsOffCandidatePolicyError,
+    WheelsOffCandidateRuntimeServiceInterval,
 };
-#[cfg(all(feature = "nano-bench", unix))]
-pub use zero_only_config::{
-    BoundZeroOnlyActuationConfigV1, MAX_ZERO_ONLY_ACTUATION_POLICY_JSON_BYTES,
-    ZERO_ONLY_ACTUATION_POLICY_V1, ZeroOnlyActuationBindingError, ZeroOnlyActuationPolicyError,
-    ZeroOnlyActuationPolicyV1,
-};
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+pub use wheels_off_qualification_console::*;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+pub use wheels_off_qualification_http::*;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+pub use wheels_off_qualification_runtime::*;

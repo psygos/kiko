@@ -20,6 +20,7 @@ use super::mpc::{FitResidualsV1, PlantEvidenceV1, PlantModelV1};
 use super::{ControlPeriodNs, SolverBudgetNs};
 
 pub const NAVIGATION_ACTUATION_CONFIG_V1: u32 = 1;
+pub const NAVIGATION_ACTUATION_CONFIG_V2: u32 = 2;
 pub const MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES: usize = 16 * 1_024;
 const MAX_CLAIM_ID_BYTES: usize = 128;
 const SHA256_BYTES: usize = 32;
@@ -62,6 +63,44 @@ impl ClaimId {
     }
 }
 
+/// Canonical SHA-256 content identity of the physical evidence dataset used
+/// by the fitter. It is never reused as a plant-artifact digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlantEvidenceDatasetContentId {
+    canonical: ClaimId,
+    sha256: [u8; SHA256_BYTES],
+}
+
+impl PlantEvidenceDatasetContentId {
+    fn parse(value: String) -> Result<Self, ActuationConfigParseError> {
+        let sha256 = parse_canonical_sha256_id(&value)
+            .ok_or(ActuationConfigParseError::PlantDatasetContentIdIsNotCanonicalSha256)?;
+        Ok(Self {
+            canonical: ClaimId::parse("plant_dataset_content_id", value)?,
+            sha256,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.canonical.as_str()
+    }
+
+    pub const fn sha256(&self) -> &[u8; SHA256_BYTES] {
+        &self.sha256
+    }
+}
+
+/// SHA-256 of the exact serialized plant-model artifact selected from the
+/// deployment manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlantArtifactContentSha256([u8; SHA256_BYTES]);
+
+impl PlantArtifactContentSha256 {
+    pub const fn as_bytes(&self) -> &[u8; SHA256_BYTES] {
+        &self.0
+    }
+}
+
 /// Caller-asserted approval metadata. The name intentionally does not say
 /// "verified": only exact agreement with the parsed navigation model is
 /// established here.
@@ -69,7 +108,7 @@ impl ClaimId {
 pub struct OperatorClaimedPhysicalApprovalV1 {
     approval_id: ClaimId,
     approver_id: ClaimId,
-    plant_dataset_content_id: ClaimId,
+    plant_dataset_content_id: PlantEvidenceDatasetContentId,
     plant_identification_method_id: ClaimId,
     plant_sample_count: NonZeroU64,
     plant_fit_residuals: FitResidualsV1,
@@ -89,11 +128,10 @@ impl OperatorClaimedPhysicalApprovalV1 {
 
     /// Caller-asserted content identity for the physical plant dataset.
     ///
-    /// Parsing the V1 config only retains this bounded claim. Production
-    /// admission separately requires the canonical `sha256:<lowerhex>` value
-    /// to match an exact manifest-bound, no-follow hashed plant artifact.
-    pub fn plant_dataset_content_id(&self) -> &str {
-        self.plant_dataset_content_id.as_str()
+    /// This identity is checked against model evidence only. The distinct
+    /// plant artifact hash is retained by [`NavigationActuationConfigV2`].
+    pub const fn plant_dataset_content_id(&self) -> &PlantEvidenceDatasetContentId {
+        &self.plant_dataset_content_id
     }
 
     pub fn imu_calibration_id(&self) -> &str {
@@ -110,7 +148,7 @@ impl OperatorClaimedPhysicalApprovalV1 {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct NavigationActuationConfigV1 {
+pub struct NavigationActuationConfigV2 {
     robot_id: ClaimId,
     command_endpoint: UdpEndpoint,
     navigation_config_sha256: NavigationConfigSha256,
@@ -120,6 +158,7 @@ pub struct NavigationActuationConfigV1 {
     actuator_config_fingerprint: ActuatorConfigFingerprint,
     plant_model_id: ClaimId,
     plant_model_version: NonZeroU32,
+    plant_artifact_content_sha256: PlantArtifactContentSha256,
     approval: OperatorClaimedPhysicalApprovalV1,
     apply_ack_budget: TimeoutNs,
     stop_ack_budget: TimeoutNs,
@@ -130,7 +169,7 @@ pub struct NavigationActuationConfigV1 {
     maximum_uncommanded_motion_ns: NonZeroU64,
 }
 
-impl NavigationActuationConfigV1 {
+impl NavigationActuationConfigV2 {
     pub fn parse_and_authorize(
         bytes: &[u8],
         requested_robot_id: &str,
@@ -145,9 +184,12 @@ impl NavigationActuationConfigV1 {
                 maximum_bytes: MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES,
             });
         }
-        let dto: NavigationActuationConfigV1Dto =
+        let dto: NavigationActuationConfigWireDto =
             serde_json::from_slice(bytes).map_err(ActuationConfigParseError::Json)?;
-        if dto.schema_version != NAVIGATION_ACTUATION_CONFIG_V1 {
+        if dto.schema_version == NAVIGATION_ACTUATION_CONFIG_V1 {
+            return Err(ActuationConfigParseError::LegacyAmbiguousPlantBindingSchema);
+        }
+        if dto.schema_version != NAVIGATION_ACTUATION_CONFIG_V2 {
             return Err(ActuationConfigParseError::UnsupportedSchemaVersion(
                 dto.schema_version,
             ));
@@ -193,6 +235,12 @@ impl NavigationActuationConfigV1 {
         let plant_model_id = ClaimId::parse("plant_model_id", dto.plant_model_id)?;
         let plant_model_version = NonZeroU32::new(dto.plant_model_version)
             .ok_or(ActuationConfigParseError::ZeroPlantModelVersion)?;
+        let plant_artifact_content_sha256 = PlantArtifactContentSha256(parse_lower_hex_exact(
+            "plant_artifact_sha256_hex",
+            dto.plant_artifact_sha256_hex
+                .as_deref()
+                .ok_or(ActuationConfigParseError::MissingPlantArtifactSha256)?,
+        )?);
         if plant_model.model_id().as_str() != plant_model_id.as_str()
             || plant_model.model_version() != plant_model_version
         {
@@ -200,6 +248,9 @@ impl NavigationActuationConfigV1 {
         }
 
         let approval = parse_approval(dto.operator_claimed_physical_approval)?;
+        if plant_artifact_content_sha256.as_bytes() == approval.plant_dataset_content_id.sha256() {
+            return Err(ActuationConfigParseError::PlantArtifactDigestReusesDatasetContentId);
+        }
         match plant_model.evidence() {
             PlantEvidenceV1::SyntheticFixture { .. } => {
                 return Err(ActuationConfigParseError::SyntheticPlantCannotActuate);
@@ -210,7 +261,9 @@ impl NavigationActuationConfigV1 {
                 sample_count,
                 residuals,
             } => {
-                if dataset_content_id.as_str() != approval.plant_dataset_content_id.as_str()
+                let model_dataset_content_id =
+                    PlantEvidenceDatasetContentId::parse(dataset_content_id.as_str().to_owned())?;
+                if model_dataset_content_id != approval.plant_dataset_content_id
                     || identification_method_id.as_str()
                         != approval.plant_identification_method_id.as_str()
                     || sample_count != approval.plant_sample_count
@@ -303,6 +356,7 @@ impl NavigationActuationConfigV1 {
             actuator_config_fingerprint,
             plant_model_id,
             plant_model_version,
+            plant_artifact_content_sha256,
             approval,
             apply_ack_budget,
             stop_ack_budget,
@@ -348,6 +402,10 @@ impl NavigationActuationConfigV1 {
 
     pub const fn plant_model_version(&self) -> NonZeroU32 {
         self.plant_model_version
+    }
+
+    pub const fn plant_artifact_content_sha256(&self) -> PlantArtifactContentSha256 {
+        self.plant_artifact_content_sha256
     }
 
     pub const fn apply_ack_budget(&self) -> TimeoutNs {
@@ -398,6 +456,10 @@ impl NavigationActuationConfigV1 {
     }
 }
 
+/// Compatibility name for existing call sites. It parses schema V2 only;
+/// schema V1 is explicitly rejected as ambiguous.
+pub type NavigationActuationConfigV1 = NavigationActuationConfigV2;
+
 #[derive(Debug)]
 pub enum ActuationConfigParseError {
     InputTooLarge {
@@ -405,6 +467,7 @@ pub enum ActuationConfigParseError {
         maximum_bytes: usize,
     },
     Json(serde_json::Error),
+    LegacyAmbiguousPlantBindingSchema,
     UnsupportedSchemaVersion(u32),
     InvalidClaimId {
         field: &'static str,
@@ -428,6 +491,9 @@ pub enum ActuationConfigParseError {
     ZeroFirmwareAbi,
     ZeroFirmwareBuildId,
     ZeroPlantModelVersion,
+    MissingPlantArtifactSha256,
+    PlantDatasetContentIdIsNotCanonicalSha256,
+    PlantArtifactDigestReusesDatasetContentId,
     PlantModelIdentityMismatch,
     SyntheticPlantCannotActuate,
     ZeroPhysicalSampleCount,
@@ -469,6 +535,9 @@ impl fmt::Display for ActuationConfigParseError {
                 "navigation actuation config is {actual_bytes} bytes; maximum is {maximum_bytes}"
             ),
             Self::Json(source) => write!(formatter, "invalid actuation config JSON: {source}"),
+            Self::LegacyAmbiguousPlantBindingSchema => formatter.write_str(
+                "navigation actuation schema V1 is rejected because it ambiguously reused the physical dataset identity as the plant-artifact digest; render schema V2 with distinct bindings",
+            ),
             Self::UnsupportedSchemaVersion(version) => {
                 write!(
                     formatter,
@@ -525,6 +594,15 @@ impl fmt::Display for ActuationConfigParseError {
             Self::ZeroPlantModelVersion => {
                 formatter.write_str("plant_model_version must be nonzero")
             }
+            Self::MissingPlantArtifactSha256 => formatter.write_str(
+                "schema V2 requires plant_artifact_sha256_hex as a distinct exact artifact binding",
+            ),
+            Self::PlantDatasetContentIdIsNotCanonicalSha256 => formatter.write_str(
+                "plant_dataset_content_id must be canonical sha256:<64 lowercase hexadecimal digits>",
+            ),
+            Self::PlantArtifactDigestReusesDatasetContentId => formatter.write_str(
+                "plant_artifact_sha256_hex must not reuse the evidence-dataset content digest",
+            ),
             Self::PlantModelIdentityMismatch => formatter.write_str(
                 "actuation manifest plant identity does not match the parsed navigation model",
             ),
@@ -593,7 +671,7 @@ impl std::error::Error for ActuationConfigParseError {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NavigationActuationConfigV1Dto {
+struct NavigationActuationConfigWireDto {
     schema_version: u32,
     robot_id: String,
     command_endpoint: String,
@@ -604,6 +682,9 @@ struct NavigationActuationConfigV1Dto {
     actuator_config_fingerprint_hex: String,
     plant_model_id: String,
     plant_model_version: u32,
+    /// Optional only so schema V1 can be rejected with a precise legacy error
+    /// after one strict deserialization pass. Schema V2 requires this field.
+    plant_artifact_sha256_hex: Option<String>,
     operator_claimed_physical_approval: OperatorClaimedPhysicalApprovalV1Dto,
     apply_ack_budget_ns: u64,
     stop_ack_budget_ns: u64,
@@ -661,8 +742,7 @@ fn parse_approval(
     Ok(OperatorClaimedPhysicalApprovalV1 {
         approval_id: ClaimId::parse("approval_id", dto.approval_id)?,
         approver_id: ClaimId::parse("approver_id", dto.approver_id)?,
-        plant_dataset_content_id: ClaimId::parse(
-            "plant_dataset_content_id",
+        plant_dataset_content_id: PlantEvidenceDatasetContentId::parse(
             dto.plant_dataset_content_id,
         )?,
         plant_identification_method_id: ClaimId::parse(
@@ -686,6 +766,52 @@ fn residuals_equal(left: FitResidualsV1, right: FitResidualsV1) -> bool {
         && left.right_velocity_rmse_mps.to_bits() == right.right_velocity_rmse_mps.to_bits()
         && left.yaw_rate_rmse_rad_s.to_bits() == right.yaw_rate_rmse_rad_s.to_bits()
         && left.max_abs_velocity_error_mps.to_bits() == right.max_abs_velocity_error_mps.to_bits()
+}
+
+fn parse_canonical_sha256_id(value: &str) -> Option<[u8; SHA256_BYTES]> {
+    let hex = value.strip_prefix("sha256:")?;
+    parse_lower_hex_exact_option(hex)
+}
+
+fn parse_lower_hex_exact(
+    field: &'static str,
+    value: &str,
+) -> Result<[u8; SHA256_BYTES], ActuationConfigParseError> {
+    if value.len() != SHA256_BYTES * 2 {
+        return Err(ActuationConfigParseError::InvalidHexLength {
+            field,
+            expected_digits: SHA256_BYTES * 2,
+            actual_digits: value.len(),
+        });
+    }
+    parse_lower_hex_exact_option(value).ok_or_else(|| {
+        let digit_index = value
+            .bytes()
+            .position(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            .unwrap_or(0);
+        ActuationConfigParseError::InvalidHexDigit { field, digit_index }
+    })
+}
+
+fn parse_lower_hex_exact_option(value: &str) -> Option<[u8; SHA256_BYTES]> {
+    if value.len() != SHA256_BYTES * 2 {
+        return None;
+    }
+    let mut digest = [0_u8; SHA256_BYTES];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = canonical_hex_nibble(pair[0])?;
+        let low = canonical_hex_nibble(pair[1])?;
+        digest[index] = (high << 4) | low;
+    }
+    Some(digest)
+}
+
+const fn canonical_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn parse_hex_exact<const N: usize>(
@@ -742,6 +868,10 @@ mod tests {
 
     const NAVIGATION_BYTES: &[u8] = br#"{"schema":"navigation-fixture"}"#;
 
+    fn dataset_content_id() -> String {
+        format!("sha256:{}", "aa".repeat(32))
+    }
+
     fn physical_model() -> PlantModelV1 {
         PlantModelV1::parse(PlantModelV1Dto {
             schema_version: PLANT_MODEL_V1,
@@ -770,7 +900,7 @@ mod tests {
                 max_abs_lateral_velocity_mps: 0.1,
             },
             evidence: PlantEvidenceV1Dto::ClaimedPhysicalIdentification {
-                dataset_content_id: "sha256:plant".to_string(),
+                dataset_content_id: dataset_content_id(),
                 identification_method_id: "method-v1".to_string(),
                 sample_count: 100,
                 residuals: FitResidualsV1Dto {
@@ -821,7 +951,7 @@ mod tests {
                 max_abs_lateral_velocity_mps: 0.1,
             },
             evidence: PlantEvidenceV1Dto::ClaimedPhysicalIdentification {
-                dataset_content_id: "sha256:plant".to_string(),
+                dataset_content_id: dataset_content_id(),
                 identification_method_id: "method-v1".to_string(),
                 sample_count: 100,
                 residuals: FitResidualsV1Dto {
@@ -838,7 +968,7 @@ mod tests {
         let hash = NavigationConfigSha256::digest(NAVIGATION_BYTES).bytes();
         let hash_hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "robot_id": "kiko-01",
             "command_endpoint": "127.0.0.1:8080",
             "navigation_config_sha256_hex": hash_hex,
@@ -848,10 +978,11 @@ mod tests {
             "actuator_config_fingerprint_hex": "11223344556677889900aabbccddeeff",
             "plant_model_id": "kiko-physical-v1",
             "plant_model_version": 1,
+            "plant_artifact_sha256_hex": "bb".repeat(32),
             "operator_claimed_physical_approval": {
                 "approval_id": "approval-2026-07-18",
                 "approver_id": "operator@example.com",
-                "plant_dataset_content_id": "sha256:plant",
+                "plant_dataset_content_id": dataset_content_id(),
                 "plant_identification_method_id": "method-v1",
                 "plant_sample_count": 100,
                 "plant_fit_residuals": {
@@ -895,6 +1026,57 @@ mod tests {
         assert!(parsed.command_endpoint().socket_addr().ip().is_loopback());
         assert_eq!(parsed.controller_motion_lease().get(), 200);
         assert_eq!(parsed.approval().approval_id(), "approval-2026-07-18");
+        assert_eq!(
+            parsed.approval().plant_dataset_content_id().sha256(),
+            &[0xaa; 32]
+        );
+        assert_eq!(
+            parsed.plant_artifact_content_sha256().as_bytes(),
+            &[0xbb; 32]
+        );
+        assert_ne!(
+            parsed.approval().plant_dataset_content_id().sha256(),
+            parsed.plant_artifact_content_sha256().as_bytes()
+        );
+    }
+
+    #[test]
+    fn legacy_ambiguous_schema_and_noncanonical_hashes_are_rejected() {
+        let mut legacy = valid_json();
+        legacy["schema_version"] = json!(1);
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("plant_artifact_sha256_hex");
+        assert!(matches!(
+            parse(&legacy, physical_model()),
+            Err(ActuationConfigParseError::LegacyAmbiguousPlantBindingSchema)
+        ));
+
+        let mut ambiguous_dataset = valid_json();
+        ambiguous_dataset["operator_claimed_physical_approval"]["plant_dataset_content_id"] =
+            json!("dataset-v1");
+        assert!(matches!(
+            parse(&ambiguous_dataset, physical_model()),
+            Err(ActuationConfigParseError::PlantDatasetContentIdIsNotCanonicalSha256)
+        ));
+
+        let mut uppercase_artifact = valid_json();
+        uppercase_artifact["plant_artifact_sha256_hex"] = json!("BB".repeat(32));
+        assert!(matches!(
+            parse(&uppercase_artifact, physical_model()),
+            Err(ActuationConfigParseError::InvalidHexDigit {
+                field: "plant_artifact_sha256_hex",
+                ..
+            })
+        ));
+
+        let mut reused_digest = valid_json();
+        reused_digest["plant_artifact_sha256_hex"] = json!("aa".repeat(32));
+        assert!(matches!(
+            parse(&reused_digest, physical_model()),
+            Err(ActuationConfigParseError::PlantArtifactDigestReusesDatasetContentId)
+        ));
     }
 
     #[test]

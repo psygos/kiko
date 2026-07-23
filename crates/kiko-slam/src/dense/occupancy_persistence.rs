@@ -40,6 +40,18 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "nano-agent")]
+use std::ffi::OsStr;
+#[cfg(feature = "nano-agent")]
+use std::os::fd::AsFd;
+#[cfg(feature = "nano-agent")]
+use std::path::Component;
+
+#[cfg(feature = "nano-agent")]
+use rustix::fs::{AtFlags, Mode, OFlags, fstat, fsync, openat, renameat, statat, unlinkat};
+#[cfg(feature = "nano-agent")]
+use rustix::io::Errno;
+
 use super::occupancy::{
     HeightRangeError, HeightRangeMeters, OccupancyGridGeometry, OccupancyGridGeometryError,
     OccupancyGridSnapshot, WorldToOccupancy, WorldToOccupancyError,
@@ -338,6 +350,7 @@ pub enum OccupancyMapSaveOperation {
     WriteTemporary,
     SyncTemporary,
     PublishRename,
+    InspectPublishedDestination,
     OpenParentDirectory,
     SyncParentDirectory,
 }
@@ -349,6 +362,7 @@ impl fmt::Display for OccupancyMapSaveOperation {
             Self::WriteTemporary => "write temporary file",
             Self::SyncTemporary => "sync temporary file",
             Self::PublishRename => "publish temporary file",
+            Self::InspectPublishedDestination => "inspect published destination",
             Self::OpenParentDirectory => "open parent directory after publication",
             Self::SyncParentDirectory => "sync parent directory after publication",
         };
@@ -776,6 +790,13 @@ impl fmt::Display for OccupancyReplayBindError {
 
 impl std::error::Error for OccupancyReplayBindError {}
 
+/// Returns the exact encoded length without allocating an encoded buffer.
+pub fn occupancy_map_encoded_len(
+    snapshot: &OccupancyGridSnapshot,
+) -> Result<usize, OccupancyMapEncodeError> {
+    encoded_parts(snapshot).map(|parts| parts.encoded_len)
+}
+
 /// Encodes one snapshot without platform-dependent padding or byte order.
 pub fn encode_occupancy_map(
     snapshot: &OccupancyGridSnapshot,
@@ -907,6 +928,212 @@ pub fn save_occupancy_map_atomic(
     })
 }
 
+/// Production-only descriptor-relative form of [`save_occupancy_map_atomic`].
+///
+/// `parent` must be the already-admitted destination directory. Every mutable
+/// filesystem operation remains relative to that one retained descriptor, so
+/// replacing the pathname used to obtain it cannot redirect publication or
+/// make the final durability sync target a different directory.
+#[cfg(feature = "nano-agent")]
+pub(crate) fn save_occupancy_map_atomic_at(
+    parent: impl AsFd,
+    file_name: &OsStr,
+    destination: &Path,
+    snapshot: &OccupancyGridSnapshot,
+) -> Result<(), OccupancyMapSaveError> {
+    let mut components = Path::new(file_name).components();
+    let is_simple_file_name =
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+    if destination.file_name() != Some(file_name) || !is_simple_file_name {
+        return Err(OccupancyMapSaveError::InvalidDestination {
+            path: destination.to_path_buf(),
+        });
+    }
+
+    let parts = encoded_parts(snapshot)?;
+    let mut temporary = None;
+    for _ in 0..TEMP_CREATE_ATTEMPTS {
+        let nonce = NEXT_TEMPORARY_FILE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(file_name);
+        temporary_name.push(format!(".kiko-map.{}.{}.tmp", std::process::id(), nonce));
+        let temporary_path = destination.with_file_name(&temporary_name);
+        match openat(
+            parent.as_fd(),
+            &temporary_name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(file) => {
+                temporary = Some((temporary_name, temporary_path, file));
+                break;
+            }
+            Err(Errno::EXIST) => {}
+            Err(source) => {
+                return Err(OccupancyMapSaveError::Io(OccupancyMapSaveIoError {
+                    operation: OccupancyMapSaveOperation::CreateTemporary,
+                    destination: destination.to_path_buf(),
+                    temporary_path: Some(temporary_path),
+                    published: false,
+                    source: errno_as_io(source),
+                    cleanup_error: None,
+                }));
+            }
+        }
+    }
+    let Some((temporary_name, temporary_path, temporary_fd)) = temporary else {
+        return Err(OccupancyMapSaveError::TemporaryNameCollisions {
+            destination: destination.to_path_buf(),
+            attempts: TEMP_CREATE_ATTEMPTS,
+        });
+    };
+
+    let temporary_identity = fstat(&temporary_fd).map_err(|source| {
+        descriptor_save_error_with_cleanup(
+            parent.as_fd(),
+            &temporary_name,
+            OccupancyMapSaveOperation::CreateTemporary,
+            destination,
+            &temporary_path,
+            errno_as_io(source),
+        )
+    })?;
+    let mut temporary_file: File = temporary_fd.into();
+    if let Err(source) = temporary_file
+        .write_all(&parts.header)
+        .and_then(|()| temporary_file.write_all(parts.cells))
+        .and_then(|()| temporary_file.write_all(&parts.checksum.to_le_bytes()))
+    {
+        return Err(descriptor_save_error_with_cleanup(
+            parent.as_fd(),
+            &temporary_name,
+            OccupancyMapSaveOperation::WriteTemporary,
+            destination,
+            &temporary_path,
+            source,
+        ));
+    }
+    if let Err(source) = temporary_file.sync_all() {
+        return Err(descriptor_save_error_with_cleanup(
+            parent.as_fd(),
+            &temporary_name,
+            OccupancyMapSaveOperation::SyncTemporary,
+            destination,
+            &temporary_path,
+            source,
+        ));
+    }
+    let synchronized_identity = fstat(temporary_file.as_fd()).map_err(|source| {
+        descriptor_save_error_with_cleanup(
+            parent.as_fd(),
+            &temporary_name,
+            OccupancyMapSaveOperation::SyncTemporary,
+            destination,
+            &temporary_path,
+            errno_as_io(source),
+        )
+    })?;
+    if synchronized_identity.st_dev != temporary_identity.st_dev
+        || synchronized_identity.st_ino != temporary_identity.st_ino
+        || synchronized_identity.st_nlink != 1
+    {
+        return Err(descriptor_save_error_with_cleanup(
+            parent.as_fd(),
+            &temporary_name,
+            OccupancyMapSaveOperation::SyncTemporary,
+            destination,
+            &temporary_path,
+            io::Error::other("temporary occupancy identity changed before publication"),
+        ));
+    }
+
+    if let Err(source) = renameat(parent.as_fd(), &temporary_name, parent.as_fd(), file_name) {
+        return Err(descriptor_save_error_with_cleanup(
+            parent.as_fd(),
+            &temporary_name,
+            OccupancyMapSaveOperation::PublishRename,
+            destination,
+            &temporary_path,
+            errno_as_io(source),
+        ));
+    }
+    let require_published_identity = || -> Result<(), OccupancyMapSaveError> {
+        let published =
+            statat(parent.as_fd(), file_name, AtFlags::SYMLINK_NOFOLLOW).map_err(|source| {
+                descriptor_post_publish_error(
+                    OccupancyMapSaveOperation::InspectPublishedDestination,
+                    destination,
+                    errno_as_io(source),
+                )
+            })?;
+        if published.st_dev != temporary_identity.st_dev
+            || published.st_ino != temporary_identity.st_ino
+        {
+            return Err(descriptor_post_publish_error(
+                OccupancyMapSaveOperation::InspectPublishedDestination,
+                destination,
+                io::Error::other("published occupancy identity changed"),
+            ));
+        }
+        Ok(())
+    };
+    require_published_identity()?;
+    fsync(parent.as_fd()).map_err(|source| {
+        descriptor_post_publish_error(
+            OccupancyMapSaveOperation::SyncParentDirectory,
+            destination,
+            errno_as_io(source),
+        )
+    })?;
+    require_published_identity()?;
+    drop(temporary_file);
+    Ok(())
+}
+
+#[cfg(feature = "nano-agent")]
+fn descriptor_save_error_with_cleanup(
+    parent: impl AsFd,
+    temporary_name: &OsStr,
+    operation: OccupancyMapSaveOperation,
+    destination: &Path,
+    temporary_path: &Path,
+    source: io::Error,
+) -> OccupancyMapSaveError {
+    let cleanup_error = match unlinkat(parent.as_fd(), temporary_name, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => None,
+        Err(error) => Some(errno_as_io(error)),
+    };
+    OccupancyMapSaveError::Io(OccupancyMapSaveIoError {
+        operation,
+        destination: destination.to_path_buf(),
+        temporary_path: Some(temporary_path.to_path_buf()),
+        published: false,
+        source,
+        cleanup_error,
+    })
+}
+
+#[cfg(feature = "nano-agent")]
+fn descriptor_post_publish_error(
+    operation: OccupancyMapSaveOperation,
+    destination: &Path,
+    source: io::Error,
+) -> OccupancyMapSaveError {
+    OccupancyMapSaveError::Io(OccupancyMapSaveIoError {
+        operation,
+        destination: destination.to_path_buf(),
+        temporary_path: None,
+        published: true,
+        source,
+        cleanup_error: None,
+    })
+}
+
+#[cfg(feature = "nano-agent")]
+fn errno_as_io(source: Errno) -> io::Error {
+    io::Error::from_raw_os_error(source.raw_os_error())
+}
+
 /// Loads a regular file with a metadata size check before cell allocation.
 pub fn load_occupancy_map(
     path: impl AsRef<Path>,
@@ -930,16 +1157,26 @@ pub fn load_occupancy_map(
             path: path.to_path_buf(),
         });
     }
-    let encoded_len = usize::try_from(metadata.len()).map_err(|_| {
+    load_occupancy_map_from_reader(&mut file, metadata.len(), path, limits)
+}
+
+fn load_occupancy_map_from_reader(
+    reader: &mut impl Read,
+    encoded_bytes: u64,
+    path: &Path,
+    limits: OccupancyMapLimits,
+) -> Result<OccupancyGridSnapshot, OccupancyMapLoadError> {
+    let encoded_len = usize::try_from(encoded_bytes).map_err(|_| {
         OccupancyMapLoadError::FileLengthNotAddressable {
             path: path.to_path_buf(),
-            bytes: metadata.len(),
+            bytes: encoded_bytes,
         }
     })?;
     validate_boundary_length(encoded_len, limits)?;
 
     let mut header = [0_u8; OCCUPANCY_MAP_HEADER_BYTES];
-    file.read_exact(&mut header)
+    reader
+        .read_exact(&mut header)
         .map_err(|source| OccupancyMapLoadError::Io {
             operation: OccupancyMapLoadOperation::ReadHeader,
             path: path.to_path_buf(),
@@ -956,7 +1193,7 @@ pub fn load_occupancy_map(
     })?;
     let cell_read_limit = u64::try_from(cells_len)
         .map_err(|_| OccupancyMapDecodeError::EncodedLengthOverflow { cells: cells_len })?;
-    let cells_read = (&mut file)
+    let cells_read = (&mut *reader)
         .take(cell_read_limit)
         .read_to_end(&mut cells)
         .map_err(|source| OccupancyMapLoadError::Io {
@@ -972,7 +1209,8 @@ pub fn load_occupancy_map(
         .into());
     }
     let mut checksum_bytes = [0_u8; OCCUPANCY_MAP_CHECKSUM_BYTES];
-    file.read_exact(&mut checksum_bytes)
+    reader
+        .read_exact(&mut checksum_bytes)
         .map_err(|source| OccupancyMapLoadError::Io {
             operation: OccupancyMapLoadOperation::ReadChecksum,
             path: path.to_path_buf(),
@@ -980,7 +1218,7 @@ pub fn load_occupancy_map(
         })?;
     let stored_checksum = u32::from_le_bytes(checksum_bytes);
     let mut trailing = [0_u8; 1];
-    let trailing_len = file
+    let trailing_len = reader
         .read(&mut trailing)
         .map_err(|source| OccupancyMapLoadError::Io {
             operation: OccupancyMapLoadOperation::CheckEndOfFile,
@@ -1005,6 +1243,21 @@ pub fn load_persisted_occupancy_map(
     limits: OccupancyMapLimits,
 ) -> Result<PersistedOccupancyMap, OccupancyMapLoadError> {
     load_occupancy_map(path, limits).map(PersistedOccupancyMap::from_decoded)
+}
+
+/// Parse one already-opened, length-admitted occupancy stream exactly once.
+///
+/// The caller owns descriptor admission and may wrap `reader` to bind a digest
+/// to the exact bytes consumed by this parser. No pathname is reopened.
+#[cfg(feature = "nano-agent")]
+pub(crate) fn load_persisted_occupancy_map_from_reader(
+    reader: &mut impl Read,
+    encoded_bytes: u64,
+    diagnostic_path: &Path,
+    limits: OccupancyMapLimits,
+) -> Result<PersistedOccupancyMap, OccupancyMapLoadError> {
+    load_occupancy_map_from_reader(reader, encoded_bytes, diagnostic_path, limits)
+        .map(PersistedOccupancyMap::from_decoded)
 }
 
 fn verify_exact_replay(
@@ -1484,6 +1737,8 @@ fn read_f64(input: &[u8], offset: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(feature = "nano-agent")]
+    use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -2153,6 +2408,42 @@ mod tests {
         let loaded = load_occupancy_map(&destination, limits(48)).expect("load replacement map");
         assert_exact_snapshot(&replacement, &loaded);
         assert_no_temporary_files(directory.path());
+    }
+
+    #[test]
+    #[cfg(feature = "nano-agent")]
+    fn descriptor_relative_save_cannot_be_redirected_by_parent_path_replacement() {
+        let directory = TestDirectory::create("descriptor-parent-replacement");
+        let configured_parent = directory.path().join("maps");
+        let retained_parent_path = directory.path().join("maps-retained");
+        let attacker_parent = directory.path().join("maps-attacker");
+        fs::create_dir(&configured_parent).expect("configured map parent");
+        fs::create_dir(&attacker_parent).expect("attacker map parent");
+        let retained_parent = File::open(&configured_parent).expect("retained map parent");
+        fs::rename(&configured_parent, &retained_parent_path).expect("move retained map parent");
+        symlink(&attacker_parent, &configured_parent)
+            .expect("replace configured parent by symlink");
+
+        let snapshot = fixture(4, 3, 73);
+        let configured_destination = configured_parent.join("current.kmap");
+        save_occupancy_map_atomic_at(
+            &retained_parent,
+            OsStr::new("current.kmap"),
+            &configured_destination,
+            &snapshot,
+        )
+        .expect("descriptor-relative save");
+
+        assert_eq!(
+            fs::read(retained_parent_path.join("current.kmap")).expect("retained publication"),
+            encode_occupancy_map(&snapshot).expect("expected encoded map")
+        );
+        assert!(
+            !attacker_parent.join("current.kmap").exists(),
+            "the replacement pathname must never receive publication"
+        );
+        assert_no_temporary_files(&retained_parent_path);
+        assert_no_temporary_files(&attacker_parent);
     }
 
     #[test]

@@ -5,6 +5,8 @@ use std::num::NonZeroUsize;
 use super::occupancy::{
     OccupancyConfig, OccupancyError, OccupancyGridSnapshot, OccupancyMapper, OccupancyRemoveOutcome,
 };
+#[cfg(any(feature = "nano-agent", test))]
+use super::occupancy_persistence::ReplayMatchedOccupancyMap;
 use super::{DenseCommand, DenseCommandReceiver, DenseStats, ReconState};
 use crate::{DropSender, SendOutcome, Timestamp};
 
@@ -190,6 +192,27 @@ impl OccupancyRuntime {
         &self.mapper
     }
 
+    /// Transition an exactly replay-matched map into live publication state.
+    ///
+    /// Replay commands were intentionally processed with publication disabled.
+    /// Consuming the match proof both supplies the persisted cell buffer for
+    /// the first publication and clears replay-only cadence/dirty bookkeeping,
+    /// so the continued worker neither emits a duplicate final snapshot nor
+    /// charges historical integrations against the first live cadence.
+    #[cfg(any(feature = "nano-agent", test))]
+    pub(crate) fn continue_from_replay_match(
+        &mut self,
+        timestamp: Timestamp,
+        matched: ReplayMatchedOccupancyMap,
+    ) -> TimedOccupancySnapshot {
+        self.successful_integrations_since_snapshot = 0;
+        self.dirty_timestamp = None;
+        TimedOccupancySnapshot {
+            timestamp,
+            snapshot: matched.into_snapshot(),
+        }
+    }
+
     pub fn process(
         &mut self,
         command: DenseCommand,
@@ -346,12 +369,30 @@ pub fn run_occupancy_worker(
     config: OccupancyRuntimeConfig,
     command_rx: &DenseCommandReceiver,
     stats_tx: Option<&DropSender<DenseStats>>,
+    snapshot_tx: Option<DropSender<TimedOccupancySnapshot>>,
+) -> Result<(), OccupancyRuntimeError> {
+    let runtime = OccupancyRuntime::try_new(config).map_err(OccupancyRuntimeError::Mapping)?;
+    run_occupancy_worker_from_runtime(runtime, None, command_rx, stats_tx, snapshot_tx)
+}
+
+/// Continue an exactly replayed occupancy owner instead of constructing a
+/// fresh empty mapper. The optional initial snapshot is published before any
+/// live command can mutate that owner.
+pub fn run_occupancy_worker_from_runtime(
+    mut runtime: OccupancyRuntime,
+    initial_snapshot: Option<TimedOccupancySnapshot>,
+    command_rx: &DenseCommandReceiver,
+    stats_tx: Option<&DropSender<DenseStats>>,
     mut snapshot_tx: Option<DropSender<TimedOccupancySnapshot>>,
 ) -> Result<(), OccupancyRuntimeError> {
-    let mut runtime = OccupancyRuntime::try_new(config).map_err(OccupancyRuntimeError::Mapping)?;
     let mut deferred_snapshot_error = None;
     if let Some(sender) = stats_tx {
         let _ = sender.try_send(runtime.stats());
+    }
+    if let (Some(sender), Some(snapshot)) = (snapshot_tx.as_ref(), initial_snapshot)
+        && matches!(sender.try_send(snapshot), SendOutcome::Disconnected)
+    {
+        snapshot_tx = None;
     }
 
     while let Ok(command) = command_rx.recv() {
@@ -427,6 +468,10 @@ mod tests {
     use super::super::occupancy::{
         DepthCameraModel, DepthRangeMeters, DepthToTrackingCamera, HeightRangeMeters,
         OccupancyEvidenceModel, OccupancyGridGeometry, WorldToOccupancy,
+    };
+    use super::super::occupancy_persistence::{
+        OccupancyMapLimits, ReplayOccupancyEvidence, decode_persisted_occupancy_map,
+        encode_occupancy_map,
     };
 
     fn runtime_config(cadence: usize) -> OccupancyRuntimeConfig {
@@ -579,6 +624,67 @@ mod tests {
                 .snapshot
                 .is_none(),
             "one integration after a final snapshot must not inherit the previous cadence count"
+        );
+    }
+
+    #[test]
+    fn replay_match_becomes_the_only_initial_publication_and_resets_cadence() {
+        let mut map = SlamMap::new();
+        let keyframe_id = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                WorldToCamera::identity(),
+                ImageSize::try_new(1, 1).expect("test image size"),
+                vec![Keypoint { x: 0.0, y: 0.0 }],
+            )
+            .expect("test keyframe");
+        let replay_map = map.snapshot();
+        let mut runtime = OccupancyRuntime::try_new(runtime_config(8)).expect("runtime");
+        runtime
+            .process(integrate(keyframe_id, 10), false)
+            .expect("replay integration");
+
+        let replay_snapshot = runtime.mapper().snapshot().expect("replay snapshot");
+        let persisted_bytes = encode_occupancy_map(&replay_snapshot).expect("persisted encoding");
+        let persisted = decode_persisted_occupancy_map(
+            &persisted_bytes,
+            OccupancyMapLimits::try_new(36).expect("map limits"),
+        )
+        .expect("persisted map");
+        let evidence = ReplayOccupancyEvidence::try_new(replay_map, replay_snapshot)
+            .expect("matching sparse and occupancy replay");
+        let matched = persisted
+            .verify_replay_and_bind(evidence)
+            .expect("exact replay match");
+        let initial = runtime.continue_from_replay_match(Timestamp::from_nanos(10), matched);
+
+        let (command_tx, command_rx, _) = dense_command_channel(
+            ChannelCapacity::try_from(1_usize).expect("data capacity"),
+            ChannelCapacity::try_from(1_usize).expect("control capacity"),
+            Duration::from_millis(1),
+        )
+        .expect("command channel");
+        drop(command_tx);
+        let (snapshot_tx, snapshot_rx, _) = bounded_channel(
+            ChannelCapacity::try_from(2_usize).expect("snapshot capacity"),
+            DropPolicy::DropOldest,
+        );
+        run_occupancy_worker_from_runtime(
+            runtime,
+            Some(initial),
+            &command_rx,
+            None,
+            Some(snapshot_tx),
+        )
+        .expect("continued worker");
+
+        let published = snapshot_rx.try_recv().expect("initial publication");
+        assert_eq!(published.timestamp(), Timestamp::from_nanos(10));
+        assert_eq!(published.snapshot().metadata().revision(), 1);
+        assert!(
+            snapshot_rx.try_recv().is_err(),
+            "replay state must not be emitted again by worker finalization"
         );
     }
 

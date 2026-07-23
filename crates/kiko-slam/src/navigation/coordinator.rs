@@ -1005,6 +1005,11 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         self.motion_mode
     }
 
+    #[cfg(all(test, feature = "agent-runtime", feature = "actuation"))]
+    pub(crate) fn exhaust_motion_mode_generation_for_test(&mut self) {
+        self.motion_mode_generation = u64::MAX;
+    }
+
     /// Enter manual reference mode after a separately evidenced zero handover.
     #[allow(
         dead_code,
@@ -1134,6 +1139,52 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
 
     pub fn current_map_binding(&self) -> Option<CurrentMapEpochBinding> {
         self.current_map.map(|current| current.binding)
+    }
+
+    /// Evaluate the exact sensor-side prerequisites for granting new motion
+    /// authority at `now`.
+    ///
+    /// This is deliberately stricter than checking whether a stream has ever
+    /// produced a sample. It applies the configured odometry prediction/host
+    /// age bounds and the configured local-depth age/alignment bound without
+    /// mutating coordinator state. Goal, path, mode, supervisor, and
+    /// controller checks remain separate typed gates owned by their existing
+    /// layers.
+    pub fn motion_start_readiness_at(
+        &self,
+        now: HostMonotonicTimestamp,
+    ) -> Result<(), CoordinatorTickBlocker> {
+        if self.latch.is_some() {
+            return Err(CoordinatorTickBlocker::JournalLatched);
+        }
+        if let Some(blocker) = self.direct_preflight_blocker() {
+            return Err(blocker);
+        }
+        self.estimate_state_at(now)?;
+        let expected_depth = match self.depth_readiness {
+            DepthReadiness::Current(frame) => frame,
+            DepthReadiness::NoObservation => {
+                return Err(CoordinatorTickBlocker::DepthUnavailable);
+            }
+            DepthReadiness::Unaligned { .. } | DepthReadiness::Rejected { .. } => {
+                return Err(CoordinatorTickBlocker::DepthUnaligned);
+            }
+        };
+        match self.local_costmap.view_at(now) {
+            Ok(view)
+                if view.freshness().is_current()
+                    && view
+                        .provenance()
+                        .is_some_and(|provenance| provenance.frame() == expected_depth) =>
+            {
+                Ok(())
+            }
+            Ok(view) if view.freshness().is_current() => {
+                Err(CoordinatorTickBlocker::DepthUnaligned)
+            }
+            Ok(_) => Err(CoordinatorTickBlocker::LocalCostmapExpired),
+            Err(source) => Err(CoordinatorTickBlocker::LocalCostmapClock(source)),
+        }
     }
 
     /// Bind the freshest admitted robot pose to this exact immutable global

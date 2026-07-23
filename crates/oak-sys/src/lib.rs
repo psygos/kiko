@@ -2706,14 +2706,12 @@ mod tests {
             13.0
         );
         let component = f32::MAX / 4.0;
-        assert!(
-            Vec3 {
-                x: component,
-                y: component,
-                z: component,
-            }
-            .magnitude()
-            .is_finite()
-        );
+        assert!(Vec3 {
+            x: component,
+            y: component,
+            z: component,
+        }
+        .magnitude()
+        .is_finite());
     }
 }

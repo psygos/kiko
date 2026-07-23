@@ -21,7 +21,7 @@ use robot_command_client::{
 use super::actuation::LiveActuationError;
 use super::{
     ActuationAdmissionError, AdmittedNavigationActuationConfigV1, DisarmedNanoStartupParts,
-    LiveMpcControlDriver, NanoAgentPolicyConfigV1, NanoStartupAdmissionError,
+    LiveMpcControlDriver, NanoAgentPolicyConfigV3, NanoStartupAdmissionError,
     NanoStartupSupervisorError, NavigationActuationConfigV1, NavigationClockEpoch,
     PendingLiveMpcAdmissionError, PendingLiveMpcControlDriver, ProductionObservedDeviceInventoryV1,
 };
@@ -134,7 +134,7 @@ impl PreparedNanoProductionRuntime {
     /// so every failure from this point explicitly consumes it through a stop.
     #[allow(clippy::too_many_arguments)]
     pub fn admit(
-        policy: NanoAgentPolicyConfigV1,
+        policy: NanoAgentPolicyConfigV3,
         loaded_manifest: LoadedExpectedManifestV1,
         artifact_hashes: ManifestArtifactHashes,
         observed_inventory: ProductionObservedDeviceInventoryV1,
@@ -183,6 +183,15 @@ impl PreparedNanoProductionRuntime {
 
     pub const fn initial_zero(&self) -> &AppliedCommandReceipt {
         &self.initial_zero
+    }
+
+    /// Consume an admitted runtime before a live owner has been constructed.
+    ///
+    /// This is the only truthful post-bootstrap cancellation path: the exact
+    /// controller session is explicitly disarmed and its receipt or stop
+    /// uncertainty is returned to the launch owner.
+    pub fn abort_before_owner(mut self) -> Result<DisarmReceipt, LiveActuationError> {
+        self.physical_driver.disarm()
     }
 
     pub fn into_parts(self) -> PreparedNanoProductionRuntimeParts {
@@ -458,7 +467,7 @@ type PrepareWithPendingControllerResult<Pending> = Result<
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_with_pending_controller<Pending>(
-    policy: NanoAgentPolicyConfigV1,
+    policy: NanoAgentPolicyConfigV3,
     loaded_manifest: LoadedExpectedManifestV1,
     artifact_hashes: ManifestArtifactHashes,
     observed_inventory: ObservedDeviceInventoryV1,
@@ -640,6 +649,7 @@ mod tests {
     const NAVIGATION_BYTES: &[u8] = b"production navigation config";
     const CALIBRATION_BYTES: &[u8] = b"production calibration";
     const PLANT_BYTES: &[u8] = b"production physical plant dataset";
+    const PLANT_EVIDENCE_DATASET_BYTES: &[u8] = b"distinct production physical evidence dataset";
     const RESPONSE_DELAY: Duration = Duration::from_millis(1);
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -688,20 +698,28 @@ mod tests {
                 .expect("no-follow artifact hashes")
         }
 
-        fn policy(&self) -> NanoAgentPolicyConfigV1 {
+        fn policy(&self) -> NanoAgentPolicyConfigV3 {
             let socket_path = PathBuf::from(format!(
                 "/tmp/kiko-npa-{}-{}.sock",
                 std::process::id(),
                 self.sequence
             ));
             let encoded = serde_json::to_vec(&json!({
-                "schema_version": 1,
+                "schema_version": 3,
                 "control": {
                     "socket_path": socket_path,
                     "read_timeout_ms": 100,
                     "write_timeout_ms": 100,
                     "runtime_response_timeout_ms": 500,
-                    "runtime_queue_capacity": 8
+                    "terminal_response_timeout_ms": 300000,
+                    "runtime_queue_capacity": 8,
+                    "operator_console": {
+                        "bind_address": "127.0.0.1:9877",
+                        "capability_path": socket_path.with_extension("capability"),
+                        "deadman_tick_ms": 20,
+                        "manual_command_forward_mm_per_s": 100,
+                        "manual_command_yaw_millirad_per_s": 500
+                    }
                 },
                 "inventory": {
                     "manifest_path": self.manifest_path,
@@ -738,7 +756,7 @@ mod tests {
                 }
             }))
             .expect("policy JSON");
-            NanoAgentPolicyConfigV1::parse_json(&encoded).expect("parsed policy")
+            NanoAgentPolicyConfigV3::parse_json(&encoded).expect("parsed policy")
         }
     }
 
@@ -878,7 +896,7 @@ mod tests {
                 max_abs_lateral_velocity_mps: 0.1,
             },
             evidence: PlantEvidenceV1Dto::ClaimedPhysicalIdentification {
-                dataset_content_id: canonical_sha256_id(PLANT_BYTES),
+                dataset_content_id: canonical_sha256_id(PLANT_EVIDENCE_DATASET_BYTES),
                 identification_method_id: "method-v1".into(),
                 sample_count: 100,
                 residuals: FitResidualsV1Dto {
@@ -898,7 +916,7 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let encoded = serde_json::to_vec(&json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "robot_id": ROBOT_ID,
             "command_endpoint": endpoint,
             "navigation_config_sha256_hex": navigation_sha256,
@@ -908,10 +926,14 @@ mod tests {
             "actuator_config_fingerprint_hex": "22222222222222222222222222222222",
             "plant_model_id": "kiko-physical-v1",
             "plant_model_version": 1,
+            "plant_artifact_sha256_hex": sha256(PLANT_BYTES)
+                .into_iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
             "operator_claimed_physical_approval": {
                 "approval_id": "approval-v1",
                 "approver_id": "operator@example.com",
-                "plant_dataset_content_id": canonical_sha256_id(PLANT_BYTES),
+                "plant_dataset_content_id": canonical_sha256_id(PLANT_EVIDENCE_DATASET_BYTES),
                 "plant_identification_method_id": "method-v1",
                 "plant_sample_count": 100,
                 "plant_fit_residuals": {

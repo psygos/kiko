@@ -287,7 +287,8 @@ pub struct ObservedHoldConfigInput {
 
 /// Weak fields for one explicitly reviewed return-to-target transaction.
 /// Start windows, target, and travel limits are all in canonical
-/// bow/curl/yaw/roll order.
+/// bow/curl/yaw/roll order. Post-return ownership lifetime is deliberately not
+/// part of this transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReturnToTargetConfigInput {
     pub write_timeout_ms: u64,
@@ -308,7 +309,6 @@ pub struct ReturnToTargetConfigInput {
     pub maximum_start_ticks: [u16; 4],
     pub target_ticks: [u16; 4],
     pub maximum_travel_ticks: [u16; 4],
-    pub maximum_hold_ms: u64,
 }
 
 /// Fully parsed target and structural travel bounds. Timing of the motion
@@ -389,12 +389,15 @@ impl HeadReturnPlan {
 }
 
 /// Parsed return transaction derived from one already parsed probe boundary.
+///
+/// This type contains no hold lease or duration. A caller may retain the
+/// returned actor continuously or apply its own separately typed lifetime
+/// policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReturnToTargetConfig {
     runtime: HeadRuntimeConfig,
     start_bounds: ConfiguredHeadPoseBounds,
     plan: HeadReturnPlan,
-    maximum_duration: Duration,
 }
 
 impl ReturnToTargetConfig {
@@ -474,13 +477,6 @@ impl ReturnToTargetConfig {
                 }
             }
         }
-        if !(1..=MAX_HOLD_DURATION_MS).contains(&input.maximum_hold_ms) {
-            return Err(ReturnToTargetConfigParseError::DurationOutOfRange {
-                milliseconds: input.maximum_hold_ms,
-                minimum_ms: 1,
-                maximum_ms: MAX_HOLD_DURATION_MS,
-            });
-        }
         let runtime = HeadRuntimeConfig::parse_tuning(
             probe.device.clone(),
             probe.response_timeout,
@@ -508,7 +504,6 @@ impl ReturnToTargetConfig {
                 direction_regression_tolerance,
                 final_sample_tolerance,
             },
-            maximum_duration: Duration::from_millis(input.maximum_hold_ms),
         })
     }
 
@@ -534,10 +529,6 @@ impl ReturnToTargetConfig {
         self,
     ) -> (HeadRuntimeConfig, ConfiguredHeadPoseBounds, HeadReturnPlan) {
         (self.runtime, self.start_bounds, self.plan)
-    }
-
-    pub const fn maximum_duration(&self) -> Duration {
-        self.maximum_duration
     }
 }
 
@@ -572,11 +563,6 @@ pub enum ReturnToTargetConfigParseError {
         tolerance_ticks: u16,
         maximum_travel_ticks: u16,
     },
-    DurationOutOfRange {
-        milliseconds: u64,
-        minimum_ms: u64,
-        maximum_ms: u64,
-    },
 }
 
 impl fmt::Display for ReturnToTargetConfigParseError {
@@ -598,8 +584,7 @@ impl std::error::Error for ReturnToTargetConfigParseError {
             Self::InvalidMaximumTravel { .. }
             | Self::TravelAboveMaximum { .. }
             | Self::ToleranceOrdering { .. }
-            | Self::ToleranceAboveTravel { .. }
-            | Self::DurationOutOfRange { .. } => None,
+            | Self::ToleranceAboveTravel { .. } => None,
         }
     }
 }
@@ -1164,7 +1149,6 @@ mod tests {
             maximum_start_ticks: [2_518, 2_932, 2_919, 2_919],
             target_ticks: [2_155, 2_545, 2_943, 2_876],
             maximum_travel_ticks: [400, 400, 64, 64],
-            maximum_hold_ms: 900_000,
         }
     }
 
@@ -1265,16 +1249,6 @@ mod tests {
                     ..
                 }
             ))
-        ));
-
-        let mut input = valid_return_input();
-        input.maximum_hold_ms = 0;
-        assert!(matches!(
-            ReturnToTargetConfig::parse(&probe, input),
-            Err(ReturnToTargetConfigParseError::DurationOutOfRange {
-                milliseconds: 0,
-                ..
-            })
         ));
 
         let mut input = valid_return_input();

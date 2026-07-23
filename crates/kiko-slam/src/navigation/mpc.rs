@@ -9,6 +9,7 @@ use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 
 use robot_protocol::{PwmPercent, PwmPercentError};
+use serde::Deserialize;
 
 use crate::{DeviceSessionId, HostMonotonicTimestamp, MapSnapshot};
 
@@ -138,7 +139,10 @@ impl fmt::Display for IdentifierError {
 }
 impl std::error::Error for IdentifierError {}
 
-#[derive(Clone, Debug, PartialEq)]
+pub const MAX_PLANT_MODEL_JSON_BYTES: usize = 64 * 1_024;
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlantModelV1Dto {
     pub schema_version: u32,
     pub model_id: String,
@@ -151,7 +155,8 @@ pub struct PlantModelV1Dto {
     pub evidence: PlantEvidenceV1Dto,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WheelPlantV1Dto {
     /// Signed steady velocity gain in m/s per canonical PWM percent.
     /// The sign captures motor wiring; no separate channel convention exists.
@@ -159,7 +164,8 @@ pub struct WheelPlantV1Dto {
     pub time_constant_s: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlantValidityEnvelopeV1Dto {
     pub left_pwm_min_percent: i8,
     pub left_pwm_max_percent: i8,
@@ -169,19 +175,24 @@ pub struct PlantValidityEnvelopeV1Dto {
     pub left_velocity_max_mps: f64,
     pub right_velocity_min_mps: f64,
     pub right_velocity_max_mps: f64,
+    #[serde(rename = "maximum_absolute_yaw_rate_rad_per_sec")]
     pub max_abs_yaw_rate_rad_s: f64,
+    #[serde(rename = "maximum_absolute_lateral_velocity_m_per_sec")]
     pub max_abs_lateral_velocity_mps: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FitResidualsV1Dto {
     pub left_velocity_rmse_mps: f64,
     pub right_velocity_rmse_mps: f64,
     pub yaw_rate_rmse_rad_s: f64,
+    #[serde(rename = "maximum_absolute_velocity_error_mps")]
     pub max_abs_velocity_error_mps: f64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlantEvidenceV1Dto {
     SyntheticFixture {
         fixture_id: String,
@@ -267,6 +278,25 @@ pub struct PlantModelV1 {
 }
 
 impl PlantModelV1 {
+    /// Parse one bounded canonical plant artifact.
+    ///
+    /// This is the same domain constructor used by MPC. Deployment code must
+    /// pass the returned model to navigation binding instead of treating a
+    /// digest of arbitrary bytes as plant-model evidence.
+    pub fn parse_json(bytes: &[u8]) -> Result<Self, PlantModelJsonParseError> {
+        if bytes.len() > MAX_PLANT_MODEL_JSON_BYTES {
+            return Err(PlantModelJsonParseError::InputTooLarge {
+                actual_bytes: bytes.len(),
+                maximum_bytes: MAX_PLANT_MODEL_JSON_BYTES,
+            });
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        let dto = PlantModelV1Dto::deserialize(&mut deserializer)
+            .map_err(PlantModelJsonParseError::Json)?;
+        deserializer.end().map_err(PlantModelJsonParseError::Json)?;
+        Self::parse(dto).map_err(PlantModelJsonParseError::Domain)
+    }
+
     pub fn parse(dto: PlantModelV1Dto) -> Result<Self, PlantModelParseError> {
         if dto.schema_version != PLANT_MODEL_V1 {
             return Err(PlantModelParseError::UnsupportedSchemaVersion(
@@ -410,6 +440,42 @@ impl PlantModelV1 {
     }
     pub fn evidence(self) -> PlantEvidenceV1 {
         self.evidence
+    }
+}
+
+#[derive(Debug)]
+pub enum PlantModelJsonParseError {
+    InputTooLarge {
+        actual_bytes: usize,
+        maximum_bytes: usize,
+    },
+    Json(serde_json::Error),
+    Domain(PlantModelParseError),
+}
+
+impl fmt::Display for PlantModelJsonParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InputTooLarge {
+                actual_bytes,
+                maximum_bytes,
+            } => write!(
+                formatter,
+                "plant-model JSON is {actual_bytes} bytes; maximum is {maximum_bytes}"
+            ),
+            Self::Json(source) => write!(formatter, "invalid plant-model JSON: {source}"),
+            Self::Domain(source) => write!(formatter, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for PlantModelJsonParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Json(source) => Some(source),
+            Self::Domain(source) => Some(source),
+            Self::InputTooLarge { .. } => None,
+        }
     }
 }
 
@@ -846,6 +912,27 @@ impl MpcConfigV1 {
     }
     pub fn max_rollout_evaluations(self) -> u64 {
         self.evaluation_limit
+    }
+
+    /// Exact controller-domain bounds which every selected left command must
+    /// satisfy. These are exposed for binding a parsed MPC policy to the
+    /// independently admitted firmware envelope before physical authority is
+    /// granted.
+    pub const fn left_pwm_bounds_percent(self) -> (i8, i8) {
+        (self.left_pwm.min.get(), self.left_pwm.max.get())
+    }
+
+    /// Exact controller-domain bounds which every selected right command must
+    /// satisfy.
+    pub const fn right_pwm_bounds_percent(self) -> (i8, i8) {
+        (self.right_pwm.min.get(), self.right_pwm.max.get())
+    }
+
+    pub const fn maximum_slew_percent_per_step(self) -> (u16, u16) {
+        (
+            self.left_slew_percent_per_step,
+            self.right_slew_percent_per_step,
+        )
     }
 }
 

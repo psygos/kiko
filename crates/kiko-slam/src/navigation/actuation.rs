@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use robot_command_client::{
     AcquireFailure, AppliedCommandReceipt, ApplyFailure, ArmedCommandClient, ClientConfig,
-    DisarmFailure, DisarmReceipt, DisarmedCommandClient, MonotonicClock, MonotonicInstant,
-    PendingPhysicalCommand, RobotProtocolV2WireAdapter, UdpTransportBuildError, UdpV2Transport,
+    DisarmFailure, DisarmReceipt, MonotonicClock, MonotonicInstant, PendingPhysicalCommand,
+    RobotProtocolV2WireAdapter, UdpTransportBuildError, UdpV2Transport,
     VerifiedControllerAcquisition,
 };
 use robot_protocol::v2::{DomainError, ForceStopReason, TimerPwm, V2CommandLeaseMs};
@@ -23,6 +23,9 @@ use crate::HostMonotonicTimestamp;
 
 type ConcreteTransport = UdpV2Transport<RobotProtocolV2WireAdapter>;
 type ConcreteArmed = ArmedCommandClient<ConcreteTransport, ActuationMonotonicClock>;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+type ConcreteDisarmed =
+    robot_command_client::DisarmedCommandClient<ConcreteTransport, ActuationMonotonicClock>;
 type ConcreteAcquireFailure = AcquireFailure<ConcreteTransport, ActuationMonotonicClock>;
 type ConcreteApplyFailure = ApplyFailure<ConcreteTransport, ActuationMonotonicClock>;
 type ConcreteDisarmFailure = DisarmFailure<ConcreteTransport, ActuationMonotonicClock>;
@@ -66,6 +69,13 @@ impl ActuationTiming {
         }
     }
 
+    #[cfg(all(
+        any(
+            feature = "nano-wheels-off-qualification",
+            feature = "nano-base-commissioning"
+        ),
+        unix
+    ))]
     fn from_zero_client(config: &ClientConfig) -> Self {
         Self {
             apply_ack_budget_ns: config.applied_ack_timeout().get(),
@@ -167,36 +177,38 @@ pub struct PhysicalActuationSession {
     timing: ActuationTiming,
 }
 
-/// A zero-only live controller session for non-motion diagnostics.
+/// Linear ownership of one exactly stopped candidate transport.
 ///
-/// The type exposes no PWM-bearing input and can therefore only refresh an
-/// already acquired zero or request a terminal stop.
-#[must_use = "a zero-only session must be explicitly disarmed and its receipt checked"]
-pub struct PhysicalZeroHoldSession {
-    inner: PhysicalActuationSession,
+/// This token is intentionally candidate-only and non-cloneable. Reacquiring
+/// consumes it, so a stopped transport cannot create concurrent armed owners.
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+pub(super) struct StoppedCandidateActuationClient {
+    disarmed: ConcreteDisarmed,
+    clock: ActuationMonotonicClock,
+    timing: ActuationTiming,
 }
 
-impl PhysicalZeroHoldSession {
-    pub fn acquire_zero_only(
-        config: ClientConfig,
-        clock_origin: Instant,
-    ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
-        let timing = ActuationTiming::from_zero_client(&config);
-        let (inner, receipt) =
-            PhysicalActuationSession::acquire_from_client_config(config, clock_origin, timing)?;
-        Ok((Self { inner }, receipt))
-    }
-
-    pub fn refresh_zero(&mut self) -> Result<AppliedCommandReceipt, LiveActuationError> {
-        self.inner.apply_fresh_zero()
-    }
-
-    pub fn disarm(mut self) -> Result<DisarmReceipt, LiveActuationError> {
-        self.inner.disarm()
-    }
-
-    pub const fn is_consumed(&self) -> bool {
-        self.inner.is_consumed()
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl StoppedCandidateActuationClient {
+    pub(super) fn reacquire_zero(
+        self,
+    ) -> Result<(PhysicalActuationSession, AppliedCommandReceipt), LiveActuationError> {
+        let Self {
+            disarmed,
+            clock,
+            timing,
+        } = self;
+        let (armed, receipt) = disarmed
+            .acquire_zero()
+            .map_err(LiveActuationError::Acquire)?;
+        Ok((
+            PhysicalActuationSession {
+                armed: Some(armed),
+                clock,
+                timing,
+            },
+            receipt,
+        ))
     }
 }
 
@@ -212,6 +224,24 @@ impl PhysicalActuationSession {
         )
     }
 
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    pub(super) fn acquire_candidate(
+        config: ClientConfig,
+        clock_origin: Instant,
+    ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
+        let timing = ActuationTiming::from_zero_client(&config);
+        Self::acquire_from_client_config(config, clock_origin, timing)
+    }
+
+    #[cfg(all(feature = "nano-base-commissioning", unix))]
+    pub(super) fn acquire_commissioning(
+        config: ClientConfig,
+        clock_origin: Instant,
+    ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
+        let timing = ActuationTiming::from_zero_client(&config);
+        Self::acquire_from_client_config(config, clock_origin, timing)
+    }
+
     fn acquire_from_client_config(
         config: ClientConfig,
         clock_origin: Instant,
@@ -220,7 +250,7 @@ impl PhysicalActuationSession {
         let transport = UdpV2Transport::connect_canonical(config.endpoint())
             .map_err(LiveActuationError::TransportBuild)?;
         let clock = ActuationMonotonicClock::new(clock_origin);
-        let client = DisarmedCommandClient::new(transport, clock, config);
+        let client = robot_command_client::DisarmedCommandClient::new(transport, clock, config);
         let (armed, receipt) = client.acquire_zero().map_err(LiveActuationError::Acquire)?;
         Ok((
             Self {
@@ -294,6 +324,55 @@ impl PhysicalActuationSession {
         self.apply_pending(pending)
     }
 
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    pub(super) fn apply_candidate_pwm(
+        &mut self,
+        admitted: super::wheels_off_candidate_actuation::AdmittedCandidatePwm,
+    ) -> Result<AppliedCommandReceipt, LiveActuationError> {
+        let timer_pwm = admitted.timer_pwm();
+        let now = self.clock.host_now().map_err(|source| {
+            let stop_reason = source.force_stop_reason();
+            self.reject_local_decision(source, stop_reason)
+        })?;
+        let acknowledgement_deadline_ns = now
+            .as_nanos()
+            .checked_add(self.timing.apply_ack_budget_ns)
+            .ok_or(PhysicalDecisionError::DeadlineArithmeticOverflow)
+            .map_err(|source| {
+                let stop_reason = source.force_stop_reason();
+                self.reject_local_decision(source, stop_reason)
+            })?;
+        self.apply_pending(PendingPhysicalCommand::new(
+            timer_pwm,
+            self.timing.lease,
+            MonotonicInstant::from_nanos_since_clock_start(u128::from(acknowledgement_deadline_ns)),
+        ))
+    }
+
+    #[cfg(all(feature = "nano-base-commissioning", unix))]
+    pub(super) fn apply_commissioning_pwm(
+        &mut self,
+        requested_pwm: TimerPwm,
+    ) -> Result<AppliedCommandReceipt, LiveActuationError> {
+        let now = self.clock.host_now().map_err(|source| {
+            let stop_reason = source.force_stop_reason();
+            self.reject_local_decision(source, stop_reason)
+        })?;
+        let acknowledgement_deadline_ns = now
+            .as_nanos()
+            .checked_add(self.timing.apply_ack_budget_ns)
+            .ok_or(PhysicalDecisionError::DeadlineArithmeticOverflow)
+            .map_err(|source| {
+                let stop_reason = source.force_stop_reason();
+                self.reject_local_decision(source, stop_reason)
+            })?;
+        self.apply_pending(PendingPhysicalCommand::new(
+            requested_pwm,
+            self.timing.lease,
+            MonotonicInstant::from_nanos_since_clock_start(u128::from(acknowledgement_deadline_ns)),
+        ))
+    }
+
     fn apply_pending(
         &mut self,
         pending: PendingPhysicalCommand,
@@ -312,6 +391,24 @@ impl PhysicalActuationSession {
         let armed = self.take_armed()?;
         match armed.disarm() {
             Ok((_disarmed, receipt)) => Ok(receipt),
+            Err(failure) => Err(LiveActuationError::Disarm(failure)),
+        }
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    pub(super) fn stop_candidate(
+        mut self,
+    ) -> Result<(StoppedCandidateActuationClient, DisarmReceipt), LiveActuationError> {
+        let armed = self.take_armed()?;
+        match armed.disarm() {
+            Ok((disarmed, receipt)) => Ok((
+                StoppedCandidateActuationClient {
+                    disarmed,
+                    clock: self.clock,
+                    timing: self.timing,
+                },
+                receipt,
+            )),
             Err(failure) => Err(LiveActuationError::Disarm(failure)),
         }
     }
@@ -345,7 +442,7 @@ impl PhysicalActuationSession {
         let stop = match self.armed.take() {
             Some(armed) => match armed.disarm_with_reason(stop_reason) {
                 Ok((_disarmed, receipt)) => LocalRejectionStop::Confirmed(receipt),
-                Err(failure) => LocalRejectionStop::Uncertain(failure),
+                Err(failure) => LocalRejectionStop::DisarmFailed(failure),
             },
             None => LocalRejectionStop::SessionAlreadyConsumed,
         };
@@ -355,7 +452,7 @@ impl PhysicalActuationSession {
 
 pub enum LocalRejectionStop {
     Confirmed(DisarmReceipt),
-    Uncertain(ConcreteDisarmFailure),
+    DisarmFailed(ConcreteDisarmFailure),
     SessionAlreadyConsumed,
 }
 
@@ -410,9 +507,10 @@ impl fmt::Display for LiveActuationError {
                     "physical decision rejected before send ({source}); controller stop confirmed at {} ns",
                     receipt.acknowledged_at().nanos_since_clock_start()
                 ),
-                LocalRejectionStop::Uncertain(failure) => write!(
+                LocalRejectionStop::DisarmFailed(failure) => write!(
                     formatter,
-                    "physical decision rejected before send ({source}); controller stop uncertain: {}",
+                    "physical decision rejected before send ({source}); stop operation failed ({}): {}",
+                    stop_evidence_text(failure.stop_knowledge()),
                     failure.cause()
                 ),
                 LocalRejectionStop::SessionAlreadyConsumed => write!(

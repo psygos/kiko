@@ -5,11 +5,12 @@
 //! second save cannot overlap the durable temporary-file/sync/rename/directory
 //! sync sequence.
 //!
-//! Warm start deliberately stops at a dataset-replay request. The current
-//! policy binds only mutable pathnames, not an immutable dataset content
-//! identity. Consequently a loaded occupancy artifact cannot claim
-//! localization, and it cannot acquire a live map identity until the existing
-//! dense persistence verifier proves exact equality with final replay output.
+//! Production warm start resolves one atomically selected, finalized session.
+//! The selection binds the session manifest and its session-local occupancy
+//! artifact by exact byte lengths and SHA-256 digests. Replay rechecks those
+//! bindings before and after reconstruction, then still requires exact final
+//! occupancy equality. None of this claims current-camera localization; that
+//! remains a separate live relocalization transition.
 
 use std::fmt;
 use std::fs::{self, File};
@@ -18,11 +19,44 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "nano-agent")]
+use std::ffi::OsStr;
+#[cfg(feature = "nano-agent")]
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(feature = "nano-agent")]
+use std::os::fd::AsFd;
+#[cfg(feature = "nano-agent")]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(feature = "nano-agent")]
+use std::path::Component;
+#[cfg(feature = "nano-agent")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(feature = "nano-agent")]
+use rustix::fs::{
+    AtFlags, FileType, Mode, OFlags, RenameFlags, fstat, fsync, openat, renameat, renameat_with,
+    statat, unlinkat,
+};
+#[cfg(feature = "nano-agent")]
+use rustix::io::Errno;
+#[cfg(feature = "nano-agent")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "nano-agent")]
+use sha2::{Digest, Sha256};
+
 use crate::dense::occupancy::OccupancyGridSnapshot;
+#[cfg(feature = "nano-agent")]
+use crate::dense::occupancy_persistence::load_persisted_occupancy_map_from_reader;
+#[cfg(feature = "nano-agent")]
+use crate::dense::occupancy_persistence::save_occupancy_map_atomic_at;
 use crate::dense::occupancy_persistence::{
     OccupancyMapEncodeError, OccupancyMapLimits, OccupancyMapLoadError, OccupancyMapSaveError,
     OccupancyReplayBindError, PersistedOccupancyMap, ReplayMatchedOccupancyMap,
-    ReplayOccupancyEvidence, load_persisted_occupancy_map, save_occupancy_map_atomic,
+    ReplayOccupancyEvidence, occupancy_map_encoded_len,
+};
+#[cfg(not(feature = "nano-agent"))]
+use crate::dense::occupancy_persistence::{
+    load_persisted_occupancy_map, save_occupancy_map_atomic,
 };
 use crate::map::MapInstanceId;
 
@@ -31,6 +65,33 @@ use super::control_api::{AgentControlCommandKindV1, AgentControlRejectionCodeV1}
 use super::control_socket::{AgentControlClaimedRequest, AgentControlDispatchResponseError};
 use super::ingress::{CurrentMapEpochBinding, RecordedMapEpochId};
 use super::nano_bootstrap::NanoBootstrapRoots;
+use super::nano_state_quota::{
+    NanoStateQuotaCommitError, NanoStateQuotaOwner, NanoStateQuotaReserveError,
+    NanoStateQuotaWriteReceipt,
+};
+
+#[cfg(feature = "nano-agent")]
+const NANO_WARM_SELECTION_SCHEMA_VERSION: u32 = 1;
+#[cfg(feature = "nano-agent")]
+const NANO_WARM_SELECTION_FILE: &str = "selected-warm-start-v1.json";
+#[cfg(feature = "nano-agent")]
+const NANO_WARM_OCCUPANCY_FILE: &str = "occupancy.kmap";
+#[cfg(feature = "nano-agent")]
+const DATASET_MANIFEST_FILE: &str = "manifest.json";
+#[cfg(feature = "nano-agent")]
+pub const MAX_NANO_WARM_SELECTION_BYTES: u64 = 4 * 1_024;
+#[cfg(feature = "nano-agent")]
+pub const MAX_NANO_DATASET_MANIFEST_BYTES: u64 =
+    crate::dataset::MAX_PRODUCTION_DATASET_MANIFEST_BYTES;
+#[cfg(feature = "nano-agent")]
+const MAX_NANO_SELECTED_OCCUPANCY_BYTES: u64 = 256 * 1_024 * 1_024;
+const SHA256_BYTES: usize = 32;
+#[cfg(feature = "nano-agent")]
+const SHA256_HEX_BYTES: usize = SHA256_BYTES * 2;
+#[cfg(feature = "nano-agent")]
+const MAX_DATASET_DIRECTORY_NAME_BYTES: usize = 128;
+#[cfg(feature = "nano-agent")]
+static NEXT_SELECTION_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 /// Filesystem roles reported by persistence path admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,6 +323,53 @@ impl NanoMapSnapshotIdentity {
     }
 }
 
+/// Final accepted map identity parsed back from the synchronized navigation
+/// journal. This deliberately excludes the process-local map instance: the
+/// journal's wire contract records only the stable epoch and mapper revision.
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NanoFinalizedJournalMapIdentity {
+    map_epoch_id: RecordedMapEpochId,
+    revision: u64,
+}
+
+#[cfg(feature = "nano-agent")]
+impl NanoFinalizedJournalMapIdentity {
+    pub const fn new(map_epoch_id: RecordedMapEpochId, revision: u64) -> Self {
+        Self {
+            map_epoch_id,
+            revision,
+        }
+    }
+
+    pub const fn map_epoch_id(self) -> RecordedMapEpochId {
+        self.map_epoch_id
+    }
+
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+fn require_finalized_journal_map_matches_retained(
+    finalized_map_identity: Option<NanoFinalizedJournalMapIdentity>,
+    retained: NanoMapSnapshotIdentity,
+) -> Result<(), NanoWarmCheckpointError> {
+    let finalized =
+        finalized_map_identity.ok_or(NanoWarmCheckpointError::FinalizedJournalHasNoAcceptedMap)?;
+    if finalized.map_epoch_id() != retained.map_epoch_id()
+        || finalized.revision() != retained.revision()
+    {
+        return Err(NanoWarmCheckpointError::FinalizedJournalMapMismatch {
+            finalized,
+            retained_epoch_id: retained.map_epoch_id(),
+            retained_revision: retained.revision(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NanoMapRetentionOutcome {
     retained: NanoMapSnapshotIdentity,
@@ -325,6 +433,7 @@ struct RetainedNanoMapSnapshot {
 pub struct NanoMapSaveReceipt {
     identity: NanoMapSnapshotIdentity,
     destination: PathBuf,
+    quota_verification: Option<Box<NanoStateQuotaWriteReceipt>>,
 }
 
 impl NanoMapSaveReceipt {
@@ -334,6 +443,13 @@ impl NanoMapSaveReceipt {
 
     pub fn destination(&self) -> &Path {
         &self.destination
+    }
+
+    /// Present only when the launch-bound map quota owner admitted the exact
+    /// planned length and transient headroom before publication, then verified
+    /// the exact length and post-save free-space floor afterwards.
+    pub fn quota_verification(&self) -> Option<&NanoStateQuotaWriteReceipt> {
+        self.quota_verification.as_deref()
     }
 }
 
@@ -345,7 +461,16 @@ pub enum NanoMapSaveError {
         retained: NanoMapSnapshotIdentity,
     },
     Path(NanoMapPersistencePathError),
+    QuotaReservation(NanoStateQuotaReserveError),
     Persistence(OccupancyMapSaveError),
+    PublishedButPersistenceFailed {
+        source: OccupancyMapSaveError,
+        quota_verification: Result<Box<NanoStateQuotaWriteReceipt>, Box<NanoStateQuotaCommitError>>,
+    },
+    PublishedButQuotaVerificationFailed {
+        receipt: NanoMapSaveReceipt,
+        source: Box<NanoStateQuotaCommitError>,
+    },
 }
 
 impl NanoMapSaveError {
@@ -353,11 +478,17 @@ impl NanoMapSaveError {
         match self {
             Self::NoSnapshot => (AgentControlRejectionCodeV1::MapUnavailable, true),
             Self::StaleSelection { .. } => (AgentControlRejectionCodeV1::StaleMapSelection, true),
-            Self::Path(_) => (AgentControlRejectionCodeV1::PersistenceFailed, false),
+            Self::Path(_) | Self::QuotaReservation(_) => {
+                (AgentControlRejectionCodeV1::PersistenceFailed, false)
+            }
             Self::Persistence(source) => (
                 AgentControlRejectionCodeV1::PersistenceFailed,
                 persistence_error_may_be_retryable(source),
             ),
+            Self::PublishedButPersistenceFailed { .. }
+            | Self::PublishedButQuotaVerificationFailed { .. } => {
+                (AgentControlRejectionCodeV1::PersistenceFailed, false)
+            }
         }
     }
 
@@ -366,7 +497,11 @@ impl NanoMapSaveError {
     pub fn destination_may_have_been_published(&self) -> bool {
         matches!(
             self,
-            Self::Persistence(OccupancyMapSaveError::Io(source)) if source.published()
+            Self::Persistence(source) if persistence_error_was_published(source)
+        ) || matches!(
+            self,
+            Self::PublishedButPersistenceFailed { .. }
+                | Self::PublishedButQuotaVerificationFailed { .. }
         )
     }
 }
@@ -383,7 +518,28 @@ impl fmt::Display for NanoMapSaveError {
                 "requested map snapshot {requested:?} is not the retained latest snapshot {retained:?}"
             ),
             Self::Path(source) => write!(formatter, "map save path is not admitted: {source}"),
+            Self::QuotaReservation(source) => {
+                write!(formatter, "map save quota was not admitted: {source}")
+            }
             Self::Persistence(source) => write!(formatter, "durable map save failed: {source}"),
+            Self::PublishedButPersistenceFailed {
+                source,
+                quota_verification: Ok(_),
+            } => write!(
+                formatter,
+                "map destination was published and quota-verified, but durable map save failed: {source}"
+            ),
+            Self::PublishedButPersistenceFailed {
+                source,
+                quota_verification: Err(quota),
+            } => write!(
+                formatter,
+                "map destination was published, durable map save failed ({source}), and quota verification also failed: {quota}"
+            ),
+            Self::PublishedButQuotaVerificationFailed { source, .. } => write!(
+                formatter,
+                "durable map publication completed but quota verification failed: {source}"
+            ),
         }
     }
 }
@@ -392,10 +548,17 @@ impl std::error::Error for NanoMapSaveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Path(source) => Some(source),
+            Self::QuotaReservation(source) => Some(source),
             Self::Persistence(source) => Some(source),
+            Self::PublishedButPersistenceFailed { source, .. } => Some(source),
+            Self::PublishedButQuotaVerificationFailed { source, .. } => Some(source),
             Self::NoSnapshot | Self::StaleSelection { .. } => None,
         }
     }
+}
+
+fn persistence_error_was_published(source: &OccupancyMapSaveError) -> bool {
+    matches!(source, OccupancyMapSaveError::Io(source) if source.published())
 }
 
 fn persistence_error_may_be_retryable(source: &OccupancyMapSaveError) -> bool {
@@ -457,8 +620,61 @@ impl std::error::Error for NanoMapSaveCommandError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NanoDatasetContentBindingStatus {
-    /// The schema carries a path but no digest or manifest content identity.
+    /// Non-production compatibility builds retain the legacy pathname-only
+    /// contract. The production Nano build never admits this status.
     MissingImmutableContentIdentity,
+    /// A durably published selection binds the exact finalized dataset
+    /// manifest and occupancy artifact by SHA-256. Exact replay equality is
+    /// still required, and remains distinct from live-camera localization.
+    FinalizedSelectionV1 {
+        dataset_manifest_sha256: [u8; SHA256_BYTES],
+        occupancy_sha256: [u8; SHA256_BYTES],
+    },
+}
+
+impl NanoDatasetContentBindingStatus {
+    pub const fn dataset_manifest_sha256(self) -> Option<[u8; 32]> {
+        match self {
+            Self::MissingImmutableContentIdentity => None,
+            Self::FinalizedSelectionV1 {
+                dataset_manifest_sha256,
+                ..
+            } => Some(dataset_manifest_sha256),
+        }
+    }
+
+    pub const fn occupancy_sha256(self) -> Option<[u8; 32]> {
+        match self {
+            Self::MissingImmutableContentIdentity => None,
+            Self::FinalizedSelectionV1 {
+                occupancy_sha256, ..
+            } => Some(occupancy_sha256),
+        }
+    }
+}
+
+impl fmt::Display for NanoDatasetContentBindingStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingImmutableContentIdentity => {
+                formatter.write_str("missing_immutable_content_identity")
+            }
+            Self::FinalizedSelectionV1 {
+                dataset_manifest_sha256,
+                occupancy_sha256,
+            } => {
+                formatter.write_str("finalized_selection_v1:manifest_sha256=")?;
+                for byte in dataset_manifest_sha256 {
+                    write!(formatter, "{byte:02x}")?;
+                }
+                formatter.write_str(",occupancy_sha256=")?;
+                for byte in occupancy_sha256 {
+                    write!(formatter, "{byte:02x}")?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -468,6 +684,367 @@ enum AdmittedNanoWarmStart {
         occupancy_snapshot_path: PathBuf,
         slam_dataset_directory_path: PathBuf,
     },
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NanoWarmSelectionContentIdentity {
+    dataset_manifest_sha256: [u8; SHA256_BYTES],
+    occupancy_sha256: [u8; SHA256_BYTES],
+    dataset_manifest_bytes: u64,
+    occupancy_bytes: u64,
+}
+
+#[cfg(feature = "nano-agent")]
+impl NanoWarmSelectionContentIdentity {
+    const fn binding_status(self) -> NanoDatasetContentBindingStatus {
+        NanoDatasetContentBindingStatus::FinalizedSelectionV1 {
+            dataset_manifest_sha256: self.dataset_manifest_sha256,
+            occupancy_sha256: self.occupancy_sha256,
+        }
+    }
+}
+
+/// Durable proof that one final map revision and one finalized recording were
+/// selected together. Completion never implies current-camera localization.
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NanoWarmCheckpointReceipt {
+    staged_map: NanoMapSaveReceipt,
+    occupancy_snapshot_path: PathBuf,
+    dataset_directory: PathBuf,
+    selection_path: PathBuf,
+    binding: NanoDatasetContentBindingStatus,
+}
+
+#[cfg(feature = "nano-agent")]
+impl NanoWarmCheckpointReceipt {
+    pub const fn map_identity(&self) -> NanoMapSnapshotIdentity {
+        self.staged_map.identity()
+    }
+
+    /// Exact immutable occupancy selected for restart.
+    pub fn occupancy_snapshot_path(&self) -> &Path {
+        &self.occupancy_snapshot_path
+    }
+
+    /// Launch-bound staging path at which quota publication and exact length
+    /// were verified before the same inode was relocated into the finalized
+    /// session. This pathname no longer names the artifact after success.
+    pub fn quota_staging_path(&self) -> &Path {
+        self.staged_map.destination()
+    }
+
+    pub fn quota_verification(&self) -> Option<&NanoStateQuotaWriteReceipt> {
+        self.staged_map.quota_verification()
+    }
+
+    pub fn dataset_directory(&self) -> &Path {
+        &self.dataset_directory
+    }
+
+    pub fn selection_path(&self) -> &Path {
+        &self.selection_path
+    }
+
+    pub const fn dataset_content_binding_status(&self) -> NanoDatasetContentBindingStatus {
+        self.binding
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Debug)]
+pub enum NanoWarmCheckpointError {
+    FinalizedJournalHasNoAcceptedMap,
+    FinalizedJournalMapMismatch {
+        finalized: NanoFinalizedJournalMapIdentity,
+        retained_epoch_id: RecordedMapEpochId,
+        retained_revision: u64,
+    },
+    DatasetHasNoSelectionParent {
+        dataset_directory: PathBuf,
+    },
+    DatasetPath(NanoMapPersistencePathError),
+    DatasetIsNotDirectSelectionChild {
+        selection_root: PathBuf,
+        dataset_directory: PathBuf,
+    },
+    DatasetManifestMissing {
+        path: PathBuf,
+    },
+    OccupancyAlreadyExists {
+        path: PathBuf,
+    },
+    MissingQuotaVerification,
+    SaveMap(NanoMapSaveError),
+    Selection(NanoWarmSelectionError),
+}
+
+#[cfg(feature = "nano-agent")]
+impl NanoWarmCheckpointError {
+    fn rejection(&self) -> (AgentControlRejectionCodeV1, bool) {
+        match self {
+            Self::SaveMap(source) => source.rejection(),
+            Self::FinalizedJournalHasNoAcceptedMap
+            | Self::FinalizedJournalMapMismatch { .. }
+            | Self::DatasetHasNoSelectionParent { .. }
+            | Self::DatasetPath(_)
+            | Self::DatasetIsNotDirectSelectionChild { .. }
+            | Self::DatasetManifestMissing { .. }
+            | Self::OccupancyAlreadyExists { .. }
+            | Self::MissingQuotaVerification
+            | Self::Selection(_) => (AgentControlRejectionCodeV1::PersistenceFailed, false),
+        }
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl fmt::Display for NanoWarmCheckpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FinalizedJournalHasNoAcceptedMap => formatter
+                .write_str("finalized navigation journal has no accepted map in its final epoch"),
+            Self::FinalizedJournalMapMismatch {
+                finalized,
+                retained_epoch_id,
+                retained_revision,
+            } => write!(
+                formatter,
+                "finalized journal map epoch/revision {}:{} does not equal retained occupancy {}:{}",
+                finalized.map_epoch_id().as_u64(),
+                finalized.revision(),
+                retained_epoch_id.as_u64(),
+                retained_revision,
+            ),
+            Self::DatasetHasNoSelectionParent { dataset_directory } => write!(
+                formatter,
+                "finalized dataset '{}' has no parent selection directory",
+                dataset_directory.display()
+            ),
+            Self::DatasetPath(source) => {
+                write!(formatter, "dataset path is not admitted: {source}")
+            }
+            Self::DatasetIsNotDirectSelectionChild {
+                selection_root,
+                dataset_directory,
+            } => write!(
+                formatter,
+                "finalized dataset '{}' is not one direct child of warm selection root '{}'",
+                dataset_directory.display(),
+                selection_root.display()
+            ),
+            Self::DatasetManifestMissing { path } => {
+                write!(
+                    formatter,
+                    "finalized dataset manifest '{}' is missing",
+                    path.display()
+                )
+            }
+            Self::OccupancyAlreadyExists { path } => write!(
+                formatter,
+                "refusing to replace immutable checkpoint occupancy '{}'",
+                path.display()
+            ),
+            Self::MissingQuotaVerification => formatter
+                .write_str("quota-bound map staging returned no quota verification evidence"),
+            Self::SaveMap(source) => write!(formatter, "latest-map publication failed: {source}"),
+            Self::Selection(source) => write!(formatter, "warm selection failed: {source}"),
+        }
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl std::error::Error for NanoWarmCheckpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DatasetPath(source) => Some(source),
+            Self::SaveMap(source) => Some(source),
+            Self::Selection(source) => Some(source),
+            Self::DatasetHasNoSelectionParent { .. }
+            | Self::FinalizedJournalHasNoAcceptedMap
+            | Self::FinalizedJournalMapMismatch { .. }
+            | Self::DatasetIsNotDirectSelectionChild { .. }
+            | Self::DatasetManifestMissing { .. }
+            | Self::OccupancyAlreadyExists { .. } => None,
+            Self::MissingQuotaVerification => None,
+        }
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Debug)]
+pub enum NanoWarmCheckpointCommandError {
+    WrongCommandRejected {
+        actual: AgentControlCommandKindV1,
+    },
+    WrongCommandResponseFailed {
+        actual: AgentControlCommandKindV1,
+        response: AgentControlDispatchResponseError,
+    },
+    CheckpointRejected {
+        source: NanoWarmCheckpointError,
+    },
+    CheckpointAndRejectionResponseFailed {
+        source: NanoWarmCheckpointError,
+        response: AgentControlDispatchResponseError,
+    },
+    CheckpointedButCompletionResponseFailed {
+        receipt: Box<NanoWarmCheckpointReceipt>,
+        response: AgentControlDispatchResponseError,
+    },
+}
+
+#[cfg(feature = "nano-agent")]
+impl fmt::Display for NanoWarmCheckpointCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Nano warm-checkpoint command failed: {self:?}")
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl std::error::Error for NanoWarmCheckpointCommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WrongCommandResponseFailed { response, .. }
+            | Self::CheckpointedButCompletionResponseFailed { response, .. } => Some(response),
+            Self::CheckpointRejected { source }
+            | Self::CheckpointAndRejectionResponseFailed { source, .. } => Some(source),
+            Self::WrongCommandRejected { .. } => None,
+        }
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Debug)]
+pub enum NanoWarmSelectionError {
+    Path(NanoMapPersistencePathError),
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+    NotRegularFile {
+        path: PathBuf,
+    },
+    FilesystemObjectChanged {
+        path: PathBuf,
+        expected_device: u64,
+        expected_inode: u64,
+        observed_device: u64,
+        observed_inode: u64,
+    },
+    FileTooLarge {
+        path: PathBuf,
+        actual_bytes: u64,
+        maximum_bytes: u64,
+    },
+    Truncated {
+        path: PathBuf,
+        expected_bytes: u64,
+        actual_bytes: usize,
+    },
+    Json(serde_json::Error),
+    UnsupportedSchema {
+        actual: u32,
+    },
+    InvalidDatasetDirectoryName,
+    InvalidSha256 {
+        field: &'static str,
+    },
+    ZeroMapEpoch,
+    DigestMismatch {
+        path: PathBuf,
+        expected: [u8; SHA256_BYTES],
+        observed: [u8; SHA256_BYTES],
+    },
+    LengthMismatch {
+        path: PathBuf,
+        expected: u64,
+        observed: u64,
+    },
+    MapRevisionMismatch {
+        selected: u64,
+        observed: u64,
+    },
+    MapEpochMismatch {
+        selected: u64,
+        observed: u64,
+    },
+    SelectionEncodingTooLarge {
+        actual_bytes: usize,
+        maximum_bytes: u64,
+    },
+    TemporaryNameCollisions {
+        parent: PathBuf,
+    },
+    SelectionPublishedButDurabilityUnconfirmed {
+        selection_path: PathBuf,
+        operation: NanoWarmSelectionPostPublishOperation,
+        source: io::Error,
+    },
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NanoWarmSelectionPostPublishOperation {
+    InspectPublishedSelection,
+    SynchronizeSelectionRoot,
+}
+
+#[cfg(feature = "nano-agent")]
+impl NanoWarmSelectionError {
+    /// The selection rename completed, but parent-directory durability could
+    /// not be proven. No completion response may be emitted for this state.
+    pub const fn selection_may_have_been_published(&self) -> bool {
+        matches!(
+            self,
+            Self::SelectionPublishedButDurabilityUnconfirmed { .. }
+        )
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl fmt::Display for NanoWarmSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid Nano warm selection: {self:?}")
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl std::error::Error for NanoWarmSelectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Path(source) => Some(source),
+            Self::Io { source, .. } => Some(source),
+            Self::Json(source) => Some(source),
+            Self::SelectionPublishedButDurabilityUnconfirmed { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NanoWarmSelectionV1Dto {
+    schema_version: u32,
+    dataset_directory_name: String,
+    dataset_manifest_sha256_hex: String,
+    dataset_manifest_bytes: u64,
+    occupancy_file_name: String,
+    occupancy_sha256_hex: String,
+    occupancy_bytes: u64,
+    map_epoch_id: u64,
+    map_revision: u64,
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Debug)]
+struct ParsedNanoWarmSelectionV1 {
+    dataset_directory_name: String,
+    content: NanoWarmSelectionContentIdentity,
+    map_epoch_id: RecordedMapEpochId,
+    map_revision: u64,
 }
 
 /// Typed warm-start load result. There is intentionally no localized variant.
@@ -489,6 +1066,30 @@ pub struct NanoDatasetReplayRequired {
     state_root: PathBuf,
     state_root_identity: FilesystemObjectIdentity,
     dataset_directory_identity: FilesystemObjectIdentity,
+    #[cfg(feature = "nano-agent")]
+    selection_root: PathBuf,
+    #[cfg(feature = "nano-agent")]
+    selection_root_identity: FilesystemObjectIdentity,
+    #[cfg(feature = "nano-agent")]
+    selection_root_file: File,
+    #[cfg(feature = "nano-agent")]
+    selection_file: File,
+    #[cfg(feature = "nano-agent")]
+    selection_identity: FilesystemObjectIdentity,
+    #[cfg(feature = "nano-agent")]
+    dataset_directory_file: File,
+    #[cfg(feature = "nano-agent")]
+    manifest_file: File,
+    #[cfg(feature = "nano-agent")]
+    manifest_identity: FilesystemObjectIdentity,
+    #[cfg(feature = "nano-agent")]
+    occupancy_file: File,
+    #[cfg(feature = "nano-agent")]
+    occupancy_identity: FilesystemObjectIdentity,
+    #[cfg(feature = "nano-agent")]
+    content_identity: NanoWarmSelectionContentIdentity,
+    #[cfg(feature = "nano-agent")]
+    selected_map_epoch_id: RecordedMapEpochId,
 }
 
 impl NanoDatasetReplayRequired {
@@ -501,18 +1102,84 @@ impl NanoDatasetReplayRequired {
     }
 
     pub const fn dataset_content_binding_status(&self) -> NanoDatasetContentBindingStatus {
-        NanoDatasetContentBindingStatus::MissingImmutableContentIdentity
+        #[cfg(feature = "nano-agent")]
+        {
+            self.content_identity.binding_status()
+        }
+        #[cfg(not(feature = "nano-agent"))]
+        {
+            NanoDatasetContentBindingStatus::MissingImmutableContentIdentity
+        }
     }
 
     pub fn persisted_snapshot(&self) -> &OccupancyGridSnapshot {
         self.persisted.snapshot()
     }
 
+    #[cfg(feature = "nano-agent")]
+    pub const fn selected_map_epoch_id(&self) -> RecordedMapEpochId {
+        self.selected_map_epoch_id
+    }
+
+    #[cfg(feature = "nano-agent")]
+    pub fn selected_map_revision(&self) -> u64 {
+        self.persisted.snapshot().revision()
+    }
+
+    /// Rewind the exact retained manifest descriptor and bind every byte
+    /// consumed by `DatasetReader` to the atomic selection digest.
+    #[cfg(feature = "nano-agent")]
+    pub(crate) fn selected_manifest_reader(
+        &mut self,
+    ) -> Result<SelectedManifestReader<'_>, NanoWarmSelectionError> {
+        self.require_selected_handles_current()?;
+        self.manifest_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|source| NanoWarmSelectionError::Io {
+                operation: "rewind retained selected manifest",
+                path: self.slam_dataset_directory_path.join(DATASET_MANIFEST_FILE),
+                source,
+            })?;
+        Ok(SelectedManifestReader {
+            reader: DigestingReader::new(&mut self.manifest_file),
+            expected_digest: self.content_identity.dataset_manifest_sha256,
+            expected_bytes: self.content_identity.dataset_manifest_bytes,
+            path: self.slam_dataset_directory_path.join(DATASET_MANIFEST_FILE),
+        })
+    }
+
+    /// Require the canonical final map event derived from the selected
+    /// dataset's bounded navigation journal to match the atomic selection.
+    ///
+    /// This is independent restart evidence for the wire-stable epoch and
+    /// revision. It does not prove a current live-camera pose.
+    #[cfg(feature = "nano-agent")]
+    pub fn verify_selected_dataset_map_identity(
+        &self,
+        observed_map_epoch_id: RecordedMapEpochId,
+        observed_map_revision: u64,
+    ) -> Result<(), NanoWarmSelectionError> {
+        if observed_map_epoch_id != self.selected_map_epoch_id {
+            return Err(NanoWarmSelectionError::MapEpochMismatch {
+                selected: self.selected_map_epoch_id.as_u64(),
+                observed: observed_map_epoch_id.as_u64(),
+            });
+        }
+        let selected_map_revision = self.selected_map_revision();
+        if observed_map_revision != selected_map_revision {
+            return Err(NanoWarmSelectionError::MapRevisionMismatch {
+                selected: selected_map_revision,
+                observed: observed_map_revision,
+            });
+        }
+        Ok(())
+    }
+
     /// Revalidate the retained directory identity, then require exact equality
     /// with final sparse/occupancy replay evidence. Success is replay matching,
     /// not current-camera relocalization.
     pub fn verify_exact_replay(
-        self,
+        mut self,
         replay: ReplayOccupancyEvidence,
     ) -> Result<NanoReplayMatchedWarmStart, NanoWarmStartReplayBindError> {
         require_unchanged_directory(
@@ -527,6 +1194,19 @@ impl NanoDatasetReplayRequired {
             self.dataset_directory_identity,
         )
         .map_err(NanoWarmStartReplayBindError::Path)?;
+        #[cfg(feature = "nano-agent")]
+        {
+            self.require_selected_handles_current()
+                .map_err(NanoWarmStartReplayBindError::Selection)?;
+            verify_selected_content_from_handles(
+                &mut self.manifest_file,
+                &mut self.occupancy_file,
+                &self.slam_dataset_directory_path,
+                &self.occupancy_snapshot_path,
+                self.content_identity,
+            )
+            .map_err(NanoWarmStartReplayBindError::Selection)?;
+        }
         let replay_matched = self
             .persisted
             .verify_replay_and_bind(replay)
@@ -535,7 +1215,72 @@ impl NanoDatasetReplayRequired {
             replay_matched,
             occupancy_snapshot_path: self.occupancy_snapshot_path,
             slam_dataset_directory_path: self.slam_dataset_directory_path,
+            #[cfg(feature = "nano-agent")]
+            content_identity: self.content_identity,
         })
+    }
+
+    #[cfg(feature = "nano-agent")]
+    fn require_selected_handles_current(&self) -> Result<(), NanoWarmSelectionError> {
+        require_unchanged_directory(
+            NanoMapPathRole::WarmSlamDatasetDirectory,
+            &self.selection_root,
+            self.selection_root_identity,
+        )
+        .map_err(NanoWarmSelectionError::Path)?;
+        require_directory_identity_at(
+            &self.selection_root_file,
+            NanoMapPathRole::WarmSlamDatasetDirectory,
+            &self.selection_root,
+            self.selection_root_identity,
+        )
+        .map_err(NanoWarmSelectionError::Path)?;
+        require_directory_identity_at(
+            &self.dataset_directory_file,
+            NanoMapPathRole::WarmSlamDatasetDirectory,
+            &self.slam_dataset_directory_path,
+            self.dataset_directory_identity,
+        )
+        .map_err(NanoWarmSelectionError::Path)?;
+        require_open_regular_file_identity(
+            &self.selection_file,
+            &self.selection_root.join(NANO_WARM_SELECTION_FILE),
+            self.selection_identity,
+        )?;
+        require_regular_file_identity_at(
+            &self.selection_root_file,
+            OsStr::new(NANO_WARM_SELECTION_FILE),
+            &self.selection_root.join(NANO_WARM_SELECTION_FILE),
+            self.selection_identity,
+        )?;
+        require_open_regular_file_identity(
+            &self.manifest_file,
+            &self.slam_dataset_directory_path.join(DATASET_MANIFEST_FILE),
+            self.manifest_identity,
+        )?;
+        require_open_regular_file_identity(
+            &self.occupancy_file,
+            &self.occupancy_snapshot_path,
+            self.occupancy_identity,
+        )?;
+        require_unchanged_directory(
+            NanoMapPathRole::WarmSlamDatasetDirectory,
+            &self.slam_dataset_directory_path,
+            self.dataset_directory_identity,
+        )
+        .map_err(NanoWarmSelectionError::Path)?;
+        require_regular_file_identity_at(
+            &self.dataset_directory_file,
+            OsStr::new(DATASET_MANIFEST_FILE),
+            &self.slam_dataset_directory_path.join(DATASET_MANIFEST_FILE),
+            self.manifest_identity,
+        )?;
+        require_regular_file_identity_at(
+            &self.dataset_directory_file,
+            OsStr::new(NANO_WARM_OCCUPANCY_FILE),
+            &self.occupancy_snapshot_path,
+            self.occupancy_identity,
+        )
     }
 }
 
@@ -546,6 +1291,8 @@ pub struct NanoReplayMatchedWarmStart {
     replay_matched: ReplayMatchedOccupancyMap,
     occupancy_snapshot_path: PathBuf,
     slam_dataset_directory_path: PathBuf,
+    #[cfg(feature = "nano-agent")]
+    content_identity: NanoWarmSelectionContentIdentity,
 }
 
 impl NanoReplayMatchedWarmStart {
@@ -562,7 +1309,14 @@ impl NanoReplayMatchedWarmStart {
     }
 
     pub const fn dataset_content_binding_status(&self) -> NanoDatasetContentBindingStatus {
-        NanoDatasetContentBindingStatus::MissingImmutableContentIdentity
+        #[cfg(feature = "nano-agent")]
+        {
+            self.content_identity.binding_status()
+        }
+        #[cfg(not(feature = "nano-agent"))]
+        {
+            NanoDatasetContentBindingStatus::MissingImmutableContentIdentity
+        }
     }
 
     pub fn into_replay_matched_map(self) -> ReplayMatchedOccupancyMap {
@@ -573,6 +1327,8 @@ impl NanoReplayMatchedWarmStart {
 #[derive(Debug)]
 pub enum NanoMapWarmStartLoadError {
     Path(NanoMapPersistencePathError),
+    #[cfg(feature = "nano-agent")]
+    Selection(NanoWarmSelectionError),
     Occupancy(OccupancyMapLoadError),
 }
 
@@ -580,6 +1336,10 @@ impl fmt::Display for NanoMapWarmStartLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Path(source) => write!(formatter, "warm-start path is not admitted: {source}"),
+            #[cfg(feature = "nano-agent")]
+            Self::Selection(source) => {
+                write!(formatter, "warm-start selection is not admitted: {source}")
+            }
             Self::Occupancy(source) => write!(formatter, "cannot load warm occupancy: {source}"),
         }
     }
@@ -589,6 +1349,8 @@ impl std::error::Error for NanoMapWarmStartLoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Path(source) => Some(source),
+            #[cfg(feature = "nano-agent")]
+            Self::Selection(source) => Some(source),
             Self::Occupancy(source) => Some(source),
         }
     }
@@ -597,6 +1359,8 @@ impl std::error::Error for NanoMapWarmStartLoadError {
 #[derive(Debug)]
 pub enum NanoWarmStartReplayBindError {
     Path(NanoMapPersistencePathError),
+    #[cfg(feature = "nano-agent")]
+    Selection(NanoWarmSelectionError),
     ExactReplay(OccupancyReplayBindError),
 }
 
@@ -604,6 +1368,11 @@ impl fmt::Display for NanoWarmStartReplayBindError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Path(source) => write!(formatter, "replay dataset path changed: {source}"),
+            #[cfg(feature = "nano-agent")]
+            Self::Selection(source) => write!(
+                formatter,
+                "selected replay dataset content changed during replay: {source}"
+            ),
             Self::ExactReplay(source) => write!(formatter, "occupancy replay mismatch: {source}"),
         }
     }
@@ -613,6 +1382,8 @@ impl std::error::Error for NanoWarmStartReplayBindError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Path(source) => Some(source),
+            #[cfg(feature = "nano-agent")]
+            Self::Selection(source) => Some(source),
             Self::ExactReplay(source) => Some(source),
         }
     }
@@ -845,23 +1616,84 @@ impl NanoMapPersistenceOwner {
         self.save_with_selection(Some(selected))
     }
 
+    /// Quota-bound form required by the production Nano save-map path.
+    pub fn save_latest_with_quota(
+        &mut self,
+        quota: &mut NanoStateQuotaOwner,
+    ) -> Result<NanoMapSaveReceipt, NanoMapSaveError> {
+        self.save_with_quota(None, quota)
+    }
+
+    /// Exact-selection quota-bound form required after a displayed map
+    /// identity was captured.
+    pub fn save_selected_with_quota(
+        &mut self,
+        selected: NanoMapSnapshotIdentity,
+        quota: &mut NanoStateQuotaOwner,
+    ) -> Result<NanoMapSaveReceipt, NanoMapSaveError> {
+        self.save_with_quota(Some(selected), quota)
+    }
+
     fn save_with_selection(
         &mut self,
         selected: Option<NanoMapSnapshotIdentity>,
     ) -> Result<NanoMapSaveReceipt, NanoMapSaveError> {
-        self.save_with(selected, |path, snapshot| {
-            save_occupancy_map_atomic(path, snapshot)
-        })
+        self.save_atomically(selected)
     }
 
-    fn save_with<F>(
+    fn save_with_quota(
         &mut self,
         selected: Option<NanoMapSnapshotIdentity>,
-        save: F,
-    ) -> Result<NanoMapSaveReceipt, NanoMapSaveError>
-    where
-        F: FnOnce(&Path, &OccupancyGridSnapshot) -> Result<(), OccupancyMapSaveError>,
-    {
+        quota: &mut NanoStateQuotaOwner,
+    ) -> Result<NanoMapSaveReceipt, NanoMapSaveError> {
+        let retained = self.retained_for_selection(selected)?;
+        let cells = retained.snapshot.class_ids().len();
+        let encoded_bytes = occupancy_map_encoded_len(&retained.snapshot)
+            .map_err(OccupancyMapSaveError::from)
+            .map_err(NanoMapSaveError::Persistence)?;
+        let encoded_bytes = u64::try_from(encoded_bytes).map_err(|_| {
+            NanoMapSaveError::Persistence(OccupancyMapSaveError::Encode(
+                OccupancyMapEncodeError::EncodedLengthOverflow { cells },
+            ))
+        })?;
+        let reservation = quota
+            .reserve_map_replacement(&self.save_snapshot_path, encoded_bytes)
+            .map_err(NanoMapSaveError::QuotaReservation)?;
+        #[cfg(feature = "nano-agent")]
+        let save_result =
+            self.save_with_parent_descriptor(selected, reservation.publication_parent());
+        #[cfg(not(feature = "nano-agent"))]
+        let save_result = self.save_atomically(selected);
+        let mut receipt = match save_result {
+            Ok(receipt) => receipt,
+            Err(NanoMapSaveError::Persistence(source))
+                if persistence_error_was_published(&source) =>
+            {
+                let quota_verification = reservation
+                    .verify_committed()
+                    .map(Box::new)
+                    .map_err(Box::new);
+                return Err(NanoMapSaveError::PublishedButPersistenceFailed {
+                    source,
+                    quota_verification,
+                });
+            }
+            Err(source) => return Err(source),
+        };
+        let quota_verification = reservation.verify_committed().map_err(|source| {
+            NanoMapSaveError::PublishedButQuotaVerificationFailed {
+                receipt: receipt.clone(),
+                source: Box::new(source),
+            }
+        })?;
+        receipt.quota_verification = Some(Box::new(quota_verification));
+        Ok(receipt)
+    }
+
+    fn retained_for_selection(
+        &self,
+        selected: Option<NanoMapSnapshotIdentity>,
+    ) -> Result<&RetainedNanoMapSnapshot, NanoMapSaveError> {
         let retained = self.latest.as_ref().ok_or(NanoMapSaveError::NoSnapshot)?;
         if let Some(requested) = selected
             && requested != retained.identity
@@ -871,6 +1703,94 @@ impl NanoMapPersistenceOwner {
                 retained: retained.identity,
             });
         }
+        Ok(retained)
+    }
+
+    fn save_atomically(
+        &mut self,
+        selected: Option<NanoMapSnapshotIdentity>,
+    ) -> Result<NanoMapSaveReceipt, NanoMapSaveError> {
+        #[cfg(feature = "nano-agent")]
+        {
+            self.save_with_admitted_parent(selected)
+        }
+        #[cfg(not(feature = "nano-agent"))]
+        {
+            self.save_with(selected, |path, snapshot| {
+                save_occupancy_map_atomic(path, snapshot)
+            })
+        }
+    }
+
+    #[cfg(feature = "nano-agent")]
+    fn save_with_admitted_parent(
+        &mut self,
+        selected: Option<NanoMapSnapshotIdentity>,
+    ) -> Result<NanoMapSaveReceipt, NanoMapSaveError> {
+        require_unchanged_directory(
+            NanoMapPathRole::StateRoot,
+            &self.state_root,
+            self.state_root_identity,
+        )
+        .map_err(NanoMapSaveError::Path)?;
+        let save_parent = open_unchanged_directory_file(
+            NanoMapPathRole::SaveParent,
+            &self.save_parent_path,
+            self.save_parent_identity,
+        )
+        .map_err(NanoMapSaveError::Path)?;
+        self.save_with_parent_descriptor(selected, &save_parent)
+    }
+
+    #[cfg(feature = "nano-agent")]
+    fn save_with_parent_descriptor(
+        &mut self,
+        selected: Option<NanoMapSnapshotIdentity>,
+        save_parent: impl AsFd,
+    ) -> Result<NanoMapSaveReceipt, NanoMapSaveError> {
+        let retained = self.retained_for_selection(selected)?;
+        require_directory_identity_at(
+            &save_parent,
+            NanoMapPathRole::SaveParent,
+            &self.save_parent_path,
+            self.save_parent_identity,
+        )
+        .map_err(NanoMapSaveError::Path)?;
+        require_optional_regular_file_at(
+            &save_parent,
+            self.save_snapshot_path
+                .file_name()
+                .expect("admitted save snapshot has one file name"),
+            NanoMapPathRole::SaveSnapshot,
+            &self.save_snapshot_path,
+        )
+        .map_err(NanoMapSaveError::Path)?;
+        save_occupancy_map_atomic_at(
+            &save_parent,
+            self.save_snapshot_path
+                .file_name()
+                .expect("admitted save snapshot has one file name"),
+            &self.save_snapshot_path,
+            &retained.snapshot,
+        )
+        .map_err(NanoMapSaveError::Persistence)?;
+        Ok(NanoMapSaveReceipt {
+            identity: retained.identity,
+            destination: self.save_snapshot_path.clone(),
+            quota_verification: None,
+        })
+    }
+
+    #[cfg(any(test, not(feature = "nano-agent")))]
+    fn save_with<F>(
+        &mut self,
+        selected: Option<NanoMapSnapshotIdentity>,
+        save: F,
+    ) -> Result<NanoMapSaveReceipt, NanoMapSaveError>
+    where
+        F: FnOnce(&Path, &OccupancyGridSnapshot) -> Result<(), OccupancyMapSaveError>,
+    {
+        let retained = self.retained_for_selection(selected)?;
         require_unchanged_directory(
             NanoMapPathRole::StateRoot,
             &self.state_root,
@@ -894,6 +1814,7 @@ impl NanoMapPersistenceOwner {
         Ok(NanoMapSaveReceipt {
             identity: retained.identity,
             destination: self.save_snapshot_path.clone(),
+            quota_verification: None,
         })
     }
 
@@ -916,8 +1837,283 @@ impl NanoMapPersistenceOwner {
         finish_claimed_save(claimed, || self.save_selected(selected)).map_err(Into::into)
     }
 
-    /// Load the configured warm artifact once. A dataset path is admitted and
-    /// retained, but it is explicitly not treated as content identity.
+    /// Production command form: completion is emitted only after both durable
+    /// atomic publication and exact post-write map quota verification.
+    pub fn respond_to_claimed_save_map_with_quota(
+        &mut self,
+        claimed: AgentControlClaimedRequest,
+        quota: &mut NanoStateQuotaOwner,
+    ) -> Result<NanoMapSaveReceipt, NanoMapSaveCommandError> {
+        finish_claimed_save(claimed, || self.save_latest_with_quota(quota)).map_err(Into::into)
+    }
+
+    /// Exact-selection production command form with launch-bound map quota
+    /// admission and post-write verification.
+    pub fn respond_to_claimed_selected_save_map_with_quota(
+        &mut self,
+        claimed: AgentControlClaimedRequest,
+        selected: NanoMapSnapshotIdentity,
+        quota: &mut NanoStateQuotaOwner,
+    ) -> Result<NanoMapSaveReceipt, NanoMapSaveCommandError> {
+        finish_claimed_save(claimed, || self.save_selected_with_quota(selected, quota))
+            .map_err(Into::into)
+    }
+
+    /// Whether `save_map` must terminate capture and bind the drained final
+    /// map to the finalized session dataset before it may complete.
+    #[cfg(feature = "nano-agent")]
+    pub const fn requires_quiescent_warm_checkpoint(&self) -> bool {
+        true
+    }
+
+    /// Publish one restart-safe terminal checkpoint.
+    ///
+    /// The caller must first stop capture, drain inference/dense/navigation,
+    /// finalize the exact session dataset manifest, and retain the final
+    /// occupancy snapshot. This method then:
+    ///
+    /// 1. writes and quota-verifies the configured staging pathname;
+    /// 2. relocates that exact inode, without replacement or a second encode,
+    ///    into the immutable session-local occupancy pathname;
+    /// 3. hashes that artifact and the finalized dataset manifest; and
+    /// 4. atomically selects the pair by a synchronized rename.
+    ///
+    /// Every error before the selection rename leaves the previous selection
+    /// untouched. An error after rename but before directory synchronization
+    /// is explicitly reported as publication uncertainty and never receives a
+    /// completion response. A successful receipt proves replay inputs, not
+    /// current-camera localization.
+    #[cfg(feature = "nano-agent")]
+    pub fn publish_quiescent_warm_checkpoint_with_quota(
+        &mut self,
+        finalized_dataset_directory: &Path,
+        finalized_map_identity: Option<NanoFinalizedJournalMapIdentity>,
+        quota: &mut NanoStateQuotaOwner,
+    ) -> Result<NanoWarmCheckpointReceipt, NanoWarmCheckpointError> {
+        let selected = self
+            .latest_identity()
+            .ok_or(NanoWarmCheckpointError::SaveMap(
+                NanoMapSaveError::NoSnapshot,
+            ))?;
+        require_finalized_journal_map_matches_retained(finalized_map_identity, selected)?;
+        let selection_root = match &self.warm_start {
+            AdmittedNanoWarmStart::None => finalized_dataset_directory
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| NanoWarmCheckpointError::DatasetHasNoSelectionParent {
+                    dataset_directory: finalized_dataset_directory.to_path_buf(),
+                })?,
+            AdmittedNanoWarmStart::DatasetReplay {
+                slam_dataset_directory_path,
+                ..
+            } => slam_dataset_directory_path.clone(),
+        };
+        require_unchanged_directory(
+            NanoMapPathRole::StateRoot,
+            &self.state_root,
+            self.state_root_identity,
+        )
+        .map_err(NanoWarmCheckpointError::DatasetPath)?;
+        require_strict_descendant(
+            NanoMapPathRole::WarmSlamDatasetDirectory,
+            &self.state_root,
+            &selection_root,
+        )
+        .map_err(NanoWarmCheckpointError::DatasetPath)?;
+        let selection_root_identity =
+            require_canonical_directory(NanoMapPathRole::WarmSlamDatasetDirectory, &selection_root)
+                .map_err(NanoWarmCheckpointError::DatasetPath)?;
+        require_direct_child(&selection_root, finalized_dataset_directory).map_err(|()| {
+            NanoWarmCheckpointError::DatasetIsNotDirectSelectionChild {
+                selection_root: selection_root.clone(),
+                dataset_directory: finalized_dataset_directory.to_path_buf(),
+            }
+        })?;
+        let dataset_identity = require_canonical_directory(
+            NanoMapPathRole::WarmSlamDatasetDirectory,
+            finalized_dataset_directory,
+        )
+        .map_err(NanoWarmCheckpointError::DatasetPath)?;
+        let manifest_path = finalized_dataset_directory.join(DATASET_MANIFEST_FILE);
+        match require_canonical_regular_file(
+            NanoMapPathRole::WarmSlamDatasetDirectory,
+            &manifest_path,
+        ) {
+            Ok(_) => {}
+            Err(NanoMapPersistencePathError::Missing { .. }) => {
+                return Err(NanoWarmCheckpointError::DatasetManifestMissing {
+                    path: manifest_path,
+                });
+            }
+            Err(source) => return Err(NanoWarmCheckpointError::DatasetPath(source)),
+        }
+
+        let occupancy_path = finalized_dataset_directory.join(NANO_WARM_OCCUPANCY_FILE);
+        match fs::symlink_metadata(&occupancy_path) {
+            Ok(_) => {
+                return Err(NanoWarmCheckpointError::OccupancyAlreadyExists {
+                    path: occupancy_path,
+                });
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(NanoWarmCheckpointError::Selection(
+                    NanoWarmSelectionError::Io {
+                        operation: "inspect checkpoint occupancy destination",
+                        path: occupancy_path,
+                        source,
+                    },
+                ));
+            }
+        }
+        let staged_map = self
+            .save_selected_with_quota(selected, quota)
+            .map_err(NanoWarmCheckpointError::SaveMap)?;
+        let maximum_occupancy_bytes = staged_map
+            .quota_verification()
+            .map(NanoStateQuotaWriteReceipt::exact_bytes)
+            .ok_or(NanoWarmCheckpointError::MissingQuotaVerification)?;
+        relocate_staged_checkpoint_occupancy(
+            staged_map.destination(),
+            &self.save_parent_path,
+            self.save_parent_identity,
+            &occupancy_path,
+            finalized_dataset_directory,
+            dataset_identity,
+        )
+        .map_err(NanoWarmCheckpointError::Selection)?;
+
+        let (dataset_manifest_sha256, dataset_manifest_bytes) =
+            hash_bounded_regular_file(&manifest_path, MAX_NANO_DATASET_MANIFEST_BYTES)
+                .map_err(NanoWarmCheckpointError::Selection)?;
+        let (occupancy_sha256, occupancy_bytes) =
+            hash_bounded_regular_file(&occupancy_path, maximum_occupancy_bytes)
+                .map_err(NanoWarmCheckpointError::Selection)?;
+        if occupancy_bytes != maximum_occupancy_bytes {
+            return Err(NanoWarmCheckpointError::Selection(
+                NanoWarmSelectionError::LengthMismatch {
+                    path: occupancy_path,
+                    expected: maximum_occupancy_bytes,
+                    observed: occupancy_bytes,
+                },
+            ));
+        }
+        require_unchanged_directory(
+            NanoMapPathRole::WarmSlamDatasetDirectory,
+            finalized_dataset_directory,
+            dataset_identity,
+        )
+        .map_err(NanoWarmCheckpointError::DatasetPath)?;
+        require_unchanged_directory(
+            NanoMapPathRole::WarmSlamDatasetDirectory,
+            &selection_root,
+            selection_root_identity,
+        )
+        .map_err(NanoWarmCheckpointError::DatasetPath)?;
+
+        let dataset_directory_name = finalized_dataset_directory
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or(NanoWarmCheckpointError::Selection(
+                NanoWarmSelectionError::InvalidDatasetDirectoryName,
+            ))?
+            .to_owned();
+        let content = NanoWarmSelectionContentIdentity {
+            dataset_manifest_sha256,
+            occupancy_sha256,
+            dataset_manifest_bytes,
+            occupancy_bytes,
+        };
+        let selection = ParsedNanoWarmSelectionV1 {
+            dataset_directory_name,
+            content,
+            map_epoch_id: selected.map_epoch_id,
+            map_revision: selected.revision,
+        };
+        let selection_path =
+            publish_warm_selection(&selection_root, selection_root_identity, &selection)
+                .map_err(NanoWarmCheckpointError::Selection)?;
+        Ok(NanoWarmCheckpointReceipt {
+            staged_map,
+            occupancy_snapshot_path: occupancy_path,
+            dataset_directory: finalized_dataset_directory.to_path_buf(),
+            selection_path,
+            binding: content.binding_status(),
+        })
+    }
+
+    /// Claimed-command form. The accepted completion is sent only after the
+    /// dataset/map selection rename and its parent-directory synchronization.
+    #[cfg(feature = "nano-agent")]
+    pub fn respond_to_claimed_quiescent_warm_checkpoint_with_quota(
+        &mut self,
+        claimed: AgentControlClaimedRequest,
+        finalized_dataset_directory: &Path,
+        finalized_map_identity: Option<NanoFinalizedJournalMapIdentity>,
+        quota: &mut NanoStateQuotaOwner,
+        require_wire_delivery: bool,
+    ) -> Result<NanoWarmCheckpointReceipt, NanoWarmCheckpointCommandError> {
+        let actual = claimed.request().command().kind();
+        if actual != AgentControlCommandKindV1::SaveMap {
+            let response = if require_wire_delivery {
+                claimed
+                    .reject_after_wire_delivery(AgentControlRejectionCodeV1::InternalFault, false)
+            } else {
+                claimed.reject(AgentControlRejectionCodeV1::InternalFault, false)
+            };
+            return match response {
+                Ok(()) => Err(NanoWarmCheckpointCommandError::WrongCommandRejected { actual }),
+                Err(response) => Err(NanoWarmCheckpointCommandError::WrongCommandResponseFailed {
+                    actual,
+                    response,
+                }),
+            };
+        }
+        match self.publish_quiescent_warm_checkpoint_with_quota(
+            finalized_dataset_directory,
+            finalized_map_identity,
+            quota,
+        ) {
+            Ok(receipt) => match if require_wire_delivery {
+                claimed.respond_completed_after_wire_delivery()
+            } else {
+                claimed.respond_completed()
+            } {
+                Ok(()) => Ok(receipt),
+                Err(response) => Err(
+                    NanoWarmCheckpointCommandError::CheckpointedButCompletionResponseFailed {
+                        receipt: Box::new(receipt),
+                        response,
+                    },
+                ),
+            },
+            Err(source) => {
+                let (code, retryable) = source.rejection();
+                let response = if require_wire_delivery {
+                    claimed.reject_after_wire_delivery(code, retryable)
+                } else {
+                    claimed.reject(code, retryable)
+                };
+                match response {
+                    Ok(()) => Err(NanoWarmCheckpointCommandError::CheckpointRejected { source }),
+                    Err(response) => Err(
+                        NanoWarmCheckpointCommandError::CheckpointAndRejectionResponseFailed {
+                            source,
+                            response,
+                        },
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Load the configured warm artifact once.
+    ///
+    /// Production resolves only the durably selected finalized session. The
+    /// configured dataset pathname is the selection root, never a mutable
+    /// recording directory and never a symlink. The selected manifest and
+    /// occupancy digests are checked before replay and again when exact replay
+    /// is bound.
     pub fn load_warm_start(&self) -> Result<NanoMapWarmStartLoad, NanoMapWarmStartLoadError> {
         require_unchanged_directory(
             NanoMapPathRole::StateRoot,
@@ -933,36 +2129,1258 @@ impl NanoMapPersistenceOwner {
             return Ok(NanoMapWarmStartLoad::Disabled);
         };
 
-        let dataset_directory_identity = require_canonical_directory(
+        #[cfg(feature = "nano-agent")]
+        {
+            let _ = occupancy_snapshot_path;
+            self.load_selected_warm_start(slam_dataset_directory_path)
+        }
+
+        #[cfg(not(feature = "nano-agent"))]
+        {
+            let dataset_directory_identity = require_canonical_directory(
+                NanoMapPathRole::WarmSlamDatasetDirectory,
+                slam_dataset_directory_path,
+            )
+            .map_err(NanoMapWarmStartLoadError::Path)?;
+            let snapshot_identity = require_canonical_regular_file(
+                NanoMapPathRole::WarmOccupancySnapshot,
+                occupancy_snapshot_path,
+            )
+            .map_err(NanoMapWarmStartLoadError::Path)?;
+            let persisted = load_persisted_occupancy_map(occupancy_snapshot_path, self.limits)
+                .map_err(NanoMapWarmStartLoadError::Occupancy)?;
+            require_unchanged_regular_file(
+                NanoMapPathRole::WarmOccupancySnapshot,
+                occupancy_snapshot_path,
+                snapshot_identity,
+            )
+            .map_err(NanoMapWarmStartLoadError::Path)?;
+
+            Ok(NanoMapWarmStartLoad::DatasetReplayRequired(Box::new(
+                NanoDatasetReplayRequired {
+                    persisted,
+                    occupancy_snapshot_path: occupancy_snapshot_path.clone(),
+                    slam_dataset_directory_path: slam_dataset_directory_path.clone(),
+                    state_root: self.state_root.clone(),
+                    state_root_identity: self.state_root_identity,
+                    dataset_directory_identity,
+                },
+            )))
+        }
+    }
+
+    #[cfg(feature = "nano-agent")]
+    fn load_selected_warm_start(
+        &self,
+        selection_root: &Path,
+    ) -> Result<NanoMapWarmStartLoad, NanoMapWarmStartLoadError> {
+        let selection_root_identity =
+            require_canonical_directory(NanoMapPathRole::WarmSlamDatasetDirectory, selection_root)
+                .map_err(NanoMapWarmStartLoadError::Path)?;
+        let selection_root_file = open_unchanged_directory_nofollow(
             NanoMapPathRole::WarmSlamDatasetDirectory,
-            slam_dataset_directory_path,
+            selection_root,
+            selection_root_identity,
+        )
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
+        let selection_path = selection_root.join(NANO_WARM_SELECTION_FILE);
+        let (mut selection_file, selection_identity) = open_regular_file_at_nofollow(
+            &selection_root_file,
+            OsStr::new(NANO_WARM_SELECTION_FILE),
+            &selection_path,
+        )
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
+        let selection_bytes = read_bounded_open_file(
+            &mut selection_file,
+            &selection_path,
+            MAX_NANO_WARM_SELECTION_BYTES,
+        )
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
+        let parsed = parse_warm_selection_bytes(selection_root, &selection_bytes)
+            .map_err(NanoMapWarmStartLoadError::Selection)?;
+        let dataset_directory = selection_root.join(&parsed.dataset_directory_name);
+        require_direct_child(selection_root, &dataset_directory).map_err(|()| {
+            NanoMapWarmStartLoadError::Selection(
+                NanoWarmSelectionError::InvalidDatasetDirectoryName,
+            )
+        })?;
+        let (dataset_directory_file, dataset_directory_identity) = open_directory_at_nofollow(
+            &selection_root_file,
+            OsStr::new(&parsed.dataset_directory_name),
+            &dataset_directory,
+        )
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
+        require_unchanged_directory(
+            NanoMapPathRole::WarmSlamDatasetDirectory,
+            &dataset_directory,
+            dataset_directory_identity,
         )
         .map_err(NanoMapWarmStartLoadError::Path)?;
-        let snapshot_identity = require_canonical_regular_file(
-            NanoMapPathRole::WarmOccupancySnapshot,
-            occupancy_snapshot_path,
+        let manifest_path = dataset_directory.join(DATASET_MANIFEST_FILE);
+        let (mut manifest_file, manifest_identity) = open_regular_file_at_nofollow(
+            &dataset_directory_file,
+            OsStr::new(DATASET_MANIFEST_FILE),
+            &manifest_path,
         )
-        .map_err(NanoMapWarmStartLoadError::Path)?;
-        let persisted = load_persisted_occupancy_map(occupancy_snapshot_path, self.limits)
-            .map_err(NanoMapWarmStartLoadError::Occupancy)?;
-        require_unchanged_regular_file(
-            NanoMapPathRole::WarmOccupancySnapshot,
-            occupancy_snapshot_path,
-            snapshot_identity,
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
+        let occupancy_snapshot_path = dataset_directory.join(NANO_WARM_OCCUPANCY_FILE);
+        let (mut occupancy_file, occupancy_identity) = open_regular_file_at_nofollow(
+            &dataset_directory_file,
+            OsStr::new(NANO_WARM_OCCUPANCY_FILE),
+            &occupancy_snapshot_path,
         )
-        .map_err(NanoMapWarmStartLoadError::Path)?;
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
+
+        let (manifest_digest, manifest_bytes) = hash_bounded_open_file(
+            &mut manifest_file,
+            &manifest_path,
+            MAX_NANO_DATASET_MANIFEST_BYTES,
+        )
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
+        verify_selected_digest(
+            &manifest_path,
+            parsed.content.dataset_manifest_sha256,
+            parsed.content.dataset_manifest_bytes,
+            manifest_digest,
+            manifest_bytes,
+        )
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
+
+        let occupancy_bytes = occupancy_file
+            .metadata()
+            .map_err(|source| {
+                NanoMapWarmStartLoadError::Selection(NanoWarmSelectionError::Io {
+                    operation: "inspect retained selected occupancy",
+                    path: occupancy_snapshot_path.clone(),
+                    source,
+                })
+            })?
+            .len();
+        if occupancy_bytes != parsed.content.occupancy_bytes {
+            return Err(NanoMapWarmStartLoadError::Selection(
+                NanoWarmSelectionError::LengthMismatch {
+                    path: occupancy_snapshot_path,
+                    expected: parsed.content.occupancy_bytes,
+                    observed: occupancy_bytes,
+                },
+            ));
+        }
+        occupancy_file.seek(SeekFrom::Start(0)).map_err(|source| {
+            NanoMapWarmStartLoadError::Selection(NanoWarmSelectionError::Io {
+                operation: "rewind retained selected occupancy",
+                path: occupancy_snapshot_path.clone(),
+                source,
+            })
+        })?;
+        let mut occupancy_reader = DigestingReader::new(&mut occupancy_file);
+        let persisted = load_persisted_occupancy_map_from_reader(
+            &mut occupancy_reader,
+            occupancy_bytes,
+            &occupancy_snapshot_path,
+            self.limits,
+        )
+        .map_err(NanoMapWarmStartLoadError::Occupancy)?;
+        let (occupancy_digest, observed_occupancy_bytes) = occupancy_reader.finish();
+        verify_selected_digest(
+            &occupancy_snapshot_path,
+            parsed.content.occupancy_sha256,
+            parsed.content.occupancy_bytes,
+            occupancy_digest,
+            observed_occupancy_bytes,
+        )
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
+        if persisted.snapshot().revision() != parsed.map_revision {
+            return Err(NanoMapWarmStartLoadError::Selection(
+                NanoWarmSelectionError::MapRevisionMismatch {
+                    selected: parsed.map_revision,
+                    observed: persisted.snapshot().revision(),
+                },
+            ));
+        }
+        require_regular_file_identity_at(
+            &selection_root_file,
+            OsStr::new(NANO_WARM_SELECTION_FILE),
+            &selection_path,
+            selection_identity,
+        )
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
+        require_regular_file_identity_at(
+            &dataset_directory_file,
+            OsStr::new(DATASET_MANIFEST_FILE),
+            &manifest_path,
+            manifest_identity,
+        )
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
+        require_regular_file_identity_at(
+            &dataset_directory_file,
+            OsStr::new(NANO_WARM_OCCUPANCY_FILE),
+            &occupancy_snapshot_path,
+            occupancy_identity,
+        )
+        .map_err(NanoMapWarmStartLoadError::Selection)?;
 
         Ok(NanoMapWarmStartLoad::DatasetReplayRequired(Box::new(
             NanoDatasetReplayRequired {
                 persisted,
-                occupancy_snapshot_path: occupancy_snapshot_path.clone(),
-                slam_dataset_directory_path: slam_dataset_directory_path.clone(),
+                occupancy_snapshot_path,
+                slam_dataset_directory_path: dataset_directory,
                 state_root: self.state_root.clone(),
                 state_root_identity: self.state_root_identity,
                 dataset_directory_identity,
+                selection_root: selection_root.to_path_buf(),
+                selection_root_identity,
+                selection_root_file,
+                selection_file,
+                selection_identity,
+                dataset_directory_file,
+                manifest_file,
+                manifest_identity,
+                occupancy_file,
+                occupancy_identity,
+                content_identity: parsed.content,
+                selected_map_epoch_id: parsed.map_epoch_id,
             },
         )))
     }
+}
+
+#[cfg(feature = "nano-agent")]
+fn require_direct_child(parent: &Path, child: &Path) -> Result<(), ()> {
+    if child.parent() != Some(parent) {
+        return Err(());
+    }
+    let Some(name) = child.file_name().and_then(OsStr::to_str) else {
+        return Err(());
+    };
+    parse_dataset_directory_name(name).map(|_| ())
+}
+
+#[cfg(feature = "nano-agent")]
+fn parse_dataset_directory_name(value: &str) -> Result<&str, ()> {
+    if value.is_empty()
+        || value.len() > MAX_DATASET_DIRECTORY_NAME_BYTES
+        || Path::new(value).components().count() != 1
+        || !matches!(
+            Path::new(value).components().next(),
+            Some(Component::Normal(_))
+        )
+    {
+        return Err(());
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "nano-agent")]
+fn parse_sha256_hex(
+    field: &'static str,
+    value: &str,
+) -> Result<[u8; SHA256_BYTES], NanoWarmSelectionError> {
+    if value.len() != SHA256_HEX_BYTES || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(NanoWarmSelectionError::InvalidSha256 { field });
+    }
+    let mut digest = [0_u8; SHA256_BYTES];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high =
+            decode_hex_nibble(chunk[0]).ok_or(NanoWarmSelectionError::InvalidSha256 { field })?;
+        let low =
+            decode_hex_nibble(chunk[1]).ok_or(NanoWarmSelectionError::InvalidSha256 { field })?;
+        digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
+#[cfg(feature = "nano-agent")]
+fn decode_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+fn encode_sha256_hex(value: [u8; SHA256_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(SHA256_HEX_BYTES);
+    for byte in value {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+#[cfg(feature = "nano-agent")]
+fn open_regular_file_nofollow(path: &Path) -> Result<File, NanoWarmSelectionError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "open regular file without following links",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "inspect opened regular file",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !metadata.is_file() {
+        return Err(NanoWarmSelectionError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(file)
+}
+
+#[cfg(feature = "nano-agent")]
+fn open_regular_file_at_nofollow(
+    parent: impl AsFd,
+    name: &OsStr,
+    path: &Path,
+) -> Result<(File, FilesystemObjectIdentity), NanoWarmSelectionError> {
+    let descriptor = openat(
+        parent.as_fd(),
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| NanoWarmSelectionError::Io {
+        operation: "open retained regular file without following links",
+        path: path.to_path_buf(),
+        source: rustix_errno_as_io(source),
+    })?;
+    let file = File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "inspect retained regular file",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !metadata.is_file() {
+        return Err(NanoWarmSelectionError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok((file, FilesystemObjectIdentity::from_metadata(&metadata)))
+}
+
+#[cfg(feature = "nano-agent")]
+fn open_directory_at_nofollow(
+    parent: impl AsFd,
+    name: &OsStr,
+    path: &Path,
+) -> Result<(File, FilesystemObjectIdentity), NanoWarmSelectionError> {
+    let descriptor = openat(
+        parent.as_fd(),
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| NanoWarmSelectionError::Io {
+        operation: "open retained directory without following links",
+        path: path.to_path_buf(),
+        source: rustix_errno_as_io(source),
+    })?;
+    let file = File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "inspect retained directory",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !metadata.is_dir() {
+        return Err(NanoWarmSelectionError::Path(
+            NanoMapPersistencePathError::NotDirectory {
+                role: NanoMapPathRole::WarmSlamDatasetDirectory,
+                path: path.to_path_buf(),
+            },
+        ));
+    }
+    Ok((file, FilesystemObjectIdentity::from_metadata(&metadata)))
+}
+
+#[cfg(feature = "nano-agent")]
+fn require_regular_file_identity_at(
+    parent: impl AsFd,
+    name: &OsStr,
+    path: &Path,
+    expected: FilesystemObjectIdentity,
+) -> Result<(), NanoWarmSelectionError> {
+    let stat = statat(parent.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW).map_err(|source| {
+        NanoWarmSelectionError::Io {
+            operation: "inspect retained selected file name",
+            path: path.to_path_buf(),
+            source: rustix_errno_as_io(source),
+        }
+    })?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(NanoWarmSelectionError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    let observed_device = u64::try_from(stat.st_dev).map_err(|_| NanoWarmSelectionError::Io {
+        operation: "parse retained selected file device number",
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file device number is not representable as u64",
+        ),
+    })?;
+    let observed_inode = stat.st_ino;
+    if (observed_device, observed_inode) != (expected.device, expected.inode) {
+        return Err(NanoWarmSelectionError::FilesystemObjectChanged {
+            path: path.to_path_buf(),
+            expected_device: expected.device,
+            expected_inode: expected.inode,
+            observed_device,
+            observed_inode,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nano-agent")]
+fn require_open_regular_file_identity(
+    file: &File,
+    path: &Path,
+    expected: FilesystemObjectIdentity,
+) -> Result<(), NanoWarmSelectionError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "inspect retained selected file descriptor",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !metadata.is_file() {
+        return Err(NanoWarmSelectionError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    let observed = FilesystemObjectIdentity::from_metadata(&metadata);
+    if observed != expected {
+        return Err(NanoWarmSelectionError::FilesystemObjectChanged {
+            path: path.to_path_buf(),
+            expected_device: expected.device,
+            expected_inode: expected.inode,
+            observed_device: observed.device,
+            observed_inode: observed.inode,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nano-agent")]
+fn open_unchanged_directory_nofollow(
+    role: NanoMapPathRole,
+    path: &Path,
+    expected: FilesystemObjectIdentity,
+) -> Result<File, NanoWarmSelectionError> {
+    open_unchanged_directory_file(role, path, expected).map_err(NanoWarmSelectionError::Path)
+}
+
+#[cfg(feature = "nano-agent")]
+fn open_unchanged_directory_file(
+    role: NanoMapPathRole,
+    path: &Path,
+    expected: FilesystemObjectIdentity,
+) -> Result<File, NanoMapPersistencePathError> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    let directory = options
+        .open(path)
+        .map_err(|source| NanoMapPersistencePathError::Io {
+            operation: NanoMapPathOperation::OpenDirectoryForSync,
+            role,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = directory
+        .metadata()
+        .map_err(|source| NanoMapPersistencePathError::Io {
+            operation: NanoMapPathOperation::Inspect,
+            role,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    require_same_identity(
+        role,
+        path,
+        expected,
+        FilesystemObjectIdentity::from_metadata(&metadata),
+    )?;
+    Ok(directory)
+}
+
+#[cfg(feature = "nano-agent")]
+fn require_directory_identity_at(
+    directory: impl AsFd,
+    role: NanoMapPathRole,
+    path: &Path,
+    expected: FilesystemObjectIdentity,
+) -> Result<(), NanoMapPersistencePathError> {
+    let stat = fstat(directory.as_fd()).map_err(|source| NanoMapPersistencePathError::Io {
+        operation: NanoMapPathOperation::Inspect,
+        role,
+        path: path.to_path_buf(),
+        source: rustix_errno_as_io(source),
+    })?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+        return Err(NanoMapPersistencePathError::NotDirectory {
+            role,
+            path: path.to_path_buf(),
+        });
+    }
+    let actual_device =
+        u64::try_from(stat.st_dev).map_err(|_| NanoMapPersistencePathError::Io {
+            operation: NanoMapPathOperation::Inspect,
+            role,
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "directory device number is not representable as u64",
+            ),
+        })?;
+    let actual_inode = stat.st_ino;
+    require_same_identity(
+        role,
+        path,
+        expected,
+        FilesystemObjectIdentity {
+            device: actual_device,
+            inode: actual_inode,
+        },
+    )
+}
+
+#[cfg(feature = "nano-agent")]
+fn require_optional_regular_file_at(
+    parent: impl AsFd,
+    name: &OsStr,
+    role: NanoMapPathRole,
+    path: &Path,
+) -> Result<(), NanoMapPersistencePathError> {
+    let stat = match statat(parent.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(source) => {
+            return Err(NanoMapPersistencePathError::Io {
+                operation: NanoMapPathOperation::Inspect,
+                role,
+                path: path.to_path_buf(),
+                source: rustix_errno_as_io(source),
+            });
+        }
+    };
+    match FileType::from_raw_mode(stat.st_mode) {
+        FileType::RegularFile => Ok(()),
+        FileType::Symlink => Err(NanoMapPersistencePathError::Symlink {
+            role,
+            path: path.to_path_buf(),
+        }),
+        _ => Err(NanoMapPersistencePathError::NotRegularFile {
+            role,
+            path: path.to_path_buf(),
+        }),
+    }
+}
+
+/// Move the quota-verified encoded artifact into its immutable session with
+/// no second encode, allocation, copy, or overwrite.
+#[cfg(feature = "nano-agent")]
+fn relocate_staged_checkpoint_occupancy(
+    staged_path: &Path,
+    staged_parent: &Path,
+    staged_parent_identity: FilesystemObjectIdentity,
+    occupancy_path: &Path,
+    dataset_directory: &Path,
+    dataset_directory_identity: FilesystemObjectIdentity,
+) -> Result<(), NanoWarmSelectionError> {
+    let staged_name = staged_path
+        .file_name()
+        .ok_or(NanoWarmSelectionError::InvalidDatasetDirectoryName)?;
+    let occupancy_name = occupancy_path
+        .file_name()
+        .ok_or(NanoWarmSelectionError::InvalidDatasetDirectoryName)?;
+    if staged_path.parent() != Some(staged_parent)
+        || occupancy_path.parent() != Some(dataset_directory)
+    {
+        return Err(NanoWarmSelectionError::InvalidDatasetDirectoryName);
+    }
+    let staged_identity =
+        require_canonical_regular_file(NanoMapPathRole::SaveSnapshot, staged_path)
+            .map_err(NanoWarmSelectionError::Path)?;
+    let staged_parent_file = open_unchanged_directory_nofollow(
+        NanoMapPathRole::SaveParent,
+        staged_parent,
+        staged_parent_identity,
+    )?;
+    let dataset_directory_file = open_unchanged_directory_nofollow(
+        NanoMapPathRole::WarmSlamDatasetDirectory,
+        dataset_directory,
+        dataset_directory_identity,
+    )?;
+    renameat_with(
+        &staged_parent_file,
+        staged_name,
+        &dataset_directory_file,
+        occupancy_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|source| NanoWarmSelectionError::Io {
+        operation: "relocate quota-verified occupancy without replacement",
+        path: occupancy_path.to_path_buf(),
+        source: io::Error::from_raw_os_error(source.raw_os_error()),
+    })?;
+    let relocated_identity =
+        require_canonical_regular_file(NanoMapPathRole::WarmOccupancySnapshot, occupancy_path)
+            .map_err(NanoWarmSelectionError::Path)?;
+    require_same_identity(
+        NanoMapPathRole::WarmOccupancySnapshot,
+        occupancy_path,
+        staged_identity,
+        relocated_identity,
+    )
+    .map_err(NanoWarmSelectionError::Path)?;
+    dataset_directory_file
+        .sync_all()
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "synchronize checkpoint occupancy directory",
+            path: dataset_directory.to_path_buf(),
+            source,
+        })?;
+    staged_parent_file
+        .sync_all()
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "synchronize emptied quota-staging directory",
+            path: staged_parent.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(all(feature = "nano-agent", test))]
+fn read_bounded_regular_file(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, NanoWarmSelectionError> {
+    let mut file = open_regular_file_nofollow(path)?;
+    read_bounded_open_file(&mut file, path, maximum_bytes)
+}
+
+#[cfg(feature = "nano-agent")]
+fn read_bounded_open_file(
+    file: &mut File,
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, NanoWarmSelectionError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "inspect bounded input",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let expected_bytes = metadata.len();
+    if expected_bytes > maximum_bytes {
+        return Err(NanoWarmSelectionError::FileTooLarge {
+            path: path.to_path_buf(),
+            actual_bytes: expected_bytes,
+            maximum_bytes,
+        });
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "rewind bounded input",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let capacity =
+        usize::try_from(expected_bytes).map_err(|_| NanoWarmSelectionError::FileTooLarge {
+            path: path.to_path_buf(),
+            actual_bytes: expected_bytes,
+            maximum_bytes,
+        })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    Read::by_ref(file)
+        .take(expected_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "read bounded input",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() != capacity {
+        return if bytes.len() < capacity {
+            Err(NanoWarmSelectionError::Truncated {
+                path: path.to_path_buf(),
+                expected_bytes,
+                actual_bytes: bytes.len(),
+            })
+        } else {
+            Err(NanoWarmSelectionError::LengthMismatch {
+                path: path.to_path_buf(),
+                expected: expected_bytes,
+                observed: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            })
+        };
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "nano-agent")]
+fn hash_bounded_regular_file(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<([u8; SHA256_BYTES], u64), NanoWarmSelectionError> {
+    const HASH_BUFFER_BYTES: usize = 64 * 1_024;
+
+    let mut file = open_regular_file_nofollow(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "inspect hash input",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let expected_bytes = metadata.len();
+    if expected_bytes > maximum_bytes {
+        return Err(NanoWarmSelectionError::FileTooLarge {
+            path: path.to_path_buf(),
+            actual_bytes: expected_bytes,
+            maximum_bytes,
+        });
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+    let mut observed = 0_u64;
+    loop {
+        let remaining = expected_bytes.saturating_sub(observed);
+        if remaining == 0 {
+            break;
+        }
+        let request = usize::try_from(remaining.min(HASH_BUFFER_BYTES as u64))
+            .expect("bounded hash chunk fits usize");
+        let read =
+            file.read(&mut buffer[..request])
+                .map_err(|source| NanoWarmSelectionError::Io {
+                    operation: "hash bounded input",
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        if read == 0 {
+            return Err(NanoWarmSelectionError::Truncated {
+                path: path.to_path_buf(),
+                expected_bytes,
+                actual_bytes: usize::try_from(observed).unwrap_or(usize::MAX),
+            });
+        }
+        hasher.update(&buffer[..read]);
+        observed = observed
+            .checked_add(u64::try_from(read).expect("read length fits u64"))
+            .expect("observed bytes cannot exceed the admitted file length");
+    }
+    let mut trailing = [0_u8; 1];
+    let trailing_bytes = file
+        .read(&mut trailing)
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "verify hash input end",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if trailing_bytes != 0 {
+        return Err(NanoWarmSelectionError::LengthMismatch {
+            path: path.to_path_buf(),
+            expected: expected_bytes,
+            observed: expected_bytes.saturating_add(1),
+        });
+    }
+    Ok((hasher.finalize().into(), observed))
+}
+
+#[cfg(feature = "nano-agent")]
+struct DigestingReader<R> {
+    inner: R,
+    hasher: Sha256,
+    observed_bytes: u64,
+}
+
+#[cfg(feature = "nano-agent")]
+impl<R> DigestingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            observed_bytes: 0,
+        }
+    }
+
+    fn finish(self) -> ([u8; SHA256_BYTES], u64) {
+        (self.hasher.finalize().into(), self.observed_bytes)
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl<R: Read> Read for DigestingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        self.observed_bytes = self
+            .observed_bytes
+            .checked_add(u64::try_from(read).expect("read length fits u64"))
+            .ok_or_else(|| io::Error::other("digested byte count overflow"))?;
+        Ok(read)
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+pub(crate) struct SelectedManifestReader<'file> {
+    reader: DigestingReader<&'file mut File>,
+    expected_digest: [u8; SHA256_BYTES],
+    expected_bytes: u64,
+    path: PathBuf,
+}
+
+#[cfg(feature = "nano-agent")]
+impl Read for SelectedManifestReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(buffer)
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl SelectedManifestReader<'_> {
+    pub(crate) fn verify(mut self) -> Result<(), NanoWarmSelectionError> {
+        let mut trailing = [0_u8; 8 * 1_024];
+        loop {
+            let read = self
+                .read(&mut trailing)
+                .map_err(|source| NanoWarmSelectionError::Io {
+                    operation: "finish digesting retained selected manifest",
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if read == 0 {
+                break;
+            }
+        }
+        let (observed_digest, observed_bytes) = self.reader.finish();
+        verify_selected_digest(
+            &self.path,
+            self.expected_digest,
+            self.expected_bytes,
+            observed_digest,
+            observed_bytes,
+        )
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+fn hash_bounded_open_file(
+    file: &mut File,
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<([u8; SHA256_BYTES], u64), NanoWarmSelectionError> {
+    const HASH_BUFFER_BYTES: usize = 64 * 1_024;
+
+    let metadata = file
+        .metadata()
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "inspect retained hash input",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !metadata.is_file() {
+        return Err(NanoWarmSelectionError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    if metadata.len() > maximum_bytes {
+        return Err(NanoWarmSelectionError::FileTooLarge {
+            path: path.to_path_buf(),
+            actual_bytes: metadata.len(),
+            maximum_bytes,
+        });
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| NanoWarmSelectionError::Io {
+            operation: "rewind retained hash input",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut reader = DigestingReader::new(file);
+    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|source| NanoWarmSelectionError::Io {
+                operation: "hash retained input",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        if reader.observed_bytes > maximum_bytes {
+            return Err(NanoWarmSelectionError::FileTooLarge {
+                path: path.to_path_buf(),
+                actual_bytes: reader.observed_bytes,
+                maximum_bytes,
+            });
+        }
+    }
+    Ok(reader.finish())
+}
+
+#[cfg(feature = "nano-agent")]
+fn verify_selected_digest(
+    path: &Path,
+    expected_digest: [u8; SHA256_BYTES],
+    expected_bytes: u64,
+    observed_digest: [u8; SHA256_BYTES],
+    observed_bytes: u64,
+) -> Result<(), NanoWarmSelectionError> {
+    if observed_bytes != expected_bytes {
+        return Err(NanoWarmSelectionError::LengthMismatch {
+            path: path.to_path_buf(),
+            expected: expected_bytes,
+            observed: observed_bytes,
+        });
+    }
+    if observed_digest != expected_digest {
+        return Err(NanoWarmSelectionError::DigestMismatch {
+            path: path.to_path_buf(),
+            expected: expected_digest,
+            observed: observed_digest,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nano-agent")]
+fn verify_selected_content_from_handles(
+    manifest_file: &mut File,
+    occupancy_file: &mut File,
+    dataset_directory: &Path,
+    occupancy_path: &Path,
+    expected: NanoWarmSelectionContentIdentity,
+) -> Result<(), NanoWarmSelectionError> {
+    let manifest_path = dataset_directory.join(DATASET_MANIFEST_FILE);
+    let (observed_manifest, observed_manifest_bytes) = hash_bounded_open_file(
+        manifest_file,
+        &manifest_path,
+        MAX_NANO_DATASET_MANIFEST_BYTES,
+    )?;
+    verify_selected_digest(
+        &manifest_path,
+        expected.dataset_manifest_sha256,
+        expected.dataset_manifest_bytes,
+        observed_manifest,
+        observed_manifest_bytes,
+    )?;
+    let (observed_occupancy, observed_occupancy_bytes) = hash_bounded_open_file(
+        occupancy_file,
+        occupancy_path,
+        MAX_NANO_SELECTED_OCCUPANCY_BYTES,
+    )?;
+    verify_selected_digest(
+        occupancy_path,
+        expected.occupancy_sha256,
+        expected.occupancy_bytes,
+        observed_occupancy,
+        observed_occupancy_bytes,
+    )
+}
+
+#[cfg(all(feature = "nano-agent", test))]
+fn load_warm_selection(
+    selection_root: &Path,
+) -> Result<ParsedNanoWarmSelectionV1, NanoWarmSelectionError> {
+    let path = selection_root.join(NANO_WARM_SELECTION_FILE);
+    let bytes = read_bounded_regular_file(&path, MAX_NANO_WARM_SELECTION_BYTES)?;
+    parse_warm_selection_bytes(selection_root, &bytes)
+}
+
+#[cfg(feature = "nano-agent")]
+fn parse_warm_selection_bytes(
+    selection_root: &Path,
+    bytes: &[u8],
+) -> Result<ParsedNanoWarmSelectionV1, NanoWarmSelectionError> {
+    let dto: NanoWarmSelectionV1Dto =
+        serde_json::from_slice(bytes).map_err(NanoWarmSelectionError::Json)?;
+    if dto.schema_version != NANO_WARM_SELECTION_SCHEMA_VERSION {
+        return Err(NanoWarmSelectionError::UnsupportedSchema {
+            actual: dto.schema_version,
+        });
+    }
+    let dataset_directory_name = parse_dataset_directory_name(&dto.dataset_directory_name)
+        .map_err(|()| NanoWarmSelectionError::InvalidDatasetDirectoryName)?
+        .to_owned();
+    if dto.occupancy_file_name != NANO_WARM_OCCUPANCY_FILE {
+        return Err(NanoWarmSelectionError::InvalidDatasetDirectoryName);
+    }
+    if dto.dataset_manifest_bytes == 0
+        || dto.dataset_manifest_bytes > MAX_NANO_DATASET_MANIFEST_BYTES
+    {
+        return Err(NanoWarmSelectionError::FileTooLarge {
+            path: selection_root
+                .join(&dataset_directory_name)
+                .join(DATASET_MANIFEST_FILE),
+            actual_bytes: dto.dataset_manifest_bytes,
+            maximum_bytes: MAX_NANO_DATASET_MANIFEST_BYTES,
+        });
+    }
+    if dto.occupancy_bytes == 0 || dto.occupancy_bytes > MAX_NANO_SELECTED_OCCUPANCY_BYTES {
+        return Err(NanoWarmSelectionError::FileTooLarge {
+            path: selection_root
+                .join(&dataset_directory_name)
+                .join(NANO_WARM_OCCUPANCY_FILE),
+            actual_bytes: dto.occupancy_bytes,
+            maximum_bytes: MAX_NANO_SELECTED_OCCUPANCY_BYTES,
+        });
+    }
+    let map_epoch_id = RecordedMapEpochId::try_new(dto.map_epoch_id)
+        .map_err(|_| NanoWarmSelectionError::ZeroMapEpoch)?;
+    Ok(ParsedNanoWarmSelectionV1 {
+        dataset_directory_name,
+        content: NanoWarmSelectionContentIdentity {
+            dataset_manifest_sha256: parse_sha256_hex(
+                "dataset_manifest_sha256_hex",
+                &dto.dataset_manifest_sha256_hex,
+            )?,
+            occupancy_sha256: parse_sha256_hex("occupancy_sha256_hex", &dto.occupancy_sha256_hex)?,
+            dataset_manifest_bytes: dto.dataset_manifest_bytes,
+            occupancy_bytes: dto.occupancy_bytes,
+        },
+        map_epoch_id,
+        map_revision: dto.map_revision,
+    })
+}
+
+#[cfg(feature = "nano-agent")]
+fn publish_warm_selection(
+    selection_root: &Path,
+    selection_root_identity: FilesystemObjectIdentity,
+    selection: &ParsedNanoWarmSelectionV1,
+) -> Result<PathBuf, NanoWarmSelectionError> {
+    parse_dataset_directory_name(&selection.dataset_directory_name)
+        .map_err(|()| NanoWarmSelectionError::InvalidDatasetDirectoryName)?;
+    let dto = NanoWarmSelectionV1Dto {
+        schema_version: NANO_WARM_SELECTION_SCHEMA_VERSION,
+        dataset_directory_name: selection.dataset_directory_name.clone(),
+        dataset_manifest_sha256_hex: encode_sha256_hex(selection.content.dataset_manifest_sha256),
+        dataset_manifest_bytes: selection.content.dataset_manifest_bytes,
+        occupancy_file_name: NANO_WARM_OCCUPANCY_FILE.to_owned(),
+        occupancy_sha256_hex: encode_sha256_hex(selection.content.occupancy_sha256),
+        occupancy_bytes: selection.content.occupancy_bytes,
+        map_epoch_id: selection.map_epoch_id.as_u64(),
+        map_revision: selection.map_revision,
+    };
+    let bytes = serde_json::to_vec_pretty(&dto).map_err(NanoWarmSelectionError::Json)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_NANO_WARM_SELECTION_BYTES {
+        return Err(NanoWarmSelectionError::SelectionEncodingTooLarge {
+            actual_bytes: bytes.len(),
+            maximum_bytes: MAX_NANO_WARM_SELECTION_BYTES,
+        });
+    }
+    let destination = selection_root.join(NANO_WARM_SELECTION_FILE);
+    let root = open_unchanged_directory_nofollow(
+        NanoMapPathRole::WarmSlamDatasetDirectory,
+        selection_root,
+        selection_root_identity,
+    )?;
+    require_optional_regular_file_at(
+        &root,
+        OsStr::new(NANO_WARM_SELECTION_FILE),
+        NanoMapPathRole::WarmSlamDatasetDirectory,
+        &destination,
+    )
+    .map_err(NanoWarmSelectionError::Path)?;
+    publish_warm_selection_bytes_at(&root, selection_root, &destination, &bytes)?;
+    Ok(destination)
+}
+
+#[cfg(feature = "nano-agent")]
+fn publish_warm_selection_bytes_at(
+    root: &File,
+    selection_root: &Path,
+    destination: &Path,
+    bytes: &[u8],
+) -> Result<(), NanoWarmSelectionError> {
+    let mut temporary = None;
+    for _ in 0..16 {
+        let serial = NEXT_SELECTION_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            ".{NANO_WARM_SELECTION_FILE}.tmp-{}-{serial:016x}",
+            std::process::id()
+        );
+        let path = selection_root.join(&name);
+        match openat(
+            root,
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(file) => {
+                temporary = Some((name, path, file));
+                break;
+            }
+            Err(Errno::EXIST) => {}
+            Err(source) => {
+                return Err(NanoWarmSelectionError::Io {
+                    operation: "create warm selection temporary file",
+                    path,
+                    source: rustix_errno_as_io(source),
+                });
+            }
+        }
+    }
+    let Some((temporary_name, temporary_path, temporary_fd)) = temporary else {
+        return Err(NanoWarmSelectionError::TemporaryNameCollisions {
+            parent: selection_root.to_path_buf(),
+        });
+    };
+    let mut file = File::from(temporary_fd);
+    let temporary_identity =
+        FilesystemObjectIdentity::from_metadata(&file.metadata().map_err(|source| {
+            warm_selection_error_with_cleanup(
+                root,
+                &temporary_name,
+                "inspect warm selection temporary file",
+                &temporary_path,
+                source,
+            )
+        })?);
+    file.write_all(bytes).map_err(|source| {
+        warm_selection_error_with_cleanup(
+            root,
+            &temporary_name,
+            "write warm selection temporary file",
+            &temporary_path,
+            source,
+        )
+    })?;
+    file.sync_all().map_err(|source| {
+        warm_selection_error_with_cleanup(
+            root,
+            &temporary_name,
+            "synchronize warm selection temporary file",
+            &temporary_path,
+            source,
+        )
+    })?;
+    let synchronized_identity =
+        FilesystemObjectIdentity::from_metadata(&file.metadata().map_err(|source| {
+            warm_selection_error_with_cleanup(
+                root,
+                &temporary_name,
+                "inspect synchronized warm selection temporary file",
+                &temporary_path,
+                source,
+            )
+        })?);
+    if synchronized_identity != temporary_identity {
+        return Err(warm_selection_error_with_cleanup(
+            root,
+            &temporary_name,
+            "inspect synchronized warm selection temporary file",
+            &temporary_path,
+            io::Error::other("temporary warm selection identity changed"),
+        ));
+    }
+    renameat(
+        root,
+        &temporary_name,
+        root,
+        OsStr::new(NANO_WARM_SELECTION_FILE),
+    )
+    .map_err(|source| {
+        warm_selection_error_with_cleanup(
+            root,
+            &temporary_name,
+            "atomically publish warm selection",
+            destination,
+            rustix_errno_as_io(source),
+        )
+    })?;
+    require_published_selection_identity(root, destination, temporary_identity)?;
+    fsync(root).map_err(|source| {
+        NanoWarmSelectionError::SelectionPublishedButDurabilityUnconfirmed {
+            selection_path: destination.to_path_buf(),
+            operation: NanoWarmSelectionPostPublishOperation::SynchronizeSelectionRoot,
+            source: rustix_errno_as_io(source),
+        }
+    })?;
+    require_published_selection_identity(root, destination, temporary_identity)?;
+    drop(file);
+    Ok(())
+}
+
+#[cfg(feature = "nano-agent")]
+fn warm_selection_error_with_cleanup(
+    root: &File,
+    temporary_name: &str,
+    operation: &'static str,
+    path: &Path,
+    source: io::Error,
+) -> NanoWarmSelectionError {
+    let cleanup = unlinkat(root, temporary_name, AtFlags::empty());
+    let source = match cleanup {
+        Ok(()) | Err(Errno::NOENT) => source,
+        Err(cleanup) => io::Error::new(
+            source.kind(),
+            format!("{source}; temporary cleanup also failed: {cleanup}"),
+        ),
+    };
+    NanoWarmSelectionError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+fn require_published_selection_identity(
+    root: &File,
+    destination: &Path,
+    expected: FilesystemObjectIdentity,
+) -> Result<(), NanoWarmSelectionError> {
+    let observed = statat(
+        root,
+        OsStr::new(NANO_WARM_SELECTION_FILE),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(
+        |source| NanoWarmSelectionError::SelectionPublishedButDurabilityUnconfirmed {
+            selection_path: destination.to_path_buf(),
+            operation: NanoWarmSelectionPostPublishOperation::InspectPublishedSelection,
+            source: rustix_errno_as_io(source),
+        },
+    )?;
+    if u64::try_from(observed.st_dev).ok() != Some(expected.device)
+        || observed.st_ino != expected.inode
+    {
+        return Err(
+            NanoWarmSelectionError::SelectionPublishedButDurabilityUnconfirmed {
+                selection_path: destination.to_path_buf(),
+                operation: NanoWarmSelectionPostPublishOperation::InspectPublishedSelection,
+                source: io::Error::other("published warm selection identity changed"),
+            },
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nano-agent")]
+fn rustix_errno_as_io(source: Errno) -> io::Error {
+    io::Error::from_raw_os_error(source.raw_os_error())
 }
 
 trait SaveMapResponder {
@@ -1344,6 +3762,7 @@ fn require_unchanged_directory(
     require_same_identity(role, path, expected, actual)
 }
 
+#[cfg(not(feature = "nano-agent"))]
 fn require_unchanged_regular_file(
     role: NanoMapPathRole,
     path: &Path,
@@ -1406,13 +3825,21 @@ mod tests {
             json!({"kind": "none"})
         };
         let value = json!({
-            "schema_version": 1,
+            "schema_version": 3,
             "control": {
                 "socket_path": "/tmp/kiko-agent/control.sock",
                 "read_timeout_ms": 100,
                 "write_timeout_ms": 100,
                 "runtime_response_timeout_ms": 500,
-                "runtime_queue_capacity": 8
+                "terminal_response_timeout_ms": 300000,
+                "runtime_queue_capacity": 8,
+                "operator_console": {
+                    "bind_address": "127.0.0.1:9877",
+                    "capability_path": "/tmp/kiko-agent/operator-console.capability",
+                    "deadman_tick_ms": 20,
+                    "manual_command_forward_mm_per_s": 100,
+                    "manual_command_yaw_millirad_per_s": 500
+                }
             },
             "inventory": {
                 "manifest_path": "/opt/kiko/deployment/manifest.json",
@@ -1448,7 +3875,7 @@ mod tests {
                 "frontier_explore": {"permission": "disabled"}
             }
         });
-        super::super::NanoAgentPolicyConfigV1::parse_json(
+        super::super::NanoAgentPolicyConfigV3::parse_json(
             &serde_json::to_vec(&value).expect("policy JSON"),
         )
         .expect("test policy")
@@ -1604,6 +4031,43 @@ mod tests {
                 pivot.max(15)
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "nano-agent")]
+    fn finalized_journal_epoch_and_revision_must_exactly_match_retained_occupancy() {
+        let map = SlamMap::new();
+        let retained = NanoMapSnapshotIdentity {
+            map_epoch_id: bindings(&[&map])[0].map_epoch_id(),
+            map_instance_id: map.snapshot().instance_id(),
+            revision: 17,
+        };
+        let exact = NanoFinalizedJournalMapIdentity::new(retained.map_epoch_id(), 17);
+        require_finalized_journal_map_matches_retained(Some(exact), retained)
+            .expect("exact finalized journal identity");
+
+        assert!(matches!(
+            require_finalized_journal_map_matches_retained(None, retained),
+            Err(NanoWarmCheckpointError::FinalizedJournalHasNoAcceptedMap)
+        ));
+        let stale = NanoFinalizedJournalMapIdentity::new(retained.map_epoch_id(), 16);
+        assert!(matches!(
+            require_finalized_journal_map_matches_retained(Some(stale), retained),
+            Err(NanoWarmCheckpointError::FinalizedJournalMapMismatch {
+                finalized,
+                retained_epoch_id,
+                retained_revision: 17,
+            }) if finalized == stale && retained_epoch_id == retained.map_epoch_id()
+        ));
+
+        let other_map = SlamMap::new();
+        let other_epoch = bindings(&[&map, &other_map])[1].map_epoch_id();
+        let wrong_epoch = NanoFinalizedJournalMapIdentity::new(other_epoch, 17);
+        assert!(matches!(
+            require_finalized_journal_map_matches_retained(Some(wrong_epoch), retained),
+            Err(NanoWarmCheckpointError::FinalizedJournalMapMismatch { finalized, .. })
+                if finalized == wrong_epoch
+        ));
     }
 
     #[test]
@@ -1856,6 +4320,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "nano-agent"))]
     fn warm_start_requires_exact_replay_and_never_claims_localization() {
         let directory = TestDirectory::create("warm");
         let mut owner = owner(&directory, true, 4);
@@ -1892,6 +4357,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "nano-agent"))]
     fn warm_start_rejects_mismatched_replay_and_changed_dataset_directory() {
         let directory = TestDirectory::create("warm-mismatch");
         let mut owner = owner(&directory, true, 4);
@@ -1935,6 +4401,398 @@ mod tests {
                 NanoMapPersistencePathError::FilesystemObjectChanged { .. }
             ))
         ));
+    }
+
+    #[cfg(feature = "nano-agent")]
+    fn publish_test_warm_selection(
+        directory: &TestDirectory,
+        session_name: &str,
+        map: &SlamMap,
+        binding: CurrentMapEpochBinding,
+        revision: u64,
+        occupied_index: usize,
+        manifest: &[u8],
+    ) -> (PathBuf, NanoWarmSelectionContentIdentity) {
+        let selection_root = directory.path.join("dataset");
+        let session = selection_root.join(session_name);
+        fs::create_dir(&session).expect("session directory");
+        let manifest_path = session.join(DATASET_MANIFEST_FILE);
+        fs::write(&manifest_path, manifest).expect("manifest");
+        let occupancy_path = session.join(NANO_WARM_OCCUPANCY_FILE);
+        let occupancy = snapshot(map, revision, occupied_index);
+        crate::dense::occupancy_persistence::save_occupancy_map_atomic(&occupancy_path, &occupancy)
+            .expect("session occupancy");
+        let (dataset_manifest_sha256, dataset_manifest_bytes) =
+            hash_bounded_regular_file(&manifest_path, MAX_NANO_DATASET_MANIFEST_BYTES)
+                .expect("manifest digest");
+        let (occupancy_sha256, occupancy_bytes) =
+            hash_bounded_regular_file(&occupancy_path, MAX_NANO_SELECTED_OCCUPANCY_BYTES)
+                .expect("occupancy digest");
+        let content = NanoWarmSelectionContentIdentity {
+            dataset_manifest_sha256,
+            occupancy_sha256,
+            dataset_manifest_bytes,
+            occupancy_bytes,
+        };
+        let selection_root_identity =
+            require_canonical_directory(NanoMapPathRole::WarmSlamDatasetDirectory, &selection_root)
+                .expect("selection root identity");
+        publish_warm_selection(
+            &selection_root,
+            selection_root_identity,
+            &ParsedNanoWarmSelectionV1 {
+                dataset_directory_name: session_name.to_owned(),
+                content,
+                map_epoch_id: binding.map_epoch_id(),
+                map_revision: revision,
+            },
+        )
+        .expect("selection");
+        (session, content)
+    }
+
+    #[test]
+    #[cfg(feature = "nano-agent")]
+    fn production_selection_loads_only_the_exact_session_and_never_claims_localization() {
+        let directory = TestDirectory::create("selected-warm");
+        let owner = owner(&directory, true, 4);
+        assert!(owner.requires_quiescent_warm_checkpoint());
+        fs::create_dir(directory.path.join("dataset/session-unselected"))
+            .expect("unselected session");
+
+        let map = SlamMap::new();
+        let binding = bindings(&[&map])[0];
+        let (selected_session, content) = publish_test_warm_selection(
+            &directory,
+            "session-selected",
+            &map,
+            binding,
+            11,
+            2,
+            br#"{"session":1}"#,
+        );
+
+        let NanoMapWarmStartLoad::DatasetReplayRequired(required) =
+            owner.load_warm_start().expect("selected warm request")
+        else {
+            panic!("dataset replay required");
+        };
+        assert_eq!(
+            required.slam_dataset_directory_path(),
+            selected_session.as_path()
+        );
+        assert_eq!(
+            required.occupancy_snapshot_path(),
+            selected_session.join(NANO_WARM_OCCUPANCY_FILE)
+        );
+        assert_eq!(required.selected_map_epoch_id(), binding.map_epoch_id());
+        assert_eq!(required.selected_map_revision(), 11);
+        assert!(matches!(
+            required.verify_selected_dataset_map_identity(
+                RecordedMapEpochId::try_new(2).expect("different epoch"),
+                11,
+            ),
+            Err(NanoWarmSelectionError::MapEpochMismatch {
+                selected: 1,
+                observed: 2,
+            })
+        ));
+        assert!(matches!(
+            required.verify_selected_dataset_map_identity(binding.map_epoch_id(), 10),
+            Err(NanoWarmSelectionError::MapRevisionMismatch {
+                selected: 11,
+                observed: 10,
+            })
+        ));
+        required
+            .verify_selected_dataset_map_identity(binding.map_epoch_id(), 11)
+            .expect("journal identity matches selection");
+        let status = required.dataset_content_binding_status();
+        assert_eq!(
+            status.dataset_manifest_sha256(),
+            Some(content.dataset_manifest_sha256)
+        );
+        assert_eq!(status.occupancy_sha256(), Some(content.occupancy_sha256));
+
+        let replay = ReplayOccupancyEvidence::try_new(map.snapshot(), snapshot(&map, 11, 2))
+            .expect("exact replay evidence");
+        let matched = required.verify_exact_replay(replay).expect("exact replay");
+        assert_eq!(
+            matched.slam_dataset_directory_path(),
+            selected_session.as_path()
+        );
+        assert_eq!(matched.dataset_content_binding_status(), status);
+    }
+
+    #[test]
+    #[cfg(feature = "nano-agent")]
+    fn quota_staging_inode_is_relocated_once_without_copy_or_replacement() {
+        let directory = TestDirectory::create("checkpoint-relocation");
+        let staging_parent = directory.path.join("maps");
+        let dataset_directory = directory.path.join("dataset/session-1");
+        fs::create_dir(&staging_parent).expect("staging parent");
+        fs::create_dir_all(&dataset_directory).expect("dataset directory");
+        let staged = staging_parent.join("current.kmap");
+        let destination = dataset_directory.join(NANO_WARM_OCCUPANCY_FILE);
+        fs::write(&staged, b"exact-encoded-occupancy").expect("staged map");
+        let before = fs::metadata(&staged).expect("staged metadata");
+        relocate_staged_checkpoint_occupancy(
+            &staged,
+            &staging_parent,
+            require_canonical_directory(NanoMapPathRole::SaveParent, &staging_parent)
+                .expect("staging parent identity"),
+            &destination,
+            &dataset_directory,
+            require_canonical_directory(
+                NanoMapPathRole::WarmSlamDatasetDirectory,
+                &dataset_directory,
+            )
+            .expect("dataset identity"),
+        )
+        .expect("relocation");
+        assert!(!staged.exists());
+        assert_eq!(
+            fs::read(&destination).expect("relocated bytes"),
+            b"exact-encoded-occupancy"
+        );
+        let after = fs::metadata(&destination).expect("relocated metadata");
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+
+        fs::write(&staged, b"new").expect("second staged map");
+        assert!(matches!(
+            relocate_staged_checkpoint_occupancy(
+                &staged,
+                &staging_parent,
+                require_canonical_directory(NanoMapPathRole::SaveParent, &staging_parent)
+                    .expect("staging parent identity"),
+                &destination,
+                &dataset_directory,
+                require_canonical_directory(
+                    NanoMapPathRole::WarmSlamDatasetDirectory,
+                    &dataset_directory,
+                )
+                .expect("dataset identity"),
+            ),
+            Err(NanoWarmSelectionError::Io { .. })
+        ));
+        assert_eq!(
+            fs::read(&destination).expect("original destination retained"),
+            b"exact-encoded-occupancy"
+        );
+        assert_eq!(fs::read(&staged).expect("new staging retained"), b"new");
+    }
+
+    #[test]
+    #[cfg(feature = "nano-agent")]
+    fn selected_content_is_rechecked_after_load_before_replay_binding() {
+        let directory = TestDirectory::create("selected-warm-tamper");
+        let owner = owner(&directory, true, 4);
+        let map = SlamMap::new();
+        let binding = bindings(&[&map])[0];
+        let manifest = br#"{"session":1}"#;
+        let (session, _) = publish_test_warm_selection(
+            &directory,
+            "session-selected",
+            &map,
+            binding,
+            7,
+            1,
+            manifest,
+        );
+        let NanoMapWarmStartLoad::DatasetReplayRequired(required) =
+            owner.load_warm_start().expect("selected warm request")
+        else {
+            panic!("dataset replay required");
+        };
+        let replacement = br#"{"session":2}"#;
+        assert_eq!(replacement.len(), manifest.len());
+        fs::write(session.join(DATASET_MANIFEST_FILE), replacement)
+            .expect("same-length manifest replacement");
+        let replay = ReplayOccupancyEvidence::try_new(map.snapshot(), snapshot(&map, 7, 1))
+            .expect("exact occupancy replay");
+        assert!(matches!(
+            required.verify_exact_replay(replay),
+            Err(NanoWarmStartReplayBindError::Selection(
+                NanoWarmSelectionError::DigestMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "nano-agent")]
+    fn selected_manifest_parse_stream_stays_on_one_handle_across_path_replacement() {
+        let directory = TestDirectory::create("selected-manifest-handle");
+        let owner = owner(&directory, true, 4);
+        let map = SlamMap::new();
+        let binding = bindings(&[&map])[0];
+        let manifest = br#"{"session":"retained"}"#;
+        let (session, _) = publish_test_warm_selection(
+            &directory,
+            "session-selected",
+            &map,
+            binding,
+            7,
+            1,
+            manifest,
+        );
+        let NanoMapWarmStartLoad::DatasetReplayRequired(mut required) =
+            owner.load_warm_start().expect("selected warm request")
+        else {
+            panic!("dataset replay required");
+        };
+        let manifest_path = session.join(DATASET_MANIFEST_FILE);
+        let retained_path = session.join("manifest-retained.json");
+        let mut selected_reader = required
+            .selected_manifest_reader()
+            .expect("retained manifest reader");
+        fs::rename(&manifest_path, &retained_path).expect("move selected manifest pathname");
+        fs::write(&manifest_path, br#"{"session":"attacker"}"#)
+            .expect("replace selected manifest pathname");
+        let mut parsed_bytes = Vec::new();
+        selected_reader
+            .read_to_end(&mut parsed_bytes)
+            .expect("read retained manifest handle");
+        assert_eq!(parsed_bytes, manifest);
+        selected_reader
+            .verify()
+            .expect("retained bytes match selected digest");
+
+        let replay = ReplayOccupancyEvidence::try_new(map.snapshot(), snapshot(&map, 7, 1))
+            .expect("exact occupancy replay");
+        assert!(matches!(
+            required.verify_exact_replay(replay),
+            Err(NanoWarmStartReplayBindError::Selection(
+                NanoWarmSelectionError::FilesystemObjectChanged { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "nano-agent")]
+    fn weak_selection_json_is_bounded_and_parsed_fail_closed_once() {
+        let directory = TestDirectory::create("selection-parse");
+        fs::create_dir(directory.path.join("dataset")).expect("selection root");
+        let selection_root = directory.path.join("dataset");
+        let path = selection_root.join(NANO_WARM_SELECTION_FILE);
+        let digest = "00".repeat(SHA256_BYTES);
+        let valid = json!({
+            "schema_version": 1,
+            "dataset_directory_name": "../escape",
+            "dataset_manifest_sha256_hex": digest,
+            "dataset_manifest_bytes": 1,
+            "occupancy_file_name": NANO_WARM_OCCUPANCY_FILE,
+            "occupancy_sha256_hex": "00".repeat(SHA256_BYTES),
+            "occupancy_bytes": 1,
+            "map_epoch_id": 1,
+            "map_revision": 0
+        });
+        fs::write(&path, serde_json::to_vec(&valid).expect("json")).expect("selection");
+        assert!(matches!(
+            load_warm_selection(&selection_root),
+            Err(NanoWarmSelectionError::InvalidDatasetDirectoryName)
+        ));
+
+        let mut unknown = valid;
+        unknown["dataset_directory_name"] = json!("session-1");
+        unknown["unexpected"] = json!(true);
+        fs::write(&path, serde_json::to_vec(&unknown).expect("json")).expect("selection");
+        assert!(matches!(
+            load_warm_selection(&selection_root),
+            Err(NanoWarmSelectionError::Json(_))
+        ));
+
+        fs::write(
+            &path,
+            vec![b' '; usize::try_from(MAX_NANO_WARM_SELECTION_BYTES).unwrap() + 1],
+        )
+        .expect("oversized selection");
+        assert!(matches!(
+            load_warm_selection(&selection_root),
+            Err(NanoWarmSelectionError::FileTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "nano-agent")]
+    fn invalid_next_selection_cannot_replace_the_previous_atomic_selection() {
+        let directory = TestDirectory::create("selection-preserved");
+        let mut owner = owner(&directory, true, 4);
+        let map = SlamMap::new();
+        let binding = bindings(&[&map])[0];
+        owner
+            .retain_latest(binding, snapshot(&map, 3, 0))
+            .expect("retained map");
+        let (_, content) = publish_test_warm_selection(
+            &directory,
+            "session-selected",
+            &map,
+            binding,
+            3,
+            0,
+            br#"{"session":1}"#,
+        );
+        let selection_root = directory.path.join("dataset");
+        let selection_path = selection_root.join(NANO_WARM_SELECTION_FILE);
+        let previous = fs::read(&selection_path).expect("previous selection");
+        let invalid = ParsedNanoWarmSelectionV1 {
+            dataset_directory_name: "x".repeat(MAX_DATASET_DIRECTORY_NAME_BYTES + 1),
+            content,
+            map_epoch_id: binding.map_epoch_id(),
+            map_revision: 3,
+        };
+        let selection_root_identity =
+            require_canonical_directory(NanoMapPathRole::WarmSlamDatasetDirectory, &selection_root)
+                .expect("selection root identity");
+        assert!(matches!(
+            publish_warm_selection(&selection_root, selection_root_identity, &invalid),
+            Err(NanoWarmSelectionError::InvalidDatasetDirectoryName)
+        ));
+        assert_eq!(
+            fs::read(&selection_path).expect("retained selection"),
+            previous
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "nano-agent")]
+    fn descriptor_relative_selection_publish_cannot_follow_a_replaced_root_path() {
+        let directory = TestDirectory::create("selection-root-replacement");
+        let selection_root = directory.path.join("dataset");
+        let retained_root_path = directory.path.join("dataset-retained");
+        let attacker_root = directory.path.join("dataset-attacker");
+        fs::create_dir(&selection_root).expect("selection root");
+        fs::create_dir(&attacker_root).expect("attacker root");
+        let root_identity =
+            require_canonical_directory(NanoMapPathRole::WarmSlamDatasetDirectory, &selection_root)
+                .expect("selection root identity");
+        let retained_root = open_unchanged_directory_nofollow(
+            NanoMapPathRole::WarmSlamDatasetDirectory,
+            &selection_root,
+            root_identity,
+        )
+        .expect("retained selection root");
+        fs::rename(&selection_root, &retained_root_path).expect("move retained root");
+        symlink(&attacker_root, &selection_root).expect("replace selection root by symlink");
+
+        let destination = selection_root.join(NANO_WARM_SELECTION_FILE);
+        let selection_bytes = br#"{"schema_version":1,"test":"descriptor-relative"}"#;
+        publish_warm_selection_bytes_at(
+            &retained_root,
+            &selection_root,
+            &destination,
+            selection_bytes,
+        )
+        .expect("descriptor-relative selection publication");
+
+        assert_eq!(
+            fs::read(retained_root_path.join(NANO_WARM_SELECTION_FILE))
+                .expect("retained selection bytes"),
+            selection_bytes
+        );
+        assert!(
+            !attacker_root.join(NANO_WARM_SELECTION_FILE).exists(),
+            "the replacement selection root must never receive publication"
+        );
     }
 
     #[derive(Clone)]
@@ -1984,6 +4842,7 @@ mod tests {
                 revision: 1,
             },
             destination: PathBuf::from("/var/lib/kiko/maps/current.kmap"),
+            quota_verification: None,
         }
     }
 

@@ -14,9 +14,10 @@ use crate::inertial::{
     SensorAccuracy,
 };
 use crate::navigation::{
-    MAX_NAVIGATION_INGRESS_RECORDS, NavigationIngressCapacity, NavigationIngressReader,
-    NavigationIngressSidecarDescriptor, NavigationIngressSidecarDescriptorError,
-    NavigationIngressStreamReadError, NavigationRecordingId, NavigationRecordingIdError,
+    MAX_NAVIGATION_INGRESS_RECORDS, NAVIGATION_INGRESS_STREAM_FILE, NavigationIngressCapacity,
+    NavigationIngressReader, NavigationIngressSidecarDescriptor,
+    NavigationIngressSidecarDescriptorError, NavigationIngressStreamReadError,
+    NavigationRecordingId, NavigationRecordingIdError,
 };
 use crate::triangulation::{
     RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError, StereoBaselineError,
@@ -49,11 +50,18 @@ pub mod format {
     }
 }
 
+/// Production's reviewed ceiling for the monolithic completion manifest.
+pub const MAX_PRODUCTION_DATASET_MANIFEST_BYTES: u64 = 64 * 1_024 * 1_024;
+
 mod reader;
 pub use reader::{
     DatasetDepthCursor, DatasetImuCursor, DatasetImuReportCursor, DatasetReadTimings,
     DatasetReader, DatasetStats, TimedPair,
 };
+#[cfg(unix)]
+mod storage_quota;
+#[cfg(unix)]
+pub use storage_quota::{DatasetStorageLimits, DatasetStorageQuota, DatasetStorageQuotaError};
 
 // Meta Structs
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1423,6 +1431,10 @@ pub enum DatasetError {
     InvalidConfig {
         msg: &'static str,
     },
+    #[cfg(unix)]
+    StorageQuota {
+        source: DatasetStorageQuotaError,
+    },
     InvalidFramePath {
         path: String,
         reason: &'static str,
@@ -1629,6 +1641,10 @@ pub enum DatasetError {
         field: &'static str,
         value: u64,
     },
+    ManifestByteLimitExceeded {
+        actual: u64,
+        maximum: u64,
+    },
     PublishManifest {
         temporary_path: PathBuf,
         manifest_path: PathBuf,
@@ -1682,6 +1698,8 @@ impl std::fmt::Display for DatasetError {
             DatasetError::InvalidConfig { msg } => {
                 write!(f, "invalid dataset config: {msg}")
             }
+            #[cfg(unix)]
+            DatasetError::StorageQuota { source } => source.fmt(f),
             DatasetError::InvalidFramePath { path, reason } => {
                 write!(f, "invalid dataset frame path {path:?}: {reason}")
             }
@@ -1989,6 +2007,10 @@ impl std::fmt::Display for DatasetError {
                 f,
                 "dataset manifest count {field}={value} exceeds the host address space"
             ),
+            DatasetError::ManifestByteLimitExceeded { actual, maximum } => write!(
+                f,
+                "dataset manifest is {actual} bytes, above the production limit of {maximum} bytes"
+            ),
             DatasetError::PublishManifest {
                 temporary_path,
                 manifest_path,
@@ -2054,6 +2076,8 @@ impl std::error::Error for DatasetError {
             DatasetError::InvalidCameraIntrinsics { source, .. } => Some(source),
             DatasetError::InvalidStereoBaseline { source } => Some(source),
             DatasetError::WriteContract { source } => Some(source),
+            #[cfg(unix)]
+            DatasetError::StorageQuota { source } => Some(source),
             DatasetError::AlreadyExists { .. }
             | DatasetError::InvalidConfig { .. }
             | DatasetError::InvalidFramePath { .. }
@@ -2106,6 +2130,7 @@ impl std::error::Error for DatasetError {
             | DatasetError::ManifestPairDeltaMismatch { .. }
             | DatasetError::ManifestPairOutsideWindow { .. }
             | DatasetError::ManifestCountOutOfRange { .. }
+            | DatasetError::ManifestByteLimitExceeded { .. }
             | DatasetError::WorkerJoin { .. } => None,
         }
     }
@@ -2149,6 +2174,11 @@ impl Drop for DatasetWriter {
 }
 
 impl DatasetWriter {
+    #[cfg(unix)]
+    pub fn storage_quota(&self) -> Option<Arc<DatasetStorageQuota>> {
+        self.state.storage_quota.as_ref().map(Arc::clone)
+    }
+
     pub fn create(
         path: impl Into<PathBuf>,
         meta: &Meta,
@@ -2160,6 +2190,8 @@ impl DatasetWriter {
             calibration,
             DatasetWriterConfig::default(),
             ManifestMode::InferPairs,
+            None,
+            #[cfg(unix)]
             None,
         )
     }
@@ -2176,6 +2208,8 @@ impl DatasetWriter {
             calibration,
             config,
             ManifestMode::InferPairs,
+            None,
+            #[cfg(unix)]
             None,
         )
     }
@@ -2195,6 +2229,8 @@ impl DatasetWriter {
             config,
             ManifestMode::InferPairs,
             Some(imu_metadata),
+            #[cfg(unix)]
+            None,
         )
     }
 
@@ -2232,6 +2268,8 @@ impl DatasetWriter {
             config,
             ManifestMode::PreservePairs { pairing_window },
             None,
+            #[cfg(unix)]
+            None,
         )?;
         Ok((
             PairedDatasetWriter {
@@ -2263,6 +2301,44 @@ impl DatasetWriter {
             config,
             ManifestMode::PreservePairs { pairing_window },
             Some(imu_metadata),
+            #[cfg(unix)]
+            None,
+        )?;
+        Ok((
+            PairedDatasetWriter {
+                inner,
+                pairing_window,
+            },
+            handle,
+        ))
+    }
+
+    /// Create the production paired writer under one enforceable per-session
+    /// storage contract. The returned quota is shared with the navigation
+    /// journal so payload and journal growth cannot race independent limits.
+    #[cfg(unix)]
+    pub fn create_paired_with_imu_config_and_storage_limits(
+        path: impl Into<PathBuf>,
+        meta: &Meta,
+        calibration: &Calibration,
+        pairing_window: PairingWindowNs,
+        imu_metadata: ImuStreamMetadata,
+        config: DatasetWriterConfig,
+        storage_limits: DatasetStorageLimits,
+    ) -> Result<(PairedDatasetWriter, DatasetWriterHandle), DatasetError> {
+        if config.max_spool_frames < 2 {
+            return Err(DatasetError::InvalidConfig {
+                msg: "paired writer max_spool_frames must be >= 2",
+            });
+        }
+        let (inner, handle) = Self::create_internal(
+            path,
+            meta,
+            calibration,
+            config,
+            ManifestMode::PreservePairs { pairing_window },
+            Some(imu_metadata),
+            Some(storage_limits),
         )?;
         Ok((
             PairedDatasetWriter {
@@ -2280,6 +2356,7 @@ impl DatasetWriter {
         config: DatasetWriterConfig,
         manifest_mode: ManifestMode,
         imu_metadata: Option<ImuStreamMetadata>,
+        #[cfg(unix)] storage_limits: Option<DatasetStorageLimits>,
     ) -> Result<(Self, DatasetWriterHandle), DatasetError> {
         if config.max_spool_frames == 0 {
             return Err(DatasetError::InvalidConfig {
@@ -2340,10 +2417,26 @@ impl DatasetWriter {
             source: e,
         })?;
 
+        #[cfg(unix)]
+        let storage_quota = storage_limits
+            .map(|limits| DatasetStorageQuota::open(path.clone(), frames_dir.clone(), limits))
+            .transpose()
+            .map_err(|source| DatasetError::StorageQuota { source })?
+            .map(Arc::new);
         let calibration_path = path.join(format::CALIBRATION_FILE);
-        write_new_file(&calibration_path, &calibration_json)?;
+        write_new_file(
+            &calibration_path,
+            &calibration_json,
+            #[cfg(unix)]
+            storage_quota.as_deref(),
+        )?;
         let meta_path = path.join(format::META_FILE);
-        write_new_file(&meta_path, &meta_json)?;
+        write_new_file(
+            &meta_path,
+            &meta_json,
+            #[cfg(unix)]
+            storage_quota.as_deref(),
+        )?;
 
         let state = Arc::new(WriterState::new(
             config,
@@ -2355,6 +2448,8 @@ impl DatasetWriter {
                 meta_json,
                 calibration_json,
             },
+            #[cfg(unix)]
+            storage_quota,
         ));
         let state_for_thread = state.clone();
 
@@ -2424,7 +2519,7 @@ impl DatasetWriter {
     }
 
     fn write_item(&self, item: SpoolItem) -> Result<WriteOutcome, DatasetWriteError> {
-        if self.state.failed.load(Ordering::Acquire) {
+        if !self.is_healthy() {
             return Ok(WriteOutcome::WriterFailed);
         }
 
@@ -2520,7 +2615,20 @@ impl DatasetWriter {
     }
 
     pub fn is_healthy(&self) -> bool {
-        !self.state.failed.load(Ordering::Acquire)
+        !self.state.failed.load(Ordering::Acquire) && {
+            #[cfg(unix)]
+            {
+                !self
+                    .state
+                    .storage_quota
+                    .as_ref()
+                    .is_some_and(|quota| quota.is_poisoned())
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
     }
 }
 
@@ -2572,6 +2680,24 @@ impl PairedDatasetWriter {
 
     pub fn is_healthy(&self) -> bool {
         self.inner.is_healthy()
+    }
+
+    #[cfg(unix)]
+    pub fn storage_quota(&self) -> Option<Arc<DatasetStorageQuota>> {
+        self.inner.storage_quota()
+    }
+
+    #[cfg(unix)]
+    pub fn create_quota_bound_navigation_ingress_file(
+        &self,
+    ) -> Result<(std::fs::File, Arc<DatasetStorageQuota>), DatasetError> {
+        let quota = self.storage_quota().ok_or(DatasetError::InvalidConfig {
+            msg: "navigation ingress quota requested from an unbounded dataset writer",
+        })?;
+        let file = quota
+            .create_empty_live_file(Path::new(NAVIGATION_INGRESS_STREAM_FILE))
+            .map_err(|source| DatasetError::StorageQuota { source })?;
+        Ok((file, quota))
     }
 }
 
@@ -2807,6 +2933,8 @@ struct WriterState {
     recorded_pairs: Mutex<Vec<RecordedPair>>,
     recorded_depth: Mutex<Vec<RecordedDepth>>,
     recorded_imu: Mutex<Option<RecordedImuStream>>,
+    #[cfg(unix)]
+    storage_quota: Option<Arc<DatasetStorageQuota>>,
 }
 
 impl WriterState {
@@ -2817,6 +2945,7 @@ impl WriterState {
         manifest_mode: ManifestMode,
         dataset_contract: WriterDatasetContract,
         sidecars: WriterSidecars,
+        #[cfg(unix)] storage_quota: Option<Arc<DatasetStorageQuota>>,
     ) -> Self {
         Self {
             config,
@@ -2845,6 +2974,8 @@ impl WriterState {
             recorded_pairs: Mutex::new(Vec::new()),
             recorded_depth: Mutex::new(Vec::new()),
             recorded_imu: Mutex::new(None),
+            #[cfg(unix)]
+            storage_quota,
         }
     }
 
@@ -2968,12 +3099,38 @@ struct ImuFileWriter {
     record_count: u64,
     order: InertialOrderTracker,
     published: bool,
+    #[cfg(unix)]
+    storage_quota: Option<Arc<DatasetStorageQuota>>,
 }
 
 impl ImuFileWriter {
-    fn create(dataset_dir: &Path, session_id: DeviceSessionId) -> Result<Self, DatasetError> {
+    fn create(
+        dataset_dir: &Path,
+        session_id: DeviceSessionId,
+        #[cfg(unix)] storage_quota: Option<Arc<DatasetStorageQuota>>,
+    ) -> Result<Self, DatasetError> {
         let temporary_path = dataset_dir.join(format::IMU_STREAM_TEMP_FILE);
         let stream_path = dataset_dir.join(format::IMU_STREAM_FILE);
+        #[cfg(unix)]
+        let quota_file = storage_quota
+            .as_ref()
+            .map(|quota| quota.create_empty_live_file(Path::new(format::IMU_STREAM_TEMP_FILE)))
+            .transpose()
+            .map_err(|source| DatasetError::StorageQuota { source })?;
+        #[cfg(unix)]
+        let mut file = match quota_file {
+            Some(file) => file,
+            None => std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)
+                .map_err(|source| DatasetError::WriteFile {
+                    path: temporary_path.clone(),
+                    source,
+                })?,
+        };
+        #[cfg(not(unix))]
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -2983,13 +3140,30 @@ impl ImuFileWriter {
                 path: temporary_path.clone(),
                 source,
             })?;
-        if let Err(source) = file.write_all(&encode_imu_header(0)) {
-            drop(file);
-            let _ = std::fs::remove_file(&temporary_path);
-            return Err(DatasetError::WriteFile {
-                path: temporary_path,
+        let header = encode_imu_header(0);
+        #[cfg(unix)]
+        let header_result = match storage_quota.as_ref() {
+            Some(quota) => quota
+                .append_live(&mut file, Path::new(format::IMU_STREAM_TEMP_FILE), &header)
+                .map_err(|source| DatasetError::StorageQuota { source }),
+            None => file
+                .write_all(&header)
+                .map_err(|source| DatasetError::WriteFile {
+                    path: temporary_path.clone(),
+                    source,
+                }),
+        };
+        #[cfg(not(unix))]
+        let header_result = file
+            .write_all(&header)
+            .map_err(|source| DatasetError::WriteFile {
+                path: temporary_path.clone(),
                 source,
             });
+        if let Err(error) = header_result {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(error);
         }
         Ok(Self {
             file,
@@ -2998,6 +3172,8 @@ impl ImuFileWriter {
             record_count: 0,
             order: InertialOrderTracker::with_session(session_id),
             published: false,
+            #[cfg(unix)]
+            storage_quota,
         })
     }
 
@@ -3031,6 +3207,24 @@ impl ImuFileWriter {
                 source: map_inertial_order_error(record_index, source),
             })?;
         let bytes = ImuWireRecord::from_report(report).encode();
+        #[cfg(unix)]
+        match self.storage_quota.as_ref() {
+            Some(quota) => quota
+                .append_live(
+                    &mut self.file,
+                    Path::new(format::IMU_STREAM_TEMP_FILE),
+                    &bytes,
+                )
+                .map_err(|source| DatasetError::StorageQuota { source })?,
+            None => self
+                .file
+                .write_all(&bytes)
+                .map_err(|source| DatasetError::WriteFile {
+                    path: self.temporary_path.clone(),
+                    source,
+                })?,
+        }
+        #[cfg(not(unix))]
         self.file
             .write_all(&bytes)
             .map_err(|source| DatasetError::WriteFile {
@@ -3056,6 +3250,28 @@ impl ImuFileWriter {
                 path: self.temporary_path.clone(),
                 source,
             })?;
+        #[cfg(unix)]
+        match self.storage_quota.as_ref() {
+            Some(quota) => {
+                quota
+                    .verify_tracked_file(&self.file, Path::new(format::IMU_STREAM_TEMP_FILE))
+                    .and_then(|()| {
+                        quota.rename_live_file(
+                            Path::new(format::IMU_STREAM_TEMP_FILE),
+                            Path::new(format::IMU_STREAM_FILE),
+                        )
+                    })
+                    .map_err(|source| DatasetError::StorageQuota { source })?;
+            }
+            None => std::fs::rename(&self.temporary_path, &self.stream_path).map_err(|source| {
+                DatasetError::PublishImuStream {
+                    temporary_path: self.temporary_path.clone(),
+                    stream_path: self.stream_path.clone(),
+                    source,
+                }
+            })?,
+        }
+        #[cfg(not(unix))]
         std::fs::rename(&self.temporary_path, &self.stream_path).map_err(|source| {
             DatasetError::PublishImuStream {
                 temporary_path: self.temporary_path.clone(),
@@ -3082,7 +3298,12 @@ impl Drop for ImuFileWriter {
 fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
     let mut imu_writer = match state.dataset_contract.imu.as_ref() {
         Some(contract) => {
-            match ImuFileWriter::create(&state.dataset_dir, contract.metadata.device_session_id) {
+            match ImuFileWriter::create(
+                &state.dataset_dir,
+                contract.metadata.device_session_id,
+                #[cfg(unix)]
+                state.storage_quota.as_ref().map(Arc::clone),
+            ) {
                 Ok(writer) => Some(writer),
                 Err(error) => {
                     state.fail(error);
@@ -3103,7 +3324,12 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
             writer.write_report(report)?;
             Ok(WrittenManifestItem::None)
         }
-        item => write_item_to_dir(&frames_dir, item),
+        item => write_item_to_dir(
+            &frames_dir,
+            item,
+            #[cfg(unix)]
+            state.storage_quota.as_deref(),
+        ),
     });
     if state.failed.load(Ordering::Acquire) {
         return;
@@ -3182,31 +3408,61 @@ fn writer_loop_with(
 fn write_item_to_dir(
     frames_dir: &Path,
     item: SpoolItem,
+    #[cfg(unix)] storage_quota: Option<&DatasetStorageQuota>,
 ) -> Result<WrittenManifestItem, DatasetError> {
     match item {
         SpoolItem::Mono(frame) => {
-            write_frame_to_dir(frames_dir, frame)?;
+            write_frame_to_dir(
+                frames_dir,
+                frame,
+                #[cfg(unix)]
+                storage_quota,
+            )?;
             Ok(WrittenManifestItem::None)
         }
-        SpoolItem::Pair(pair) => write_pair_to_dir(frames_dir, pair).map(WrittenManifestItem::Pair),
-        SpoolItem::Depth(depth) => {
-            write_depth_to_dir(frames_dir, depth).map(WrittenManifestItem::Depth)
-        }
+        SpoolItem::Pair(pair) => write_pair_to_dir(
+            frames_dir,
+            pair,
+            #[cfg(unix)]
+            storage_quota,
+        )
+        .map(WrittenManifestItem::Pair),
+        SpoolItem::Depth(depth) => write_depth_to_dir(
+            frames_dir,
+            depth,
+            #[cfg(unix)]
+            storage_quota,
+        )
+        .map(WrittenManifestItem::Depth),
         SpoolItem::Imu(_) => Err(DatasetError::InvalidConfig {
             msg: "IMU stream requires the transactional stream writer",
         }),
     }
 }
 
-fn write_pair_to_dir(frames_dir: &Path, pair: StereoPair) -> Result<RecordedPair, DatasetError> {
+fn write_pair_to_dir(
+    frames_dir: &Path,
+    pair: StereoPair,
+    #[cfg(unix)] storage_quota: Option<&DatasetStorageQuota>,
+) -> Result<RecordedPair, DatasetError> {
     let left_frame_id = pair.left().frame_id();
     let left_timestamp_ns = pair.left().timestamp().as_nanos();
     let right_frame_id = pair.right().frame_id();
     let right_timestamp_ns = pair.right().timestamp().as_nanos();
     let delta_ns = pair.timestamp_delta_ns();
     let (left_frame, right_frame) = pair.into_parts();
-    write_frame_to_dir(frames_dir, left_frame)?;
-    write_frame_to_dir(frames_dir, right_frame)?;
+    write_frame_to_dir(
+        frames_dir,
+        left_frame,
+        #[cfg(unix)]
+        storage_quota,
+    )?;
+    write_frame_to_dir(
+        frames_dir,
+        right_frame,
+        #[cfg(unix)]
+        storage_quota,
+    )?;
     Ok(RecordedPair {
         left_frame_id,
         left_timestamp_ns,
@@ -3216,7 +3472,11 @@ fn write_pair_to_dir(frames_dir: &Path, pair: StereoPair) -> Result<RecordedPair
     })
 }
 
-fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetError> {
+fn write_frame_to_dir(
+    frames_dir: &Path,
+    frame: Frame,
+    #[cfg(unix)] storage_quota: Option<&DatasetStorageQuota>,
+) -> Result<(), DatasetError> {
     let Frame {
         sensor_id,
         frame_id: _,
@@ -3227,12 +3487,21 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
     let filename = format::frame_name(timestamp.as_nanos(), sensor_to_str(sensor_id));
     let path = frames_dir.join(&filename);
 
-    write_new_file(&path, data.as_ref())?;
+    write_new_file(
+        &path,
+        data.as_ref(),
+        #[cfg(unix)]
+        storage_quota,
+    )?;
 
     Ok(())
 }
 
-fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<RecordedDepth, DatasetError> {
+fn write_depth_to_dir(
+    frames_dir: &Path,
+    depth: DepthImage,
+    #[cfg(unix)] storage_quota: Option<&DatasetStorageQuota>,
+) -> Result<RecordedDepth, DatasetError> {
     let frame_id = depth.frame_id();
     let timestamp_ns = depth.timestamp().as_nanos();
     let filename = format::frame_name(timestamp_ns, "depth");
@@ -3246,14 +3515,42 @@ fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<RecordedDe
     for value in depth.depth_m() {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-    write_new_file(&path, &bytes)?;
+    write_new_file(
+        &path,
+        &bytes,
+        #[cfg(unix)]
+        storage_quota,
+    )?;
     Ok(RecordedDepth {
         frame_id,
         timestamp_ns,
     })
 }
 
-fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), DatasetError> {
+fn write_new_file(
+    path: &Path,
+    bytes: &[u8],
+    #[cfg(unix)] storage_quota: Option<&DatasetStorageQuota>,
+) -> Result<(), DatasetError> {
+    #[cfg(unix)]
+    if let Some(storage_quota) = storage_quota {
+        let file_name = path.file_name().ok_or(DatasetError::InvalidConfig {
+            msg: "dataset output path has no filename",
+        })?;
+        let relative_path = if path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|parent| parent == format::FRAMES_DIR)
+        {
+            Path::new(format::FRAMES_DIR).join(file_name)
+        } else {
+            PathBuf::from(file_name)
+        };
+        storage_quota
+            .create_new_live_file(&relative_path, bytes)
+            .map_err(|source| DatasetError::StorageQuota { source })?;
+        return Ok(());
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3387,11 +3684,25 @@ fn open_validated_navigation_ingress_sidecar(
     Ok((resolved, reader))
 }
 
-fn publish_manifest(dataset_dir: &Path, bytes: &[u8]) -> Result<(), DatasetError> {
+fn publish_manifest(
+    dataset_dir: &Path,
+    bytes: &[u8],
+    #[cfg(unix)] storage_quota: Option<&DatasetStorageQuota>,
+) -> Result<(), DatasetError> {
     const TEMP_FILE: &str = ".manifest.json.tmp";
 
     let temporary_path = dataset_dir.join(TEMP_FILE);
     let manifest_path = dataset_dir.join(format::MANIFEST_FILE);
+    #[cfg(unix)]
+    if let Some(storage_quota) = storage_quota {
+        return storage_quota
+            .publish_terminal_file(
+                Path::new(TEMP_FILE),
+                Path::new(format::MANIFEST_FILE),
+                bytes,
+            )
+            .map_err(|source| DatasetError::StorageQuota { source });
+    }
     let mut temporary_created = false;
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -3920,7 +4231,32 @@ fn write_manifest(
             document: "manifest",
             source,
         })?;
-    publish_manifest(&state.dataset_dir, &bytes)
+    #[cfg(unix)]
+    if state.storage_quota.is_some() {
+        let actual =
+            u64::try_from(bytes.len()).map_err(|_| DatasetError::ManifestByteLimitExceeded {
+                actual: u64::MAX,
+                maximum: MAX_PRODUCTION_DATASET_MANIFEST_BYTES,
+            })?;
+        require_production_manifest_byte_limit(actual)?;
+    }
+    publish_manifest(
+        &state.dataset_dir,
+        &bytes,
+        #[cfg(unix)]
+        state.storage_quota.as_deref(),
+    )
+}
+
+fn require_production_manifest_byte_limit(actual: u64) -> Result<(), DatasetError> {
+    if actual > MAX_PRODUCTION_DATASET_MANIFEST_BYTES {
+        Err(DatasetError::ManifestByteLimitExceeded {
+            actual,
+            maximum: MAX_PRODUCTION_DATASET_MANIFEST_BYTES,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn recorded_depth_entries(
@@ -4552,6 +4888,39 @@ mod tests {
         NavigationIngressCapacity::try_new(value).expect("valid navigation ingress capacity")
     }
 
+    #[cfg(unix)]
+    fn production_storage_limits(maximum_files: u64) -> DatasetStorageLimits {
+        let map_bytes = 1_048_576;
+        let selection_bytes = 4_096;
+        let terminal_reserve = map_bytes + MAX_PRODUCTION_DATASET_MANIFEST_BYTES + selection_bytes;
+        DatasetStorageLimits::try_new(
+            terminal_reserve + 16 * 1_024 * 1_024,
+            maximum_files,
+            1,
+            terminal_reserve,
+            map_bytes,
+            MAX_PRODUCTION_DATASET_MANIFEST_BYTES,
+            selection_bytes,
+        )
+        .expect("production storage limits")
+    }
+
+    #[cfg(unix)]
+    fn quota_bound_navigation_journal(
+        writer: &PairedDatasetWriter,
+    ) -> NavigationIngressWriter<std::fs::File> {
+        let (file, quota) = writer
+            .create_quota_bound_navigation_ingress_file()
+            .expect("quota-bound navigation journal file");
+        NavigationIngressWriter::new_with_dataset_storage_quota(
+            file,
+            navigation_recording_id(9),
+            navigation_capacity(4),
+            quota,
+        )
+        .expect("quota-bound navigation journal")
+    }
+
     fn write_navigation_ingress_sidecar(
         dataset_path: &Path,
         recording_id: NavigationRecordingId,
@@ -4578,6 +4947,88 @@ mod tests {
         file.sync_all().expect("sync finalized navigation sidecar");
         drop(file);
         descriptor
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quota_exact_file_boundary_publishes_manifest_after_journal_finalization() {
+        let path = unique_dataset_path("quota-publish-boundary");
+        let metadata = meta_with_imu(200);
+        let window = PairingWindowNs::new(0).expect("exact pairing window");
+        let (writer, handle) = DatasetWriter::create_paired_with_imu_config_and_storage_limits(
+            &path,
+            &metadata,
+            &calibration(),
+            window,
+            imu_stream_metadata(7),
+            DatasetWriterConfig::default(),
+            production_storage_limits(5),
+        )
+        .expect("quota-bound dataset");
+        let journal = quota_bound_navigation_journal(&writer);
+        let finalized = journal
+            .finish_with_descriptor()
+            .expect("finalize empty quota-bound journal");
+        let (file, descriptor) = finalized.into_parts();
+        file.sync_all().expect("sync journal");
+        drop(file);
+        drop(writer);
+        handle
+            .finish_with_navigation_ingress(descriptor)
+            .expect("fifth and terminal file is the manifest");
+        assert!(path.join(format::MANIFEST_FILE).is_file());
+        std::fs::remove_dir_all(path).expect("remove quota publication fixture");
+    }
+
+    #[test]
+    fn production_manifest_limit_accepts_exact_boundary_and_rejects_next_byte() {
+        assert!(
+            require_production_manifest_byte_limit(MAX_PRODUCTION_DATASET_MANIFEST_BYTES).is_ok()
+        );
+        assert!(matches!(
+            require_production_manifest_byte_limit(
+                MAX_PRODUCTION_DATASET_MANIFEST_BYTES + 1
+            ),
+            Err(DatasetError::ManifestByteLimitExceeded {
+                actual,
+                maximum: MAX_PRODUCTION_DATASET_MANIFEST_BYTES
+            }) if actual == MAX_PRODUCTION_DATASET_MANIFEST_BYTES + 1
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quota_file_exhaustion_poison_aborts_without_manifest() {
+        let path = unique_dataset_path("quota-abort-boundary");
+        let metadata = meta_with_imu(200);
+        let window = PairingWindowNs::new(0).expect("exact pairing window");
+        let (writer, handle) = DatasetWriter::create_paired_with_imu_config_and_storage_limits(
+            &path,
+            &metadata,
+            &calibration(),
+            window,
+            imu_stream_metadata(7),
+            DatasetWriterConfig::default(),
+            production_storage_limits(5),
+        )
+        .expect("quota-bound dataset");
+        let journal = quota_bound_navigation_journal(&writer);
+        assert_eq!(
+            writer
+                .write_pair(stereo_pair(11, 11, window))
+                .expect("enqueue pair"),
+            WriteOutcome::Enqueued
+        );
+        drop(journal);
+        drop(writer);
+        assert!(matches!(
+            handle.abort_without_manifest(),
+            Err(DatasetError::StorageQuota {
+                source: DatasetStorageQuotaError::FileLimitExceeded { .. }
+            })
+        ));
+        assert!(!path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(path).expect("remove quota abort fixture");
     }
 
     fn navigation_dataset_fixture(
@@ -6984,6 +7435,8 @@ mod tests {
                 },
                 writer_contract(),
                 writer_sidecars(),
+                #[cfg(unix)]
+                None,
             ));
             {
                 let mut spool = state.spool.lock().expect("lock spool");
@@ -7036,6 +7489,8 @@ mod tests {
             ManifestMode::InferPairs,
             writer_contract(),
             writer_sidecars(),
+            #[cfg(unix)]
+            None,
         ));
         let writer = DatasetWriter {
             config,
@@ -7125,6 +7580,8 @@ mod tests {
             ManifestMode::InferPairs,
             writer_contract(),
             writer_sidecars(),
+            #[cfg(unix)]
+            None,
         ));
         {
             let mut spool = state.spool.lock().expect("lock spool");
@@ -8410,6 +8867,8 @@ mod tests {
                 calibration_json: serde_json::to_vec_pretty(&calibration())
                     .expect("serialize calibration"),
             },
+            #[cfg(unix)]
+            None,
         ));
         {
             let mut spool = state.spool.lock().expect("lock IMU spool");

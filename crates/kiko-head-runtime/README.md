@@ -78,7 +78,8 @@ and direction tolerances cannot exceed the corridor tolerance, and none of the
 three return tolerances can exceed the corresponding travel limit. Each
 nonzero travel limit is at most 512 ticks and must cover the target's distance
 from both ends of the corresponding admitted start window. The object also
-requires the literal JSON consent value:
+requires a positive commissioning-only `maximum_hold_ms` no greater than
+900,000 and the literal JSON consent value:
 
 ```json
 "physical_motion_consent": "return_to_reviewed_target"
@@ -114,6 +115,11 @@ tolerances, and travel limits therefore cannot be cross-paired at the command
 API. Every telemetry identity and device-status field is checked before any
 position from that set may influence motion or recovery.
 
+The `maximum_hold_ms` field is parsed by `kiko-head-commission` into a separate
+typed timer. It is not part of `ReturnToTargetConfig` or
+`ReturnToTargetConfigInput`: the reusable return transaction describes motion,
+not the lifetime of a caller which retains the actor afterward.
+
 The complete path geometry for all four joints is admitted before a recovery
 pose capability exists. A corridor departure therefore cannot authorize a new
 goal from rejected telemetry. For a later kinematic fault such as timeout,
@@ -126,27 +132,31 @@ kinematic fault in the typed error. This is write-completion evidence, not a
 servo acknowledgement or stopped readback.
 
 Clock regression, identity/order mismatch, device status, telemetry failure,
-or an incomplete recovery write terminates the actor and attempts four-joint
-torque-disable cleanup. The commissioning CLI also shuts down immediately
-after every return fault, including an owner-retaining fault; it does not turn
-an unsupervised recovery write into a long hold. A successful return remains
-actively held only until SIGINT, SIGTERM, the configured hold duration, handle
-loss, or an actor fault initiates that same cleanup. This bounded hold performs
-no autonomous health polling and is explicitly not a production supervisor.
+or an incomplete recovery write terminates the actor. The commissioning actor
+then attempts four-joint torque-disable cleanup. The production actor instead
+closes ownership without a torque-switch write. The commissioning CLI also
+shuts down immediately after every return fault, including an owner-retaining
+fault; it does not turn an unsupervised recovery write into a long hold. After
+success, only the commissioning wrapper applies its finite hold timer; the
+reusable actor itself has no lease.
 
-The natural-hold `HeadActorHandle` does expose a repeatable, read-only
-`check_health` request for a production supervisor to poll. Each successful
-request retains exact bow/curl/yaw/roll telemetry and monotonic request,
-receive, and whole-check timing. The actor admits success only when every
-response has the expected identity, telemetry device status is zero, the
-moving flag reports stopped, and position remains inside the same parsed
-readback tolerance around the actor's admitted natural-hold target. Speed,
-load, voltage, temperature, current, and unqualified registers remain raw;
-this crate assigns them no physical units or policy thresholds. Transport,
-framing, protocol, clock, status, moving, and position failures remain
-distinct typed outcomes with the accepted joint prefix. A failed or
-caller-cancelled health receipt does not itself change goals or torque and
-does not release the actor's exclusive bus ownership.
+`HeadActorHandle`, `HeadReturnActorHandle`, and
+`TensionPreservingHeadReturnActorHandle` expose a repeatable, read-only
+`check_health` request for a supervisor to poll. Each
+successful request retains exact bow/curl/yaw/roll telemetry, the typed active
+hold target, and monotonic request, receive, and whole-check timing. Before a
+successful return the return actor reports `StartupObserved`; after success it
+reports `ReviewedReturn` with the exact configured target. Recoverable
+kinematic faults retain a distinct `RecoverableReturnCommand` target. The actor
+admits success only when every response has the expected identity, telemetry
+device status is zero, the moving flag reports stopped, and position remains
+inside the parsed readback tolerance around that active target. Speed, load,
+voltage, temperature, current, and unqualified registers remain raw; this
+crate assigns them no physical units or policy thresholds. Transport, framing,
+protocol, clock, status, moving, and position failures remain distinct typed
+outcomes with the accepted joint prefix. A failed or caller-cancelled health
+receipt does not itself change goals or torque and does not release the actor's
+exclusive bus ownership.
 
 One actor admits at most one return attempt. A second request during motion is
 reported as `CommandAlreadyInProgress`; a request after the recorded attempt is
@@ -179,9 +189,16 @@ Natural hold is not guaranteed to be motionless: the head can move between the
 second observation and torque engagement or settle within the configured
 readback bound. A return additionally requires
 `PhysicalHeadMotionConsent::explicitly_granted()`. The entire parsed
-`ReturnToTargetConfig` is consumed by `spawn_head_return_actor` or
-`start_serial_head_return_actor`; the internal motion plan is not public and
-cannot be supplied later by a command caller.
+`ReturnToTargetConfig` is consumed by a commissioning return API or the
+separate `spawn_tension_preserving_head_return_actor` /
+`start_serial_tension_preserving_head_return_actor` production API; the
+internal motion plan is not public and cannot be supplied later by a command
+caller. The production API additionally requires
+`ProductionTensionPreservingTakeoverConsent` and returns a narrower handle
+which has no torque-disable method. The type deliberately contains no hold
+lease or duration. A continuous production owner retains that handle, polls
+health, and coordinates a hold-preserving ownership release; the commissioning
+CLI independently owns its finite timer and disable-first cleanup.
 
 Both generic and production spawn paths first require an active Tokio runtime.
 Absence is returned as a typed error; production checks this before opening or
@@ -189,17 +206,20 @@ changing the physical serial port.
 
 ## State and error semantics
 
-Startup is ordered and fail-closed:
+Commissioning and production have distinct first steps. Commissioning attempts
+torque-disable on every joint and stops if any write does not complete.
+Production performs no torque-switch read or write and makes no claim about
+the prior torque state. Its first protocol traffic is the observation below.
+The remaining startup transaction is shared and ordered:
 
-1. Attempt torque-disable on every joint and stop if any write does not complete.
-2. Read every joint twice and admit only same-ID positions within tolerance.
-3. Write all four nonzero torque limits before any goal write.
-4. Write each freshly observed position together with mandatory nonzero speed.
-5. Enable torque on all four joints.
-6. Before each enable write, require that the oldest admitted observation is
+1. Read every joint twice and admit only same-ID positions within tolerance.
+2. Write all four nonzero torque limits before any goal write.
+3. Write each freshly observed position together with mandatory nonzero speed.
+4. Enable or refresh torque on all four joints.
+5. Before each enable write, require that the oldest admitted observation is
    still inside the typed arming-freshness bound and that the remaining window
-   covers every configured bounded write attempt; otherwise fail and disable.
-7. Read exact full telemetry twice for each expected ID. Both samples must be
+   covers every configured bounded write attempt; otherwise fail.
+6. Read exact full telemetry twice for each expected ID. Both samples must be
    status zero and stopped, each must agree with its observed target, and the
    pair must agree with each other inside the configured tick bound.
 
@@ -215,11 +235,13 @@ otherwise non-retryable writes fail immediately. Every recovered failure is
 retained in success evidence; the transport performs no internal retry.
 
 Startup success is `VerifiedNaturalHoldEvidence`: all requested host writes
-completed and all eight stopped verification samples parsed and agreed. The installed servos'
-response level is zero and the qualified full-telemetry window does not include
-goal, speed, torque-limit, or torque-switch registers. Therefore this evidence
-does **not** claim those register writes were acknowledged or independently
-read back.
+completed and all eight stopped verification samples parsed and agreed.
+`HeadStartupTorqueEvidence` distinguishes the commissioning disable report
+from a tension-preserving production takeover; the latter deliberately carries
+no prior torque-state claim. The installed servos' response level is zero and
+the qualified full-telemetry window does not include goal, speed, torque-limit,
+or torque-switch registers. Therefore this evidence does **not** claim those
+register writes were acknowledged or independently read back.
 
 `VerifiedHeadHealthEvidence` is narrower: it proves one later, complete,
 identity-ordered status-zero stopped telemetry pass remained inside the
@@ -235,14 +257,21 @@ four-joint waypoint write cycle, and the two final stopped telemetry sets. The
 exact reviewed target must have completed one full four-joint write before
 tolerance-based stopped samples can produce success.
 
-On startup fault, requested shutdown, or loss of the public handle, the actor
-attempts a torque-disable write for every joint even if an earlier disable
-fails. `all_writes_completed` means only that all four host writes completed.
-The exact outcomes are returned in `TorqueDisableReport` and remain
-in `ActorExit`. Dropping the handle requests this asynchronous cleanup; callers
-must await the actor task to know its outcome. Process termination, power loss,
-or forcibly aborting the actor task cannot be made safe by Rust `Drop` and is
-not claimed to disable hardware.
+Commissioning startup fault, requested shutdown, or handle loss attempts a
+torque-disable write for every joint even if an earlier disable fails.
+`all_writes_completed` means only that all four host writes completed; exact
+outcomes remain in `ActorExit`.
+
+The production actor never torque-disables on startup failure, return fault,
+health fault, handle loss, ordinary API shutdown, or process/systemd shutdown.
+Its distinct handle exposes only `release_ownership_preserving_hold`, and its
+distinct exit type carries `HoldPreservingOwnershipReleaseEvidence`. That
+evidence proves only that actor cleanup issued no torque-switch write; it does
+not prove that torque was enabled before or after serial close. Electrical
+power loss, another bus owner, servo protection, or forcibly aborting the task
+can still release the neck. Physical torque release requires a separately
+reviewed commissioning operation with physical support, not a generic
+production lifecycle event.
 
 An open, exclusivity, or serial-configuration error occurs before an actor or a
 qualified bus exists. That path sends no protocol byte and reports

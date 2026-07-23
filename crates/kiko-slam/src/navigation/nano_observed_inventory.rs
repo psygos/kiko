@@ -14,6 +14,8 @@
 //! admission.
 
 use std::fmt;
+#[cfg(feature = "nano-wheels-off-qualification")]
+use std::net::SocketAddr;
 use std::path::Path;
 
 use kiko_device_inventory::{
@@ -111,10 +113,22 @@ impl ProductionObservedDeviceInventoryV1 {
 struct DeploymentObservation {
     robot_id: String,
     control_endpoint_identity: String,
-    controller_uid: [u8; 12],
-    firmware_abi: u16,
-    firmware_build_id: u32,
-    hardware_profile_fingerprint: [u8; 16],
+    controller_expectation: DeploymentControllerExpectation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeploymentControllerExpectation {
+    ProductionActuation {
+        controller_uid: [u8; 12],
+        firmware_abi: u16,
+        firmware_build_id: u32,
+        hardware_profile_fingerprint: [u8; 16],
+    },
+    /// Qualification binds the candidate server/client/manifest before
+    /// acquisition, then lets exact inventory comparison bind the acquisition
+    /// fields. No expected controller identity is copied into observation.
+    #[cfg(feature = "nano-wheels-off-qualification")]
+    CandidateExactInventory,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,10 +218,38 @@ impl NanoObservedInventoryBuilder {
                     "udp://{}",
                     deployment.command_endpoint().socket_addr()
                 ),
-                controller_uid: *deployment.controller_uid().as_bytes(),
-                firmware_abi: deployment.firmware_abi().get(),
-                firmware_build_id: deployment.firmware_build_id().get(),
-                hardware_profile_fingerprint: *deployment.actuator_config_fingerprint().as_bytes(),
+                controller_expectation: DeploymentControllerExpectation::ProductionActuation {
+                    controller_uid: *deployment.controller_uid().as_bytes(),
+                    firmware_abi: deployment.firmware_abi().get(),
+                    firmware_build_id: deployment.firmware_build_id().get(),
+                    hardware_profile_fingerprint: *deployment
+                        .actuator_config_fingerprint()
+                        .as_bytes(),
+                },
+            },
+            NanoObservedInventoryEvidenceKind::Deployment,
+        )
+    }
+
+    /// Retain only qualification deployment facts which cannot be observed
+    /// from a device: the logical robot selector and command route.
+    ///
+    /// Controller UID/build/fingerprint are deliberately absent. Those fields
+    /// enter the observed snapshot only through [`Self::observe_stm32`] and
+    /// are subsequently bound by exact comparison with the V2 manifest's
+    /// inner V1 inventory.
+    #[cfg(feature = "nano-wheels-off-qualification")]
+    pub fn observe_candidate_deployment(
+        &mut self,
+        robot_id: &str,
+        command_endpoint: SocketAddr,
+    ) -> Result<(), NanoObservedInventoryEvidenceError> {
+        retain_once(
+            &mut self.deployment,
+            DeploymentObservation {
+                robot_id: robot_id.to_owned(),
+                control_endpoint_identity: format!("udp://{command_endpoint}"),
+                controller_expectation: DeploymentControllerExpectation::CandidateExactInventory,
             },
             NanoObservedInventoryEvidenceKind::Deployment,
         )
@@ -541,32 +583,48 @@ fn cross_bind_controller(
     deployment: &DeploymentObservation,
     observed: &Stm32Observation,
 ) -> Result<(), NanoObservedInventoryBuildError> {
-    if deployment.controller_uid != observed.controller_uid {
+    let (controller_uid, firmware_abi, firmware_build_id, hardware_profile_fingerprint) =
+        match deployment.controller_expectation {
+            DeploymentControllerExpectation::ProductionActuation {
+                controller_uid,
+                firmware_abi,
+                firmware_build_id,
+                hardware_profile_fingerprint,
+            } => (
+                controller_uid,
+                firmware_abi,
+                firmware_build_id,
+                hardware_profile_fingerprint,
+            ),
+            #[cfg(feature = "nano-wheels-off-qualification")]
+            DeploymentControllerExpectation::CandidateExactInventory => return Ok(()),
+        };
+    if controller_uid != observed.controller_uid {
         return Err(NanoObservedInventoryBuildError::ControllerUidMismatch {
-            deployment: deployment.controller_uid,
+            deployment: controller_uid,
             observed: observed.controller_uid,
         });
     }
-    if deployment.firmware_abi != observed.firmware_abi {
+    if firmware_abi != observed.firmware_abi {
         return Err(
             NanoObservedInventoryBuildError::ControllerFirmwareAbiMismatch {
-                deployment: deployment.firmware_abi,
+                deployment: firmware_abi,
                 observed: observed.firmware_abi,
             },
         );
     }
-    if deployment.firmware_build_id != observed.firmware_build_id {
+    if firmware_build_id != observed.firmware_build_id {
         return Err(
             NanoObservedInventoryBuildError::ControllerFirmwareBuildMismatch {
-                deployment: deployment.firmware_build_id,
+                deployment: firmware_build_id,
                 observed: observed.firmware_build_id,
             },
         );
     }
-    if deployment.hardware_profile_fingerprint != observed.hardware_profile_fingerprint {
+    if hardware_profile_fingerprint != observed.hardware_profile_fingerprint {
         return Err(
             NanoObservedInventoryBuildError::ControllerHardwareProfileMismatch {
-                deployment: deployment.hardware_profile_fingerprint,
+                deployment: hardware_profile_fingerprint,
                 observed: observed.hardware_profile_fingerprint,
             },
         );
@@ -682,10 +740,12 @@ mod tests {
         DeploymentObservation {
             robot_id: ROBOT_ID.into(),
             control_endpoint_identity: "udp://127.0.0.1:8080".into(),
-            controller_uid: CONTROLLER_UID,
-            firmware_abi: u16::from(robot_protocol::v2::VERSION),
-            firmware_build_id: 7,
-            hardware_profile_fingerprint: HARDWARE_PROFILE,
+            controller_expectation: DeploymentControllerExpectation::ProductionActuation {
+                controller_uid: CONTROLLER_UID,
+                firmware_abi: u16::from(robot_protocol::v2::VERSION),
+                firmware_build_id: 7,
+                hardware_profile_fingerprint: HARDWARE_PROFILE,
+            },
         }
     }
 
@@ -909,6 +969,38 @@ mod tests {
             builder.build(),
             Err(NanoObservedInventoryBuildError::ControllerHardwareProfileMismatch { .. })
         ));
+    }
+
+    #[cfg(feature = "nano-wheels-off-qualification")]
+    #[test]
+    fn candidate_observation_does_not_copy_controller_expectations() {
+        let mut builder = complete_builder();
+        builder
+            .deployment
+            .as_mut()
+            .expect("deployment")
+            .controller_expectation = DeploymentControllerExpectation::CandidateExactInventory;
+        let stm32 = builder.stm32.as_mut().expect("STM32");
+        stm32.controller_uid = [9; 12];
+        stm32.firmware_build_id = 99;
+        stm32.hardware_profile_fingerprint = [8; 16];
+
+        let observed = builder
+            .build()
+            .expect("candidate identity remains live evidence");
+        let observed_stm32 = observed.inventory().stm32().expect("STM32");
+        assert_eq!(
+            observed_stm32.static_identity().controller_uid().as_bytes(),
+            &[9; 12]
+        );
+        assert_eq!(observed_stm32.static_identity().firmware_build_id(), 99);
+        assert_eq!(
+            observed_stm32
+                .static_identity()
+                .hardware_profile()
+                .as_bytes(),
+            &[8; 16]
+        );
     }
 
     #[test]

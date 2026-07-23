@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 const CONFIG_SCHEMA_VERSION: u8 = 1;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
+const MAX_COMMISSIONING_HOLD_DURATION_MS: u64 = 900_000;
 #[cfg(target_os = "linux")]
 const O_NOFOLLOW: i32 = 0o400000;
 #[cfg(target_os = "macos")]
@@ -134,6 +135,7 @@ enum ConfigFileError {
     Probe(kiko_head_runtime::ConfigParseError),
     Hold(kiko_head_runtime::ObservedHoldConfigParseError),
     Return(kiko_head_runtime::ReturnToTargetConfigParseError),
+    ReturnHoldDuration(CommissioningHoldDurationError),
     ConflictingConfigurations,
     HoldModeMissingConfiguration,
     ReturnModeMissingConfiguration,
@@ -195,6 +197,9 @@ impl fmt::Display for ConfigFileError {
             Self::Probe(_) => formatter.write_str("probe configuration is invalid"),
             Self::Hold(_) => formatter.write_str("observed-hold configuration is invalid"),
             Self::Return(_) => formatter.write_str("return-to-target configuration is invalid"),
+            Self::ReturnHoldDuration(_) => {
+                formatter.write_str("return commissioning hold duration is invalid")
+            }
             Self::ConflictingConfigurations => {
                 formatter.write_str("hold_observed and return_to_target cannot both be configured")
             }
@@ -215,6 +220,7 @@ impl Error for ConfigFileError {
             Self::Probe(source) => Some(source),
             Self::Hold(source) => Some(source),
             Self::Return(source) => Some(source),
+            Self::ReturnHoldDuration(source) => Some(source),
             Self::PathMustBeAbsolute { .. }
             | Self::PathContainsTraversal { .. }
             | Self::NotRegularFile { .. }
@@ -227,6 +233,46 @@ impl Error for ConfigFileError {
         }
     }
 }
+
+/// Bounded lease used only by the commissioning command after a successful
+/// return. It is deliberately absent from the reusable return transaction and
+/// from the continuous production owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommissioningHoldDuration(Duration);
+
+impl CommissioningHoldDuration {
+    fn parse(milliseconds: u64) -> Result<Self, CommissioningHoldDurationError> {
+        if !(1..=MAX_COMMISSIONING_HOLD_DURATION_MS).contains(&milliseconds) {
+            return Err(CommissioningHoldDurationError::OutOfRange {
+                milliseconds,
+                minimum_ms: 1,
+                maximum_ms: MAX_COMMISSIONING_HOLD_DURATION_MS,
+            });
+        }
+        Ok(Self(Duration::from_millis(milliseconds)))
+    }
+
+    const fn get(self) -> Duration {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommissioningHoldDurationError {
+    OutOfRange {
+        milliseconds: u64,
+        minimum_ms: u64,
+        maximum_ms: u64,
+    },
+}
+
+impl fmt::Display for CommissioningHoldDurationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid commissioning hold duration: {self:?}")
+    }
+}
+
+impl Error for CommissioningHoldDurationError {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -291,7 +337,12 @@ enum PhysicalMotionConsentInput {
 struct CommissionConfig {
     probe: HeadProbeConfig,
     hold: Option<ObservedHoldConfig>,
-    head_return: Option<ReturnToTargetConfig>,
+    head_return: Option<CommissioningReturnConfig>,
+}
+
+struct CommissioningReturnConfig {
+    transaction: ReturnToTargetConfig,
+    hold_duration: CommissioningHoldDuration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -517,7 +568,9 @@ fn load_config(path: &Path) -> Result<CommissionConfig, ConfigFileError> {
         .map(|head_return| {
             let PhysicalMotionConsentInput::ReturnToReviewedTarget =
                 head_return.physical_motion_consent;
-            ReturnToTargetConfig::parse(
+            let hold_duration = CommissioningHoldDuration::parse(head_return.maximum_hold_ms)
+                .map_err(ConfigFileError::ReturnHoldDuration)?;
+            let transaction = ReturnToTargetConfig::parse(
                 &probe,
                 ReturnToTargetConfigInput {
                     write_timeout_ms: head_return.write_timeout_ms,
@@ -535,12 +588,15 @@ fn load_config(path: &Path) -> Result<CommissionConfig, ConfigFileError> {
                     maximum_start_ticks: head_return.maximum_start_ticks,
                     target_ticks: head_return.target_ticks,
                     maximum_travel_ticks: head_return.maximum_travel_ticks,
-                    maximum_hold_ms: head_return.maximum_hold_ms,
                 },
             )
+            .map_err(ConfigFileError::Return)?;
+            Ok(CommissioningReturnConfig {
+                transaction,
+                hold_duration,
+            })
         })
-        .transpose()
-        .map_err(ConfigFileError::Return)?;
+        .transpose()?;
     if hold.is_some() && head_return.is_some() {
         return Err(ConfigFileError::ConflictingConfigurations);
     }
@@ -630,11 +686,11 @@ async fn run_observed_hold(config: ObservedHoldConfig) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-async fn run_return_to_target(config: ReturnToTargetConfig) -> Result<(), Box<dyn Error>> {
-    let maximum_duration = config.maximum_duration();
+async fn run_return_to_target(config: CommissioningReturnConfig) -> Result<(), Box<dyn Error>> {
+    let maximum_duration = config.hold_duration.get();
     let mut stop_signals = StopSignals::install()?;
     let (serial, handle, startup, task) = start_serial_head_return_actor(
-        config,
+        config.transaction,
         PhysicalTorqueEnableConsent::explicitly_granted(),
         PhysicalHeadMotionConsent::explicitly_granted(),
     )?;
@@ -723,7 +779,8 @@ async fn run_return_to_target(config: ReturnToTargetConfig) -> Result<(), Box<dy
         Err(source) => {
             // A commissioning recovery write is not continuously supervised.
             // Preserve the typed return error, but end the lease and clean up
-            // immediately instead of blindly holding for maximum_hold_ms.
+            // immediately instead of blindly holding for the commissioning
+            // duration.
             eprintln!(
                 "return_failed owner_retained={} error={source}",
                 source.retains_owner_after_fault()
@@ -835,12 +892,13 @@ fn print_serial(label: &str, serial: &SerialConfigurationEvidence) {
 }
 
 fn print_hold_started(evidence: &VerifiedNaturalHoldEvidence, maximum_duration: Duration) {
+    let pre_observation_disable_complete = evidence
+        .pre_observation_torque_disable()
+        .is_some_and(TorqueDisableReport::all_writes_completed);
     println!(
         "hold_started observed_ticks={:?} pre_observation_disable_complete={} maximum_hold_ms={}",
         evidence.observed_pose().positions(),
-        evidence
-            .pre_observation_torque_disable()
-            .all_writes_completed(),
+        pre_observation_disable_complete,
         maximum_duration.as_millis(),
     );
 }
@@ -1071,8 +1129,41 @@ mod tests {
             config
                 .head_return
                 .expect("return configuration")
-                .maximum_duration(),
+                .hold_duration
+                .get(),
             Duration::from_millis(1_000)
+        );
+    }
+
+    #[test]
+    fn commissioning_return_hold_duration_is_separate_and_bounded() {
+        assert_eq!(
+            CommissioningHoldDuration::parse(1)
+                .expect("minimum duration")
+                .get(),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            CommissioningHoldDuration::parse(MAX_COMMISSIONING_HOLD_DURATION_MS)
+                .expect("maximum duration")
+                .get(),
+            Duration::from_millis(MAX_COMMISSIONING_HOLD_DURATION_MS)
+        );
+        assert_eq!(
+            CommissioningHoldDuration::parse(0),
+            Err(CommissioningHoldDurationError::OutOfRange {
+                milliseconds: 0,
+                minimum_ms: 1,
+                maximum_ms: MAX_COMMISSIONING_HOLD_DURATION_MS,
+            })
+        );
+        assert_eq!(
+            CommissioningHoldDuration::parse(MAX_COMMISSIONING_HOLD_DURATION_MS + 1),
+            Err(CommissioningHoldDurationError::OutOfRange {
+                milliseconds: MAX_COMMISSIONING_HOLD_DURATION_MS + 1,
+                minimum_ms: 1,
+                maximum_ms: MAX_COMMISSIONING_HOLD_DURATION_MS,
+            })
         );
     }
 

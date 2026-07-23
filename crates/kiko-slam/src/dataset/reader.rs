@@ -221,11 +221,42 @@ impl DatasetReader {
                 path: requested_root,
                 source,
             })?;
+        let manifest = read_manifest(&root)?;
+        Self::open_with_parsed_manifest(root, manifest)
+    }
+
+    /// Open a dataset while parsing the manifest from one caller-admitted
+    /// stream instead of reopening `manifest.json` by pathname.
+    ///
+    /// This is used by Nano warm replay so its selected SHA-256 digest and the
+    /// manifest domain object are derived from the exact same descriptor read.
+    /// Other dataset payloads retain the generic reader's path-based contract.
+    #[cfg(feature = "nano-agent")]
+    pub(crate) fn open_with_manifest_reader(
+        path: impl Into<PathBuf>,
+        manifest_reader: &mut impl Read,
+    ) -> Result<Self, DatasetError> {
+        let requested_root = path.into();
+        let root =
+            std::fs::canonicalize(&requested_root).map_err(|source| DatasetError::ReadFile {
+                path: requested_root,
+                source,
+            })?;
+        let manifest_path = root.join(super::format::MANIFEST_FILE);
+        let manifest = serde_json::from_reader(manifest_reader).map_err(|source| {
+            DatasetError::DeserializeJson {
+                path: manifest_path,
+                source,
+            }
+        })?;
+        Self::open_with_parsed_manifest(root, manifest)
+    }
+
+    fn open_with_parsed_manifest(root: PathBuf, manifest: Manifest) -> Result<Self, DatasetError> {
         let meta = read_meta(&root)?;
         let calibration = read_calibration(&root)?;
         let parsed_mono = ParsedMonoContract::parse(&meta, &calibration)?;
         let image = parsed_mono.image;
-        let manifest = read_manifest(&root)?;
         let contract = ParsedManifestContract::parse(&manifest.header, image, &meta)?;
         let depth_projection = contract.depth.map(DepthImageContract::projection);
         let parsed = parse_manifest(&root, manifest, contract)?;

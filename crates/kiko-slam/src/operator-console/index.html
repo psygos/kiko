@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Kiko · Operator Console</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">KIKO / LOCAL CONTROL PLANE</p>
+      <h1>Operator console</h1>
+    </div>
+    <div class="header-state">
+      <span id="connection-pill" class="pill unknown">LOCKED</span>
+      <span id="runtime-pill" class="pill unknown">RUNTIME UNKNOWN</span>
+    </div>
+  </header>
+
+  <section id="control-profile-banner" class="profile-banner hidden" role="status">
+    <strong id="control-profile-title">CONTROL PROFILE UNKNOWN</strong>
+    <span id="control-profile-detail">Motion remains inhibited until an exact profile is received.</span>
+  </section>
+
+  <section id="unlock-panel" class="unlock panel">
+    <div>
+      <h2>Unlock this boot</h2>
+      <p>Paste the mode-0600 per-boot console capability. It remains only in this page's memory and is never placed in a URL or browser storage.</p>
+    </div>
+    <form id="unlock-form" autocomplete="off">
+      <input id="capability" type="password" inputmode="text" minlength="64" maxlength="64"
+             placeholder="64 hexadecimal characters" aria-label="Per-boot capability" required>
+      <button type="submit">Connect locally</button>
+    </form>
+  </section>
+
+  <main id="console" class="hidden">
+    <section class="map-panel panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">LIVE SLAM</p>
+          <h2>Map / pose / plan</h2>
+        </div>
+        <div class="map-meta">
+          <span id="map-binding">epoch — · rev —</span>
+          <span id="localization" class="pill unknown">UNKNOWN</span>
+        </div>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="map" width="960" height="640" aria-label="Occupancy map"></canvas>
+        <div id="map-empty" class="canvas-empty">Waiting for a known map grid…</div>
+        <div id="map-freshness" class="canvas-freshness hidden" role="status" aria-live="polite"></div>
+        <div class="legend" aria-hidden="true">
+          <span><i class="free"></i>free</span>
+          <span><i class="occupied"></i>occupied</span>
+          <span><i class="path"></i>path</span>
+          <span><i class="mpc"></i>MPC rollout</span>
+        </div>
+      </div>
+      <p class="hint">Click a known map to submit a point goal bound to the displayed epoch and revision. Rerun remains the high-bandwidth diagnostic view; this page never opens the OAK camera.</p>
+    </section>
+
+    <aside>
+      <section class="panel control-panel">
+        <div class="panel-heading">
+          <div>
+            <p id="manual-domain-label" class="eyebrow">BODY-FRAME SI CONTROL</p>
+            <h2>Manual drive</h2>
+          </div>
+          <span id="owner-pill" class="pill unknown">NO KNOWN OWNER</span>
+        </div>
+        <div class="drive-grid" aria-label="Hold-to-drive controls">
+          <button data-drive="forward" aria-label="Drive forward">↑<small>W</small></button>
+          <button data-drive="left" aria-label="Turn left">←<small>A</small></button>
+          <button id="manual-release" class="release" aria-label="Release manual control">■<small>release</small></button>
+          <button data-drive="right" aria-label="Turn right">→<small>D</small></button>
+          <button data-drive="backward" aria-label="Drive backward">↓<small>S</small></button>
+        </div>
+        <p id="manual-control-hint" class="hint">Hold Arrow/WASD. Browser release is best-effort; the server's monotonic deadman is authoritative.</p>
+      </section>
+
+      <section id="mode-panel" class="panel modes">
+        <p class="eyebrow">OPERATING INTENT</p>
+        <h2>Modes</h2>
+        <div class="button-row">
+          <button data-intent="arm">Arm</button>
+          <button data-intent="disarm">Disarm</button>
+          <button data-intent="autonomous_map_only">Map only</button>
+          <button data-intent="autonomous_frontier_explore">Explore</button>
+          <button data-intent="save_map">Finalize map &amp; stop</button>
+          <button data-intent="stop">Stop</button>
+        </div>
+        <p id="mode-state" class="mode-state">No active mode is published.</p>
+      </section>
+
+      <section class="panel evidence">
+        <p class="eyebrow">TRUTHFUL EVIDENCE</p>
+        <h2>Controller</h2>
+        <dl>
+          <div><dt>This session</dt><dd id="request-state">none</dd></div>
+          <div><dt>Global request</dt><dd id="global-request-state">none</dd></div>
+          <div><dt>Requested owner</dt><dd id="requested-owner-state">none</dd></div>
+          <div><dt>Readiness</dt><dd id="readiness-state">unknown</dd></div>
+          <div><dt>Shadow / safety</dt><dd id="actuation-request-state">none</dd></div>
+          <div><dt>Applied receipt</dt><dd id="receipt-state">unknown</dd></div>
+          <div><dt>Stop certainty</dt><dd id="stop-certainty">unknown</dd></div>
+          <div><dt>Physical E-stop</dt><dd id="physical-estop-state">unknown</dd></div>
+          <div><dt>STM32</dt><dd id="stm-health">unknown</dd></div>
+          <div><dt>OAK / SLAM</dt><dd id="oak-health">unknown</dd></div>
+          <div><dt>Head / eyes</dt><dd id="expression-health">unknown</dd></div>
+          <div><dt>MPC / tick</dt><dd id="timing-state">unknown</dd></div>
+          <div><dt>Fault summary</dt><dd id="fault-state">unknown</dd></div>
+          <div><dt>Telemetry</dt><dd id="telemetry-state">locked</dd></div>
+        </dl>
+        <a id="rerun-link" class="diagnostic-link hidden" rel="noreferrer">Open Rerun diagnostics ↗</a>
+      </section>
+
+      <section class="safety">
+        <button id="software-stop">
+          <strong>SOFTWARE SAFETY STOP</strong>
+          <span>One-way for this process · not the physical E-stop</span>
+        </button>
+        <p id="safety-state">Not latched. The independent physical emergency stop remains separate.</p>
+      </section>
+    </aside>
+  </main>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/view-model.js"></script>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

@@ -108,6 +108,31 @@ impl ShadowNavigationConfigV1 {
         json: &[u8],
         runtime_depth_camera: DepthCameraModel,
     ) -> Result<Self, ShadowNavigationConfigParseError> {
+        Self::parse_json_with_optional_plant_artifact(json, runtime_depth_camera, None)
+    }
+
+    /// Parse navigation while binding its embedded V1 plant declaration to
+    /// the separately content-addressed plant artifact selected at deployment.
+    ///
+    /// The returned MPC solver contains the supplied artifact model. A
+    /// navigation document whose duplicate declaration differs is rejected.
+    pub fn parse_json_bound_to_plant_artifact(
+        json: &[u8],
+        runtime_depth_camera: DepthCameraModel,
+        plant_artifact_model: PlantModelV1,
+    ) -> Result<Self, ShadowNavigationConfigParseError> {
+        Self::parse_json_with_optional_plant_artifact(
+            json,
+            runtime_depth_camera,
+            Some(plant_artifact_model),
+        )
+    }
+
+    fn parse_json_with_optional_plant_artifact(
+        json: &[u8],
+        runtime_depth_camera: DepthCameraModel,
+        plant_artifact_model: Option<PlantModelV1>,
+    ) -> Result<Self, ShadowNavigationConfigParseError> {
         if json.len() > MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES {
             return Err(ShadowNavigationConfigParseError::InputTooLarge {
                 actual_bytes: json.len(),
@@ -212,8 +237,15 @@ impl ShadowNavigationConfigV1 {
         )
         .map_err(ShadowNavigationConfigParseError::GlobalPlanner)?;
 
-        let plant_model = PlantModelV1::parse(dto.plant_model.into_domain_dto())
+        let configured_plant_model = PlantModelV1::parse(dto.plant_model.into_domain_dto())
             .map_err(ShadowNavigationConfigParseError::PlantModel)?;
+        let plant_model = match plant_artifact_model {
+            Some(artifact_model) if artifact_model == configured_plant_model => artifact_model,
+            Some(_) => {
+                return Err(ShadowNavigationConfigParseError::PlantArtifactModelMismatch);
+            }
+            None => configured_plant_model,
+        };
         let mpc_step_period_s = dto.mpc.step_period_s;
         let mpc_config = MpcConfigV1::parse(dto.mpc.into_domain_dto())
             .map_err(ShadowNavigationConfigParseError::MpcConfig)?;
@@ -427,6 +459,7 @@ pub enum ShadowNavigationConfigParseError {
     LocalCostmap(LocalCostmapConfigError),
     GlobalPlanner(GlobalPlanError),
     PlantModel(PlantModelParseError),
+    PlantArtifactModelMismatch,
     MpcConfig(MpcConfigParseError),
     PathReference(PathReferenceConfigParseError),
     ZeroControlPeriod,
@@ -494,6 +527,9 @@ impl fmt::Display for ShadowNavigationConfigParseError {
             Self::LocalCostmap(source) => write!(formatter, "{source}"),
             Self::GlobalPlanner(source) => write!(formatter, "{source}"),
             Self::PlantModel(source) => write!(formatter, "{source}"),
+            Self::PlantArtifactModelMismatch => formatter.write_str(
+                "content-addressed plant artifact does not exactly equal the navigation plant model",
+            ),
             Self::MpcConfig(source) => write!(formatter, "{source}"),
             Self::PathReference(source) => write!(formatter, "{source}"),
             Self::ZeroControlPeriod => {
@@ -573,6 +609,7 @@ impl std::error::Error for ShadowNavigationConfigParseError {
             Self::MpcSolver(source) => Some(source),
             Self::InputTooLarge { .. }
             | Self::UnsupportedSchemaVersion { .. }
+            | Self::PlantArtifactModelMismatch
             | Self::ZeroControlPeriod
             | Self::MpcStepPeriodNotIntegralNanoseconds { .. }
             | Self::MpcStepPeriodNanosecondsOutOfRange { .. }
@@ -1203,6 +1240,37 @@ mod tests {
             parsed.tracking_camera_to_base().pose().rotation(),
             parsed.local_costmap().tracking_to_base().pose().rotation()
         );
+    }
+
+    #[test]
+    fn content_addressed_plant_artifact_must_equal_the_model_mpc_uses() {
+        let value = fixture();
+        let navigation_bytes = serde_json::to_vec(&value).expect("navigation fixture");
+        let plant_bytes =
+            serde_json::to_vec(&value["plant_model"]).expect("plant artifact fixture");
+        let plant = PlantModelV1::parse_json(&plant_bytes).expect("canonical plant artifact");
+        let parsed = ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+            &navigation_bytes,
+            camera(),
+            plant,
+        )
+        .expect("exact model binding");
+        assert_eq!(parsed.mpc_solver().model(), plant);
+
+        let mut different = value["plant_model"].clone();
+        different["model_id"] = json!("different-plant");
+        let different = PlantModelV1::parse_json(
+            &serde_json::to_vec(&different).expect("different plant bytes"),
+        )
+        .expect("individually valid different model");
+        assert!(matches!(
+            ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+                &navigation_bytes,
+                camera(),
+                different,
+            ),
+            Err(ShadowNavigationConfigParseError::PlantArtifactModelMismatch)
+        ));
     }
 
     #[test]

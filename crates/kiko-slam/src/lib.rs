@@ -453,6 +453,19 @@ impl Frame {
     pub fn timestamp(&self) -> Timestamp {
         self.timestamp
     }
+
+    /// Replace only this frame's process-local identity while retaining the
+    /// immutable pixel allocation, sensor, capture time, and dimensions.
+    ///
+    /// This is crate-private because ordinary capture and dataset boundaries
+    /// must preserve the identity they parsed. Persisted-map replay uses it to
+    /// place historical frames in a namespace disjoint from a fresh OAK
+    /// session without copying full image payloads.
+    #[cfg(feature = "nano-agent")]
+    pub(crate) fn with_frame_id(mut self, frame_id: FrameId) -> Self {
+        self.frame_id = frame_id;
+        self
+    }
 }
 
 #[repr(C)]

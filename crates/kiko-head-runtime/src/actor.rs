@@ -49,6 +49,23 @@ impl PhysicalHeadMotionConsent {
     }
 }
 
+/// Deliberate opt-in to omit the commissioning-only pre-observation
+/// torque-disable transaction during a manifest-bound production handoff.
+///
+/// This consent makes no claim about the torque-switch register or physical
+/// tension before this actor acquires the bus. It permits only a
+/// tension-preserving takeover attempt: observe the present pose, admit it
+/// against the parsed bounds and freshness budget, write that same pose as the
+/// bounded hold goal, and enable or refresh torque.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProductionTensionPreservingTakeoverConsent(());
+
+impl ProductionTensionPreservingTakeoverConsent {
+    pub const fn explicitly_granted_for_manifest_bound_owner() -> Self {
+        Self(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RuntimeStage {
     ObserveFirst,
@@ -204,15 +221,39 @@ impl ReadbackEvidence {
     }
 }
 
+/// Exact startup torque-policy evidence.
+///
+/// `TensionPreservingTakeover` records only which transaction the host ran. It
+/// deliberately does not claim that torque was enabled, disabled, or actively
+/// holding before the actor acquired exclusive serial ownership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadStartupTorqueEvidence {
+    CommissioningDisableFirst { report: Box<TorqueDisableReport> },
+    TensionPreservingTakeover,
+}
+
+impl HeadStartupTorqueEvidence {
+    pub fn commissioning_disable_report(&self) -> Option<&TorqueDisableReport> {
+        match self {
+            Self::CommissioningDisableFirst { report } => Some(report.as_ref()),
+            Self::TensionPreservingTakeover => None,
+        }
+    }
+
+    pub const fn is_tension_preserving_takeover(&self) -> bool {
+        matches!(self, Self::TensionPreservingTakeover)
+    }
+}
+
 /// Success is emitted only after two stopped post-write positions per joint
 /// parse exactly, agree with each other, and agree with the observed targets.
-/// Servo response level zero means the
-/// individual writes remain write-completion evidence, not register readback.
+/// Servo response level zero means the individual writes remain
+/// write-completion evidence, not register readback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedNaturalHoldEvidence {
     started_at: MonotonicTime,
     completed_at: MonotonicTime,
-    pre_observation_torque_disable: TorqueDisableReport,
+    startup_torque: HeadStartupTorqueEvidence,
     observed_pose: HeadPose,
     configured_pose: HeadPoseWithinConfiguredBounds,
     observations: [PositionObservationEvidence; 4],
@@ -231,10 +272,16 @@ impl VerifiedNaturalHoldEvidence {
         self.completed_at
     }
 
+    /// The selected startup torque policy and its exact available evidence.
+    pub const fn startup_torque(&self) -> &HeadStartupTorqueEvidence {
+        &self.startup_torque
+    }
+
     /// All four host writes which established a torque-disabled baseline
-    /// before the actor attempted its first position observation.
-    pub const fn pre_observation_torque_disable(&self) -> &TorqueDisableReport {
-        &self.pre_observation_torque_disable
+    /// before a commissioning actor attempted its first observation. A
+    /// tension-preserving production takeover returns `None`.
+    pub fn pre_observation_torque_disable(&self) -> Option<&TorqueDisableReport> {
+        self.startup_torque.commissioning_disable_report()
     }
 
     pub const fn observed_pose(&self) -> HeadPose {
@@ -881,6 +928,7 @@ impl std::error::Error for RequestError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancellationCause {
     RequestedShutdown,
+    RequestedHoldPreservingRelease,
     HandleDropped,
 }
 
@@ -1047,6 +1095,7 @@ impl TorqueDisableReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActorTermination {
     RequestedShutdown,
+    RequestedHoldPreservingRelease,
     HandleDropped,
     StartupFault,
     StartupFaultWithShutdownRequested,
@@ -1081,6 +1130,58 @@ impl ActorExit {
     }
 }
 
+/// Evidence that the production actor closed its bus owner without issuing a
+/// torque-switch write as part of cleanup.
+///
+/// This does not prove that servo torque was enabled before or after release.
+/// Electrical power loss, another bus owner, or the servo itself can still
+/// change physical holding state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoldPreservingOwnershipReleaseEvidence {
+    recorded_at: MonotonicTime,
+}
+
+impl HoldPreservingOwnershipReleaseEvidence {
+    /// Host timestamp at which the actor selected the no-write cleanup path.
+    /// It is not a measurement of the physical torque state.
+    pub const fn recorded_at(&self) -> MonotonicTime {
+        self.recorded_at
+    }
+}
+
+/// Exit evidence for the production-only tension-preserving actor.
+///
+/// Unlike [`ActorExit`], this type cannot contain a torque-disable report: the
+/// corresponding handle exposes no torque-release operation, and every exit
+/// path closes ownership without a torque-switch write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensionPreservingHeadActorExit {
+    startup: Result<VerifiedNaturalHoldEvidence, HeadRuntimeError>,
+    head_return: Option<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
+    termination: ActorTermination,
+    hold_preserving_release: HoldPreservingOwnershipReleaseEvidence,
+}
+
+impl TensionPreservingHeadActorExit {
+    pub const fn startup(&self) -> &Result<VerifiedNaturalHoldEvidence, HeadRuntimeError> {
+        &self.startup
+    }
+
+    pub const fn head_return(
+        &self,
+    ) -> Option<&Result<VerifiedHeadReturnEvidence, HeadReturnError>> {
+        self.head_return.as_ref()
+    }
+
+    pub const fn termination(&self) -> &ActorTermination {
+        &self.termination
+    }
+
+    pub const fn hold_preserving_release(&self) -> &HoldPreservingOwnershipReleaseEvidence {
+        &self.hold_preserving_release
+    }
+}
+
 enum HeadCommand {
     CheckHealth {
         response: oneshot::Sender<Result<VerifiedHeadHealthEvidence, HeadHealthCheckError>>,
@@ -1090,6 +1191,9 @@ enum HeadCommand {
     },
     Shutdown {
         response: oneshot::Sender<TorqueDisableReport>,
+    },
+    ReleaseOwnershipPreservingHold {
+        response: oneshot::Sender<HoldPreservingOwnershipReleaseEvidence>,
     },
 }
 
@@ -1168,6 +1272,55 @@ impl HeadReturnActorHandle {
         let (response, result) = oneshot::channel();
         self.commands
             .send(HeadCommand::Shutdown { response })
+            .await
+            .map_err(|_| ShutdownError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| ShutdownError::ActorStoppedBeforeReporting)
+    }
+}
+
+/// Production-only motion endpoint for a tension-preserving handoff.
+///
+/// This handle intentionally has no torque-disable method. Releasing it,
+/// including through ordinary process shutdown, closes exclusive serial
+/// ownership without writing the torque-switch register.
+pub struct TensionPreservingHeadReturnActorHandle {
+    commands: mpsc::Sender<HeadCommand>,
+}
+
+impl TensionPreservingHeadReturnActorHandle {
+    pub async fn return_to_target(
+        &self,
+    ) -> Result<Result<VerifiedHeadReturnEvidence, HeadReturnError>, HeadCommandError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::ReturnToTarget { response })
+            .await
+            .map_err(|_| HeadCommandError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| HeadCommandError::ActorStoppedBeforeReporting)
+    }
+
+    pub async fn check_health(&self) -> Result<VerifiedHeadHealthEvidence, HeadHealthRequestError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::CheckHealth { response })
+            .await
+            .map_err(|_| HeadHealthRequestError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| HeadHealthRequestError::ActorStoppedBeforeReporting)?
+            .map_err(|source| HeadHealthRequestError::Check { source })
+    }
+
+    pub async fn release_ownership_preserving_hold(
+        self,
+    ) -> Result<HoldPreservingOwnershipReleaseEvidence, ShutdownError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::ReleaseOwnershipPreservingHold { response })
             .await
             .map_err(|_| ShutdownError::ActorAlreadyStopped)?;
         result
@@ -1259,6 +1412,16 @@ pub struct HeadActorTask {
 
 impl HeadActorTask {
     pub async fn join(self) -> Result<ActorExit, JoinError> {
+        self.task.await
+    }
+}
+
+pub struct TensionPreservingHeadActorTask {
+    task: JoinHandle<TensionPreservingHeadActorExit>,
+}
+
+impl TensionPreservingHeadActorTask {
+    pub async fn join(self) -> Result<TensionPreservingHeadActorExit, JoinError> {
         self.task.await
     }
 }
@@ -1356,6 +1519,50 @@ where
     Ok((HeadReturnActorHandle { commands }, startup, task))
 }
 
+/// Spawn the testable core for the manifest-bound production handoff without
+/// first torque-disabling the neck.
+///
+/// Unlike [`spawn_head_return_actor`], this path does not establish or claim a
+/// known prior torque state. Its first protocol traffic is the redundant
+/// present-position observation used to adopt the current pose.
+pub fn spawn_tension_preserving_head_return_actor<T, C>(
+    transport: T,
+    clock: C,
+    config: ReturnToTargetConfig,
+    torque_consent: PhysicalTorqueEnableConsent,
+    _motion_consent: PhysicalHeadMotionConsent,
+    _takeover_consent: ProductionTensionPreservingTakeoverConsent,
+) -> Result<
+    (
+        TensionPreservingHeadReturnActorHandle,
+        StartupReceipt,
+        TensionPreservingHeadActorTask,
+    ),
+    HeadActorSpawnError,
+>
+where
+    T: AsyncByteTransport,
+    C: MonotonicClock,
+{
+    let runtime =
+        Handle::try_current().map_err(|source| HeadActorSpawnError::NoTokioRuntime { source })?;
+    let (runtime_config, start_bounds, plan) = config.into_actor_parts();
+    let (commands, startup, task) = spawn_tension_preserving_head_actor_on(
+        &runtime,
+        transport,
+        clock,
+        runtime_config,
+        start_bounds,
+        torque_consent,
+        Some(plan),
+    );
+    Ok((
+        TensionPreservingHeadReturnActorHandle { commands },
+        startup,
+        task,
+    ))
+}
+
 fn spawn_head_actor_on<T, C>(
     runtime: &Handle,
     transport: T,
@@ -1376,9 +1583,15 @@ where
         clock,
         config,
         configured_pose_bounds,
+        startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
         return_plan,
     };
-    let task = runtime.spawn(actor.run(receiver, startup_sender));
+    let task = runtime.spawn(async move {
+        actor
+            .run(receiver, startup_sender)
+            .await
+            .into_commissioning()
+    });
     (
         commands,
         StartupReceipt {
@@ -1388,8 +1601,51 @@ where
     )
 }
 
-/// Open, exclusively claim, configure, and then spawn the production serial
-/// actor. No protocol traffic occurs until every serial setting succeeds.
+fn spawn_tension_preserving_head_actor_on<T, C>(
+    runtime: &Handle,
+    transport: T,
+    clock: C,
+    config: HeadRuntimeConfig,
+    configured_pose_bounds: ConfiguredHeadPoseBounds,
+    _consent: PhysicalTorqueEnableConsent,
+    return_plan: Option<HeadReturnPlan>,
+) -> (
+    mpsc::Sender<HeadCommand>,
+    StartupReceipt,
+    TensionPreservingHeadActorTask,
+)
+where
+    T: AsyncByteTransport,
+    C: MonotonicClock,
+{
+    let (commands, receiver) = mpsc::channel(ACTOR_MAILBOX_CAPACITY);
+    let (startup_sender, startup_result) = oneshot::channel();
+    let actor = HeadActor {
+        transport,
+        clock,
+        config,
+        configured_pose_bounds,
+        startup_torque_policy: StartupTorquePolicy::TensionPreservingTakeover,
+        return_plan,
+    };
+    let task = runtime.spawn(async move {
+        actor
+            .run(receiver, startup_sender)
+            .await
+            .into_tension_preserving()
+    });
+    (
+        commands,
+        StartupReceipt {
+            result: startup_result,
+        },
+        TensionPreservingHeadActorTask { task },
+    )
+}
+
+/// Open, exclusively claim, configure, and then spawn the disable-first serial
+/// actor used by commissioning. No protocol traffic occurs until every serial
+/// setting succeeds.
 pub fn start_serial_head_actor(
     config: HeadRuntimeConfig,
     configured_pose_bounds: ConfiguredHeadPoseBounds,
@@ -1464,17 +1720,67 @@ pub fn start_serial_head_return_actor(
     ))
 }
 
+/// Open and exclusively own the configured production bus, then attempt a
+/// tension-preserving adoption of the present pose before the reviewed return.
+///
+/// No torque-disable write is issued before observation. Serial-open failure
+/// produces no protocol traffic, and startup evidence never claims a prior
+/// torque-switch state.
+pub fn start_serial_tension_preserving_head_return_actor(
+    config: ReturnToTargetConfig,
+    torque_consent: PhysicalTorqueEnableConsent,
+    _motion_consent: PhysicalHeadMotionConsent,
+    _takeover_consent: ProductionTensionPreservingTakeoverConsent,
+) -> Result<
+    (
+        SerialConfigurationEvidence,
+        TensionPreservingHeadReturnActorHandle,
+        StartupReceipt,
+        TensionPreservingHeadActorTask,
+    ),
+    HeadActorStartError,
+> {
+    let runtime =
+        Handle::try_current().map_err(|source| HeadActorStartError::NoTokioRuntime { source })?;
+    let (runtime_config, start_bounds, plan) = config.into_actor_parts();
+    let transport = SerialTransport::open(runtime_config.device())
+        .map_err(|source| HeadActorStartError::Serial { source })?;
+    let serial_evidence = transport.evidence().clone();
+    let (commands, startup, task) = spawn_tension_preserving_head_actor_on(
+        &runtime,
+        transport,
+        TokioClock::new(),
+        runtime_config,
+        start_bounds,
+        torque_consent,
+        Some(plan),
+    );
+    Ok((
+        serial_evidence,
+        TensionPreservingHeadReturnActorHandle { commands },
+        startup,
+        task,
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupTorquePolicy {
+    CommissioningDisableFirst,
+    TensionPreservingTakeover,
+}
+
 struct HeadActor<T, C> {
     transport: T,
     clock: C,
     config: HeadRuntimeConfig,
     configured_pose_bounds: ConfiguredHeadPoseBounds,
+    startup_torque_policy: StartupTorquePolicy,
     return_plan: Option<HeadReturnPlan>,
 }
 
 struct ControlState {
     termination: Option<ActorTermination>,
-    shutdown_response: Option<oneshot::Sender<TorqueDisableReport>>,
+    shutdown_response: Option<HeadShutdownResponse>,
 }
 
 impl ControlState {
@@ -1482,6 +1788,49 @@ impl ControlState {
         Self {
             termination: None,
             shutdown_response: None,
+        }
+    }
+}
+
+enum HeadShutdownResponse {
+    Disable(oneshot::Sender<TorqueDisableReport>),
+    Preserve(oneshot::Sender<HoldPreservingOwnershipReleaseEvidence>),
+}
+
+enum HeadActorCleanup {
+    TorqueDisable(Box<TorqueDisableReport>),
+    HoldPreservingRelease(HoldPreservingOwnershipReleaseEvidence),
+}
+
+struct HeadActorRunExit {
+    startup: Result<VerifiedNaturalHoldEvidence, HeadRuntimeError>,
+    head_return: Option<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
+    termination: ActorTermination,
+    cleanup: HeadActorCleanup,
+}
+
+impl HeadActorRunExit {
+    fn into_commissioning(self) -> ActorExit {
+        let HeadActorCleanup::TorqueDisable(torque_disable) = self.cleanup else {
+            unreachable!("commissioning actor always executes torque-disable cleanup");
+        };
+        ActorExit {
+            startup: self.startup,
+            head_return: self.head_return,
+            termination: self.termination,
+            torque_disable: *torque_disable,
+        }
+    }
+
+    fn into_tension_preserving(self) -> TensionPreservingHeadActorExit {
+        let HeadActorCleanup::HoldPreservingRelease(hold_preserving_release) = self.cleanup else {
+            unreachable!("production actor never executes torque-disable cleanup");
+        };
+        TensionPreservingHeadActorExit {
+            startup: self.startup,
+            head_return: self.head_return,
+            termination: self.termination,
+            hold_preserving_release,
         }
     }
 }
@@ -1552,7 +1901,7 @@ where
         mut self,
         mut commands: mpsc::Receiver<HeadCommand>,
         startup_sender: oneshot::Sender<Result<VerifiedNaturalHoldEvidence, HeadRuntimeError>>,
-    ) -> ActorExit {
+    ) -> HeadActorRunExit {
         let mut control = ControlState::new();
         let startup = self.startup(&mut commands, &mut control).await;
         let mut head_return = None;
@@ -1570,8 +1919,14 @@ where
                     commands.close();
                     match commands.try_recv() {
                         Ok(HeadCommand::Shutdown { response }) => {
-                            control.shutdown_response = Some(response);
+                            control.shutdown_response =
+                                Some(HeadShutdownResponse::Disable(response));
                             ActorTermination::StartupFaultWithShutdownRequested
+                        }
+                        Ok(HeadCommand::ReleaseOwnershipPreservingHold { response }) => {
+                            control.shutdown_response =
+                                Some(HeadShutdownResponse::Preserve(response));
+                            ActorTermination::RequestedHoldPreservingRelease
                         }
                         Ok(HeadCommand::CheckHealth { response }) => {
                             let _requester_present = response
@@ -1604,16 +1959,39 @@ where
         };
         commands.close();
 
-        let torque_disable = self.disable_all().await;
-        if let Some(response) = control.shutdown_response {
-            // The report remains in ActorExit if the requester was cancelled.
-            let _requester_present = response.send(torque_disable.clone()).is_ok();
+        let cleanup = match self.startup_torque_policy {
+            StartupTorquePolicy::CommissioningDisableFirst => {
+                HeadActorCleanup::TorqueDisable(Box::new(self.disable_all().await))
+            }
+            StartupTorquePolicy::TensionPreservingTakeover => {
+                HeadActorCleanup::HoldPreservingRelease(HoldPreservingOwnershipReleaseEvidence {
+                    recorded_at: self.clock.now(),
+                })
+            }
+        };
+        match (control.shutdown_response, &cleanup) {
+            (
+                Some(HeadShutdownResponse::Disable(response)),
+                HeadActorCleanup::TorqueDisable(report),
+            ) => {
+                let _requester_present = response.send(report.as_ref().clone()).is_ok();
+            }
+            (
+                Some(HeadShutdownResponse::Preserve(response)),
+                HeadActorCleanup::HoldPreservingRelease(evidence),
+            ) => {
+                let _requester_present = response.send(evidence.clone()).is_ok();
+            }
+            (None, _) => {}
+            (Some(_), _) => {
+                unreachable!("private handle cleanup command always matches its actor policy")
+            }
         }
-        ActorExit {
+        HeadActorRunExit {
             startup,
             head_return,
             termination,
-            torque_disable,
+            cleanup,
         }
     }
 
@@ -1628,8 +2006,12 @@ where
         loop {
             match commands.recv().await {
                 Some(HeadCommand::Shutdown { response }) => {
-                    control.shutdown_response = Some(response);
+                    control.shutdown_response = Some(HeadShutdownResponse::Disable(response));
                     return ActorTermination::RequestedShutdown;
+                }
+                Some(HeadCommand::ReleaseOwnershipPreservingHold { response }) => {
+                    control.shutdown_response = Some(HeadShutdownResponse::Preserve(response));
+                    return ActorTermination::RequestedHoldPreservingRelease;
                 }
                 Some(HeadCommand::CheckHealth { response }) => {
                     let result = self
@@ -1689,14 +2071,28 @@ where
         control: &mut ControlState,
     ) -> Result<VerifiedNaturalHoldEvidence, HeadRuntimeError> {
         let started_at = self.clock.now();
-        // Establish a known host-commanded torque-disabled baseline before any
-        // read request. All joints are attempted even when one write fails.
-        let pre_observation_torque_disable = self.disable_all().await;
-        if !pre_observation_torque_disable.all_writes_completed() {
-            return Err(HeadRuntimeError::PreObservationTorqueDisable {
-                report: Box::new(pre_observation_torque_disable),
-            });
-        }
+        let startup_torque = match self.startup_torque_policy {
+            StartupTorquePolicy::CommissioningDisableFirst => {
+                // Commissioning establishes a known host-commanded
+                // torque-disabled baseline before any read request. All
+                // joints are attempted even when one write fails.
+                let report = self.disable_all().await;
+                if !report.all_writes_completed() {
+                    return Err(HeadRuntimeError::PreObservationTorqueDisable {
+                        report: Box::new(report),
+                    });
+                }
+                HeadStartupTorqueEvidence::CommissioningDisableFirst {
+                    report: Box::new(report),
+                }
+            }
+            StartupTorquePolicy::TensionPreservingTakeover => {
+                // Production does not read or write the torque switch here and
+                // therefore makes no prior-state claim. Its first traffic is
+                // the position observation below.
+                HeadStartupTorqueEvidence::TensionPreservingTakeover
+            }
+        };
         let bow = self
             .observe_joint(HeadJoint::Bow, commands, control)
             .await?;
@@ -1727,7 +2123,12 @@ where
             .map_err(|source| HeadRuntimeError::ConfiguredPoseAdmission { source })?;
         let oldest_observation_at = observations
             .iter()
-            .map(|observation| observation.second().received_at())
+            .flat_map(|observation| {
+                [
+                    observation.first().received_at(),
+                    observation.second().received_at(),
+                ]
+            })
             .min()
             .expect("the exact head pose always has four observations");
         self.ensure_observation_freshness(
@@ -1807,7 +2208,7 @@ where
         Ok(VerifiedNaturalHoldEvidence {
             started_at,
             completed_at: self.clock.now(),
-            pre_observation_torque_disable,
+            startup_torque,
             observed_pose,
             configured_pose,
             observations,
@@ -2287,9 +2688,19 @@ where
         match commands.try_recv() {
             Ok(HeadCommand::Shutdown { response }) => {
                 control.termination = Some(ActorTermination::RequestedShutdown);
-                control.shutdown_response = Some(response);
+                control.shutdown_response = Some(HeadShutdownResponse::Disable(response));
                 Err(HeadReturnError::Cancelled {
                     cause: CancellationCause::RequestedShutdown,
+                    stage,
+                    joint,
+                    waypoint_writes: Vec::new(),
+                })
+            }
+            Ok(HeadCommand::ReleaseOwnershipPreservingHold { response }) => {
+                control.termination = Some(ActorTermination::RequestedHoldPreservingRelease);
+                control.shutdown_response = Some(HeadShutdownResponse::Preserve(response));
+                Err(HeadReturnError::Cancelled {
+                    cause: CancellationCause::RequestedHoldPreservingRelease,
                     stage,
                     joint,
                     waypoint_writes: Vec::new(),
@@ -2465,9 +2876,18 @@ where
         match commands.try_recv() {
             Ok(HeadCommand::Shutdown { response }) => {
                 control.termination = Some(ActorTermination::RequestedShutdown);
-                control.shutdown_response = Some(response);
+                control.shutdown_response = Some(HeadShutdownResponse::Disable(response));
                 Err(HeadHealthFailure::Cancelled {
                     cause: CancellationCause::RequestedShutdown,
+                    stage: RuntimeStage::HealthReadTelemetry,
+                    joint,
+                })
+            }
+            Ok(HeadCommand::ReleaseOwnershipPreservingHold { response }) => {
+                control.termination = Some(ActorTermination::RequestedHoldPreservingRelease);
+                control.shutdown_response = Some(HeadShutdownResponse::Preserve(response));
+                Err(HeadHealthFailure::Cancelled {
+                    cause: CancellationCause::RequestedHoldPreservingRelease,
                     stage: RuntimeStage::HealthReadTelemetry,
                     joint,
                 })
@@ -2953,9 +3373,18 @@ where
         match commands.try_recv() {
             Ok(HeadCommand::Shutdown { response }) => {
                 control.termination = Some(ActorTermination::RequestedShutdown);
-                control.shutdown_response = Some(response);
+                control.shutdown_response = Some(HeadShutdownResponse::Disable(response));
                 Err(HeadRuntimeError::Cancelled {
                     cause: CancellationCause::RequestedShutdown,
+                    stage,
+                    joint,
+                })
+            }
+            Ok(HeadCommand::ReleaseOwnershipPreservingHold { response }) => {
+                control.termination = Some(ActorTermination::RequestedHoldPreservingRelease);
+                control.shutdown_response = Some(HeadShutdownResponse::Preserve(response));
+                Err(HeadRuntimeError::Cancelled {
+                    cause: CancellationCause::RequestedHoldPreservingRelease,
                     stage,
                     joint,
                 })
@@ -3330,6 +3759,22 @@ mod tests {
         target: [u16; 4],
         maximum_travel_ticks: [u16; 4],
     ) -> ReturnToTargetConfig {
+        return_config_with_start_bounds_and_freshness(
+            target,
+            target,
+            target,
+            maximum_travel_ticks,
+            250,
+        )
+    }
+
+    fn return_config_with_start_bounds_and_freshness(
+        minimum_start_ticks: [u16; 4],
+        maximum_start_ticks: [u16; 4],
+        target: [u16; 4],
+        maximum_travel_ticks: [u16; 4],
+        arming_freshness_ms: u64,
+    ) -> ReturnToTargetConfig {
         let probe = HeadProbeConfig::parse(HeadProbeConfigInput {
             device_path: "/dev/serial/by-id/usb-Kiko_head_test".to_owned(),
             response_timeout_ms: 100,
@@ -3341,7 +3786,7 @@ mod tests {
             &probe,
             ReturnToTargetConfigInput {
                 write_timeout_ms: 1,
-                arming_freshness_ms: 250,
+                arming_freshness_ms,
                 write_attempts: 1,
                 redundant_read_tolerance_ticks: 10,
                 readback_tolerance_ticks: 20,
@@ -3350,11 +3795,10 @@ mod tests {
                 direction_regression_tolerance_ticks: 0,
                 goal_speed_ticks_per_second: 100,
                 torque_limit_permille: [600, 400, 400, 400],
-                minimum_start_ticks: target,
-                maximum_start_ticks: target,
+                minimum_start_ticks,
+                maximum_start_ticks,
                 target_ticks: target,
                 maximum_travel_ticks,
-                maximum_hold_ms: 1_000,
             },
         )
         .expect("test return configuration")
@@ -3377,6 +3821,30 @@ mod tests {
             config,
             PhysicalTorqueEnableConsent::explicitly_granted(),
             PhysicalHeadMotionConsent::explicitly_granted(),
+        )
+        .expect("test runtime is active");
+        (handle, startup, task, shared)
+    }
+
+    fn spawn_tension_preserving_return_fake(
+        reads: Vec<ReadAction>,
+        config: ReturnToTargetConfig,
+    ) -> (
+        TensionPreservingHeadReturnActorHandle,
+        StartupReceipt,
+        TensionPreservingHeadActorTask,
+        Arc<Mutex<FakeShared>>,
+    ) {
+        let clock = TestClock::default();
+        let (transport, shared) = FakeTransport::new(clock.clone(), reads);
+        let (handle, startup, task) = spawn_tension_preserving_head_return_actor(
+            transport,
+            clock,
+            config,
+            PhysicalTorqueEnableConsent::explicitly_granted(),
+            PhysicalHeadMotionConsent::explicitly_granted(),
+            ProductionTensionPreservingTakeoverConsent::explicitly_granted_for_manifest_bound_owner(
+            ),
         )
         .expect("test runtime is active");
         (handle, startup, task, shared)
@@ -3489,6 +3957,7 @@ mod tests {
         assert!(
             evidence
                 .pre_observation_torque_disable()
+                .expect("commissioning startup disables before observation")
                 .all_writes_completed()
         );
 
@@ -3544,6 +4013,357 @@ mod tests {
             shared.writes[32..]
                 .iter()
                 .all(|write| write[5..=6] == [40, 0])
+        );
+    }
+
+    #[tokio::test]
+    async fn production_takeover_observes_and_adopts_pose_without_a_torque_disable_gap() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let (handle, receipt, task, shared) = spawn_tension_preserving_return_fake(
+            successful_reads(),
+            valid_return_config(positions, [1; 4]),
+        );
+        let evidence = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified tension-preserving takeover");
+        assert!(matches!(
+            evidence.startup_torque(),
+            HeadStartupTorqueEvidence::TensionPreservingTakeover
+        ));
+        assert_eq!(evidence.pre_observation_torque_disable(), None);
+        assert_eq!(
+            evidence.observed_pose().positions().map(PositionTicks::get),
+            positions
+        );
+
+        let release = handle
+            .release_ownership_preserving_hold()
+            .await
+            .expect("hold-preserving ownership release");
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.startup(), &Ok(evidence));
+        assert_eq!(
+            exit.termination(),
+            &ActorTermination::RequestedHoldPreservingRelease
+        );
+        assert_eq!(exit.hold_preserving_release(), &release);
+
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.writes.len(), 28);
+        assert!(
+            shared.writes[..8]
+                .iter()
+                .all(|write| write[4..=6] == [2, 56, 2]),
+            "the first protocol writes must be the redundant present-position reads"
+        );
+        assert!(
+            shared
+                .writes
+                .iter()
+                .all(|write| write.get(5..=6) != Some(&[40, 0]))
+        );
+        for write in &shared.writes[8..12] {
+            assert_eq!(write[5], 48);
+            let index = usize::from(write[2] - 1);
+            assert_eq!(
+                u16::from_le_bytes([write[6], write[7]]),
+                [600, 400, 400, 400][index]
+            );
+        }
+        for write in &shared.writes[12..16] {
+            assert_eq!(write[5], 42);
+            let index = usize::from(write[2] - 1);
+            assert_eq!(u16::from_le_bytes([write[6], write[7]]), positions[index]);
+            assert_eq!(
+                u16::from_le_bytes([write[10], write[11]]),
+                100,
+                "the adopted goal carries the exact parsed bounded speed"
+            );
+        }
+        assert!(
+            shared.writes[16..20]
+                .iter()
+                .all(|write| write[5..=6] == [40, 1])
+        );
+        assert!(
+            shared.writes[20..28]
+                .iter()
+                .all(|write| write[4..=6] == [2, 56, 15])
+        );
+    }
+
+    #[tokio::test]
+    async fn production_takeover_rejects_invalid_pose_evidence_before_motion_writes() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let mut invalid = successful_reads();
+        invalid[1] = ReadAction::Bytes(position_response(HeadJoint::Bow, 2_200));
+        let (handle, receipt, task, shared) =
+            spawn_tension_preserving_return_fake(invalid, valid_return_config(positions, [1; 4]));
+        let error = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect_err("inconsistent present positions must fail");
+        assert!(matches!(
+            error,
+            HeadRuntimeError::PositionAgreement {
+                joint: HeadJoint::Bow,
+                ..
+            }
+        ));
+        drop(handle);
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.termination(), &ActorTermination::StartupFault);
+
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.writes.len(), 2);
+        assert!(
+            shared.writes[..2]
+                .iter()
+                .all(|write| write[4..=6] == [2, 56, 2])
+        );
+        assert!(
+            shared.writes[..2]
+                .iter()
+                .all(|write| write.get(5..=6) != Some(&[40, 0])),
+            "the production path must not pre-disable before rejected evidence"
+        );
+        assert!(shared.writes.iter().all(|write| {
+            write.get(5) != Some(&48)
+                && write.get(5) != Some(&42)
+                && write.get(5..=6) != Some(&[40, 1])
+        }));
+    }
+
+    #[tokio::test]
+    async fn production_takeover_rejects_stale_or_out_of_window_pose_before_motion_writes() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let stale_config = return_config_with_start_bounds_and_freshness(
+            positions, positions, positions, [1; 4], 1,
+        );
+        let (handle, receipt, task, stale_shared) =
+            spawn_tension_preserving_return_fake(successful_reads(), stale_config);
+        let stale = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect_err("stale pose must fail");
+        assert!(matches!(
+            stale,
+            HeadRuntimeError::ObservationStaleBeforeArming {
+                check: ArmingFreshnessCheck::BeforeConfigurationWrites,
+                ..
+            }
+        ));
+        drop(handle);
+        task.join().await.expect("actor task");
+
+        let out_of_window_target = [2_000, 2_558, 2_925, 2_930];
+        let (handle, receipt, task, bounds_shared) = spawn_tension_preserving_return_fake(
+            successful_reads(),
+            valid_return_config(out_of_window_target, [1; 4]),
+        );
+        let out_of_window = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect_err("out-of-window pose must fail");
+        assert!(matches!(
+            out_of_window,
+            HeadRuntimeError::ConfiguredPoseAdmission {
+                source: HeadPoseBoundsAdmissionError::OutsideConfiguredWindow {
+                    joint: HeadJoint::Bow,
+                    ..
+                }
+            }
+        ));
+        drop(handle);
+        task.join().await.expect("actor task");
+
+        for shared in [stale_shared, bounds_shared] {
+            let shared = shared.lock().expect("fake state");
+            assert!(
+                shared.writes.iter().all(|write| write.get(5) != Some(&48)
+                    && write.get(5) != Some(&42)
+                    && write.get(5..=6) != Some(&[40, 1])),
+                "rejected boundary evidence must not produce torque-limit, goal, or enable writes"
+            );
+            assert!(
+                shared.writes[..8]
+                    .iter()
+                    .all(|write| write[4..=6] == [2, 56, 2]),
+                "boundary admission happens only after the complete redundant observation"
+            );
+            assert!(
+                shared.writes[..8]
+                    .iter()
+                    .all(|write| write.get(5..=6) != Some(&[40, 0]))
+            );
+            assert_eq!(
+                shared.writes.len(),
+                8,
+                "production startup failure adds no cleanup write"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn production_takeover_freshness_covers_both_reads_in_every_pair() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads[1] = ReadAction::SetClockAndBytes {
+            milliseconds: 100,
+            bytes: position_response(HeadJoint::Bow, positions[0]),
+        };
+        let config = return_config_with_start_bounds_and_freshness(
+            positions, positions, positions, [1; 4], 50,
+        );
+        let (handle, receipt, task, shared) = spawn_tension_preserving_return_fake(reads, config);
+        let error = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect_err("an old first read must make the redundant observation stale");
+        assert!(matches!(
+            error,
+            HeadRuntimeError::ObservationStaleBeforeArming {
+                check: ArmingFreshnessCheck::BeforeConfigurationWrites,
+                age,
+                maximum_age,
+                ..
+            } if age > maximum_age && maximum_age == Duration::from_millis(50)
+        ));
+        drop(handle);
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.termination(), &ActorTermination::StartupFault);
+
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.writes.len(), 8);
+        assert!(shared.writes.iter().all(|write| write[4..=6] == [2, 56, 2]));
+        assert!(
+            shared
+                .writes
+                .iter()
+                .all(|write| write.get(5..=6) != Some(&[40, 0]))
+        );
+    }
+
+    #[tokio::test]
+    async fn production_health_fault_and_ordinary_release_never_torque_disable() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads.push(ReadAction::Failure(TransportFailure::timed_out(
+            TransportOperation::Read,
+            0,
+        )));
+        reads.extend(health_reads(positions));
+        let (handle, receipt, task, shared) =
+            spawn_tension_preserving_return_fake(reads, valid_return_config(positions, [1; 4]));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified tension-preserving takeover");
+
+        assert!(matches!(
+            handle.check_health().await,
+            Err(HeadHealthRequestError::Check {
+                source: HeadHealthCheckError::Observation(_),
+            })
+        ));
+        let recovered = handle
+            .check_health()
+            .await
+            .expect("a health fault does not tear down the production owner");
+        assert_eq!(
+            std::array::from_fn(|index| {
+                recovered.joints()[index]
+                    .response()
+                    .value()
+                    .position()
+                    .get()
+            }),
+            positions
+        );
+        let release = handle
+            .release_ownership_preserving_hold()
+            .await
+            .expect("hold-preserving release");
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.hold_preserving_release(), &release);
+        assert!(
+            shared
+                .lock()
+                .expect("fake state")
+                .writes
+                .iter()
+                .all(|write| write.get(5..=6) != Some(&[40, 0]))
+        );
+    }
+
+    #[tokio::test]
+    async fn production_return_fault_exits_without_a_torque_disable_write() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads.push(ReadAction::Eof);
+        let (handle, receipt, task, shared) =
+            spawn_tension_preserving_return_fake(reads, valid_return_config(positions, [1; 4]));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified tension-preserving takeover");
+        assert!(matches!(
+            handle.return_to_target().await,
+            Ok(Err(HeadReturnError::TelemetryRead {
+                joint: HeadJoint::Bow,
+                ..
+            }))
+        ));
+        drop(handle);
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.termination(), &ActorTermination::HeadReturnFault);
+        assert!(matches!(
+            exit.head_return(),
+            Some(Err(HeadReturnError::TelemetryRead {
+                joint: HeadJoint::Bow,
+                ..
+            }))
+        ));
+        assert!(
+            shared
+                .lock()
+                .expect("fake state")
+                .writes
+                .iter()
+                .all(|write| write.get(5..=6) != Some(&[40, 0]))
+        );
+    }
+
+    #[tokio::test]
+    async fn production_handle_loss_releases_ownership_without_torque_disable() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let (handle, receipt, task, shared) = spawn_tension_preserving_return_fake(
+            successful_reads(),
+            valid_return_config(positions, [1; 4]),
+        );
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified tension-preserving takeover");
+        drop(handle);
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.termination(), &ActorTermination::HandleDropped);
+        assert!(
+            shared
+                .lock()
+                .expect("fake state")
+                .writes
+                .iter()
+                .all(|write| write.get(5..=6) != Some(&[40, 0]))
         );
     }
 
@@ -4070,6 +4890,7 @@ mod tests {
             clock,
             config: valid_config(1),
             configured_pose_bounds: valid_pose_bounds(),
+            startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: Some(plan()),
         };
         let (commands, mut receiver) = mpsc::channel(1);
@@ -4114,6 +4935,7 @@ mod tests {
             clock,
             config: valid_config(1),
             configured_pose_bounds: valid_pose_bounds(),
+            startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: Some(plan()),
         };
         let (commands, mut receiver) = mpsc::channel(1);
@@ -4163,6 +4985,7 @@ mod tests {
             clock,
             config: valid_config(1),
             configured_pose_bounds: valid_pose_bounds(),
+            startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: None,
         };
         let positions =

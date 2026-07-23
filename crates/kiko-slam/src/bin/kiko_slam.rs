@@ -4,9 +4,16 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+use std::io::{BufRead, IsTerminal, Write};
+
+#[cfg(all(feature = "nano-agent", unix))]
+use kiko_expression_core::StreamEpochId;
 use kiko_slam::dataset::{
     DatasetDepthCursor, DatasetError, DatasetReader, DepthOpticalFrame, DepthProjectionContract,
 };
+#[cfg(all(feature = "nano-agent", unix))]
+use kiko_slam::dense::occupancy_persistence::OccupancyMapLimits;
 use kiko_slam::dense::{
     self, command_mapper,
     occupancy::{
@@ -30,6 +37,8 @@ use kiko_slam::{
     TriangulationConfig, TriangulationError, Triangulator, VizDecimation, VizError, VizFlushError,
     VizLogError, VizPacket,
 };
+#[cfg(all(feature = "nano-agent", unix))]
+use kiko_supervisor_core::ReadinessEpoch;
 
 use kiko_slam::env::{env_bool, env_f32, env_f64, env_string, env_u32, env_usize};
 
@@ -50,8 +59,12 @@ use kiko_slam::dataset::{
     DatasetWriterConfig, DatasetWriterHandle, DepthMeta, ImuExtrinsicProvenance, ImuMeta,
     ImuStreamMetadata, Meta, MonoMeta, PairedDatasetWriter, WriteOutcome,
 };
+#[cfg(all(feature = "nano-agent", unix))]
+use kiko_slam::dataset::{DatasetStorageLimits, MAX_PRODUCTION_DATASET_MANIFEST_BYTES};
 #[cfg(feature = "record")]
 use kiko_slam::live_runtime::LiveNavigationRequest;
+#[cfg(all(feature = "nano-agent", unix))]
+use kiko_slam::live_runtime::prepare_live_navigation_runtime_from_parsed;
 #[cfg(feature = "record")]
 use kiko_slam::live_runtime::{
     LiveNavigationPrerequisites, PreparedLiveNavigationRuntime, PreparedLiveNavigationRuntimeParts,
@@ -65,12 +78,58 @@ use kiko_slam::navigation::actuation::LiveActuationError;
 use kiko_slam::navigation::mpc::HostMonotonicClock;
 #[cfg(any(feature = "record", test))]
 use kiko_slam::navigation::mpc::HostMonotonicClockReadError;
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+use kiko_slam::navigation::{
+    AgentControlDispatchResponseError, AgentControlDispatcher, AgentControlMonotonicOrigin,
+    AgentControlRejectionCodeV1, AgentControlSocketCleanupOutcome, AgentControlSocketTask,
+    AgentControlSocketTaskExit, AgentControlSocketTaskJoinError, AgentControlSocketTaskStartError,
+    AgentControllerStopKnowledge, AgentLiveActuationDisposition, AgentLocalizationStateV1,
+    AgentManualControlCore, AgentManualRuntimePolicy, AgentMapStateV1, CoordinatorMotionModeV1,
+    LiveLifecycleZeroApplied, LiveMotionActuationFaultEvidence, LiveMotionMapAdmissionError,
+    LiveMotionOperationError, LiveMotionOwner, LiveMotionOwnerError, LiveMotionOwnerOutcome,
+    LiveMotionTerminalStop, LivePhysicalStateEvent, NanoAccessoryHealthObserver,
+    NanoAgentControlConfig, NanoLiveModePolicy, NanoManualPlantBindingError,
+    PreparedNanoProductionRuntime, PreparedNanoProductionRuntimeParts, VisualAdmissionOutcome,
+    classify_live_actuation_error,
+};
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+use kiko_slam::navigation::{
+    AgentRuntimeStateV1, ConsoleActualAuthority, ConsoleActualAuthorityMode,
+    ConsoleActualAuthoritySource, ConsoleAppliedReceipt, ConsoleCheckpointLocalizationEvidence,
+    ConsoleFiniteF64Error, ConsoleGridProjectionError, ConsoleHealth, ConsoleHostTimestampNs,
+    ConsoleLocalization, ConsoleManualCommandEnvelope, ConsoleManualCommandEnvelopeError,
+    ConsoleMapSnapshot, ConsoleNavigationSnapshot, ConsoleOccupancyGrid, ConsolePathError,
+    ConsolePoint2, ConsolePose2, ConsoleReceiptProjectionError, ConsoleRequestedActuation,
+    ConsoleSnapshotRevision, ConsoleSourceKind, ConsoleStopCertainty, ConsoleSubsystemHealth,
+    ConsoleTerminalReason, ConsoleTerminalState, LiveMotionAuthorityState,
+    LiveMotionAuthorityStateError, NanoAccessoryComponentHealth, NanoAccessoryHealthStatusError,
+    NanoOperatorConsoleFrontend, NanoOperatorConsoleFrontendShutdownEvidence,
+    NanoOperatorConsoleFrontendStartError, OperatorConsoleIngressDisposition,
+    OperatorConsoleLimits, OperatorConsoleProcessDisposition, OperatorConsoleRetainedAuthorityKind,
+    OperatorConsoleRuntimeAdapter, OperatorConsoleRuntimeAdapterError,
+    OperatorConsoleRuntimeIngressError, OperatorConsoleSnapshot, OperatorConsoleSnapshotError,
+    operator_console,
+};
 #[cfg(feature = "record")]
 use kiko_slam::navigation::{
     ControlPeriodNs, CoordinatorAdmissionError, CoordinatorTickError, CoordinatorTickOutcome,
     NAVIGATION_INGRESS_STREAM_FILE, NavigationClockEpoch, NavigationIngressBoundaryError,
-    NavigationIngressSidecarDescriptor, NavigationIngressStreamWriteError, NavigationIngressWriter,
-    NavigationRecordingId, NavigationRecordingIdError, PendingVisualAttemptIngress,
+    NavigationIngressCapacity, NavigationIngressCapacityError, NavigationIngressEvent,
+    NavigationIngressReader, NavigationIngressSidecarDescriptor, NavigationIngressStreamReadError,
+    NavigationIngressStreamWriteError, NavigationIngressWriter, NavigationRecordingId,
+    NavigationRecordingIdError, PendingVisualAttemptIngress, RecordedMapEpochId,
     SafetyDecisionOutcome, ShadowNavigationCoordinator, VisualAdmission, VisualAdmissionError,
     VisualAttemptOutcome,
 };
@@ -78,15 +137,33 @@ use kiko_slam::navigation::{
 use kiko_slam::navigation::{
     LiveMpcControlDriver, LiveMpcControlError, NavigationActuationConfigV1,
 };
+#[cfg(all(feature = "nano-agent", unix))]
+use kiko_slam::navigation::{
+    MAX_NANO_WARM_SELECTION_BYTES, NanoAccessoryFaultWaitError, NanoAccessoryFrameSubmitOutcome,
+    NanoAccessoryTerminalFault, NanoAccessoryWorker, NanoAccessoryWorkerExit,
+    NanoAccessoryWorkerJoinError, NanoBootstrapRequest, NanoBootstrapRoots,
+    NanoBootstrapStereoEvidence, NanoDatasetReplayRequired, NanoFinalizedJournalMapIdentity,
+    NanoLaunchInference, NanoLaunchOccupancy, NanoLaunchRerun, NanoLaunchStorage,
+    NanoMapPersistenceConfig, NanoMapPersistenceOwner, NanoMapPersistencePathError,
+    NanoMapSaveCommandError, NanoMapSnapshotRetentionError, NanoMapWarmStartLoad,
+    NanoOakStreamGraph, NanoStateQuotaAdmissionError, NanoStateQuotaOwner,
+    NanoWarmCheckpointCommandError, NanoWarmStartRelocalizationError,
+    NanoWarmStartRelocalizationTransition, NanoWarmStartReplayConfig, ParsedNanoLiveConfiguration,
+    PreparedNanoBootstrap, bootstrap_nano_production, replay_nano_warm_start,
+};
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+use kiko_slam::navigation::{
+    NanoAccessoryHealthPeriod, NanoAccessoryWorkerConfig, NanoAccessoryWorkerStartError,
+};
 #[cfg(feature = "record")]
 use kiko_slam::{
     DenseCommandQueueStatsHandle, DenseCommandReceiver, DenseCommandSender, DepthObservation,
     DepthObservationError, DeviceSessionId, DropPolicy, DropReceiver, DropSender,
     HostMonotonicTimestamp, ImuReport, InertialOrderingError, InertialValueError,
     PairingConfigError, PairingInputError, PairingWindowNs, SendOutcome, SensorId,
-    StereoObservation, StereoObservationError, StereoPairer, TrackerInitError, TrackerOutput,
-    VizConfigError, bounded_channel, dense_command_channel, depth_router, imu_report_router,
-    oak_to_depth_image, oak_to_frame, oak_to_imu_report,
+    StereoObservation, StereoObservationError, StereoPairer, TrackerOutput, VizConfigError,
+    bounded_channel, dense_command_channel, depth_router, imu_report_router, oak_to_depth_image,
+    oak_to_frame, oak_to_imu_report,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
@@ -99,6 +176,15 @@ use oak_sys::{
 };
 #[cfg(all(feature = "record", feature = "actuation"))]
 use robot_command_client::AppliedCommandReceipt;
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+use robot_command_client::DisarmReceipt;
+#[cfg(all(feature = "nano-agent", unix))]
+use robot_server::V2ControllerOwnerTerminationError;
 #[cfg(feature = "record")]
 use std::num::{NonZeroU32, NonZeroU64};
 #[cfg(any(feature = "record", test))]
@@ -198,6 +284,10 @@ enum Command {
     Record(RecordArgs),
     #[cfg(feature = "record")]
     Live(LiveArgs),
+    #[cfg(all(feature = "nano-agent", unix))]
+    NanoAgent(NanoAgentArgs),
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    NanoWheelsOffQualification(NanoWheelsOffQualificationArgs),
     Viz(VizArgs),
     Bench(BenchArgs),
 }
@@ -699,6 +789,38 @@ struct LiveArgs {
     navigation_arm_robot: Option<String>,
 }
 
+#[derive(Args, Clone, Debug)]
+#[cfg(all(feature = "nano-agent", unix))]
+struct NanoAgentArgs {
+    /// Root-owned directory containing the launch document and every bound asset.
+    #[arg(long, value_name = "ABSOLUTE_DIRECTORY")]
+    deployment_root: PathBuf,
+    /// Canonical deployment-relative production launch document.
+    #[arg(long, value_name = "RELATIVE_JSON")]
+    launch_config: String,
+    /// Persistent systemd-managed state root for maps, records, and evidence.
+    #[arg(long, value_name = "ABSOLUTE_DIRECTORY")]
+    state_root: PathBuf,
+}
+
+/// Manually invoked qualification surface compiled out of the production
+/// `nano-agent` feature. Physical preconditions are accepted only from an
+/// attended TTY; there are deliberately no flags or environment aliases for
+/// them.
+#[derive(Args, Clone, Debug)]
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+struct NanoWheelsOffQualificationArgs {
+    /// Root-owned directory containing the qualification launch and every bound asset.
+    #[arg(long, value_name = "ABSOLUTE_DIRECTORY")]
+    deployment_root: PathBuf,
+    /// Canonical deployment-relative wheels-off qualification launch document.
+    #[arg(long, value_name = "RELATIVE_JSON")]
+    launch_config: String,
+    /// Persistent state root for the qualification dataset and diagnostics.
+    #[arg(long, value_name = "ABSOLUTE_DIRECTORY")]
+    state_root: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BackendArg {
     #[value(name = "auto")]
@@ -1143,6 +1265,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Record(args) => run_record(args),
         #[cfg(feature = "record")]
         Command::Live(args) => run_live(args),
+        #[cfg(all(feature = "nano-agent", unix))]
+        Command::NanoAgent(args) => run_nano_agent(args),
+        #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+        Command::NanoWheelsOffQualification(args) => run_nano_wheels_off_qualification(args),
         Command::Viz(args) => run_viz(args),
         Command::Bench(args) => run_bench(args),
     }
@@ -2357,6 +2483,48 @@ impl OakRuntimeProvenance {
             self.embedded_bootloader_artifact_version,
         )
     }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    fn from_nano_bootstrap(bootstrap: &PreparedNanoBootstrap) -> Self {
+        Self::from_admitted_nano_parts(
+            &bootstrap.oak_connected_identity,
+            bootstrap.oak_usb_transport,
+            &bootstrap.depthai_build_metadata,
+        )
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    fn from_nano_wheels_off_qualification_bootstrap(
+        bootstrap: &kiko_slam::navigation::PreparedNanoWheelsOffQualificationBootstrap,
+    ) -> Self {
+        Self::from_admitted_nano_parts(
+            &bootstrap.oak_connected_identity,
+            bootstrap.oak_usb_transport,
+            &bootstrap.depthai_build_metadata,
+        )
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    fn from_admitted_nano_parts(
+        connected_identity: &oak_sys::ConnectedDeviceIdentity,
+        usb_transport: kiko_slam::navigation::AdmittedOakSuperSpeedEvidence,
+        build_metadata: &oak_sys::DepthAiBuildMetadata,
+    ) -> Self {
+        Self {
+            connected_mxid: connected_identity.mxid().to_owned(),
+            usb_requested_maximum: usb_transport.requested_maximum(),
+            usb_required_minimum: usb_transport.required_minimum(),
+            usb_observed: usb_transport.observed(),
+            depthai_sdk_version: build_metadata.sdk_version().to_owned(),
+            depthai_sdk_commit: build_metadata.sdk_commit().to_owned(),
+            embedded_device_artifact_version: build_metadata
+                .embedded_device_artifact_version()
+                .to_owned(),
+            embedded_bootloader_artifact_version: build_metadata
+                .embedded_bootloader_artifact_version()
+                .to_owned(),
+        }
+    }
 }
 
 #[cfg(feature = "record")]
@@ -3490,6 +3658,94 @@ struct LiveVizMsg {
 
 #[cfg(feature = "record")]
 #[derive(Debug)]
+struct LiveRgbVizMsg {
+    device_capture_sequence: i64,
+    device_timestamp_ns: i64,
+    width: u32,
+    height: u32,
+    pixels_bgr8: Vec<u8>,
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveRgbVizBuildError {
+    WrongStream { actual: OakStreamId },
+    RowBytesOverflow { width: u32 },
+    PixelBytesOverflow { width: u32, height: u32 },
+    StrideMismatch { expected: u32, actual: u32 },
+    PixelLengthMismatch { expected: usize, actual: usize },
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+impl std::fmt::Display for LiveRgbVizBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "live RGB diagnostic frame violates the admitted BGR8 layout: {self:?}"
+        )
+    }
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+impl std::error::Error for LiveRgbVizBuildError {}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn validate_live_rgb_viz_layout(
+    width: u32,
+    height: u32,
+    stride_bytes: u32,
+    pixel_length: usize,
+) -> Result<(), LiveRgbVizBuildError> {
+    let expected_stride = width
+        .checked_mul(3)
+        .ok_or(LiveRgbVizBuildError::RowBytesOverflow { width })?;
+    if stride_bytes != expected_stride {
+        return Err(LiveRgbVizBuildError::StrideMismatch {
+            expected: expected_stride,
+            actual: stride_bytes,
+        });
+    }
+    let expected = usize::try_from(
+        expected_stride
+            .checked_mul(height)
+            .ok_or(LiveRgbVizBuildError::PixelBytesOverflow { width, height })?,
+    )
+    .map_err(|_| LiveRgbVizBuildError::PixelBytesOverflow { width, height })?;
+    if pixel_length != expected {
+        return Err(LiveRgbVizBuildError::PixelLengthMismatch {
+            expected,
+            actual: pixel_length,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+impl LiveRgbVizMsg {
+    fn try_from_oak(frame: &OakImageFrame) -> Result<Self, LiveRgbVizBuildError> {
+        if frame.stream != OakStreamId::Rgb {
+            return Err(LiveRgbVizBuildError::WrongStream {
+                actual: frame.stream,
+            });
+        }
+        validate_live_rgb_viz_layout(
+            frame.width,
+            frame.height,
+            frame.stride_bytes,
+            frame.pixels().len(),
+        )?;
+        Ok(Self {
+            device_capture_sequence: frame.device_capture_sequence.as_i64(),
+            device_timestamp_ns: frame.timestamp.as_nanos(),
+            width: frame.width,
+            height: frame.height,
+            pixels_bgr8: frame.pixels().to_vec(),
+        })
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
 struct LiveLocalCostmapViz {
     width: u32,
     height: u32,
@@ -3508,19 +3764,51 @@ struct LiveAppliedActuationViz {
     sequence: u32,
     applied_pwm: [i8; 2],
     remaining_lease_at_server_emission_ms: u16,
+    conservative_decision_to_send_ns: Option<u64>,
+    command_send_to_ack_ns: Option<u64>,
+    conservative_decision_to_ack_ns: Option<u64>,
     acknowledged_at_ns_decimal: String,
     known_active_through_ns_decimal: String,
 }
 
+#[cfg(feature = "record")]
+#[derive(Debug)]
+struct LiveFaultActuationViz {
+    kind: String,
+    controller_stop_confirmed: bool,
+}
+
+#[cfg(feature = "record")]
+fn checked_monotonic_duration_ns(start_ns: u128, end_ns: u128) -> Option<u64> {
+    end_ns
+        .checked_sub(start_ns)
+        .and_then(|duration_ns| u64::try_from(duration_ns).ok())
+}
+
 #[cfg(all(feature = "record", feature = "actuation"))]
-fn live_applied_actuation_viz(receipt: &AppliedCommandReceipt) -> LiveAppliedActuationViz {
+fn live_applied_actuation_viz(
+    receipt: &AppliedCommandReceipt,
+    decision_started_at: Option<HostMonotonicTimestamp>,
+) -> LiveAppliedActuationViz {
     let pwm = receipt.applied_timer_pwm();
+    let sent_at_ns = receipt.sent_at().nanos_since_clock_start();
+    let acknowledged_at_ns = receipt.acknowledged_at().nanos_since_clock_start();
+    let conservative_decision_to_send_ns = decision_started_at.and_then(|started_at| {
+        checked_monotonic_duration_ns(u128::from(started_at.as_nanos()), sent_at_ns)
+    });
+    let command_send_to_ack_ns = checked_monotonic_duration_ns(sent_at_ns, acknowledged_at_ns);
+    let conservative_decision_to_ack_ns = decision_started_at.and_then(|started_at| {
+        checked_monotonic_duration_ns(u128::from(started_at.as_nanos()), acknowledged_at_ns)
+    });
     LiveAppliedActuationViz {
         controller_boot_id: receipt.controller_session().boot_id().get(),
         control_epoch: receipt.controller_session().control_epoch().get(),
         sequence: receipt.sequence().get(),
         applied_pwm: [pwm.left().get(), pwm.right().get()],
         remaining_lease_at_server_emission_ms: receipt.remaining_lease_at_server_emission().get(),
+        conservative_decision_to_send_ns,
+        command_send_to_ack_ns,
+        conservative_decision_to_ack_ns,
         acknowledged_at_ns_decimal: receipt
             .acknowledged_at()
             .nanos_since_clock_start()
@@ -3550,10 +3838,96 @@ const fn live_decision_viz_status(kind: LiveDecisionVizKind, applied: bool) -> &
 }
 
 #[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveControlTickTiming {
+    /// Delay from crossbeam's scheduled delivery instant until this worker
+    /// actually selected the tick. This excludes MPC and controller I/O.
+    current_lateness_ns: u64,
+    /// Process-lifetime high-water mark. Later packets retain a peak even when
+    /// an intermediate visualization packet was evicted by DropOldest.
+    maximum_lateness_ns: u64,
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveControlTickTimingError {
+    ScheduledAfterSelection,
+    LatenessOutsideU64 { lateness_ns: u128 },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for LiveControlTickTimingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ScheduledAfterSelection => {
+                formatter.write_str("the selected tick instant preceded the scheduled tick instant")
+            }
+            Self::LatenessOutsideU64 { lateness_ns } => write!(
+                formatter,
+                "tick lateness {lateness_ns} ns exceeds the u64 telemetry domain"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for LiveControlTickTimingError {}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveNavigationVizMessageKind {
+    State {
+        control_tick_timing: Option<LiveControlTickTiming>,
+    },
+    ControlTickTimingOnly {
+        control_tick_timing: LiveControlTickTiming,
+    },
+}
+
+#[cfg(feature = "record")]
+impl LiveNavigationVizMessageKind {
+    const fn updates_navigation_state(self) -> bool {
+        matches!(self, Self::State { .. })
+    }
+
+    const fn control_tick_timing(self) -> Option<LiveControlTickTiming> {
+        match self {
+            Self::State {
+                control_tick_timing,
+            } => control_tick_timing,
+            Self::ControlTickTimingOnly {
+                control_tick_timing,
+            } => Some(control_tick_timing),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+fn measure_live_control_tick_timing(
+    scheduled_at: Instant,
+    selected_at: Instant,
+    previous_maximum_lateness_ns: u64,
+) -> Result<LiveControlTickTiming, LiveControlTickTimingError> {
+    let current_lateness = selected_at
+        .checked_duration_since(scheduled_at)
+        .ok_or(LiveControlTickTimingError::ScheduledAfterSelection)?
+        .as_nanos();
+    let current_lateness_ns = u64::try_from(current_lateness).map_err(|_| {
+        LiveControlTickTimingError::LatenessOutsideU64 {
+            lateness_ns: current_lateness,
+        }
+    })?;
+    Ok(LiveControlTickTiming {
+        current_lateness_ns,
+        maximum_lateness_ns: previous_maximum_lateness_ns.max(current_lateness_ns),
+    })
+}
+
+#[cfg(feature = "record")]
 #[derive(Debug)]
 struct LiveNavigationVizMsg {
     tick_sequence: i64,
-    host_timestamp_ns: u64,
+    host_timestamp_ns: Option<u64>,
     goal: Option<[f32; 2]>,
     goal_state: String,
     odometry_state: Option<String>,
@@ -3562,15 +3936,110 @@ struct LiveNavigationVizMsg {
     base_to_odom: Option<[f64; 3]>,
     odom_to_map: Option<[f64; 3]>,
     predicted_odom: Option<Vec<[f32; 2]>>,
-    decision_id: u64,
+    decision_id: Option<u64>,
     request_id: Option<u64>,
     status: &'static str,
     reason: String,
-    requested_pwm: [i8; 2],
+    requested_pwm: Option<[i8; 2]>,
     objective_cost: Option<f64>,
-    shadow_record_motor_packets_sent: u64,
+    shadow_record_motor_packets_sent: Option<u64>,
     applied_actuation: Option<LiveAppliedActuationViz>,
+    fault_actuation: Option<LiveFaultActuationViz>,
     diagnostic_warning: Option<String>,
+    successful_solver_duration_ns: Option<u64>,
+    kind: LiveNavigationVizMessageKind,
+}
+
+#[cfg(feature = "record")]
+impl LiveNavigationVizMsg {
+    fn with_control_tick_timing(mut self, timing: LiveControlTickTiming) -> Self {
+        self.kind = match self.kind {
+            LiveNavigationVizMessageKind::State { .. } => LiveNavigationVizMessageKind::State {
+                control_tick_timing: Some(timing),
+            },
+            LiveNavigationVizMessageKind::ControlTickTimingOnly { .. } => {
+                LiveNavigationVizMessageKind::ControlTickTimingOnly {
+                    control_tick_timing: timing,
+                }
+            }
+        };
+        self
+    }
+
+    fn control_tick_timing_only(
+        tick_sequence: i64,
+        host_timestamp_ns: u64,
+        timing: LiveControlTickTiming,
+    ) -> Self {
+        Self {
+            tick_sequence,
+            host_timestamp_ns: Some(host_timestamp_ns),
+            goal: None,
+            goal_state: String::new(),
+            odometry_state: None,
+            path: None,
+            local_costmap: None,
+            base_to_odom: None,
+            odom_to_map: None,
+            predicted_odom: None,
+            decision_id: None,
+            request_id: None,
+            status: "control_tick_timing",
+            reason: String::new(),
+            requested_pwm: None,
+            objective_cost: None,
+            shadow_record_motor_packets_sent: None,
+            applied_actuation: None,
+            fault_actuation: None,
+            diagnostic_warning: None,
+            successful_solver_duration_ns: None,
+            kind: LiveNavigationVizMessageKind::ControlTickTimingOnly {
+                control_tick_timing: timing,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+struct LiveOdometryViz {
+    state: Option<String>,
+    base_to_odom: Option<[f64; 3]>,
+    odom_to_map: Option<[f64; 3]>,
+}
+
+#[cfg(feature = "record")]
+fn live_odometry_viz(
+    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+) -> LiveOdometryViz {
+    let current = coordinator.odometry().current();
+    LiveOdometryViz {
+        base_to_odom: current.map(|state| {
+            let transform = state.base_to_odom();
+            [
+                transform.source_origin_x_in_destination_m(),
+                transform.source_origin_y_in_destination_m(),
+                transform.source_yaw_in_destination_rad(),
+            ]
+        }),
+        odom_to_map: current.map(|state| {
+            let transform = state.odom_to_map();
+            [
+                transform.source_origin_x_in_destination_m(),
+                transform.source_origin_y_in_destination_m(),
+                transform.source_yaw_in_destination_rad(),
+            ]
+        }),
+        state: current.map(|state| {
+            format!(
+                "session_id={} segment_id={} device_timestamp_ns={} map_snapshot={:?} quality={:?}",
+                state.session_id().as_u64(),
+                state.segment_id().as_u64(),
+                state.timestamp().as_nanos(),
+                state.map_snapshot(),
+                state.quality(),
+            )
+        }),
+    }
 }
 
 #[cfg(feature = "record")]
@@ -3645,46 +4114,27 @@ fn build_live_navigation_viz_message(
         }
     };
 
-    let current = coordinator.odometry().current();
-    let base_to_odom = current.map(|state| {
-        let transform = state.base_to_odom();
-        [
-            transform.source_origin_x_in_destination_m(),
-            transform.source_origin_y_in_destination_m(),
-            transform.source_yaw_in_destination_rad(),
-        ]
-    });
-    let odom_to_map = current.map(|state| {
-        let transform = state.odom_to_map();
-        [
-            transform.source_origin_x_in_destination_m(),
-            transform.source_origin_y_in_destination_m(),
-            transform.source_yaw_in_destination_rad(),
-        ]
-    });
-    let odometry_state = current.map(|state| {
-        format!(
-            "session_id={} segment_id={} device_timestamp_ns={} map_snapshot={:?} quality={:?}",
-            state.session_id().as_u64(),
-            state.segment_id().as_u64(),
-            state.timestamp().as_nanos(),
-            state.map_snapshot(),
-            state.quality(),
-        )
-    });
+    let odometry = live_odometry_viz(coordinator);
 
     let decision = outcome.decision();
     let applied = applied_actuation.is_some();
-    let (kind, reason, objective_cost) = match decision.outcome() {
-        SafetyDecisionOutcome::Controller(controller) => (
-            LiveDecisionVizKind::Controller,
-            if applied {
-                "exact V2 controller application receipt matched; physical wheel motion remains unobserved".to_owned()
-            } else {
-                "safety-approved shadow MPC request; no transport exists".to_owned()
-            },
-            Some(controller.objective_cost()),
-        ),
+    let (kind, reason, objective_cost, successful_solver_duration_ns) = match decision.outcome() {
+        SafetyDecisionOutcome::Controller(controller) => {
+            let solve_status = controller.solve_status();
+            (
+                LiveDecisionVizKind::Controller,
+                if applied {
+                    "exact V2 controller application receipt matched; physical wheel motion remains unobserved".to_owned()
+                } else {
+                    "safety-approved shadow MPC request; no transport exists".to_owned()
+                },
+                Some(controller.objective_cost()),
+                checked_monotonic_duration_ns(
+                    u128::from(solve_status.started_at().as_nanos()),
+                    u128::from(solve_status.observed_at().as_nanos()),
+                ),
+            )
+        }
         SafetyDecisionOutcome::Stopped(stopped) => (
             LiveDecisionVizKind::Stopped,
             if applied {
@@ -3695,6 +4145,7 @@ fn build_live_navigation_viz_message(
             } else {
                 stopped.cause().to_string()
             },
+            None,
             None,
         ),
     };
@@ -3718,25 +4169,277 @@ fn build_live_navigation_viz_message(
     let pwm = record.pwm();
     LiveNavigationVizMsg {
         tick_sequence,
-        host_timestamp_ns: tick.as_nanos(),
+        host_timestamp_ns: Some(tick.as_nanos()),
         goal,
         goal_state: format!("{:?}", coordinator.goal_state()),
-        odometry_state,
+        odometry_state: odometry.state,
         path,
         local_costmap,
-        base_to_odom,
-        odom_to_map,
+        base_to_odom: odometry.base_to_odom,
+        odom_to_map: odometry.odom_to_map,
         predicted_odom,
-        decision_id: record.decision_id().as_u64(),
+        decision_id: Some(record.decision_id().as_u64()),
         request_id: decision.request_id().map(NonZeroU64::get),
         status,
         reason,
-        requested_pwm: [pwm.left().get(), pwm.right().get()],
+        requested_pwm: Some([pwm.left().get(), pwm.right().get()]),
         objective_cost,
-        shadow_record_motor_packets_sent: decision.motor_packets_sent().get(),
+        shadow_record_motor_packets_sent: Some(decision.motor_packets_sent().get()),
         applied_actuation,
+        fault_actuation: None,
         diagnostic_warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        successful_solver_duration_ns,
+        kind: LiveNavigationVizMessageKind::State {
+            control_tick_timing: None,
+        },
     }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+fn build_live_lifecycle_zero_viz_message(
+    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    tick_sequence: i64,
+    applied: &LiveLifecycleZeroApplied<AppliedCommandReceipt>,
+) -> LiveNavigationVizMsg {
+    let odometry = live_odometry_viz(coordinator);
+    LiveNavigationVizMsg {
+        tick_sequence,
+        host_timestamp_ns: Some(applied.requested_at().as_nanos()),
+        goal: None,
+        goal_state: format!("{:?}", coordinator.goal_state()),
+        odometry_state: odometry.state,
+        path: None,
+        local_costmap: None,
+        base_to_odom: odometry.base_to_odom,
+        odom_to_map: odometry.odom_to_map,
+        predicted_odom: None,
+        decision_id: None,
+        request_id: None,
+        status: "lifecycle_zero_applied",
+        reason: format!(
+            "{:?}; exact V2 zero application receipt matched; no MPC outcome is attributed to this lifecycle transition",
+            applied.reason()
+        ),
+        requested_pwm: Some([0, 0]),
+        objective_cost: None,
+        shadow_record_motor_packets_sent: None,
+        applied_actuation: Some(live_applied_actuation_viz(applied.receipt(), None)),
+        fault_actuation: None,
+        diagnostic_warning: None,
+        successful_solver_duration_ns: None,
+        kind: LiveNavigationVizMessageKind::State {
+            control_tick_timing: None,
+        },
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+fn build_live_actuation_fault_viz_message(
+    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    tick_sequence: i64,
+    observed_at: HostMonotonicTimestamp,
+    evidence: LiveMotionActuationFaultEvidence,
+) -> LiveNavigationVizMsg {
+    let odometry = live_odometry_viz(coordinator);
+    let controller_stop_confirmed =
+        evidence.controller_stop() == AgentControllerStopKnowledge::Confirmed;
+    LiveNavigationVizMsg {
+        tick_sequence,
+        host_timestamp_ns: Some(observed_at.as_nanos()),
+        goal: None,
+        goal_state: format!("{:?}", coordinator.goal_state()),
+        odometry_state: odometry.state,
+        path: None,
+        local_costmap: None,
+        base_to_odom: odometry.base_to_odom,
+        odom_to_map: odometry.odom_to_map,
+        predicted_odom: None,
+        decision_id: None,
+        request_id: None,
+        status: if controller_stop_confirmed {
+            "actuation_fault_stop_confirmed"
+        } else {
+            "actuation_fault_stop_uncertain"
+        },
+        reason: format!(
+            "physical actuation fault kind={:?}; controller_stop={:?}; no MPC outcome or receipt is fabricated",
+            evidence.kind(),
+            evidence.controller_stop()
+        ),
+        requested_pwm: None,
+        objective_cost: None,
+        shadow_record_motor_packets_sent: None,
+        applied_actuation: None,
+        fault_actuation: Some(LiveFaultActuationViz {
+            kind: format!("{:?}", evidence.kind()),
+            controller_stop_confirmed,
+        }),
+        diagnostic_warning: (!controller_stop_confirmed).then(|| {
+            "controller stop is uncertain; applied PWM is intentionally cleared".to_owned()
+        }),
+        successful_solver_duration_ns: None,
+        kind: LiveNavigationVizMessageKind::State {
+            control_tick_timing: None,
+        },
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+fn build_live_terminal_controller_stop_viz_message(
+    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    tick_sequence: i64,
+    timeline_at_ns: Option<u64>,
+    controller_stop_confirmed: bool,
+    status: &'static str,
+    kind: String,
+    reason: String,
+) -> LiveNavigationVizMsg {
+    let odometry = live_odometry_viz(coordinator);
+    LiveNavigationVizMsg {
+        tick_sequence,
+        host_timestamp_ns: timeline_at_ns,
+        goal: None,
+        goal_state: format!("{:?}", coordinator.goal_state()),
+        odometry_state: odometry.state,
+        path: None,
+        local_costmap: None,
+        base_to_odom: odometry.base_to_odom,
+        odom_to_map: odometry.odom_to_map,
+        predicted_odom: None,
+        decision_id: None,
+        request_id: None,
+        status,
+        reason,
+        requested_pwm: None,
+        objective_cost: None,
+        shadow_record_motor_packets_sent: None,
+        applied_actuation: None,
+        fault_actuation: Some(LiveFaultActuationViz {
+            kind,
+            controller_stop_confirmed,
+        }),
+        diagnostic_warning: (!controller_stop_confirmed).then(|| {
+            "terminal controller stop is uncertain; applied PWM is intentionally cleared".to_owned()
+        }),
+        successful_solver_duration_ns: None,
+        kind: LiveNavigationVizMessageKind::State {
+            control_tick_timing: None,
+        },
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LivePhysicalStateVizPublishError {
+    DroppedNewest,
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl std::fmt::Display for LivePhysicalStateVizPublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "the newest live-navigation visualization was not enqueued; timing or actuation diagnostics may remain stale",
+        )
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl std::error::Error for LivePhysicalStateVizPublishError {}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+fn publish_live_navigation_viz_message(
+    sender: &mut Option<DropSender<LiveNavigationVizMsg>>,
+    message: LiveNavigationVizMsg,
+) -> Result<(), LivePhysicalStateVizPublishError> {
+    let Some(active_sender) = sender.as_ref() else {
+        return Ok(());
+    };
+    match active_sender.try_send(message) {
+        SendOutcome::Enqueued | SendOutcome::DroppedOldest => Ok(()),
+        SendOutcome::Disconnected => {
+            *sender = None;
+            Ok(())
+        }
+        SendOutcome::DroppedNewest => Err(LivePhysicalStateVizPublishError::DroppedNewest),
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+fn publish_live_physical_state_viz(
+    sender: &mut Option<DropSender<LiveNavigationVizMsg>>,
+    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    tick_sequence: i64,
+    timing: LiveControlTickTiming,
+    event: &LivePhysicalStateEvent<
+        AppliedCommandReceipt,
+        CoordinatorTickOutcome<NavigationIngressStreamWriteError>,
+    >,
+) -> Result<(), LivePhysicalStateVizPublishError> {
+    let message = match event {
+        LivePhysicalStateEvent::CoordinatorTick(applied) => build_live_navigation_viz_message(
+            coordinator,
+            applied.tick(),
+            tick_sequence,
+            applied.diagnostic(),
+            Some(live_applied_actuation_viz(
+                applied.receipt(),
+                Some(applied.tick()),
+            )),
+        ),
+        LivePhysicalStateEvent::LifecycleZero(applied) => {
+            build_live_lifecycle_zero_viz_message(coordinator, tick_sequence, applied)
+        }
+        LivePhysicalStateEvent::ActuationFault {
+            observed_at,
+            evidence,
+        } => build_live_actuation_fault_viz_message(
+            coordinator,
+            tick_sequence,
+            *observed_at,
+            *evidence,
+        ),
+    };
+    publish_live_navigation_viz_message(sender, message.with_control_tick_timing(timing))
 }
 
 #[cfg(feature = "record")]
@@ -3745,6 +4448,60 @@ fn log_live_navigation_viz_message(
     message: LiveNavigationVizMsg,
     context_logged: &mut bool,
 ) -> Result<(), VizLogError> {
+    recording.disable_timeline("capture_ns");
+    recording.disable_timeline("oak_rgb_capture_sequence");
+    recording.set_time_sequence("navigation_tick", message.tick_sequence);
+    if let Some(host_timestamp_ns) = message
+        .host_timestamp_ns
+        .and_then(|value| i64::try_from(value).ok())
+    {
+        recording.set_time(
+            "navigation_host_ns",
+            rerun::TimeCell::from_duration_nanos(host_timestamp_ns),
+        );
+    } else {
+        recording.disable_timeline("navigation_host_ns");
+    }
+    if let Some(timing) = message.kind.control_tick_timing() {
+        recording.log(
+            "navigation/control_loop/tick_lateness_ns",
+            &rerun::Scalars::single(timing.current_lateness_ns as f64),
+        )?;
+        recording.log(
+            "navigation/control_loop/maximum_tick_lateness_ns",
+            &rerun::Scalars::single(timing.maximum_lateness_ns as f64),
+        )?;
+        recording.log(
+            "navigation/control_loop/timing_evidence",
+            &rerun::TextLog::new(format!(
+                "current_tick_lateness_ns={} maximum_tick_lateness_ns={}",
+                timing.current_lateness_ns, timing.maximum_lateness_ns
+            )),
+        )?;
+    } else {
+        for path in [
+            "navigation/control_loop/tick_lateness_ns",
+            "navigation/control_loop/maximum_tick_lateness_ns",
+            "navigation/control_loop/timing_evidence",
+        ] {
+            recording.log(path, &rerun::Clear::flat())?;
+        }
+    }
+    if !message.kind.updates_navigation_state() {
+        return Ok(());
+    }
+    if let Some(duration_ns) = message.successful_solver_duration_ns {
+        recording.log(
+            "navigation/control_loop/successful_solver_duration_ns",
+            &rerun::Scalars::single(duration_ns as f64),
+        )?;
+    } else {
+        recording.log(
+            "navigation/control_loop/successful_solver_duration_ns",
+            &rerun::Clear::flat(),
+        )?;
+    }
+
     let local_costmap_to_odom = message
         .local_costmap
         .as_ref()
@@ -3753,13 +4510,6 @@ fn log_live_navigation_viz_message(
         .local_costmap
         .as_ref()
         .map(|local| local.evidence.clone());
-    recording.set_time_sequence("navigation_tick", message.tick_sequence);
-    if let Ok(host_timestamp_ns) = i64::try_from(message.host_timestamp_ns) {
-        recording.set_time(
-            "navigation_host_ns",
-            rerun::TimeCell::from_duration_nanos(host_timestamp_ns),
-        );
-    }
     if !*context_logged {
         recording.log_static(
             "navigation/local_costmap_at_capture",
@@ -3838,17 +4588,26 @@ fn log_live_navigation_viz_message(
         )?;
     }
 
-    for (path, value) in [
-        (
+    if let Some(requested_pwm) = message.requested_pwm {
+        for (path, value) in [
+            (
+                "navigation/decision/left_pwm_percent",
+                f64::from(requested_pwm[0]),
+            ),
+            (
+                "navigation/decision/right_pwm_percent",
+                f64::from(requested_pwm[1]),
+            ),
+        ] {
+            recording.log(path, &rerun::Scalars::single(value))?;
+        }
+    } else {
+        for path in [
             "navigation/decision/left_pwm_percent",
-            f64::from(message.requested_pwm[0]),
-        ),
-        (
             "navigation/decision/right_pwm_percent",
-            f64::from(message.requested_pwm[1]),
-        ),
-    ] {
-        recording.log(path, &rerun::Scalars::single(value))?;
+        ] {
+            recording.log(path, &rerun::Clear::flat())?;
+        }
     }
     if let Some(applied) = message.applied_actuation.as_ref() {
         for (path, value) in [
@@ -3867,21 +4626,74 @@ fn log_live_navigation_viz_message(
         ] {
             recording.log(path, &rerun::Scalars::single(value))?;
         }
+        for (path, duration_ns) in [
+            (
+                "navigation/actuation/conservative_decision_to_send_ns",
+                applied.conservative_decision_to_send_ns,
+            ),
+            (
+                "navigation/actuation/command_send_to_ack_ns",
+                applied.command_send_to_ack_ns,
+            ),
+            (
+                "navigation/actuation/conservative_decision_to_ack_ns",
+                applied.conservative_decision_to_ack_ns,
+            ),
+        ] {
+            if let Some(duration_ns) = duration_ns {
+                recording.log(path, &rerun::Scalars::single(duration_ns as f64))?;
+            } else {
+                recording.log(path, &rerun::Clear::flat())?;
+            }
+        }
         recording.log(
             "navigation/actuation/applied_receipt",
             &rerun::TextLog::new(format!(
-                "boot_id={} control_epoch={} sequence={} acknowledged_at_host_ns={} known_active_through_host_ns={}",
+                "boot_id={} control_epoch={} sequence={} conservative_decision_to_send_ns={} command_send_to_ack_ns={} conservative_decision_to_ack_ns={} acknowledged_at_host_ns={} known_active_through_host_ns={}",
                 applied.controller_boot_id,
                 applied.control_epoch,
                 applied.sequence,
+                applied
+                    .conservative_decision_to_send_ns
+                    .map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
+                applied
+                    .command_send_to_ack_ns
+                    .map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
+                applied
+                    .conservative_decision_to_ack_ns
+                    .map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
                 applied.acknowledged_at_ns_decimal,
                 applied.known_active_through_ns_decimal,
+            )),
+        )?;
+        recording.log(
+            "navigation/actuation/fault_stop_evidence",
+            &rerun::Clear::flat(),
+        )?;
+    } else if let Some(fault) = message.fault_actuation.as_ref() {
+        recording.log("navigation/actuation", &rerun::Clear::recursive())?;
+        if fault.controller_stop_confirmed {
+            for path in [
+                "navigation/actuation/applied_left_pwm_percent",
+                "navigation/actuation/applied_right_pwm_percent",
+            ] {
+                recording.log(path, &rerun::Scalars::single(0.0))?;
+            }
+        }
+        recording.log(
+            "navigation/actuation/fault_stop_evidence",
+            &rerun::TextLog::new(format!(
+                "kind={} controller_stop_confirmed={}",
+                fault.kind, fault.controller_stop_confirmed
             )),
         )?;
     } else {
         recording.log("navigation/actuation", &rerun::Clear::recursive())?;
     }
-    if let Ok(motor_packets_sent) = u32::try_from(message.shadow_record_motor_packets_sent) {
+    if let Some(motor_packets_sent) = message
+        .shadow_record_motor_packets_sent
+        .and_then(|value| u32::try_from(value).ok())
+    {
         recording.log(
             "navigation/decision/shadow_record_motor_packets_sent",
             &rerun::Scalars::single(f64::from(motor_packets_sent)),
@@ -3953,14 +4765,20 @@ fn log_live_navigation_viz_message(
     }
     let mut status = format!(
         "host_timestamp_ns={} decision_id={} request_id={} status={} goal_state={} shadow_record_motor_packets_sent={} reason={}",
-        message.host_timestamp_ns,
-        message.decision_id,
+        message
+            .host_timestamp_ns
+            .map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
+        message
+            .decision_id
+            .map_or_else(|| "none".to_owned(), |id| id.to_string()),
         message
             .request_id
             .map_or_else(|| "none".to_owned(), |id| id.to_string()),
         message.status,
         message.goal_state,
-        message.shadow_record_motor_packets_sent,
+        message
+            .shadow_record_motor_packets_sent
+            .map_or_else(|| "none".to_owned(), |count| count.to_string()),
         message.reason
     );
     if let Some(local_costmap_evidence) = local_costmap_evidence {
@@ -3976,6 +4794,32 @@ fn log_live_navigation_viz_message(
         status.push_str(&warning);
     }
     recording.log("navigation/decision/status", &rerun::TextLog::new(status))?;
+    Ok(())
+}
+
+#[cfg(feature = "record")]
+fn log_live_rgb_viz_message(
+    recording: &rerun::RecordingStream,
+    message: LiveRgbVizMsg,
+) -> Result<(), VizLogError> {
+    recording.disable_timeline("navigation_tick");
+    recording.disable_timeline("navigation_host_ns");
+    let time = rerun::TimeCell::from_duration_nanos(message.device_timestamp_ns);
+    if time.as_i64() != message.device_timestamp_ns {
+        return Err(VizLogError::TimestampUnrepresentable {
+            timestamp_ns: message.device_timestamp_ns,
+            encoded_ns: time.as_i64(),
+        });
+    }
+    recording.set_time("capture_ns", time);
+    recording.set_time_sequence("oak_rgb_capture_sequence", message.device_capture_sequence);
+    let image = rerun::Image::from_color_model_and_bytes(
+        message.pixels_bgr8,
+        [message.width, message.height],
+        rerun::ColorModel::BGR,
+        rerun::ChannelDatatype::U8,
+    );
+    recording.log("view/rgb", &image)?;
     Ok(())
 }
 
@@ -4086,10 +4930,847 @@ fn classify_live_dense_route(
 #[cfg(feature = "record")]
 type LiveCoordinatorAdmissionError = CoordinatorAdmissionError<NavigationIngressStreamWriteError>;
 
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+type ProductionLiveMotionOwner =
+    LiveMotionOwner<NavigationIngressWriter<File>, LiveMpcControlDriver, InstantHostClock>;
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+type LiveProductionMotionStartFailure = Box<(
+    ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    LiveProductionOwnerStartError,
+)>;
+
+/// Motion ownership selected before the navigation worker starts.
+///
+/// The compatibility variant retains the standalone CLI behavior. The
+/// production variant accepts only the already-admitted bundle; this binary
+/// does not reconstruct admission from paths or environment values.
+#[cfg(all(feature = "record", feature = "actuation"))]
+enum LiveNavigationWorkerMotion {
+    Compatibility(Box<Option<NavigationActuationConfigV1>>),
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[allow(
+        dead_code,
+        reason = "constructed by the Nano launch owner once launch admission is wired"
+    )]
+    Production(Box<LiveProductionMotionInput>),
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualification(Box<LiveWheelsOffQualificationMotionInput>),
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+struct LiveProductionMotionInput {
+    prepared: Option<PreparedNanoProductionRuntime>,
+    control: NanoAgentControlConfig,
+    coordinator_actuation_config: NavigationActuationConfigV1,
+    accessory_health: NanoAccessoryHealthObserver,
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl LiveProductionMotionInput {
+    #[cfg(feature = "nano-agent")]
+    fn from_admitted(
+        prepared: PreparedNanoProductionRuntime,
+        accessory_health: NanoAccessoryHealthObserver,
+    ) -> Self {
+        let control = prepared.startup().policy.control().clone();
+        let coordinator_actuation_config = prepared.actuation().config().clone();
+        Self {
+            prepared: Some(prepared),
+            control,
+            coordinator_actuation_config,
+            accessory_health,
+        }
+    }
+
+    fn take_for_owner(
+        &mut self,
+    ) -> (
+        PreparedNanoProductionRuntimeParts,
+        NanoAgentControlConfig,
+        NavigationActuationConfigV1,
+        NanoAccessoryHealthObserver,
+    ) {
+        (
+            self.prepared
+                .take()
+                .expect("production admission is transferred exactly once")
+                .into_parts(),
+            self.control.clone(),
+            self.coordinator_actuation_config.clone(),
+            self.accessory_health.clone(),
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+struct LiveWheelsOffQualificationMotionInput {
+    stopped_controller: Option<kiko_slam::navigation::StoppedWheelsOffCandidateController>,
+    initial_zero: Option<AppliedCommandReceipt>,
+    initial_stop: Option<DisarmReceipt>,
+    limits: kiko_slam::navigation::WheelsOffCandidateLimits,
+    runtime_service_interval: kiko_slam::navigation::WheelsOffCandidateRuntimeServiceInterval,
+    preflight: Option<AttendedWheelsOffPreflight>,
+    attestation: Option<kiko_slam::navigation::OperatorClaimedWheelsOffAttestation>,
+    profile: kiko_slam::navigation::WheelsOffQualificationControlProfile,
+    frontend_config: kiko_slam::navigation::WheelsOffQualificationFrontendConfig,
+    initial_health: ConsoleSubsystemHealth,
+    accessory_health: NanoAccessoryHealthObserver,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl LiveWheelsOffQualificationMotionInput {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        stopped_controller: kiko_slam::navigation::StoppedWheelsOffCandidateController,
+        initial_zero: AppliedCommandReceipt,
+        initial_stop: DisarmReceipt,
+        limits: kiko_slam::navigation::WheelsOffCandidateLimits,
+        runtime_service_interval: kiko_slam::navigation::WheelsOffCandidateRuntimeServiceInterval,
+        preflight: AttendedWheelsOffPreflight,
+        profile: kiko_slam::navigation::WheelsOffQualificationControlProfile,
+        frontend_config: kiko_slam::navigation::WheelsOffQualificationFrontendConfig,
+        initial_health: ConsoleSubsystemHealth,
+        accessory_health: NanoAccessoryHealthObserver,
+    ) -> Self {
+        Self {
+            stopped_controller: Some(stopped_controller),
+            initial_zero: Some(initial_zero),
+            initial_stop: Some(initial_stop),
+            limits,
+            runtime_service_interval,
+            preflight: Some(preflight),
+            attestation: None,
+            profile,
+            frontend_config,
+            initial_health,
+            accessory_health,
+        }
+    }
+
+    fn require_fresh_attended_motion_attestation(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let preflight = self
+            .preflight
+            .take()
+            .expect("qualification attended preflight is consumed exactly once");
+        self.attestation = Some(require_fresh_attended_motion_attestation(&preflight)?);
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn take_for_owner(
+        &mut self,
+    ) -> (
+        kiko_slam::navigation::StoppedWheelsOffCandidateController,
+        AppliedCommandReceipt,
+        DisarmReceipt,
+        kiko_slam::navigation::WheelsOffCandidateLimits,
+        kiko_slam::navigation::WheelsOffCandidateRuntimeServiceInterval,
+        kiko_slam::navigation::OperatorClaimedWheelsOffAttestation,
+        kiko_slam::navigation::WheelsOffQualificationControlProfile,
+        kiko_slam::navigation::WheelsOffQualificationFrontendConfig,
+        ConsoleSubsystemHealth,
+        NanoAccessoryHealthObserver,
+    ) {
+        (
+            self.stopped_controller
+                .take()
+                .expect("qualification stopped token transfers once"),
+            self.initial_zero
+                .take()
+                .expect("qualification initial zero transfers once"),
+            self.initial_stop
+                .take()
+                .expect("qualification initial stop transfers once"),
+            self.limits,
+            self.runtime_service_interval,
+            self.attestation
+                .take()
+                .expect("qualification motion starts only after fresh attended attestation"),
+            self.profile,
+            self.frontend_config.clone(),
+            self.initial_health,
+            self.accessory_health.clone(),
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl Drop for LiveWheelsOffQualificationMotionInput {
+    fn drop(&mut self) {
+        if let Some(initial_stop) = self.initial_stop.as_ref()
+            && self.stopped_controller.is_some()
+        {
+            eprintln!(
+                "unused wheels-off qualification input remained stopped: boot_id={} request_id={}",
+                initial_stop.observed_boot_id().get(),
+                initial_stop.request_id().get(),
+            );
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl Drop for LiveProductionMotionInput {
+    fn drop(&mut self) {
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        match prepared.abort_before_owner() {
+            Ok(receipt) => eprintln!(
+                "unused production admission explicitly disarmed: boot_id={} request_id={} acknowledged_at_host_ns={}",
+                receipt.observed_boot_id().get(),
+                receipt.request_id().get(),
+                receipt.acknowledged_at().nanos_since_clock_start(),
+            ),
+            Err(source) => {
+                eprintln!("unused production admission could not prove controller stop: {source}")
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "record", feature = "actuation"))]
+impl LiveNavigationWorkerMotion {
+    fn compatibility(actuation_config: Option<NavigationActuationConfigV1>) -> Self {
+        Self::Compatibility(Box::new(actuation_config))
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+#[derive(Debug)]
+enum LiveProductionOwnerStartPrimary {
+    ControlConfigMismatch,
+    ClockEpochMismatch {
+        coordinator_origin_ns: u64,
+        supervisor_origin_ns: u64,
+    },
+    ActuationConfigMismatch,
+    CoordinatorNotMappingOnly {
+        actual: CoordinatorMotionModeV1,
+    },
+    ManualPlantBinding(NanoManualPlantBindingError),
+    ControlSocket(AgentControlSocketTaskStartError),
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    ConsoleManualEnvelope(ConsoleManualCommandEnvelopeError),
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    AccessoryHealth(NanoAccessoryHealthStatusError),
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    ConsoleFrontend(NanoOperatorConsoleFrontendStartError),
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl std::fmt::Display for LiveProductionOwnerStartPrimary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ControlConfigMismatch => formatter.write_str(
+                "production control config does not equal the config bound into startup admission",
+            ),
+            Self::ClockEpochMismatch {
+                coordinator_origin_ns,
+                supervisor_origin_ns,
+            } => write!(
+                formatter,
+                "production coordinator clock origin {coordinator_origin_ns} ns differs from supervisor origin {supervisor_origin_ns} ns"
+            ),
+            Self::ActuationConfigMismatch => formatter.write_str(
+                "production controller admission does not equal the actuation config bound to this coordinator",
+            ),
+            Self::CoordinatorNotMappingOnly { actual } => write!(
+                formatter,
+                "production owner must start mapping-only, but the coordinator starts in {actual:?}"
+            ),
+            Self::ManualPlantBinding(source) => source.fmt(formatter),
+            Self::ControlSocket(source) => source.fmt(formatter),
+            #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+            Self::ConsoleManualEnvelope(source) => source.fmt(formatter),
+            #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+            Self::AccessoryHealth(source) => source.fmt(formatter),
+            #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+            Self::ConsoleFrontend(source) => source.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl std::error::Error for LiveProductionOwnerStartPrimary {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ManualPlantBinding(source) => Some(source),
+            Self::ControlSocket(source) => Some(source),
+            #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+            Self::ConsoleManualEnvelope(source) => Some(source),
+            #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+            Self::AccessoryHealth(source) => Some(source),
+            #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+            Self::ConsoleFrontend(source) => Some(source),
+            Self::ControlConfigMismatch
+            | Self::ClockEpochMismatch { .. }
+            | Self::ActuationConfigMismatch
+            | Self::CoordinatorNotMappingOnly { .. } => None,
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+#[derive(Debug)]
+enum LiveProductionControllerStop {
+    Confirmed(DisarmReceipt),
+    DisarmFailedStopConfirmed(LiveActuationError),
+    Uncertain(LiveActuationError),
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+#[derive(Debug)]
+struct LiveProductionOwnerStartError {
+    primary: LiveProductionOwnerStartPrimary,
+    controller_stop: LiveProductionControllerStop,
+    lifecycle_cleanup:
+        Option<LiveMotionOperationError<LiveActuationError, NavigationIngressStreamWriteError>>,
+    socket_shutdown: Option<Result<AgentControlSocketTaskExit, AgentControlSocketTaskJoinError>>,
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl std::fmt::Display for LiveProductionOwnerStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "production motion-owner startup failed: {}",
+            self.primary
+        )?;
+        match &self.controller_stop {
+            LiveProductionControllerStop::Confirmed(receipt) => write!(
+                formatter,
+                "; controller stop confirmed at {} ns",
+                receipt.acknowledged_at().nanos_since_clock_start()
+            ),
+            LiveProductionControllerStop::DisarmFailedStopConfirmed(source) => write!(
+                formatter,
+                "; controller disarm failed, but recovery proved stop: {source}"
+            ),
+            LiveProductionControllerStop::Uncertain(source) => {
+                write!(formatter, "; controller stop uncertain: {source}")
+            }
+        }?;
+        if let Some(source) = &self.lifecycle_cleanup {
+            write!(formatter, "; owner lifecycle cleanup also failed: {source}")?;
+        }
+        if let Some(socket_shutdown) = &self.socket_shutdown {
+            write!(formatter, "; control socket cleanup: {socket_shutdown:?}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl std::error::Error for LiveProductionOwnerStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+struct LiveProductionConsoleRuntime {
+    adapter: Option<OperatorConsoleRuntimeAdapter>,
+    frontend: Option<NanoOperatorConsoleFrontend>,
+    observation: LiveConsoleNavigationObservation,
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+struct LiveConsoleNavigationObservation {
+    next_snapshot_revision: Option<u64>,
+    map: Option<ConsoleMapSnapshot>,
+    last_requested_actuation: Option<ConsoleRequestedActuation>,
+    last_applied: Option<ConsoleAppliedReceipt>,
+    stop_certainty: Option<ConsoleStopCertainty>,
+    successful_solver_duration_ns: Option<u64>,
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+#[derive(Debug)]
+enum LiveProductionConsoleProjectionError {
+    Grid(ConsoleGridProjectionError),
+    GridPublicationRejected {
+        map_epoch_id: u64,
+        revision: u64,
+    },
+    Receipt(ConsoleReceiptProjectionError),
+    Numeric(ConsoleFiniteF64Error),
+    Path(ConsolePathError),
+    HostClock(HostMonotonicRangeError),
+    AuthorityState(LiveMotionAuthorityStateError),
+    AuthorityAdapter(OperatorConsoleRuntimeAdapterError),
+    AccessoryHealth(NanoAccessoryHealthStatusError),
+    OwnerAuthorityWithoutConsole {
+        owner: LiveMotionAuthorityState,
+    },
+    ConsoleAuthorityWithoutOwner {
+        console: OperatorConsoleRetainedAuthorityKind,
+    },
+    ConsoleAuthorityModeMismatch {
+        owner: LiveMotionAuthorityState,
+        console: OperatorConsoleRetainedAuthorityKind,
+    },
+    MapEpochZero,
+    SnapshotRevisionExhausted,
+    Snapshot(OperatorConsoleSnapshotError),
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+impl std::fmt::Display for LiveProductionConsoleProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("live operator-console telemetry projection failed: ")?;
+        match self {
+            Self::Grid(source) => write!(formatter, "{source}"),
+            Self::GridPublicationRejected {
+                map_epoch_id,
+                revision,
+            } => write!(
+                formatter,
+                "grid publication rejected for map epoch {map_epoch_id}, revision {revision}"
+            ),
+            Self::Receipt(source) => write!(formatter, "{source}"),
+            Self::Numeric(source) => write!(formatter, "{source}"),
+            Self::Path(source) => write!(formatter, "{source}"),
+            Self::HostClock(source) => write!(formatter, "{source}"),
+            Self::AuthorityState(source) => write!(formatter, "{source}"),
+            Self::AuthorityAdapter(source) => write!(formatter, "{source}"),
+            Self::AccessoryHealth(source) => write!(formatter, "{source}"),
+            Self::OwnerAuthorityWithoutConsole { owner } => write!(
+                formatter,
+                "sole owner retains {owner:?} authority without its unified-console linear guard"
+            ),
+            Self::ConsoleAuthorityWithoutOwner { console } => write!(
+                formatter,
+                "console retains {console:?} authority without a sole-owner supervisor token"
+            ),
+            Self::ConsoleAuthorityModeMismatch { owner, console } => write!(
+                formatter,
+                "console authority {console:?} contradicts sole-owner authority {owner:?}"
+            ),
+            Self::MapEpochZero => {
+                formatter.write_str("map state is incomplete or has a zero epoch")
+            }
+            Self::SnapshotRevisionExhausted => {
+                formatter.write_str("snapshot revision exhausted its nonzero u64 domain")
+            }
+            Self::Snapshot(source) => write!(formatter, "{source}"),
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+impl std::error::Error for LiveProductionConsoleProjectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Grid(source) => Some(source),
+            Self::Receipt(source) => Some(source),
+            Self::Numeric(source) => Some(source),
+            Self::Path(source) => Some(source),
+            Self::HostClock(source) => Some(source),
+            Self::AuthorityState(source) => Some(source),
+            Self::AuthorityAdapter(source) => Some(source),
+            Self::AccessoryHealth(source) => Some(source),
+            Self::Snapshot(source) => Some(source),
+            Self::GridPublicationRejected { .. }
+            | Self::OwnerAuthorityWithoutConsole { .. }
+            | Self::ConsoleAuthorityWithoutOwner { .. }
+            | Self::ConsoleAuthorityModeMismatch { .. }
+            | Self::MapEpochZero
+            | Self::SnapshotRevisionExhausted => None,
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+struct LiveProductionMotionRuntime {
+    owner: Option<ProductionLiveMotionOwner>,
+    socket_task: Option<AgentControlSocketTask>,
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    terminal_response_timeout: Duration,
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    console: Option<LiveProductionConsoleRuntime>,
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    accessory_health: NanoAccessoryHealthObserver,
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    sensor_health: LiveSensorStreamHealth,
+    map_revision: Option<u64>,
+    localized: bool,
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    terminal_checkpoint_pending: bool,
+}
+
+#[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveSensorStream {
+    Visual,
+    Depth,
+    Imu,
+}
+
+#[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+const LIVE_SENSOR_CONSOLE_MAX_SAMPLE_AGE_NS: u64 = 1_000_000_000;
+
+#[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveSensorStreamHealth {
+    visual_observed_at: Option<HostMonotonicTimestamp>,
+    depth_observed_at: Option<HostMonotonicTimestamp>,
+    imu_observed_at: Option<HostMonotonicTimestamp>,
+    visual_open: bool,
+    depth_open: bool,
+    imu_open: bool,
+}
+
+#[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+impl LiveSensorStreamHealth {
+    const fn awaiting_first_samples() -> Self {
+        Self {
+            visual_observed_at: None,
+            depth_observed_at: None,
+            imu_observed_at: None,
+            visual_open: true,
+            depth_open: true,
+            imu_open: true,
+        }
+    }
+
+    fn observe(&mut self, stream: LiveSensorStream, observed_at: HostMonotonicTimestamp) {
+        match stream {
+            LiveSensorStream::Visual => self.visual_observed_at = Some(observed_at),
+            LiveSensorStream::Depth => self.depth_observed_at = Some(observed_at),
+            LiveSensorStream::Imu => self.imu_observed_at = Some(observed_at),
+        }
+    }
+
+    fn mark_closed(&mut self, stream: LiveSensorStream) {
+        match stream {
+            LiveSensorStream::Visual => self.visual_open = false,
+            LiveSensorStream::Depth => self.depth_open = false,
+            LiveSensorStream::Imu => self.imu_open = false,
+        }
+    }
+
+    fn console_health(self, observed_at: HostMonotonicTimestamp) -> ConsoleHealth {
+        if !self.visual_open || !self.depth_open || !self.imu_open {
+            ConsoleHealth::Faulted
+        } else if [
+            self.visual_observed_at,
+            self.depth_observed_at,
+            self.imu_observed_at,
+        ]
+        .into_iter()
+        .all(|sample| {
+            sample.is_some_and(|sample| {
+                observed_at
+                    .as_nanos()
+                    .checked_sub(sample.as_nanos())
+                    .is_some_and(|age| age <= LIVE_SENSOR_CONSOLE_MAX_SAMPLE_AGE_NS)
+            })
+        }) {
+            ConsoleHealth::Ready
+        } else {
+            ConsoleHealth::Degraded
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+fn console_oak_motion_health<J: kiko_slam::navigation::NavigationIngressSink>(
+    sensor_health: LiveSensorStreamHealth,
+    coordinator: &ShadowNavigationCoordinator<J>,
+    observed_at: HostMonotonicTimestamp,
+) -> ConsoleHealth {
+    let stream_health = sensor_health.console_health(observed_at);
+    if stream_health == ConsoleHealth::Ready
+        && coordinator.motion_start_readiness_at(observed_at).is_err()
+    {
+        ConsoleHealth::Degraded
+    } else {
+        stream_health
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveProductionMapStateError {
+    BindingWithoutRevision,
+    RevisionWithoutBinding,
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl std::fmt::Display for LiveProductionMapStateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BindingWithoutRevision => formatter.write_str(
+                "production map state has a coordinator binding without its admitted revision",
+            ),
+            Self::RevisionWithoutBinding => formatter.write_str(
+                "production map state has an admitted revision without a coordinator binding",
+            ),
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl std::error::Error for LiveProductionMapStateError {}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl LiveProductionMotionRuntime {
+    fn owner(&self) -> &ProductionLiveMotionOwner {
+        self.owner
+            .as_ref()
+            .expect("production owner exists until terminal shutdown")
+    }
+
+    fn owner_mut(&mut self) -> &mut ProductionLiveMotionOwner {
+        self.owner
+            .as_mut()
+            .expect("production owner exists until terminal shutdown")
+    }
+
+    fn take_terminal_parts(&mut self) -> (ProductionLiveMotionOwner, AgentControlSocketTask) {
+        let owner = self
+            .owner
+            .take()
+            .expect("production owner is consumed exactly once");
+        let socket_task = self
+            .socket_task
+            .take()
+            .expect("production socket task is consumed exactly once");
+        (owner, socket_task)
+    }
+
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    fn console_mut(&mut self) -> &mut LiveProductionConsoleRuntime {
+        self.console
+            .as_mut()
+            .expect("production console exists until terminal shutdown")
+    }
+
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    fn take_console(&mut self) -> LiveProductionConsoleRuntime {
+        self.console
+            .take()
+            .expect("production console is consumed exactly once")
+    }
+
+    fn map_state(&self) -> Result<AgentMapStateV1, LiveProductionMapStateError> {
+        match (
+            self.owner().coordinator().current_map_binding(),
+            self.map_revision,
+        ) {
+            (Some(binding), Some(revision)) => Ok(AgentMapStateV1::available(
+                binding.map_epoch_id(),
+                revision,
+                if self.localized {
+                    AgentLocalizationStateV1::Localized
+                } else {
+                    AgentLocalizationStateV1::Lost
+                },
+            )),
+            (None, None) => Ok(AgentMapStateV1::UNAVAILABLE),
+            (Some(_), None) => Err(LiveProductionMapStateError::BindingWithoutRevision),
+            (None, Some(_)) => Err(LiveProductionMapStateError::RevisionWithoutBinding),
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl Drop for LiveProductionMotionRuntime {
+    fn drop(&mut self) {
+        if let Some(socket_task) = self.socket_task.as_ref() {
+            socket_task.request_shutdown();
+        }
+        #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+        let mut console = self.console.take();
+        #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+        if let Some(frontend) = console
+            .as_mut()
+            .and_then(|console| console.frontend.as_mut())
+        {
+            frontend.request_shutdown();
+        }
+        if let Some(owner) = self.owner.take() {
+            let report = owner.shutdown();
+            #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+            if let Some(adapter) = console.as_mut().and_then(|console| console.adapter.take()) {
+                let outcome = adapter.shutdown(&report);
+                if !outcome.controller_stop_confirmed || outcome.lifecycle_cleanup_failed {
+                    eprintln!("production console unwind terminalized fail-closed: {outcome:?}");
+                }
+            }
+            if let Some(source) = report.lifecycle_cleanup() {
+                eprintln!(
+                    "production motion owner unwound with lifecycle cleanup failure: {source}"
+                );
+            }
+            match report.controller_stop() {
+                LiveMotionTerminalStop::Confirmed(_) => {}
+                LiveMotionTerminalStop::DisarmFailedStopConfirmed(source) => eprintln!(
+                    "production motion owner unwind disarm failed, but recovery proved controller stop: {source}"
+                ),
+                LiveMotionTerminalStop::Uncertain(source) => eprintln!(
+                    "production motion owner unwind could not prove controller stop: {source}"
+                ),
+            }
+        }
+        #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+        if let Some(frontend) = console
+            .as_mut()
+            .and_then(|console| console.frontend.as_mut())
+        {
+            let evidence = frontend.shutdown();
+            let retains_live_http_owner = evidence.retains_live_http_owner();
+            if !evidence.is_clean() {
+                eprintln!("production console unwind cleanup was not clean: {evidence}");
+            }
+            if !retains_live_http_owner && let Some(console) = console.as_mut() {
+                console.frontend.take();
+            }
+        }
+        #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+        drop(console);
+        if let Some(socket_task) = self.socket_task.take()
+            && let Err(source) = socket_task.shutdown()
+        {
+            eprintln!("production control socket unwind cleanup failed: {source}");
+        }
+    }
+}
+
 #[cfg(feature = "record")]
 #[derive(Debug)]
 enum LiveNavigationWorkerError {
     HostClock(HostMonotonicRangeError),
+    TickTiming(LiveControlTickTimingError),
     VisualAdmission {
         source: LiveCoordinatorAdmissionError,
     },
@@ -4101,6 +5782,18 @@ enum LiveNavigationWorkerError {
     },
     MapAdmission {
         source: LiveCoordinatorAdmissionError,
+    },
+    #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+    ProductionMapAdmission {
+        source: LiveMotionMapAdmissionError<NavigationIngressStreamWriteError>,
+    },
+    #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+    ProductionMapState {
+        source: LiveProductionMapStateError,
+    },
+    #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+    PhysicalStateVisualization {
+        source: LivePhysicalStateVizPublishError,
     },
     Tick {
         source: CoordinatorTickError,
@@ -4115,16 +5808,157 @@ enum LiveNavigationWorkerError {
     MpcControl {
         source: LiveMpcControlError,
     },
-    #[cfg(feature = "actuation")]
-    OperationAndDisarm {
-        operation: Box<Self>,
-        disarm: LiveActuationError,
+    #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+    ProductionStart {
+        source: Box<LiveProductionOwnerStartError>,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationStart {
+        source: Box<LiveWheelsOffQualificationMotionStartError>,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationRuntime {
+        source: Box<kiko_slam::navigation::WheelsOffQualificationRuntimeError>,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationAppliedStepBoundary {
+        source: NavigationIngressBoundaryError,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationAppliedStepJournal {
+        source: NavigationIngressStreamWriteError,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationAppliedStepCorrelation {
+        source: kiko_slam::navigation::WheelsOffQualificationAppliedStepJournalError,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationFrontendExited {
+        evidence: Box<kiko_slam::navigation::WheelsOffQualificationFrontendShutdownEvidence>,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationFrontendShutdown {
+        evidence: Box<kiko_slam::navigation::WheelsOffQualificationFrontendShutdownEvidence>,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationTelemetry {
+        source: kiko_slam::navigation::WheelsOffQualificationTelemetryError,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationProjection {
+        source: LiveProductionConsoleProjectionError,
+    },
+    #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+    ProductionOwner {
+        source: Box<LiveMotionOwnerError<LiveActuationError, NavigationIngressStreamWriteError>>,
+    },
+    #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+    ProductionConsoleIngress {
+        source: Box<
+            OperatorConsoleRuntimeIngressError<
+                LiveActuationError,
+                NavigationIngressStreamWriteError,
+            >,
+        >,
+    },
+    #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+    ProductionConsoleAdapter {
+        source: OperatorConsoleRuntimeAdapterError,
+    },
+    #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+    ProductionConsoleFrontendShutdown {
+        evidence: Box<NanoOperatorConsoleFrontendShutdownEvidence>,
+    },
+    #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+    ProductionConsoleFrontendExited {
+        evidence: Box<NanoOperatorConsoleFrontendShutdownEvidence>,
+    },
+    #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+    ProductionConsoleProjection {
+        source: LiveProductionConsoleProjectionError,
+    },
+    #[cfg(all(feature = "nano-agent", unix))]
+    ProductionSaveMap {
+        source: Box<NanoMapSaveCommandError>,
+    },
+    #[cfg(all(feature = "nano-agent", unix))]
+    ProductionWarmCheckpoint {
+        source: Box<NanoWarmCheckpointCommandError>,
+    },
+    #[cfg(all(feature = "nano-agent", unix))]
+    WarmCheckpointRequestChannelDisconnected,
+    #[cfg(all(feature = "nano-agent", unix))]
+    WarmCheckpointFinalizationChannelDisconnected,
+    #[cfg(all(feature = "nano-agent", unix))]
+    WarmCheckpointFinalizationTimedOut,
+    #[cfg(all(feature = "nano-agent", unix))]
+    WarmCheckpointDeadlineOverflow {
+        response: Option<AgentControlDispatchResponseError>,
+    },
+    #[cfg(all(feature = "nano-agent", unix))]
+    WarmCheckpointDeadlineUnavailable {
+        response: Option<AgentControlDispatchResponseError>,
+    },
+    #[cfg(all(feature = "nano-agent", unix))]
+    WarmCheckpointDatasetNotPublishedResponse {
+        source: Option<AgentControlDispatchResponseError>,
+    },
+    #[cfg(all(
+        feature = "actuation",
+        feature = "agent-runtime",
+        unix,
+        not(feature = "nano-agent")
+    ))]
+    ProductionSaveMapResponse {
+        source: AgentControlDispatchResponseError,
+    },
+    #[cfg(all(feature = "nano-agent", unix))]
+    MapPersistenceRetention {
+        source: NanoMapSnapshotRetentionError,
+    },
+    #[cfg(all(feature = "nano-agent", unix))]
+    MapPersistenceBindingUnavailable,
+    #[cfg(all(feature = "nano-agent", unix))]
+    ProductionMapPersistenceUnavailable {
+        response: Option<AgentControlDispatchResponseError>,
+    },
+    #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+    ProductionLifecycleCleanup {
+        source:
+            Box<LiveMotionOperationError<LiveActuationError, NavigationIngressStreamWriteError>>,
+    },
+    #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+    ProductionControllerStop {
+        source: LiveActuationError,
+    },
+    #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+    ProductionSocketJoin {
+        source: AgentControlSocketTaskJoinError,
+    },
+    #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+    ProductionSocketExit {
+        exit: Box<AgentControlSocketTaskExit>,
+    },
+    Multiple {
+        failures: Vec<Self>,
     },
     JournalFinalization {
         source: NavigationIngressStreamWriteError,
     },
     JournalSync {
         source: std::io::Error,
+    },
+    JournalSeek {
+        source: std::io::Error,
+    },
+    JournalRecordCountOutOfRange {
+        record_count: u64,
+    },
+    JournalCapacity {
+        source: NavigationIngressCapacityError,
+    },
+    JournalVerification {
+        source: NavigationIngressStreamReadError,
     },
 }
 
@@ -4134,6 +5968,9 @@ impl std::fmt::Display for LiveNavigationWorkerError {
         match self {
             Self::HostClock(source) => {
                 write!(formatter, "navigation host clock failed: {source}")
+            }
+            Self::TickTiming(source) => {
+                write!(formatter, "navigation control-tick timing failed: {source}")
             }
             Self::VisualAdmission { source } => {
                 write!(formatter, "visual navigation admission failed: {source}")
@@ -4150,6 +5987,17 @@ impl std::fmt::Display for LiveNavigationWorkerError {
                     "global-map navigation admission failed: {source}"
                 )
             }
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionMapAdmission { source } => {
+                write!(
+                    formatter,
+                    "production global-map navigation admission failed: {source}"
+                )
+            }
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionMapState { source } => source.fmt(formatter),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::PhysicalStateVisualization { source } => source.fmt(formatter),
             Self::Tick { source } => write!(formatter, "navigation tick failed: {source}"),
             Self::TickSequenceExhausted => {
                 formatter.write_str("navigation diagnostic tick sequence exhausted i64")
@@ -4163,11 +6011,152 @@ impl std::fmt::Display for LiveNavigationWorkerError {
             }
             #[cfg(feature = "actuation")]
             Self::MpcControl { source } => write!(formatter, "{source}"),
-            #[cfg(feature = "actuation")]
-            Self::OperationAndDisarm { operation, disarm } => write!(
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionStart { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationStart { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationRuntime { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationAppliedStepBoundary { source } => write!(
                 formatter,
-                "navigation failed ({operation}); shutdown also could not prove controller stop ({disarm})"
+                "wheels-off qualification applied-step timestamp is invalid: {source}"
             ),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationAppliedStepJournal { source } => write!(
+                formatter,
+                "wheels-off qualification applied-step journal append failed: {source}"
+            ),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationAppliedStepCorrelation { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationFrontendExited { evidence } => write!(
+                formatter,
+                "wheels-off qualification frontend exited before shutdown; controller is being stopped: {evidence:?}"
+            ),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationFrontendShutdown { evidence } => write!(
+                formatter,
+                "wheels-off qualification frontend cleanup was not clean: {evidence:?}"
+            ),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationTelemetry { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationProjection { source } => source.fmt(formatter),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionOwner { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+            Self::ProductionConsoleIngress { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+            Self::ProductionConsoleAdapter { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+            Self::ProductionConsoleFrontendShutdown { evidence } => evidence.fmt(formatter),
+            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+            Self::ProductionConsoleFrontendExited { evidence } => write!(
+                formatter,
+                "operator-console HTTP owner exited before production shutdown; motion is being stopped: {evidence}"
+            ),
+            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+            Self::ProductionConsoleProjection { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::ProductionSaveMap { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::ProductionWarmCheckpoint { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointRequestChannelDisconnected => formatter.write_str(
+                "terminal warm checkpoint could not hand its finalized journal to the dataset owner",
+            ),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointFinalizationChannelDisconnected => formatter.write_str(
+                "terminal warm checkpoint dataset owner disappeared before reporting publication",
+            ),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointFinalizationTimedOut => formatter.write_str(
+                "terminal warm checkpoint dataset publication exceeded its parsed terminal deadline",
+            ),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointDeadlineOverflow { response: None } => formatter.write_str(
+                "terminal warm checkpoint deadline overflowed and the request was rejected",
+            ),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointDeadlineOverflow {
+                response: Some(source),
+            } => write!(
+                formatter,
+                "terminal warm checkpoint deadline overflowed and its rejection response failed: {source}"
+            ),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointDeadlineUnavailable { response: None } => formatter.write_str(
+                "terminal warm checkpoint had no remaining admitted deadline or another terminal checkpoint already owned it",
+            ),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointDeadlineUnavailable {
+                response: Some(source),
+            } => write!(
+                formatter,
+                "terminal warm checkpoint had no available deadline and its rejection response failed: {source}"
+            ),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointDatasetNotPublishedResponse { source: None } => formatter
+                .write_str("terminal warm checkpoint was rejected because its exact dataset was not published"),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointDatasetNotPublishedResponse {
+                source: Some(source),
+            } => write!(
+                formatter,
+                "terminal warm checkpoint dataset was not published and the truthful rejection response also failed: {source}"
+            ),
+            #[cfg(all(
+                feature = "actuation",
+                feature = "agent-runtime",
+                unix,
+                not(feature = "nano-agent")
+            ))]
+            Self::ProductionSaveMapResponse { source } => write!(
+                formatter,
+                "unwired production map persistence was rejected but the response failed: {source}"
+            ),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::MapPersistenceRetention { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::MapPersistenceBindingUnavailable => formatter
+                .write_str("an admitted occupancy snapshot has no current coordinator map binding"),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::ProductionMapPersistenceUnavailable { response: None } => formatter.write_str(
+                "production accepted a save-map request without a map persistence owner",
+            ),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::ProductionMapPersistenceUnavailable {
+                response: Some(source),
+            } => write!(
+                formatter,
+                "production accepted a save-map request without a map persistence owner; rejection response also failed: {source}"
+            ),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionLifecycleCleanup { source } => {
+                write!(formatter, "production lifecycle cleanup failed: {source}")
+            }
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionControllerStop { source } => write!(
+                formatter,
+                "production shutdown could not prove controller stop: {source}"
+            ),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionSocketJoin { source } => source.fmt(formatter),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionSocketExit { exit } => {
+                write!(
+                    formatter,
+                    "agent-control socket task exited abnormally: {exit:?}"
+                )
+            }
+            Self::Multiple { failures } => {
+                formatter.write_str("multiple live navigation failures")?;
+                for (index, failure) in failures.iter().enumerate() {
+                    write!(formatter, "; failure {}: {failure}", index + 1)?;
+                }
+                Ok(())
+            }
             Self::JournalFinalization { source } => {
                 write!(
                     formatter,
@@ -4176,6 +6165,19 @@ impl std::fmt::Display for LiveNavigationWorkerError {
             }
             Self::JournalSync { source } => {
                 write!(formatter, "navigation journal sync failed: {source}")
+            }
+            Self::JournalSeek { source } => {
+                write!(formatter, "navigation journal rewind failed: {source}")
+            }
+            Self::JournalRecordCountOutOfRange { record_count } => write!(
+                formatter,
+                "navigation journal record count {record_count} is not representable in memory"
+            ),
+            Self::JournalCapacity { source } => {
+                write!(formatter, "navigation journal verification bound is invalid: {source}")
+            }
+            Self::JournalVerification { source } => {
+                write!(formatter, "synchronized navigation journal failed verification: {source}")
             }
         }
     }
@@ -4186,21 +6188,119 @@ impl std::error::Error for LiveNavigationWorkerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::HostClock(source) => Some(source),
+            Self::TickTiming(source) => Some(source),
             Self::VisualAdmission { source }
             | Self::ImuAdmission { source }
             | Self::DepthAdmission { source }
             | Self::MapAdmission { source } => Some(source),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionMapAdmission { source } => Some(source),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionMapState { source } => Some(source),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::PhysicalStateVisualization { source } => Some(source),
             Self::Tick { source } => Some(source),
             Self::JournalFinalization { source } => Some(source),
-            Self::JournalSync { source } => Some(source),
+            Self::JournalSync { source } | Self::JournalSeek { source } => Some(source),
+            Self::JournalCapacity { source } => Some(source),
+            Self::JournalVerification { source } => Some(source),
+            Self::JournalRecordCountOutOfRange { .. } => None,
             #[cfg(feature = "actuation")]
             Self::Actuation { source, .. } => Some(source),
             #[cfg(feature = "actuation")]
             Self::MpcControl { source } => Some(source),
-            #[cfg(feature = "actuation")]
-            Self::OperationAndDisarm { operation, .. } => Some(operation.as_ref()),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionStart { source } => Some(source),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationStart { source } => Some(source.as_ref()),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationRuntime { source } => Some(source.as_ref()),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationAppliedStepBoundary { source } => Some(source),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationAppliedStepJournal { source } => Some(source),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationAppliedStepCorrelation { source } => Some(source),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationFrontendExited { .. }
+            | Self::WheelsOffQualificationFrontendShutdown { .. } => None,
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationTelemetry { source } => Some(source),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationProjection { source } => Some(source),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionOwner { source } => Some(source.as_ref()),
+            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+            Self::ProductionConsoleIngress { source } => Some(source.as_ref()),
+            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+            Self::ProductionConsoleAdapter { source } => Some(source),
+            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+            Self::ProductionConsoleFrontendShutdown { .. }
+            | Self::ProductionConsoleFrontendExited { .. } => None,
+            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+            Self::ProductionConsoleProjection { source } => Some(source),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::ProductionSaveMap { source } => Some(source.as_ref()),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::ProductionWarmCheckpoint { source } => Some(source.as_ref()),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointDatasetNotPublishedResponse {
+                source: Some(source),
+            }
+            | Self::WarmCheckpointDeadlineOverflow {
+                response: Some(source),
+            }
+            | Self::WarmCheckpointDeadlineUnavailable {
+                response: Some(source),
+            } => Some(source),
+            #[cfg(all(
+                feature = "actuation",
+                feature = "agent-runtime",
+                unix,
+                not(feature = "nano-agent")
+            ))]
+            Self::ProductionSaveMapResponse { source } => Some(source),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::MapPersistenceRetention { source } => Some(source),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::MapPersistenceBindingUnavailable => None,
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::ProductionMapPersistenceUnavailable {
+                response: Some(source),
+            } => Some(source),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::ProductionMapPersistenceUnavailable { response: None } => None,
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointRequestChannelDisconnected
+            | Self::WarmCheckpointFinalizationChannelDisconnected
+            | Self::WarmCheckpointFinalizationTimedOut
+            | Self::WarmCheckpointDatasetNotPublishedResponse { source: None }
+            | Self::WarmCheckpointDeadlineOverflow { response: None }
+            | Self::WarmCheckpointDeadlineUnavailable { response: None } => None,
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionLifecycleCleanup { source } => Some(source.as_ref()),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionControllerStop { source } => Some(source),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionSocketJoin { source } => Some(source),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::ProductionSocketExit { .. } => None,
+            Self::Multiple { failures } => failures
+                .first()
+                .map(|failure| failure as &(dyn std::error::Error + 'static)),
             Self::TickSequenceExhausted => None,
         }
+    }
+}
+
+#[cfg(feature = "record")]
+fn combine_live_navigation_failures(
+    mut failures: Vec<LiveNavigationWorkerError>,
+) -> Result<(), LiveNavigationWorkerError> {
+    match failures.len() {
+        0 => Ok(()),
+        1 => Err(failures.pop().expect("one retained failure")),
+        _ => Err(LiveNavigationWorkerError::Multiple { failures }),
     }
 }
 
@@ -4210,12 +6310,2268 @@ struct LiveNavigationWorkerSuccess {
 }
 
 #[cfg(feature = "record")]
+struct FinalizedLiveNavigationJournal {
+    descriptor: NavigationIngressSidecarDescriptor,
+    final_map_identity: Option<FinalizedJournalMapIdentity>,
+}
+
+#[cfg(feature = "record")]
+impl FinalizedLiveNavigationJournal {
+    fn into_descriptor(self) -> NavigationIngressSidecarDescriptor {
+        let Self {
+            descriptor,
+            final_map_identity: _final_map_identity,
+        } = self;
+        descriptor
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FinalizedJournalMapIdentity {
+    map_epoch_id: RecordedMapEpochId,
+    revision: u64,
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+struct NanoDatasetCheckpointRequest {
+    descriptor: Option<NavigationIngressSidecarDescriptor>,
+    navigation_publishable: bool,
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NanoDatasetCheckpointFinalization {
+    Published,
+    Rejected,
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+struct NanoDatasetCheckpointWorkerBridge {
+    requested: Arc<AtomicBool>,
+    checkpoint_deadline: Arc<std::sync::OnceLock<Instant>>,
+    dataset_directory: PathBuf,
+    request: std::sync::mpsc::SyncSender<NanoDatasetCheckpointRequest>,
+    finalization: std::sync::mpsc::Receiver<NanoDatasetCheckpointFinalization>,
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+struct NanoDatasetCheckpointMainBridge {
+    checkpoint_deadline: Arc<std::sync::OnceLock<Instant>>,
+    request: std::sync::mpsc::Receiver<NanoDatasetCheckpointRequest>,
+    finalization: std::sync::mpsc::SyncSender<NanoDatasetCheckpointFinalization>,
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+const NANO_TERMINAL_RESPONSE_COMPLETION_RESERVE: Duration = Duration::from_secs(3);
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+// Browser polling waits 300 ms and bounds each snapshot/response request body
+// at 750 ms. Two seconds covers one already-started snapshot request, the
+// inter-poll delay, and the final response-record request.
+const NANO_OPERATOR_CONSOLE_RESPONSE_OBSERVATION_GRACE: Duration = Duration::from_secs(2);
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn nano_dataset_checkpoint_bridge(
+    requested: Arc<AtomicBool>,
+    dataset_directory: PathBuf,
+) -> (
+    NanoDatasetCheckpointWorkerBridge,
+    NanoDatasetCheckpointMainBridge,
+) {
+    let (request_tx, request_rx) = std::sync::mpsc::sync_channel(1);
+    let (finalization_tx, finalization_rx) = std::sync::mpsc::sync_channel(1);
+    let checkpoint_deadline = Arc::new(std::sync::OnceLock::new());
+    (
+        NanoDatasetCheckpointWorkerBridge {
+            requested: Arc::clone(&requested),
+            checkpoint_deadline: Arc::clone(&checkpoint_deadline),
+            dataset_directory,
+            request: request_tx,
+            finalization: finalization_rx,
+        },
+        NanoDatasetCheckpointMainBridge {
+            checkpoint_deadline,
+            request: request_rx,
+            finalization: finalization_tx,
+        },
+    )
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+struct PendingNanoWarmCheckpoint {
+    claimed: kiko_slam::navigation::AgentControlClaimedRequest,
+    console_response_pending: bool,
+}
+
+#[cfg(feature = "record")]
+struct LiveCompatibilityNavigationRuntime {
+    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    #[cfg(feature = "actuation")]
+    physical_actuation: Option<LiveMpcControlDriver>,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+struct LiveWheelsOffQualificationMotionRuntime {
+    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    controller: Option<kiko_slam::navigation::WheelsOffQualificationRuntime>,
+    frontend: Option<kiko_slam::navigation::WheelsOffQualificationFrontend>,
+    telemetry: kiko_slam::navigation::WheelsOffQualificationTelemetryStore,
+    observation: LiveConsoleNavigationObservation,
+    initial_health: ConsoleSubsystemHealth,
+    accessory_health: NanoAccessoryHealthObserver,
+    sensor_health: LiveSensorStreamHealth,
+    map_revision: Option<u64>,
+    localized: bool,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl LiveWheelsOffQualificationMotionRuntime {
+    fn controller(&self) -> &kiko_slam::navigation::WheelsOffQualificationRuntime {
+        self.controller
+            .as_ref()
+            .expect("qualification controller owner exists until terminal shutdown")
+    }
+
+    fn controller_mut(&mut self) -> &mut kiko_slam::navigation::WheelsOffQualificationRuntime {
+        self.controller
+            .as_mut()
+            .expect("qualification controller owner exists until terminal shutdown")
+    }
+
+    fn frontend_mut(&mut self) -> &mut kiko_slam::navigation::WheelsOffQualificationFrontend {
+        self.frontend
+            .as_mut()
+            .expect("qualification frontend exists until terminal shutdown")
+    }
+
+    fn take_terminal_parts(
+        &mut self,
+    ) -> (
+        kiko_slam::navigation::WheelsOffQualificationRuntime,
+        kiko_slam::navigation::WheelsOffQualificationFrontend,
+    ) {
+        (
+            self.controller
+                .take()
+                .expect("qualification controller transfers once"),
+            self.frontend
+                .take()
+                .expect("qualification frontend transfers once"),
+        )
+    }
+}
+
+#[cfg(feature = "record")]
+enum LiveNavigationRuntime {
+    Compatibility(Box<LiveCompatibilityNavigationRuntime>),
+    #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+    Production(Box<LiveProductionMotionRuntime>),
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualification(Box<LiveWheelsOffQualificationMotionRuntime>),
+}
+
+#[cfg(feature = "record")]
+impl LiveNavigationRuntime {
+    #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+    fn mark_sensor_closed(&mut self, stream: LiveSensorStream) {
+        match self {
+            Self::Compatibility(_) => {}
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::Production(runtime) => runtime.sensor_health.mark_closed(stream),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualification(runtime) => runtime.sensor_health.mark_closed(stream),
+        }
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    fn current_map_binding(&self) -> Option<kiko_slam::navigation::CurrentMapEpochBinding> {
+        match self {
+            Self::Compatibility(runtime) => runtime.coordinator.current_map_binding(),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::Production(runtime) => runtime.owner().coordinator().current_map_binding(),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualification(runtime) => runtime.coordinator.current_map_binding(),
+        }
+    }
+
+    fn accept_visual(
+        &mut self,
+        admission: VisualAdmission,
+        now: HostMonotonicTimestamp,
+    ) -> Result<(), LiveCoordinatorAdmissionError> {
+        match self {
+            Self::Compatibility(runtime) => runtime
+                .coordinator
+                .accept_visual(admission, now)
+                .map(|_| ()),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::Production(runtime) => {
+                let outcome = runtime.owner_mut().accept_visual(admission, now)?;
+                #[cfg(all(feature = "nano-agent", feature = "operator-console"))]
+                runtime.sensor_health.observe(LiveSensorStream::Visual, now);
+                runtime.localized = match &outcome {
+                    VisualAdmissionOutcome::Reanchored(state)
+                    | VisualAdmissionOutcome::Updated(state) => runtime
+                        .owner()
+                        .coordinator()
+                        .current_map_binding()
+                        .is_some_and(|binding| {
+                            binding.map_instance_id() == state.map_snapshot().instance_id()
+                        }),
+                    VisualAdmissionOutcome::ChainBroken(_)
+                    | VisualAdmissionOutcome::Rejected(_) => false,
+                };
+                Ok(())
+            }
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualification(runtime) => {
+                let outcome = runtime.coordinator.accept_visual(admission, now)?;
+                runtime.sensor_health.observe(LiveSensorStream::Visual, now);
+                runtime.localized = match &outcome {
+                    VisualAdmissionOutcome::Reanchored(state)
+                    | VisualAdmissionOutcome::Updated(state) => runtime
+                        .coordinator
+                        .current_map_binding()
+                        .is_some_and(|binding| {
+                            binding.map_instance_id() == state.map_snapshot().instance_id()
+                        }),
+                    VisualAdmissionOutcome::ChainBroken(_)
+                    | VisualAdmissionOutcome::Rejected(_) => false,
+                };
+                Ok(())
+            }
+        }
+    }
+
+    fn accept_depth(
+        &mut self,
+        observation: DepthObservation,
+        now: HostMonotonicTimestamp,
+    ) -> Result<(), LiveCoordinatorAdmissionError> {
+        match self {
+            Self::Compatibility(runtime) => runtime
+                .coordinator
+                .accept_depth(observation, now)
+                .map(|_| ()),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::Production(runtime) => {
+                runtime.owner_mut().accept_depth(observation, now)?;
+                #[cfg(all(feature = "nano-agent", feature = "operator-console"))]
+                runtime.sensor_health.observe(LiveSensorStream::Depth, now);
+                Ok(())
+            }
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualification(runtime) => {
+                runtime.coordinator.accept_depth(observation, now)?;
+                runtime.sensor_health.observe(LiveSensorStream::Depth, now);
+                Ok(())
+            }
+        }
+    }
+
+    fn accept_imu(
+        &mut self,
+        report: ImuReport,
+        now: HostMonotonicTimestamp,
+    ) -> Result<(), LiveCoordinatorAdmissionError> {
+        match self {
+            Self::Compatibility(runtime) => runtime.coordinator.accept_imu(report, now).map(|_| ()),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::Production(runtime) => {
+                runtime.owner_mut().accept_imu(report, now)?;
+                #[cfg(all(feature = "nano-agent", feature = "operator-console"))]
+                runtime.sensor_health.observe(LiveSensorStream::Imu, now);
+                Ok(())
+            }
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualification(runtime) => {
+                runtime.coordinator.accept_imu(report, now)?;
+                runtime.sensor_health.observe(LiveSensorStream::Imu, now);
+                Ok(())
+            }
+        }
+    }
+
+    fn accept_global_map(
+        &mut self,
+        host_arrival: HostMonotonicTimestamp,
+        snapshot: &TimedOccupancySnapshot,
+    ) -> Result<(), LiveNavigationWorkerError> {
+        match self {
+            Self::Compatibility(runtime) => runtime
+                .coordinator
+                .accept_global_map(host_arrival, snapshot.timestamp(), snapshot.snapshot())
+                .map(|_| ())
+                .map_err(|source| LiveNavigationWorkerError::MapAdmission { source }),
+            #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+            Self::Production(runtime) => {
+                let outcome = runtime
+                    .owner_mut()
+                    .accept_global_map(host_arrival, snapshot.timestamp(), snapshot.snapshot())
+                    .map_err(|source| LiveNavigationWorkerError::ProductionMapAdmission {
+                        source,
+                    })?;
+                runtime.map_revision = Some(outcome.revision());
+                if outcome.started_new_epoch() {
+                    runtime.localized = false;
+                }
+                Ok(())
+            }
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualification(runtime) => {
+                let outcome = runtime
+                    .coordinator
+                    .accept_global_map(host_arrival, snapshot.timestamp(), snapshot.snapshot())
+                    .map_err(|source| LiveNavigationWorkerError::MapAdmission { source })?;
+                runtime.map_revision = Some(outcome.revision());
+                if outcome.started_new_epoch() {
+                    runtime.localized = false;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+fn finalize_live_navigation_coordinator(
+    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+) -> Result<FinalizedLiveNavigationJournal, LiveNavigationWorkerError> {
+    let finalized = coordinator
+        .into_journal()
+        .finish_with_descriptor()
+        .map_err(|source| LiveNavigationWorkerError::JournalFinalization { source })?;
+    let (mut file, descriptor) = finalized.into_parts();
+    file.sync_all()
+        .map_err(|source| LiveNavigationWorkerError::JournalSync { source })?;
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))
+        .map_err(|source| LiveNavigationWorkerError::JournalSeek { source })?;
+    let declared_count = usize::try_from(descriptor.record_count()).map_err(|_| {
+        LiveNavigationWorkerError::JournalRecordCountOutOfRange {
+            record_count: descriptor.record_count(),
+        }
+    })?;
+    let capacity = NavigationIngressCapacity::try_new(declared_count.max(1))
+        .map_err(|source| LiveNavigationWorkerError::JournalCapacity { source })?;
+    let mut reader = NavigationIngressReader::new(file, descriptor.recording_id(), capacity)
+        .map_err(|source| LiveNavigationWorkerError::JournalVerification { source })?;
+    let mut final_map_identity = None;
+    while let Some(record) = reader
+        .next_record()
+        .map_err(|source| LiveNavigationWorkerError::JournalVerification { source })?
+    {
+        match record.event() {
+            NavigationIngressEvent::MapEpochStarted(_) => final_map_identity = None,
+            NavigationIngressEvent::AcceptedGlobalMap(map) => {
+                final_map_identity = Some(FinalizedJournalMapIdentity {
+                    map_epoch_id: map.map_epoch_id(),
+                    revision: map.revision(),
+                });
+            }
+            NavigationIngressEvent::VisualAttempt(_)
+            | NavigationIngressEvent::ImuReport(_)
+            | NavigationIngressEvent::AcceptedDepth(_)
+            | NavigationIngressEvent::PointGoal(_)
+            | NavigationIngressEvent::ControlTick(_)
+            | NavigationIngressEvent::QualificationAppliedStep(_) => {}
+        }
+    }
+    Ok(FinalizedLiveNavigationJournal {
+        descriptor,
+        final_map_identity,
+    })
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+fn fail_production_owner_start(
+    primary: LiveProductionOwnerStartPrimary,
+    physical_driver: &mut LiveMpcControlDriver,
+) -> LiveProductionOwnerStartError {
+    let controller_stop = match physical_driver.disarm() {
+        Ok(receipt) => LiveProductionControllerStop::Confirmed(receipt),
+        Err(source) => {
+            let AgentLiveActuationDisposition::LatchFault(fault) =
+                classify_live_actuation_error(&source);
+            if fault.controller_stop() == AgentControllerStopKnowledge::Confirmed {
+                LiveProductionControllerStop::DisarmFailedStopConfirmed(source)
+            } else {
+                LiveProductionControllerStop::Uncertain(source)
+            }
+        }
+    };
+    LiveProductionOwnerStartError {
+        primary,
+        controller_stop,
+        lifecycle_cleanup: None,
+        socket_shutdown: None,
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    unix
+))]
+fn fail_started_production_owner(
+    primary: LiveProductionOwnerStartPrimary,
+    owner: ProductionLiveMotionOwner,
+    socket_task: AgentControlSocketTask,
+) -> LiveProductionMotionStartFailure {
+    socket_task.request_shutdown();
+    let terminal = owner.shutdown();
+    let (coordinator, lifecycle_cleanup, controller_stop, _last_physical_state) =
+        terminal.into_parts();
+    let controller_stop = match controller_stop {
+        LiveMotionTerminalStop::Confirmed(receipt) => {
+            LiveProductionControllerStop::Confirmed(receipt)
+        }
+        LiveMotionTerminalStop::DisarmFailedStopConfirmed(source) => {
+            LiveProductionControllerStop::DisarmFailedStopConfirmed(source)
+        }
+        LiveMotionTerminalStop::Uncertain(source) => {
+            LiveProductionControllerStop::Uncertain(source)
+        }
+    };
+    let socket_shutdown = Some(socket_task.shutdown());
+    Box::new((
+        coordinator,
+        LiveProductionOwnerStartError {
+            primary,
+            controller_stop,
+            lifecycle_cleanup,
+            socket_shutdown,
+        },
+    ))
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+#[allow(clippy::too_many_arguments)]
+fn start_production_motion_runtime(
+    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator_clock_epoch: NavigationClockEpoch,
+    clock_origin: Instant,
+    prepared: PreparedNanoProductionRuntimeParts,
+    control: NanoAgentControlConfig,
+    coordinator_actuation_config: NavigationActuationConfigV1,
+    accessory_health: NanoAccessoryHealthObserver,
+    running: Arc<AtomicBool>,
+) -> Result<LiveProductionMotionRuntime, LiveProductionMotionStartFailure> {
+    let PreparedNanoProductionRuntimeParts {
+        startup,
+        actuation,
+        mut physical_driver,
+        initial_zero: _,
+    } = prepared;
+    let live_mode_policy: NanoLiveModePolicy = *startup.policy.live_mode_policy();
+
+    if startup.policy.control() != &control {
+        let source = fail_production_owner_start(
+            LiveProductionOwnerStartPrimary::ControlConfigMismatch,
+            &mut physical_driver,
+        );
+        return Err(Box::new((coordinator, source)));
+    }
+    let supervisor_clock_epoch = startup.authority.clock_epoch();
+    if supervisor_clock_epoch != coordinator_clock_epoch {
+        let source = fail_production_owner_start(
+            LiveProductionOwnerStartPrimary::ClockEpochMismatch {
+                coordinator_origin_ns: coordinator_clock_epoch.origin().as_nanos(),
+                supervisor_origin_ns: supervisor_clock_epoch.origin().as_nanos(),
+            },
+            &mut physical_driver,
+        );
+        return Err(Box::new((coordinator, source)));
+    }
+    if actuation.config() != &coordinator_actuation_config {
+        let source = fail_production_owner_start(
+            LiveProductionOwnerStartPrimary::ActuationConfigMismatch,
+            &mut physical_driver,
+        );
+        return Err(Box::new((coordinator, source)));
+    }
+    if coordinator.motion_mode() != CoordinatorMotionModeV1::MappingOnly {
+        let source = fail_production_owner_start(
+            LiveProductionOwnerStartPrimary::CoordinatorNotMappingOnly {
+                actual: coordinator.motion_mode(),
+            },
+            &mut physical_driver,
+        );
+        return Err(Box::new((coordinator, source)));
+    }
+
+    let plant = coordinator.safety().solver().model();
+    let manual_policy = match live_mode_policy
+        .manual()
+        .config()
+        .map(|manual| {
+            manual
+                .bind_to_plant(plant)
+                .map(AgentManualRuntimePolicy::from)
+        })
+        .transpose()
+    {
+        Ok(policy) => policy,
+        Err(source) => {
+            let source = fail_production_owner_start(
+                LiveProductionOwnerStartPrimary::ManualPlantBinding(source),
+                &mut physical_driver,
+            );
+            return Err(Box::new((coordinator, source)));
+        }
+    };
+
+    let (socket_config, runtime_queue_capacity, operator_console_config) = control.into_parts();
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    let terminal_response_timeout = socket_config.timeouts().terminal_response();
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    let manual_command_envelope = match manual_policy
+        .map(|policy| {
+            let drive = policy.drive();
+            ConsoleManualCommandEnvelope::parse(
+                drive.maximum_abs_forward_velocity_mps(),
+                drive.maximum_abs_yaw_rate_rad_s(),
+                operator_console_config.manual_command_forward_velocity_mps(),
+                operator_console_config.manual_command_yaw_rate_rad_s(),
+            )
+        })
+        .transpose()
+    {
+        Ok(envelope) => envelope,
+        Err(source) => {
+            let source = fail_production_owner_start(
+                LiveProductionOwnerStartPrimary::ConsoleManualEnvelope(source),
+                &mut physical_driver,
+            );
+            return Err(Box::new((coordinator, source)));
+        }
+    };
+    #[cfg(not(all(feature = "operator-console", feature = "nano-agent")))]
+    let _ = operator_console_config;
+    #[cfg(not(all(feature = "operator-console", feature = "nano-agent")))]
+    let _ = accessory_health;
+    let socket_clock =
+        AgentControlMonotonicOrigin::new(clock_origin, coordinator_clock_epoch.origin());
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    let (socket_task, receiver, typed_ingress) =
+        match AgentControlSocketTask::bind_and_spawn_with_typed_ingress(
+            socket_config,
+            socket_clock,
+            runtime_queue_capacity,
+            Arc::clone(&running),
+        ) {
+            Ok(runtime) => runtime,
+            Err(source) => {
+                let source = fail_production_owner_start(
+                    LiveProductionOwnerStartPrimary::ControlSocket(source),
+                    &mut physical_driver,
+                );
+                return Err(Box::new((coordinator, source)));
+            }
+        };
+    #[cfg(not(all(feature = "operator-console", feature = "nano-agent")))]
+    let (socket_task, receiver) = match AgentControlSocketTask::bind_and_spawn(
+        socket_config,
+        socket_clock,
+        runtime_queue_capacity,
+        Arc::clone(&running),
+    ) {
+        Ok(runtime) => runtime,
+        Err(source) => {
+            let source = fail_production_owner_start(
+                LiveProductionOwnerStartPrimary::ControlSocket(source),
+                &mut physical_driver,
+            );
+            return Err(Box::new((coordinator, source)));
+        }
+    };
+
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    let dispatcher = AgentControlDispatcher::new_with_unified_console_authority(
+        receiver,
+        socket_clock,
+        AgentManualControlCore::new(startup.authority, manual_policy),
+    );
+    #[cfg(not(all(feature = "operator-console", feature = "nano-agent")))]
+    let dispatcher = AgentControlDispatcher::new(
+        receiver,
+        socket_clock,
+        AgentManualControlCore::new(startup.authority, manual_policy),
+    );
+    let owner = LiveMotionOwner::new(
+        dispatcher,
+        coordinator,
+        physical_driver,
+        InstantHostClock::new(clock_origin),
+        live_mode_policy,
+    );
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    let console = {
+        let mut initial_snapshot = OperatorConsoleSnapshot::unknown(
+            ConsoleSnapshotRevision::parse(1)
+                .expect("the static initial console revision is nonzero"),
+        );
+        initial_snapshot.manual_command_envelope = manual_command_envelope;
+        initial_snapshot.runtime = Some(
+            owner
+                .dispatcher()
+                .control_status(AgentMapStateV1::UNAVAILABLE)
+                .runtime(),
+        );
+        initial_snapshot.health = ConsoleSubsystemHealth {
+            stm32: Some(ConsoleHealth::Ready),
+            head: Some(
+                if startup
+                    .policy
+                    .head()
+                    .return_to_natural_and_hold_continuously()
+                    .is_some()
+                {
+                    ConsoleHealth::Ready
+                } else {
+                    ConsoleHealth::Unavailable
+                },
+            ),
+            eyes: Some(if startup.policy.eye().static_runtime().is_some() {
+                ConsoleHealth::Ready
+            } else {
+                ConsoleHealth::Unavailable
+            }),
+            oak: Some(ConsoleHealth::Degraded),
+        };
+        initial_snapshot.health =
+            match refresh_console_accessory_health(initial_snapshot.health, &accessory_health) {
+                Ok(health) => health,
+                Err(source) => {
+                    return Err(fail_started_production_owner(
+                        LiveProductionOwnerStartPrimary::AccessoryHealth(source),
+                        owner,
+                        socket_task,
+                    ));
+                }
+            };
+        let (console_handle, console_receiver) = operator_console(
+            OperatorConsoleLimits::production_default(),
+            initial_snapshot,
+        );
+        let frontend = match NanoOperatorConsoleFrontend::start(
+            &operator_console_config,
+            socket_clock,
+            console_handle.clone(),
+        ) {
+            Ok(frontend) => frontend,
+            Err(source) => {
+                return Err(fail_started_production_owner(
+                    LiveProductionOwnerStartPrimary::ConsoleFrontend(source),
+                    owner,
+                    socket_task,
+                ));
+            }
+        };
+        eprintln!(
+            "operator console ready on {}; read the per-boot capability from {} through the private runtime directory",
+            frontend.bound_address(),
+            operator_console_config
+                .capability_path()
+                .as_path()
+                .display(),
+        );
+        LiveProductionConsoleRuntime {
+            adapter: Some(OperatorConsoleRuntimeAdapter::new(
+                console_handle,
+                console_receiver,
+                typed_ingress,
+            )),
+            frontend: Some(frontend),
+            observation: LiveConsoleNavigationObservation {
+                next_snapshot_revision: Some(2),
+                map: None,
+                last_requested_actuation: None,
+                last_applied: None,
+                stop_certainty: None,
+                successful_solver_duration_ns: None,
+            },
+        }
+    };
+    Ok(LiveProductionMotionRuntime {
+        owner: Some(owner),
+        socket_task: Some(socket_task),
+        #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+        terminal_response_timeout,
+        #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+        console: Some(console),
+        #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+        accessory_health,
+        #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+        sensor_health: LiveSensorStreamHealth::awaiting_first_samples(),
+        map_revision: None,
+        localized: false,
+        #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+        terminal_checkpoint_pending: false,
+    })
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+type LiveWheelsOffQualificationMotionStartFailure = Box<(
+    ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    LiveWheelsOffQualificationMotionStartError,
+)>;
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+enum LiveWheelsOffQualificationMotionStartPrimary {
+    Receipt(ConsoleReceiptProjectionError),
+    Telemetry(kiko_slam::navigation::WheelsOffQualificationTelemetryError),
+    Runtime(kiko_slam::navigation::WheelsOffQualificationRuntimeStartError),
+    Frontend(kiko_slam::navigation::WheelsOffQualificationFrontendStartError),
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::fmt::Display for LiveWheelsOffQualificationMotionStartPrimary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Receipt(source) => source.fmt(formatter),
+            Self::Telemetry(source) => source.fmt(formatter),
+            Self::Runtime(source) => source.fmt(formatter),
+            Self::Frontend(source) => source.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::error::Error for LiveWheelsOffQualificationMotionStartPrimary {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Receipt(source) => Some(source),
+            Self::Telemetry(source) => Some(source),
+            Self::Runtime(source) => Some(source),
+            Self::Frontend(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+enum LiveWheelsOffQualificationStartStop {
+    BootstrapExact {
+        boot_id: u64,
+        stop_request_id: u32,
+    },
+    RuntimeShutdown(
+        Result<
+            kiko_slam::navigation::WheelsOffQualificationRuntimeShutdown,
+            Box<kiko_slam::navigation::WheelsOffQualificationRuntimeError>,
+        >,
+    ),
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::fmt::Display for LiveWheelsOffQualificationStartStop {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BootstrapExact {
+                boot_id,
+                stop_request_id,
+            } => write!(
+                formatter,
+                "bootstrap exact stop (boot_id={boot_id}, request_id={stop_request_id})"
+            ),
+            Self::RuntimeShutdown(Ok(shutdown)) => write!(
+                formatter,
+                "runtime exact stop ({:?})",
+                shutdown.terminal_completion
+            ),
+            Self::RuntimeShutdown(Err(source)) => {
+                write!(formatter, "runtime shutdown failed: {source}")
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+struct LiveWheelsOffQualificationMotionStartError {
+    primary: LiveWheelsOffQualificationMotionStartPrimary,
+    controller_stop: LiveWheelsOffQualificationStartStop,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::fmt::Display for LiveWheelsOffQualificationMotionStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "wheels-off qualification owner startup failed: {}; controller stop evidence: {}",
+            self.primary, self.controller_stop,
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::error::Error for LiveWheelsOffQualificationMotionStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.primary)
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn fail_wheels_off_qualification_before_runtime(
+    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    primary: LiveWheelsOffQualificationMotionStartPrimary,
+    boot_id: u64,
+    stop_request_id: u32,
+) -> LiveWheelsOffQualificationMotionStartFailure {
+    Box::new((
+        coordinator,
+        LiveWheelsOffQualificationMotionStartError {
+            primary,
+            controller_stop: LiveWheelsOffQualificationStartStop::BootstrapExact {
+                boot_id,
+                stop_request_id,
+            },
+        },
+    ))
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn start_wheels_off_qualification_motion_runtime(
+    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    mut input: LiveWheelsOffQualificationMotionInput,
+    actual_runtime_service_interval: Duration,
+) -> Result<LiveWheelsOffQualificationMotionRuntime, LiveWheelsOffQualificationMotionStartFailure> {
+    let (
+        stopped_controller,
+        initial_zero,
+        initial_stop,
+        limits,
+        admitted_runtime_service_interval,
+        attestation,
+        profile,
+        frontend_config,
+        initial_health,
+        accessory_health,
+    ) = input.take_for_owner();
+    let boot_id = initial_stop.observed_boot_id().get();
+    let stop_request_id = initial_stop.request_id().get();
+    let last_applied = match ConsoleAppliedReceipt::from_verified(&initial_zero) {
+        Ok(receipt) => receipt,
+        Err(source) => {
+            return Err(fail_wheels_off_qualification_before_runtime(
+                coordinator,
+                LiveWheelsOffQualificationMotionStartPrimary::Receipt(source),
+                boot_id,
+                stop_request_id,
+            ));
+        }
+    };
+    let stop_certainty = ConsoleStopCertainty::from_verified_disarm(&initial_stop);
+    let mut initial_base = OperatorConsoleSnapshot::unknown(
+        ConsoleSnapshotRevision::parse(1).expect("static qualification revision is nonzero"),
+    );
+    initial_base.runtime = Some(AgentRuntimeStateV1::ReadyStopped);
+    initial_base.health = initial_health;
+    initial_base.last_applied = Some(last_applied);
+    initial_base.stop_certainty = Some(stop_certainty);
+    let (console, receiver) = kiko_slam::navigation::wheels_off_qualification_console(profile);
+    let telemetry = match kiko_slam::navigation::WheelsOffQualificationTelemetryStore::parse(
+        profile,
+        initial_base,
+        console.snapshot(),
+    ) {
+        Ok(telemetry) => telemetry,
+        Err(source) => {
+            return Err(fail_wheels_off_qualification_before_runtime(
+                coordinator,
+                LiveWheelsOffQualificationMotionStartPrimary::Telemetry(source),
+                boot_id,
+                stop_request_id,
+            ));
+        }
+    };
+    let mut controller = match kiko_slam::navigation::WheelsOffQualificationRuntime::try_new(
+        stopped_controller,
+        initial_zero,
+        initial_stop,
+        limits,
+        admitted_runtime_service_interval,
+        actual_runtime_service_interval,
+        attestation,
+        console.clone(),
+        receiver,
+    ) {
+        Ok(runtime) => runtime,
+        Err(source) => {
+            return Err(fail_wheels_off_qualification_before_runtime(
+                coordinator,
+                LiveWheelsOffQualificationMotionStartPrimary::Runtime(source),
+                boot_id,
+                stop_request_id,
+            ));
+        }
+    };
+    let frontend = match kiko_slam::navigation::WheelsOffQualificationFrontend::start(
+        &frontend_config,
+        console,
+        telemetry.clone(),
+        profile,
+    ) {
+        Ok(frontend) => frontend,
+        Err(source) => {
+            let controller_stop = controller.shutdown().map_err(Box::new);
+            return Err(Box::new((
+                coordinator,
+                LiveWheelsOffQualificationMotionStartError {
+                    primary: LiveWheelsOffQualificationMotionStartPrimary::Frontend(source),
+                    controller_stop: LiveWheelsOffQualificationStartStop::RuntimeShutdown(
+                        controller_stop,
+                    ),
+                },
+            )));
+        }
+    };
+    eprintln!(
+        "wheels-off qualification console ready on {}; capability={}; raw_timer_pwm_cap={} test_magnitude={} deadman_ms={}; autonomous actuation disabled (SLAM/MPC shadow only)",
+        frontend.bound_address(),
+        frontend_config.capability_path().display(),
+        limits.effective_max_abs_pwm_percent(),
+        limits.manual_test_magnitude_timer_pwm_percent(),
+        limits.manual_deadman().as_millis(),
+    );
+    Ok(LiveWheelsOffQualificationMotionRuntime {
+        coordinator,
+        controller: Some(controller),
+        frontend: Some(frontend),
+        telemetry,
+        observation: LiveConsoleNavigationObservation {
+            next_snapshot_revision: Some(2),
+            map: None,
+            last_requested_actuation: None,
+            last_applied: Some(last_applied),
+            stop_certainty: Some(stop_certainty),
+            successful_solver_duration_ns: None,
+        },
+        initial_health,
+        accessory_health,
+        sensor_health: LiveSensorStreamHealth::awaiting_first_samples(),
+        map_revision: None,
+        localized: false,
+    })
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+fn abnormal_production_socket_exit(
+    exit: AgentControlSocketTaskExit,
+) -> Option<LiveNavigationWorkerError> {
+    match exit {
+        AgentControlSocketTaskExit::Shutdown {
+            cleanup: AgentControlSocketCleanupOutcome::RemovedCreatedSocket,
+        } => None,
+        exit => Some(LiveNavigationWorkerError::ProductionSocketExit {
+            exit: Box::new(exit),
+        }),
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+const fn production_period_requires_motion_tick(
+    terminal_transition_requested: bool,
+    periodic_tick_deferred: bool,
+    already_applied: bool,
+) -> bool {
+    !terminal_transition_requested && !periodic_tick_deferred && !already_applied
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn observe_production_console_physical_state(
+    observation: &mut LiveConsoleNavigationObservation,
+    downstream_request_id: Option<kiko_slam::navigation::ConsoleDownstreamRequestId>,
+    event: &LivePhysicalStateEvent<
+        AppliedCommandReceipt,
+        CoordinatorTickOutcome<NavigationIngressStreamWriteError>,
+    >,
+) -> Result<(), LiveProductionConsoleProjectionError> {
+    match event {
+        LivePhysicalStateEvent::CoordinatorTick(applied) => {
+            observation.last_requested_actuation =
+                Some(ConsoleRequestedActuation::from_checked_record(
+                    downstream_request_id,
+                    applied.diagnostic().decision().record(),
+                ));
+            observation.last_applied = Some(
+                ConsoleAppliedReceipt::from_verified(applied.receipt())
+                    .map_err(LiveProductionConsoleProjectionError::Receipt)?,
+            );
+            observation.stop_certainty = Some(ConsoleStopCertainty::from_verified_applied(
+                applied.receipt(),
+            ));
+            observation.successful_solver_duration_ns =
+                match applied.diagnostic().decision().outcome() {
+                    SafetyDecisionOutcome::Controller(controller) => {
+                        let status = controller.solve_status();
+                        checked_monotonic_duration_ns(
+                            u128::from(status.started_at().as_nanos()),
+                            u128::from(status.observed_at().as_nanos()),
+                        )
+                    }
+                    SafetyDecisionOutcome::Stopped(_) => None,
+                };
+        }
+        LivePhysicalStateEvent::LifecycleZero(applied) => {
+            observation.last_requested_actuation = None;
+            observation.last_applied = Some(
+                ConsoleAppliedReceipt::from_verified(applied.receipt())
+                    .map_err(LiveProductionConsoleProjectionError::Receipt)?,
+            );
+            observation.stop_certainty = Some(ConsoleStopCertainty::from_verified_applied(
+                applied.receipt(),
+            ));
+            observation.successful_solver_duration_ns = None;
+        }
+        LivePhysicalStateEvent::ActuationFault { .. } => {
+            observation.last_requested_actuation = None;
+            observation.stop_certainty = Some(ConsoleStopCertainty::uncertain());
+            observation.successful_solver_duration_ns = None;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn compose_console_map_pose(
+    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+) -> Result<Option<ConsolePose2>, LiveProductionConsoleProjectionError> {
+    let Some(current) = coordinator.odometry().current() else {
+        return Ok(None);
+    };
+    let base_to_odom = current.base_to_odom();
+    let odom_to_map = current.odom_to_map();
+    let base_x_odom = base_to_odom.source_origin_x_in_destination_m();
+    let base_y_odom = base_to_odom.source_origin_y_in_destination_m();
+    let base_yaw_odom = base_to_odom.source_yaw_in_destination_rad();
+    let odom_x_map = odom_to_map.source_origin_x_in_destination_m();
+    let odom_y_map = odom_to_map.source_origin_y_in_destination_m();
+    let odom_yaw_map = odom_to_map.source_yaw_in_destination_rad();
+    compose_console_pose_components(
+        base_x_odom,
+        base_y_odom,
+        base_yaw_odom,
+        odom_x_map,
+        odom_y_map,
+        odom_yaw_map,
+    )
+    .map(Some)
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn compose_console_pose_components(
+    base_x_odom: f64,
+    base_y_odom: f64,
+    base_yaw_odom: f64,
+    odom_x_map: f64,
+    odom_y_map: f64,
+    odom_yaw_map: f64,
+) -> Result<ConsolePose2, LiveProductionConsoleProjectionError> {
+    let (sin_yaw, cos_yaw) = odom_yaw_map.sin_cos();
+    let base_x_map = cos_yaw.mul_add(base_x_odom, (-sin_yaw).mul_add(base_y_odom, odom_x_map));
+    let base_y_map = sin_yaw.mul_add(base_x_odom, cos_yaw.mul_add(base_y_odom, odom_y_map));
+    let raw_yaw = odom_yaw_map + base_yaw_odom;
+    let base_yaw_map = raw_yaw.sin().atan2(raw_yaw.cos());
+    ConsolePose2::parse(base_x_map, base_y_map, base_yaw_map)
+        .map_err(LiveProductionConsoleProjectionError::Numeric)
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn console_points_from_map_points(
+    points: impl IntoIterator<Item = [f64; 2]>,
+) -> Result<Vec<ConsolePoint2>, LiveProductionConsoleProjectionError> {
+    let points = points
+        .into_iter()
+        .map(|[x_m, y_m]| {
+            ConsolePoint2::parse(x_m, y_m).map_err(LiveProductionConsoleProjectionError::Numeric)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ConsoleNavigationSnapshot::parse_path(points)
+        .map_err(LiveProductionConsoleProjectionError::Path)
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn transform_console_odom_point_components(
+    x_odom_m: f64,
+    y_odom_m: f64,
+    odom_x_map_m: f64,
+    odom_y_map_m: f64,
+    odom_yaw_map_rad: f64,
+) -> Result<ConsolePoint2, LiveProductionConsoleProjectionError> {
+    let (sin_yaw, cos_yaw) = odom_yaw_map_rad.sin_cos();
+    let x_map_m = cos_yaw.mul_add(x_odom_m, (-sin_yaw).mul_add(y_odom_m, odom_x_map_m));
+    let y_map_m = sin_yaw.mul_add(x_odom_m, cos_yaw.mul_add(y_odom_m, odom_y_map_m));
+    ConsolePoint2::parse(x_map_m, y_map_m).map_err(LiveProductionConsoleProjectionError::Numeric)
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+const fn console_localized_navigation_visible(
+    localization: Option<AgentLocalizationStateV1>,
+) -> bool {
+    matches!(localization, Some(AgentLocalizationStateV1::Localized))
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+const fn console_current_solver_path_visible(
+    localization: Option<AgentLocalizationStateV1>,
+    successful_solver_duration_ns: Option<u64>,
+) -> bool {
+    console_localized_navigation_visible(localization) && successful_solver_duration_ns.is_some()
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn build_production_console_navigation_snapshot(
+    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    observation: &LiveConsoleNavigationObservation,
+    localization: Option<AgentLocalizationStateV1>,
+    tick_timing: LiveControlTickTiming,
+) -> Result<ConsoleNavigationSnapshot, LiveProductionConsoleProjectionError> {
+    let path = coordinator
+        .global_path()
+        .map(|path| {
+            console_points_from_map_points(path.points().iter().map(|point| point.as_array()))
+        })
+        .transpose()?;
+    let goal = coordinator
+        .current_goal()
+        .map(|goal| {
+            let [x_m, y_m] = goal.point().as_array();
+            ConsolePoint2::parse(x_m, y_m).map_err(LiveProductionConsoleProjectionError::Numeric)
+        })
+        .transpose()?;
+    let localized_navigation_visible = console_localized_navigation_visible(localization);
+    let current_solver_path_visible = console_current_solver_path_visible(
+        localization,
+        observation.successful_solver_duration_ns,
+    );
+    let current_odometry = localized_navigation_visible
+        .then(|| coordinator.odometry().current())
+        .flatten();
+    let mpc_predicted_path = match (
+        current_solver_path_visible,
+        current_odometry,
+        coordinator.safety().last_success_trajectory(),
+    ) {
+        (true, Some(current), Some(trajectory)) => {
+            let odom_to_map = current.odom_to_map();
+            let odom_x_map_m = odom_to_map.source_origin_x_in_destination_m();
+            let odom_y_map_m = odom_to_map.source_origin_y_in_destination_m();
+            let odom_yaw_map_rad = odom_to_map.source_yaw_in_destination_rad();
+            let points = trajectory
+                .points()
+                .iter()
+                .map(|point| {
+                    let [x_odom_m, y_odom_m] = point.pose().position().as_array();
+                    transform_console_odom_point_components(
+                        x_odom_m,
+                        y_odom_m,
+                        odom_x_map_m,
+                        odom_y_map_m,
+                        odom_yaw_map_rad,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Some(
+                ConsoleNavigationSnapshot::parse_path(points)
+                    .map_err(LiveProductionConsoleProjectionError::Path)?,
+            )
+        }
+        (false, _, _) | (_, None, _) | (_, _, None) => None,
+    };
+    Ok(ConsoleNavigationSnapshot {
+        pose: if localized_navigation_visible {
+            compose_console_map_pose(coordinator)?
+        } else {
+            None
+        },
+        path,
+        goal,
+        mpc_predicted_path,
+        solver_duration_ns: observation.successful_solver_duration_ns,
+        control_tick_lateness_ns: Some(tick_timing.current_lateness_ns),
+    })
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn project_console_actual_authority(
+    owner: &ProductionLiveMotionOwner,
+    adapter: &OperatorConsoleRuntimeAdapter,
+) -> Result<Option<ConsoleActualAuthority>, LiveProductionConsoleProjectionError> {
+    let owner_authority = owner
+        .active_motion_authority()
+        .map_err(LiveProductionConsoleProjectionError::AuthorityState)?;
+    let console_authority = adapter
+        .retained_authority()
+        .map_err(LiveProductionConsoleProjectionError::AuthorityAdapter)?
+        .map(|authority| {
+            (
+                authority.kind(),
+                authority.downstream_request_id().get(),
+                authority.source(),
+            )
+        });
+    project_console_actual_authority_state(owner_authority, console_authority)
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn project_console_actual_authority_state(
+    owner_authority: Option<LiveMotionAuthorityState>,
+    console_authority: Option<(OperatorConsoleRetainedAuthorityKind, u64, ConsoleSourceKind)>,
+) -> Result<Option<ConsoleActualAuthority>, LiveProductionConsoleProjectionError> {
+    let Some(owner_authority) = owner_authority else {
+        return match console_authority {
+            None => Ok(None),
+            Some((console, _, _)) => {
+                Err(LiveProductionConsoleProjectionError::ConsoleAuthorityWithoutOwner { console })
+            }
+        };
+    };
+    let Some(console_authority) = console_authority else {
+        return Err(
+            LiveProductionConsoleProjectionError::OwnerAuthorityWithoutConsole {
+                owner: owner_authority,
+            },
+        );
+    };
+    let (authority_lease_id, mode) = match owner_authority {
+        LiveMotionAuthorityState::Manual { lease_id } => {
+            (lease_id.get(), ConsoleActualAuthorityMode::Manual)
+        }
+        LiveMotionAuthorityState::Autonomous { lease_id, mode } => (
+            lease_id.get(),
+            match mode {
+                kiko_slam::navigation::AgentAutonomousMode::Explore => {
+                    ConsoleActualAuthorityMode::FrontierExplore
+                }
+                kiko_slam::navigation::AgentAutonomousMode::PointGoal => {
+                    ConsoleActualAuthorityMode::PointGoal
+                }
+            },
+        ),
+    };
+    let matching_console_authority = matches!(
+        (owner_authority, console_authority.0),
+        (
+            LiveMotionAuthorityState::Manual { .. },
+            OperatorConsoleRetainedAuthorityKind::Manual
+        ) | (
+            LiveMotionAuthorityState::Autonomous {
+                mode: kiko_slam::navigation::AgentAutonomousMode::Explore,
+                ..
+            },
+            OperatorConsoleRetainedAuthorityKind::Autonomous(
+                kiko_slam::navigation::AgentAutonomousMode::Explore
+            )
+        ) | (
+            LiveMotionAuthorityState::Autonomous {
+                mode: kiko_slam::navigation::AgentAutonomousMode::PointGoal,
+                ..
+            },
+            OperatorConsoleRetainedAuthorityKind::Autonomous(
+                kiko_slam::navigation::AgentAutonomousMode::PointGoal
+            )
+        )
+    );
+    if !matching_console_authority {
+        return Err(
+            LiveProductionConsoleProjectionError::ConsoleAuthorityModeMismatch {
+                owner: owner_authority,
+                console: console_authority.0,
+            },
+        );
+    }
+    Ok(Some(ConsoleActualAuthority {
+        source: match console_authority.2 {
+            ConsoleSourceKind::Operator => ConsoleActualAuthoritySource::Operator,
+            ConsoleSourceKind::Agent => ConsoleActualAuthoritySource::Agent,
+        },
+        mode,
+        authority_lease_id,
+        console_downstream_request_id: Some(console_authority.1),
+    }))
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+const fn console_health_from_accessory(health: NanoAccessoryComponentHealth) -> ConsoleHealth {
+    match health {
+        NanoAccessoryComponentHealth::Ready => ConsoleHealth::Ready,
+        NanoAccessoryComponentHealth::Degraded => ConsoleHealth::Degraded,
+        NanoAccessoryComponentHealth::Faulted => ConsoleHealth::Faulted,
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn refresh_console_accessory_health(
+    mut health: ConsoleSubsystemHealth,
+    observer: &NanoAccessoryHealthObserver,
+) -> Result<ConsoleSubsystemHealth, NanoAccessoryHealthStatusError> {
+    let accessory = observer.snapshot()?;
+    health.head = Some(console_health_from_accessory(accessory.head));
+    health.eyes = Some(console_health_from_accessory(
+        match (accessory.eyes, accessory.rgb_expression) {
+            (NanoAccessoryComponentHealth::Faulted, _)
+            | (_, NanoAccessoryComponentHealth::Faulted) => NanoAccessoryComponentHealth::Faulted,
+            (NanoAccessoryComponentHealth::Degraded, _)
+            | (_, NanoAccessoryComponentHealth::Degraded) => NanoAccessoryComponentHealth::Degraded,
+            (NanoAccessoryComponentHealth::Ready, NanoAccessoryComponentHealth::Ready) => {
+                NanoAccessoryComponentHealth::Ready
+            }
+        },
+    ));
+    Ok(health)
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+struct ProductionConsoleSnapshotContext<'runtime> {
+    terminal_checkpoint_pending: bool,
+    accessory_health: &'runtime NanoAccessoryHealthObserver,
+    sensor_health: LiveSensorStreamHealth,
+    map_state: AgentMapStateV1,
+    snapshot_clock: &'runtime InstantHostClock,
+    tick_timing: LiveControlTickTiming,
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn publish_production_console_snapshot(
+    owner: &ProductionLiveMotionOwner,
+    console: &mut LiveProductionConsoleRuntime,
+    context: ProductionConsoleSnapshotContext<'_>,
+) -> Result<(), LiveProductionConsoleProjectionError> {
+    let ProductionConsoleSnapshotContext {
+        terminal_checkpoint_pending,
+        accessory_health,
+        sensor_health,
+        map_state,
+        snapshot_clock,
+        tick_timing,
+    } = context;
+    let observation = &mut console.observation;
+    let revision = observation
+        .next_snapshot_revision
+        .take()
+        .ok_or(LiveProductionConsoleProjectionError::SnapshotRevisionExhausted)?;
+    observation.next_snapshot_revision = revision.checked_add(1);
+    let revision = ConsoleSnapshotRevision::parse(revision)
+        .map_err(|_| LiveProductionConsoleProjectionError::SnapshotRevisionExhausted)?;
+    let adapter = console
+        .adapter
+        .as_ref()
+        .expect("production console adapter exists until terminal shutdown");
+    let mut snapshot = adapter.handle().latest_snapshot().as_ref().clone();
+    snapshot.revision = revision;
+    snapshot.runtime = Some(if terminal_checkpoint_pending {
+        AgentRuntimeStateV1::ShuttingDown
+    } else {
+        owner.dispatcher().control_status(map_state).runtime()
+    });
+    snapshot.terminal =
+        terminal_checkpoint_pending.then_some(ConsoleTerminalState::ControlEnding {
+            reason: ConsoleTerminalReason::FinalizingWarmRestartCheckpoint,
+            current_camera_localization: ConsoleCheckpointLocalizationEvidence::NotClaimed,
+        });
+    snapshot.map = match (
+        map_state.map_epoch_id(),
+        map_state.revision(),
+        map_state.localization(),
+    ) {
+        (None, None, None) => None,
+        (Some(map_epoch_id), Some(revision), Some(localization)) => {
+            let map_epoch_id = NonZeroU64::new(map_epoch_id)
+                .ok_or(LiveProductionConsoleProjectionError::MapEpochZero)?;
+            let grid = observation
+                .map
+                .as_ref()
+                .filter(|map| map.map_epoch_id == map_epoch_id && map.revision == revision)
+                .and_then(|map| map.grid);
+            Some(ConsoleMapSnapshot {
+                map_epoch_id,
+                revision,
+                localization: match localization {
+                    AgentLocalizationStateV1::Localized => ConsoleLocalization::Localized,
+                    AgentLocalizationStateV1::Lost => ConsoleLocalization::Lost,
+                    AgentLocalizationStateV1::Unavailable => ConsoleLocalization::Unavailable,
+                },
+                grid,
+            })
+        }
+        _ => return Err(LiveProductionConsoleProjectionError::MapEpochZero),
+    };
+    snapshot.navigation = Some(build_production_console_navigation_snapshot(
+        owner.coordinator(),
+        observation,
+        map_state.localization(),
+        tick_timing,
+    )?);
+    snapshot.actual_authority = project_console_actual_authority(owner, adapter)?;
+    snapshot.last_requested = adapter.handle().latest_requested_command();
+    snapshot.last_requested_actuation = observation.last_requested_actuation;
+    snapshot.last_applied = observation.last_applied;
+    snapshot.stop_certainty = observation.stop_certainty;
+    snapshot.health = refresh_console_accessory_health(snapshot.health, accessory_health)
+        .map_err(LiveProductionConsoleProjectionError::AccessoryHealth)?;
+    if matches!(snapshot.runtime, Some(AgentRuntimeStateV1::Faulted)) {
+        snapshot.health.stm32 = Some(ConsoleHealth::Faulted);
+    }
+    // Sample only after every navigation/actuation telemetry field and
+    // correlated receipt has been observed. Arbitration and safety are
+    // separately documented live overlays, not timestamped by this value.
+    let telemetry_observed_at = snapshot_clock
+        .checked_now()
+        .map_err(LiveProductionConsoleProjectionError::HostClock)?;
+    snapshot.health.oak = Some(console_oak_motion_health(
+        sensor_health,
+        owner.coordinator(),
+        telemetry_observed_at,
+    ));
+    snapshot.telemetry_observed_at_host_monotonic_ns =
+        Some(ConsoleHostTimestampNs::from_host(telemetry_observed_at));
+    adapter
+        .handle()
+        .publish_snapshot(snapshot)
+        .map_err(LiveProductionConsoleProjectionError::Snapshot)
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn publish_production_console_grid(
+    production: &mut LiveProductionMotionRuntime,
+    snapshot: &TimedOccupancySnapshot,
+) -> Result<(), LiveProductionConsoleProjectionError> {
+    let binding = production
+        .owner()
+        .coordinator()
+        .current_map_binding()
+        .ok_or(LiveProductionConsoleProjectionError::MapEpochZero)?;
+    let map_epoch_id = NonZeroU64::new(binding.map_epoch_id().as_u64())
+        .ok_or(LiveProductionConsoleProjectionError::MapEpochZero)?;
+    let revision = snapshot.snapshot().revision();
+    let localized = production.localized;
+    let console = production.console_mut();
+    if console
+        .observation
+        .map
+        .as_ref()
+        .is_some_and(|map| map.map_epoch_id == map_epoch_id && map.revision >= revision)
+    {
+        return Ok(());
+    }
+    let grid = ConsoleOccupancyGrid::from_snapshot(binding, snapshot.snapshot())
+        .map_err(LiveProductionConsoleProjectionError::Grid)?;
+    let metadata = grid.metadata;
+    let adapter = console
+        .adapter
+        .as_ref()
+        .expect("production console adapter exists until terminal shutdown");
+    if !adapter.handle().publish_grid(grid) {
+        return Err(
+            LiveProductionConsoleProjectionError::GridPublicationRejected {
+                map_epoch_id: map_epoch_id.get(),
+                revision,
+            },
+        );
+    }
+    console.observation.map = Some(ConsoleMapSnapshot {
+        map_epoch_id,
+        revision,
+        localization: if localized {
+            ConsoleLocalization::Localized
+        } else {
+            ConsoleLocalization::Lost
+        },
+        grid: Some(metadata),
+    });
+    Ok(())
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn publish_wheels_off_qualification_grid(
+    runtime: &mut LiveWheelsOffQualificationMotionRuntime,
+    snapshot: &TimedOccupancySnapshot,
+) -> Result<(), LiveNavigationWorkerError> {
+    let binding = runtime.coordinator.current_map_binding().ok_or(
+        LiveNavigationWorkerError::WheelsOffQualificationProjection {
+            source: LiveProductionConsoleProjectionError::MapEpochZero,
+        },
+    )?;
+    let map_epoch_id = NonZeroU64::new(binding.map_epoch_id().as_u64()).ok_or(
+        LiveNavigationWorkerError::WheelsOffQualificationProjection {
+            source: LiveProductionConsoleProjectionError::MapEpochZero,
+        },
+    )?;
+    let revision = snapshot.snapshot().revision();
+    if runtime
+        .observation
+        .map
+        .as_ref()
+        .is_some_and(|map| map.map_epoch_id == map_epoch_id && map.revision >= revision)
+    {
+        return Ok(());
+    }
+    let grid =
+        ConsoleOccupancyGrid::from_snapshot(binding, snapshot.snapshot()).map_err(|source| {
+            LiveNavigationWorkerError::WheelsOffQualificationProjection {
+                source: LiveProductionConsoleProjectionError::Grid(source),
+            }
+        })?;
+    let metadata = grid.metadata;
+    runtime
+        .telemetry
+        .publish_grid(grid)
+        .map_err(|source| LiveNavigationWorkerError::WheelsOffQualificationTelemetry { source })?;
+    runtime.observation.map = Some(ConsoleMapSnapshot {
+        map_epoch_id,
+        revision,
+        localization: if runtime.localized {
+            ConsoleLocalization::Localized
+        } else {
+            ConsoleLocalization::Lost
+        },
+        grid: Some(metadata),
+    });
+    Ok(())
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn observe_wheels_off_qualification_controller(
+    runtime: &mut LiveWheelsOffQualificationMotionRuntime,
+) -> Result<(), LiveNavigationWorkerError> {
+    runtime.observation.last_requested_actuation = None;
+    runtime.observation.last_applied = runtime
+        .controller()
+        .last_applied()
+        .map(ConsoleAppliedReceipt::from_verified)
+        .transpose()
+        .map_err(
+            |source| LiveNavigationWorkerError::WheelsOffQualificationProjection {
+                source: LiveProductionConsoleProjectionError::Receipt(source),
+            },
+        )?;
+    runtime.observation.stop_certainty = match runtime.controller().controller_state() {
+        kiko_slam::navigation::WheelsOffQualificationControllerState::StoppedWithExactReceipt => {
+            runtime
+                .controller()
+                .last_stop()
+                .map(ConsoleStopCertainty::from_verified_disarm)
+        }
+        kiko_slam::navigation::WheelsOffQualificationControllerState::Active => runtime
+            .controller()
+            .last_applied()
+            .map(ConsoleStopCertainty::from_verified_applied),
+        kiko_slam::navigation::WheelsOffQualificationControllerState::StopConfirmedWithoutRetainedReceipt
+        | kiko_slam::navigation::WheelsOffQualificationControllerState::StopUncertain => {
+            Some(ConsoleStopCertainty::uncertain())
+        }
+    };
+    Ok(())
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn publish_wheels_off_qualification_snapshot(
+    runtime: &mut LiveWheelsOffQualificationMotionRuntime,
+    snapshot_clock: &InstantHostClock,
+    tick_timing: LiveControlTickTiming,
+) -> Result<(), LiveNavigationWorkerError> {
+    observe_wheels_off_qualification_controller(runtime)?;
+    let revision = runtime.observation.next_snapshot_revision.take().ok_or(
+        LiveNavigationWorkerError::WheelsOffQualificationProjection {
+            source: LiveProductionConsoleProjectionError::SnapshotRevisionExhausted,
+        },
+    )?;
+    runtime.observation.next_snapshot_revision = revision.checked_add(1);
+    let revision = ConsoleSnapshotRevision::parse(revision).map_err(|_| {
+        LiveNavigationWorkerError::WheelsOffQualificationProjection {
+            source: LiveProductionConsoleProjectionError::SnapshotRevisionExhausted,
+        }
+    })?;
+    let map_binding = runtime.coordinator.current_map_binding();
+    let localization = map_binding.map(|_| {
+        if runtime.localized {
+            AgentLocalizationStateV1::Localized
+        } else {
+            AgentLocalizationStateV1::Lost
+        }
+    });
+    let map = match (map_binding, runtime.map_revision, localization) {
+        (None, None, None) => None,
+        (Some(binding), Some(revision), Some(localization)) => {
+            let map_epoch_id = NonZeroU64::new(binding.map_epoch_id().as_u64()).ok_or(
+                LiveNavigationWorkerError::WheelsOffQualificationProjection {
+                    source: LiveProductionConsoleProjectionError::MapEpochZero,
+                },
+            )?;
+            let grid = runtime
+                .observation
+                .map
+                .as_ref()
+                .filter(|map| map.map_epoch_id == map_epoch_id && map.revision == revision)
+                .and_then(|map| map.grid);
+            Some(ConsoleMapSnapshot {
+                map_epoch_id,
+                revision,
+                localization: match localization {
+                    AgentLocalizationStateV1::Localized => ConsoleLocalization::Localized,
+                    AgentLocalizationStateV1::Lost => ConsoleLocalization::Lost,
+                    AgentLocalizationStateV1::Unavailable => ConsoleLocalization::Unavailable,
+                },
+                grid,
+            })
+        }
+        _ => {
+            return Err(
+                LiveNavigationWorkerError::WheelsOffQualificationProjection {
+                    source: LiveProductionConsoleProjectionError::MapEpochZero,
+                },
+            );
+        }
+    };
+    let mut snapshot = OperatorConsoleSnapshot::unknown(revision);
+    snapshot.runtime = Some(match (
+        runtime.controller().state(),
+        runtime.controller().controller_state(),
+    ) {
+        (
+            kiko_slam::navigation::WheelsOffQualificationRuntimeState::Running,
+            kiko_slam::navigation::WheelsOffQualificationControllerState::Active,
+        ) => AgentRuntimeStateV1::Active {
+            mode: kiko_slam::navigation::AgentOperatingModeV1::Commissioning,
+        },
+        (
+            kiko_slam::navigation::WheelsOffQualificationRuntimeState::Running,
+            kiko_slam::navigation::WheelsOffQualificationControllerState::StoppedWithExactReceipt,
+        ) => AgentRuntimeStateV1::ReadyStopped,
+        (
+            kiko_slam::navigation::WheelsOffQualificationRuntimeState::Shutdown,
+            _,
+        ) => AgentRuntimeStateV1::ShuttingDown,
+        _ => AgentRuntimeStateV1::Faulted,
+    });
+    snapshot.map = map;
+    snapshot.navigation = Some(
+        build_production_console_navigation_snapshot(
+            &runtime.coordinator,
+            &runtime.observation,
+            localization,
+            tick_timing,
+        )
+        .map_err(|source| LiveNavigationWorkerError::WheelsOffQualificationProjection { source })?,
+    );
+    snapshot.last_requested_actuation = runtime.observation.last_requested_actuation;
+    snapshot.last_applied = runtime.observation.last_applied;
+    snapshot.stop_certainty = runtime.observation.stop_certainty;
+    snapshot.health =
+        refresh_console_accessory_health(runtime.initial_health, &runtime.accessory_health)
+            .map_err(
+                |source| LiveNavigationWorkerError::WheelsOffQualificationProjection {
+                    source: LiveProductionConsoleProjectionError::AccessoryHealth(source),
+                },
+            )?;
+    if matches!(snapshot.runtime, Some(AgentRuntimeStateV1::Faulted)) {
+        snapshot.health.stm32 = Some(ConsoleHealth::Faulted);
+    }
+    let telemetry_observed_at = snapshot_clock
+        .checked_now()
+        .map_err(LiveNavigationWorkerError::HostClock)?;
+    snapshot.health.oak = Some(console_oak_motion_health(
+        runtime.sensor_health,
+        &runtime.coordinator,
+        telemetry_observed_at,
+    ));
+    snapshot.telemetry_observed_at_host_monotonic_ns =
+        Some(ConsoleHostTimestampNs::from_host(telemetry_observed_at));
+    runtime
+        .telemetry
+        .publish_observational_base(snapshot)
+        .map_err(|source| LiveNavigationWorkerError::WheelsOffQualificationTelemetry { source })
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+#[allow(clippy::too_many_arguments)]
+fn run_production_console_control_period(
+    production: &mut LiveProductionMotionRuntime,
+    production_state: &mut Option<NanoProductionStateOwners>,
+    pending_warm_checkpoint: &mut Option<PendingNanoWarmCheckpoint>,
+    checkpoint_bridge: &NanoDatasetCheckpointWorkerBridge,
+    running: &AtomicBool,
+    map_state: AgentMapStateV1,
+    tick: HostMonotonicTimestamp,
+    snapshot_clock: &InstantHostClock,
+    tick_sequence: i64,
+    tick_timing: LiveControlTickTiming,
+    navigation_viz_tx: &mut Option<DropSender<LiveNavigationVizMsg>>,
+) -> Result<(), LiveNavigationWorkerError> {
+    let LiveProductionMotionRuntime {
+        owner,
+        console,
+        terminal_response_timeout,
+        accessory_health,
+        sensor_health,
+        map_revision: _,
+        localized: _,
+        terminal_checkpoint_pending,
+        socket_task: _,
+    } = production;
+    let owner = owner
+        .as_mut()
+        .expect("production owner exists until terminal shutdown");
+    let console = console
+        .as_mut()
+        .expect("production console exists until terminal shutdown");
+    if let Some(evidence) = console
+        .frontend
+        .as_mut()
+        .and_then(NanoOperatorConsoleFrontend::poll_unexpected_exit)
+    {
+        return Err(LiveNavigationWorkerError::ProductionConsoleFrontendExited {
+            evidence: Box::new(evidence),
+        });
+    }
+    let adapter = console
+        .adapter
+        .as_mut()
+        .expect("production console adapter exists until terminal shutdown");
+
+    let ingress = adapter.drain_one_before_owner(owner).map_err(|source| {
+        LiveNavigationWorkerError::ProductionConsoleIngress {
+            source: Box::new(source),
+        }
+    })?;
+    if ingress == OperatorConsoleIngressDisposition::SoftwareEmergencyStopApplied {
+        let event = owner.take_last_physical_state().ok_or(
+            LiveNavigationWorkerError::ProductionConsoleAdapter {
+                source: OperatorConsoleRuntimeAdapterError::PhysicalEvidenceRequired,
+            },
+        )?;
+        let downstream_request_id = adapter
+            .correlated_downstream_request_id(&event)
+            .map_err(|source| LiveNavigationWorkerError::ProductionConsoleAdapter { source })?;
+        observe_production_console_physical_state(
+            &mut console.observation,
+            downstream_request_id,
+            &event,
+        )
+        .map_err(|source| LiveNavigationWorkerError::ProductionConsoleProjection { source })?;
+        publish_live_physical_state_viz(
+            navigation_viz_tx,
+            owner.coordinator(),
+            tick_sequence,
+            tick_timing,
+            &event,
+        )
+        .map_err(|source| LiveNavigationWorkerError::PhysicalStateVisualization { source })?;
+        drop(event);
+        adapter
+            .complete_software_emergency_stop()
+            .map_err(|source| LiveNavigationWorkerError::ProductionConsoleAdapter { source })?;
+        publish_production_console_snapshot(
+            owner,
+            console,
+            ProductionConsoleSnapshotContext {
+                terminal_checkpoint_pending: *terminal_checkpoint_pending,
+                accessory_health,
+                sensor_health: *sensor_health,
+                map_state,
+                snapshot_clock,
+                tick_timing,
+            },
+        )
+        .map_err(|source| LiveNavigationWorkerError::ProductionConsoleProjection { source })?;
+        return Ok(());
+    }
+
+    let command_outcome = match owner.process_one_with_motion_start_readiness(map_state) {
+        Ok(outcome) => outcome,
+        Err(source) => {
+            let mut failures = vec![LiveNavigationWorkerError::ProductionOwner {
+                source: Box::new(source),
+            }];
+            if let Some(event) = owner.take_last_physical_state()
+                && let Err(source) = publish_live_physical_state_viz(
+                    navigation_viz_tx,
+                    owner.coordinator(),
+                    tick_sequence,
+                    tick_timing,
+                    &event,
+                )
+            {
+                failures.push(LiveNavigationWorkerError::PhysicalStateVisualization { source });
+            }
+            if let Err(source) = adapter.fail_processed_owner_operation(owner) {
+                failures.push(LiveNavigationWorkerError::ProductionConsoleAdapter { source });
+            }
+            return Err(if failures.len() == 1 {
+                failures
+                    .pop()
+                    .expect("one retained production-owner failure")
+            } else {
+                LiveNavigationWorkerError::Multiple { failures }
+            });
+        }
+    };
+    let periodic_tick_deferred = command_outcome.defers_periodic_motion_tick();
+    let command_physical_state = owner.take_last_physical_state();
+    let command_applied = command_physical_state.is_some();
+    if let Some(event) = command_physical_state.as_ref() {
+        let downstream_request_id = adapter
+            .correlated_downstream_request_id(event)
+            .map_err(|source| LiveNavigationWorkerError::ProductionConsoleAdapter { source })?;
+        observe_production_console_physical_state(
+            &mut console.observation,
+            downstream_request_id,
+            event,
+        )
+        .map_err(|source| LiveNavigationWorkerError::ProductionConsoleProjection { source })?;
+        publish_live_physical_state_viz(
+            navigation_viz_tx,
+            owner.coordinator(),
+            tick_sequence,
+            tick_timing,
+            event,
+        )
+        .map_err(|source| LiveNavigationWorkerError::PhysicalStateVisualization { source })?;
+    }
+    let adapter_disposition = adapter
+        .complete_processed_owner_outcome(owner, &command_outcome, command_physical_state)
+        .map_err(|source| LiveNavigationWorkerError::ProductionConsoleAdapter { source })?;
+
+    let shutdown_requested = match command_outcome {
+        LiveMotionOwnerOutcome::SaveMapRequested { claimed } => {
+            let console_response_pending = matches!(
+                adapter_disposition,
+                OperatorConsoleProcessDisposition::SaveMapPersistenceRequired { .. }
+            );
+            if !console_response_pending
+                && !matches!(
+                    adapter_disposition,
+                    OperatorConsoleProcessDisposition::UnrelatedRuntimeOutcome
+                )
+            {
+                return Err(LiveNavigationWorkerError::ProductionConsoleAdapter {
+                    source: OperatorConsoleRuntimeAdapterError::OwnerOutcomeMismatch,
+                });
+            }
+            match production_state.as_mut() {
+                Some(state) => {
+                    if state.map_persistence.requires_quiescent_warm_checkpoint() {
+                        if pending_warm_checkpoint.is_some() {
+                            return Err(LiveNavigationWorkerError::ProductionConsoleAdapter {
+                                source:
+                                    OperatorConsoleRuntimeAdapterError::SaveMapCompletionPending,
+                            });
+                        }
+                        let terminal_response_deadline = match claimed
+                            .terminal_response_deadline()
+                            .or_else(|| Instant::now().checked_add(*terminal_response_timeout))
+                        {
+                            Some(deadline) => deadline,
+                            None => {
+                                let response = claimed
+                                    .reject(AgentControlRejectionCodeV1::InternalFault, false)
+                                    .err();
+                                return Err(
+                                    LiveNavigationWorkerError::WarmCheckpointDeadlineOverflow {
+                                        response,
+                                    },
+                                );
+                            }
+                        };
+                        let Some(checkpoint_deadline) = terminal_response_deadline
+                            .checked_sub(NANO_TERMINAL_RESPONSE_COMPLETION_RESERVE)
+                        else {
+                            let response = claimed
+                                .reject(AgentControlRejectionCodeV1::InternalFault, false)
+                                .err();
+                            return Err(
+                                LiveNavigationWorkerError::WarmCheckpointDeadlineOverflow {
+                                    response,
+                                },
+                            );
+                        };
+                        if checkpoint_deadline <= Instant::now()
+                            || checkpoint_bridge
+                                .checkpoint_deadline
+                                .set(checkpoint_deadline)
+                                .is_err()
+                        {
+                            let response = claimed
+                                .reject(AgentControlRejectionCodeV1::ShutdownInProgress, false)
+                                .err();
+                            return Err(
+                                LiveNavigationWorkerError::WarmCheckpointDeadlineUnavailable {
+                                    response,
+                                },
+                            );
+                        }
+                        *pending_warm_checkpoint = Some(PendingNanoWarmCheckpoint {
+                            claimed,
+                            console_response_pending,
+                        });
+                        *terminal_checkpoint_pending = true;
+                        checkpoint_bridge.requested.store(true, Ordering::Release);
+                    } else {
+                        state
+                            .map_persistence
+                            .respond_to_claimed_save_map_with_quota(claimed, &mut state.quota)
+                            .map_err(|source| LiveNavigationWorkerError::ProductionSaveMap {
+                                source: Box::new(source),
+                            })?;
+                        if console_response_pending {
+                            adapter.complete_save_map_response().map_err(|source| {
+                                LiveNavigationWorkerError::ProductionConsoleAdapter { source }
+                            })?;
+                        }
+                    }
+                }
+                None => {
+                    let response = claimed
+                        .reject(AgentControlRejectionCodeV1::PersistenceFailed, false)
+                        .err();
+                    if response.is_none() {
+                        adapter.complete_save_map_response().map_err(|source| {
+                            LiveNavigationWorkerError::ProductionConsoleAdapter { source }
+                        })?;
+                    }
+                    return Err(
+                        LiveNavigationWorkerError::ProductionMapPersistenceUnavailable { response },
+                    );
+                }
+            }
+            false
+        }
+        LiveMotionOwnerOutcome::ShutdownRequested => true,
+        LiveMotionOwnerOutcome::Idle
+        | LiveMotionOwnerOutcome::ClientUnavailableBeforeClaim
+        | LiveMotionOwnerOutcome::StatusReplied(_)
+        | LiveMotionOwnerOutcome::Rejected { .. }
+        | LiveMotionOwnerOutcome::Completed(_)
+        | LiveMotionOwnerOutcome::PeriodicManualApplied
+        | LiveMotionOwnerOutcome::PeriodicManualStopped
+        | LiveMotionOwnerOutcome::AutonomousAccepted { .. }
+        | LiveMotionOwnerOutcome::PeriodicAutonomousApplied { .. }
+        | LiveMotionOwnerOutcome::PeriodicAutonomousStopped { .. }
+        | LiveMotionOwnerOutcome::AutonomousCompleted { .. } => {
+            if matches!(
+                adapter_disposition,
+                OperatorConsoleProcessDisposition::SaveMapPersistenceRequired { .. }
+            ) {
+                return Err(LiveNavigationWorkerError::ProductionConsoleAdapter {
+                    source: OperatorConsoleRuntimeAdapterError::OwnerOutcomeMismatch,
+                });
+            }
+            false
+        }
+    };
+    if shutdown_requested {
+        running.store(false, Ordering::SeqCst);
+    }
+
+    let mut published_physical_state = command_applied;
+    if production_period_requires_motion_tick(
+        shutdown_requested || *terminal_checkpoint_pending,
+        periodic_tick_deferred,
+        command_applied,
+    ) {
+        let periodic_outcome = match owner.tick_motion() {
+            Ok(outcome) => outcome,
+            Err(source) => {
+                let owner_failure = LiveNavigationWorkerError::ProductionOwner {
+                    source: Box::new(source),
+                };
+                if let Some(event) = owner.take_last_physical_state()
+                    && let Err(source) = publish_live_physical_state_viz(
+                        navigation_viz_tx,
+                        owner.coordinator(),
+                        tick_sequence,
+                        tick_timing,
+                        &event,
+                    )
+                {
+                    return Err(LiveNavigationWorkerError::Multiple {
+                        failures: vec![
+                            owner_failure,
+                            LiveNavigationWorkerError::PhysicalStateVisualization { source },
+                        ],
+                    });
+                }
+                return Err(owner_failure);
+            }
+        };
+        let periodic_physical_state = owner.take_last_physical_state();
+        published_physical_state = periodic_physical_state.is_some();
+        if let Some(event) = periodic_physical_state.as_ref() {
+            let downstream_request_id = adapter
+                .correlated_downstream_request_id(event)
+                .map_err(|source| LiveNavigationWorkerError::ProductionConsoleAdapter { source })?;
+            observe_production_console_physical_state(
+                &mut console.observation,
+                downstream_request_id,
+                event,
+            )
+            .map_err(|source| LiveNavigationWorkerError::ProductionConsoleProjection { source })?;
+            publish_live_physical_state_viz(
+                navigation_viz_tx,
+                owner.coordinator(),
+                tick_sequence,
+                tick_timing,
+                event,
+            )
+            .map_err(|source| LiveNavigationWorkerError::PhysicalStateVisualization { source })?;
+        }
+        adapter
+            .complete_periodic_owner_outcome(&periodic_outcome, periodic_physical_state)
+            .map_err(|source| LiveNavigationWorkerError::ProductionConsoleAdapter { source })?;
+    }
+    if !published_physical_state {
+        publish_live_navigation_viz_message(
+            navigation_viz_tx,
+            LiveNavigationVizMsg::control_tick_timing_only(
+                tick_sequence,
+                tick.as_nanos(),
+                tick_timing,
+            ),
+        )
+        .map_err(|source| LiveNavigationWorkerError::PhysicalStateVisualization { source })?;
+    }
+    publish_production_console_snapshot(
+        owner,
+        console,
+        ProductionConsoleSnapshotContext {
+            terminal_checkpoint_pending: *terminal_checkpoint_pending,
+            accessory_health,
+            sensor_health: *sensor_health,
+            map_state,
+            snapshot_clock,
+            tick_timing,
+        },
+    )
+    .map_err(|source| LiveNavigationWorkerError::ProductionConsoleProjection { source })?;
+    Ok(())
+}
+
+#[cfg(feature = "record")]
+enum LiveNavigationWorkerInput {
+    Tick(Instant),
+    Visual(Result<VisualAdmission, crossbeam_channel::RecvError>),
+    Depth(Result<DepthObservation, crossbeam_channel::RecvError>),
+    Imu(Result<ImuReport, crossbeam_channel::RecvError>),
+    Map(Result<TimedOccupancySnapshot, crossbeam_channel::RecvError>),
+}
+
+#[cfg(feature = "record")]
+fn select_live_navigation_worker_input(
+    tick: &crossbeam_channel::Receiver<Instant>,
+    visual: &crossbeam_channel::Receiver<VisualAdmission>,
+    depth: &crossbeam_channel::Receiver<DepthObservation>,
+    imu: &crossbeam_channel::Receiver<ImuReport>,
+    map: &crossbeam_channel::Receiver<TimedOccupancySnapshot>,
+) -> LiveNavigationWorkerInput {
+    crossbeam_channel::select_biased! {
+        recv(tick) -> message => LiveNavigationWorkerInput::Tick(
+            message.expect("crossbeam periodic tick receivers do not disconnect"),
+        ),
+        recv(visual) -> message => LiveNavigationWorkerInput::Visual(message),
+        recv(depth) -> message => LiveNavigationWorkerInput::Depth(message),
+        recv(imu) -> message => LiveNavigationWorkerInput::Imu(message),
+        recv(map) -> message => LiveNavigationWorkerInput::Map(message),
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EntrySnapshotDrain {
+    drained: usize,
+    disconnected: bool,
+}
+
+#[cfg(feature = "record")]
+fn drain_entry_snapshot<T, E>(
+    receiver: &crossbeam_channel::Receiver<T>,
+    mut admit: impl FnMut(T) -> Result<(), E>,
+) -> Result<EntrySnapshotDrain, E> {
+    let ready_on_entry = receiver.len();
+    let mut drained = 0;
+    let mut disconnected = false;
+    for _ in 0..ready_on_entry {
+        match receiver.try_recv() {
+            Ok(value) => {
+                admit(value)?;
+                drained += 1;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+    Ok(EntrySnapshotDrain {
+        drained,
+        disconnected,
+    })
+}
+
+#[cfg(feature = "record")]
 #[allow(clippy::too_many_arguments)]
 fn run_live_navigation_worker(
-    mut coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
     control_period: ControlPeriodNs,
+    coordinator_clock_epoch: NavigationClockEpoch,
     clock_origin: Instant,
-    #[cfg(feature = "actuation")] actuation_config: Option<NavigationActuationConfigV1>,
+    #[cfg(feature = "actuation")] motion: LiveNavigationWorkerMotion,
+    #[cfg(all(feature = "nano-agent", unix))] mut production_state: Option<
+        NanoProductionStateOwners,
+    >,
+    #[cfg(all(feature = "nano-agent", unix))] checkpoint_bridge: Option<
+        NanoDatasetCheckpointWorkerBridge,
+    >,
     running: Arc<AtomicBool>,
     visual_rx: crossbeam_channel::Receiver<VisualAdmission>,
     depth_rx: DropReceiver<DepthObservation>,
@@ -4224,31 +8580,111 @@ fn run_live_navigation_worker(
     mut map_viz_tx: Option<DropSender<TimedOccupancySnapshot>>,
     mut navigation_viz_tx: Option<DropSender<LiveNavigationVizMsg>>,
 ) -> Result<LiveNavigationWorkerSuccess, LiveNavigationWorkerError> {
-    let _exit_guard = LiveThreadExitGuard(Arc::clone(&running));
-    #[cfg(feature = "actuation")]
-    let mut physical_actuation = match actuation_config.as_ref() {
-        Some(config) => {
-            let (driver, initial_zero) = LiveMpcControlDriver::acquire(config, clock_origin)
-                .map_err(|source| LiveNavigationWorkerError::Actuation {
-                    phase: "zero acquisition",
-                    source,
-                })?;
-            eprintln!(
-                "physical actuation acquired: robot_id={} boot_id={} epoch={} sequence={} applied_pwm=[{},{}] known_active_through_host_ns={}",
-                config.robot_id(),
-                initial_zero.controller_session().boot_id().get(),
-                initial_zero.controller_session().control_epoch().get(),
-                initial_zero.sequence().get(),
-                initial_zero.applied_timer_pwm().left().get(),
-                initial_zero.applied_timer_pwm().right().get(),
-                initial_zero
-                    .known_active_through_exclusive()
-                    .nanos_since_clock_start(),
-            );
-            Some(driver)
-        }
-        None => None,
+    #[cfg(all(feature = "nano-agent", unix))]
+    let _exit_guard = match checkpoint_bridge.as_ref() {
+        Some(bridge) => LiveThreadExitGuard::checkpoint_aware(
+            Arc::clone(&running),
+            Arc::clone(&bridge.requested),
+        ),
+        None => LiveThreadExitGuard::new(Arc::clone(&running)),
     };
+    #[cfg(not(all(feature = "nano-agent", unix)))]
+    let _exit_guard = LiveThreadExitGuard::new(Arc::clone(&running));
+    #[cfg(not(all(feature = "actuation", feature = "agent-runtime", unix)))]
+    let _ = coordinator_clock_epoch;
+    #[cfg(feature = "actuation")]
+    let mut runtime = match motion {
+        LiveNavigationWorkerMotion::Compatibility(actuation_config) => {
+            let physical_actuation = match actuation_config.as_ref() {
+                Some(config) => {
+                    let (driver, initial_zero) =
+                        LiveMpcControlDriver::acquire(config, clock_origin).map_err(|source| {
+                            LiveNavigationWorkerError::Actuation {
+                                phase: "zero acquisition",
+                                source,
+                            }
+                        })?;
+                    eprintln!(
+                        "physical actuation acquired: robot_id={} boot_id={} epoch={} sequence={} applied_pwm=[{},{}] known_active_through_host_ns={}",
+                        config.robot_id(),
+                        initial_zero.controller_session().boot_id().get(),
+                        initial_zero.controller_session().control_epoch().get(),
+                        initial_zero.sequence().get(),
+                        initial_zero.applied_timer_pwm().left().get(),
+                        initial_zero.applied_timer_pwm().right().get(),
+                        initial_zero
+                            .known_active_through_exclusive()
+                            .nanos_since_clock_start(),
+                    );
+                    Some(driver)
+                }
+                None => None,
+            };
+            LiveNavigationRuntime::Compatibility(Box::new(LiveCompatibilityNavigationRuntime {
+                coordinator,
+                physical_actuation,
+            }))
+        }
+        #[cfg(all(feature = "agent-runtime", unix))]
+        LiveNavigationWorkerMotion::Production(input) => {
+            let mut input = *input;
+            let (prepared, control, coordinator_actuation_config, accessory_health) =
+                input.take_for_owner();
+            match start_production_motion_runtime(
+                coordinator,
+                coordinator_clock_epoch,
+                clock_origin,
+                prepared,
+                control,
+                coordinator_actuation_config,
+                accessory_health,
+                Arc::clone(&running),
+            ) {
+                Ok(production) => LiveNavigationRuntime::Production(Box::new(production)),
+                Err(failure) => {
+                    let (coordinator, source) = *failure;
+                    let mut failures = vec![LiveNavigationWorkerError::ProductionStart {
+                        source: Box::new(source),
+                    }];
+                    if let Err(source) = finalize_live_navigation_coordinator(coordinator) {
+                        failures.push(source);
+                    }
+                    combine_live_navigation_failures(failures)?;
+                    unreachable!("production startup retained at least one failure")
+                }
+            }
+        }
+        #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+        LiveNavigationWorkerMotion::WheelsOffQualification(input) => {
+            match start_wheels_off_qualification_motion_runtime(
+                coordinator,
+                *input,
+                control_period.as_duration(),
+            ) {
+                Ok(runtime) => LiveNavigationRuntime::WheelsOffQualification(Box::new(runtime)),
+                Err(failure) => {
+                    let (coordinator, source) = *failure;
+                    let mut failures =
+                        vec![LiveNavigationWorkerError::WheelsOffQualificationStart {
+                            source: Box::new(source),
+                        }];
+                    if let Err(source) = finalize_live_navigation_coordinator(coordinator) {
+                        failures.push(source);
+                    }
+                    combine_live_navigation_failures(failures)?;
+                    unreachable!("qualification startup retained at least one failure")
+                }
+            }
+        }
+    };
+    #[cfg(not(feature = "actuation"))]
+    let mut runtime =
+        LiveNavigationRuntime::Compatibility(Box::new(LiveCompatibilityNavigationRuntime {
+            coordinator,
+        }));
+    let mut tick_sequence = 0_i64;
+    #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+    let mut pending_warm_checkpoint = None;
     let operation_result = (|| -> Result<(), LiveNavigationWorkerError> {
         let mut clock = InstantHostClock::new(clock_origin);
         let tick_rx = crossbeam_channel::tick(control_period.as_duration());
@@ -4260,8 +8696,7 @@ fn run_live_navigation_worker(
         let mut depth_open = true;
         let mut imu_open = true;
         let mut map_open = true;
-        let mut tick_sequence = 0_i64;
-
+        let mut maximum_tick_lateness_ns = 0_u64;
         while visual_open || depth_open || imu_open || map_open {
             if !running.load(Ordering::SeqCst) {
                 break;
@@ -4286,63 +8721,145 @@ fn run_live_navigation_worker(
             } else {
                 &never_map
             };
-            crossbeam_channel::select! {
-                recv(visual_receiver) -> message => match message {
+            match select_live_navigation_worker_input(
+                &tick_rx,
+                visual_receiver,
+                depth_receiver,
+                imu_receiver,
+                map_receiver,
+            ) {
+                LiveNavigationWorkerInput::Visual(message) => match message {
                     Ok(admission) => {
-                        let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
-                        coordinator.accept_visual(admission, now).map_err(|source| {
+                        let now = clock
+                            .checked_now()
+                            .map_err(LiveNavigationWorkerError::HostClock)?;
+                        runtime.accept_visual(admission, now).map_err(|source| {
                             LiveNavigationWorkerError::VisualAdmission { source }
                         })?;
                     }
-                    Err(_) => visual_open = false,
+                    Err(_) => {
+                        visual_open = false;
+                        #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+                        runtime.mark_sensor_closed(LiveSensorStream::Visual);
+                    }
                 },
-                recv(depth_receiver) -> message => match message {
+                LiveNavigationWorkerInput::Depth(message) => match message {
                     Ok(observation) => {
-                        let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
-                        coordinator.accept_depth(observation, now).map_err(|source| {
+                        let now = clock
+                            .checked_now()
+                            .map_err(LiveNavigationWorkerError::HostClock)?;
+                        runtime.accept_depth(observation, now).map_err(|source| {
                             LiveNavigationWorkerError::DepthAdmission { source }
                         })?;
                     }
-                    Err(_) => depth_open = false,
-                },
-                recv(imu_receiver) -> message => match message {
-                    Ok(report) => {
-                        let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
-                        coordinator.accept_imu(report, now).map_err(|source| {
-                            LiveNavigationWorkerError::ImuAdmission { source }
-                        })?;
+                    Err(_) => {
+                        depth_open = false;
+                        #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+                        runtime.mark_sensor_closed(LiveSensorStream::Depth);
                     }
-                    Err(_) => imu_open = false,
                 },
-                recv(map_receiver) -> message => match message {
+                LiveNavigationWorkerInput::Imu(message) => match message {
+                    Ok(report) => {
+                        let now = clock
+                            .checked_now()
+                            .map_err(LiveNavigationWorkerError::HostClock)?;
+                        runtime
+                            .accept_imu(report, now)
+                            .map_err(|source| LiveNavigationWorkerError::ImuAdmission { source })?;
+                    }
+                    Err(_) => {
+                        imu_open = false;
+                        #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+                        runtime.mark_sensor_closed(LiveSensorStream::Imu);
+                    }
+                },
+                LiveNavigationWorkerInput::Map(message) => match message {
                     Ok(snapshot) => {
                         // The inference producer routes each visual outcome before it can
                         // issue that attempt's dense-map command. Because visual and map
-                        // traffic use distinct bounded queues, `select!` may nevertheless
+                        // traffic use distinct bounded queues, selection may nevertheless
                         // observe the derived map first. Admit every visual outcome already
-                        // ready on its queue before admitting this map; the journal remains
+                        // ready on entry before admitting this map. Snapshotting the ready
+                        // count preserves that causal prefix without allowing a producer to
+                        // extend this drain and starve the control tick. The journal remains
                         // the authority for the actual cross-channel admission order.
-                        loop {
-                            match visual_rx.try_recv() {
-                                Ok(admission) => {
-                                    let now = clock
-                                        .checked_now()
-                                        .map_err(LiveNavigationWorkerError::HostClock)?;
-                                    coordinator.accept_visual(admission, now).map_err(|source| {
-                                        LiveNavigationWorkerError::VisualAdmission { source }
-                                    })?;
-                                }
-                                Err(crossbeam_channel::TryRecvError::Empty) => break,
-                                Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                                    visual_open = false;
-                                    break;
-                                }
-                            }
+                        let drained = drain_entry_snapshot(&visual_rx, |admission| {
+                            let now = clock
+                                .checked_now()
+                                .map_err(LiveNavigationWorkerError::HostClock)?;
+                            runtime.accept_visual(admission, now).map_err(|source| {
+                                LiveNavigationWorkerError::VisualAdmission { source }
+                            })
+                        })?;
+                        debug_assert!(
+                            drained.drained <= LIVE_NAVIGATION_VISUAL_QUEUE_CAPACITY,
+                            "the production visual receiver has one fixed bounded capacity"
+                        );
+                        if drained.disconnected {
+                            visual_open = false;
+                            #[cfg(all(
+                                feature = "nano-agent",
+                                feature = "operator-console",
+                                unix
+                            ))]
+                            runtime.mark_sensor_closed(LiveSensorStream::Visual);
                         }
-                        let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
-                        coordinator
-                            .accept_global_map(now, snapshot.timestamp(), snapshot.snapshot())
-                            .map_err(|source| LiveNavigationWorkerError::MapAdmission { source })?;
+                        let now = clock
+                            .checked_now()
+                            .map_err(LiveNavigationWorkerError::HostClock)?;
+                        runtime.accept_global_map(now, &snapshot)?;
+                        #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+                        if let LiveNavigationRuntime::Production(production) = &mut runtime {
+                            publish_production_console_grid(production, &snapshot).map_err(
+                                |source| LiveNavigationWorkerError::ProductionConsoleProjection {
+                                    source,
+                                },
+                            )?;
+                        }
+                        #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+                        if let LiveNavigationRuntime::WheelsOffQualification(qualification) =
+                            &mut runtime
+                        {
+                            publish_wheels_off_qualification_grid(qualification, &snapshot)?;
+                        }
+                        #[cfg(all(feature = "nano-agent", unix))]
+                        if let Some(state) = production_state.as_mut() {
+                            let viz_snapshot = if map_viz_tx.is_some() {
+                                match snapshot.try_duplicate() {
+                                    Ok(snapshot) => Some(snapshot),
+                                    Err(source) => {
+                                        eprintln!(
+                                            "non-authoritative occupancy visualization copy failed; disabling map visualization: {source}"
+                                        );
+                                        map_viz_tx = None;
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let binding = runtime.current_map_binding().ok_or(
+                                LiveNavigationWorkerError::MapPersistenceBindingUnavailable,
+                            )?;
+                            let (_, snapshot) = snapshot.into_parts();
+                            state
+                                .map_persistence
+                                .retain_latest(binding, snapshot)
+                                .map_err(|source| {
+                                    LiveNavigationWorkerError::MapPersistenceRetention { source }
+                                })?;
+                            if let (Some(sender), Some(snapshot)) =
+                                (map_viz_tx.as_ref(), viz_snapshot)
+                                && matches!(sender.try_send(snapshot), SendOutcome::Disconnected)
+                            {
+                                map_viz_tx = None;
+                            }
+                        } else if let Some(sender) = map_viz_tx.as_ref()
+                            && matches!(sender.try_send(snapshot), SendOutcome::Disconnected)
+                        {
+                            map_viz_tx = None;
+                        }
+                        #[cfg(not(all(feature = "nano-agent", unix)))]
                         if let Some(sender) = map_viz_tx.as_ref()
                             && matches!(sender.try_send(snapshot), SendOutcome::Disconnected)
                         {
@@ -4351,94 +8868,880 @@ fn run_live_navigation_worker(
                     }
                     Err(_) => map_open = false,
                 },
-                recv(&tick_rx) -> _ => {
+                LiveNavigationWorkerInput::Tick(scheduled_at) => {
                     if !running.load(Ordering::SeqCst) {
                         break;
                     }
-                    let tick = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
-                    #[cfg(feature = "actuation")]
-                    let (outcome, applied_actuation) = if let Some(driver) = physical_actuation.as_mut() {
-                        let applied = driver
-                            .tick_point_goal(&mut coordinator, tick, &mut clock)
-                            .map_err(|source| LiveNavigationWorkerError::MpcControl { source })?;
-                        let (outcome, receipt) = applied.into_parts();
-                        (outcome, Some(live_applied_actuation_viz(&receipt)))
-                    } else {
-                        let outcome = coordinator
-                            .tick(tick, &mut clock)
-                            .map_err(|source| LiveNavigationWorkerError::Tick { source })?;
-                        (outcome, None)
-                    };
-                    #[cfg(not(feature = "actuation"))]
-                    let outcome = coordinator
-                        .tick(tick, &mut clock)
-                        .map_err(|source| LiveNavigationWorkerError::Tick { source })?;
+                    let tick_timing = measure_live_control_tick_timing(
+                        scheduled_at,
+                        Instant::now(),
+                        maximum_tick_lateness_ns,
+                    )
+                    .map_err(LiveNavigationWorkerError::TickTiming)?;
+                    maximum_tick_lateness_ns = tick_timing.maximum_lateness_ns;
+                    let tick = clock
+                        .checked_now()
+                        .map_err(LiveNavigationWorkerError::HostClock)?;
                     tick_sequence = tick_sequence
                         .checked_add(1)
                         .ok_or(LiveNavigationWorkerError::TickSequenceExhausted)?;
-                    #[cfg(not(feature = "actuation"))]
-                    let applied_actuation = None;
-                    // Diagnostic copies happen only after the authoritative decision and never
-                    // feed back into planning, MPC, journal admission, applied evidence, or shadow evidence.
-                    if let Some(sender) = navigation_viz_tx.as_ref() {
-                        let message = build_live_navigation_viz_message(
-                            &coordinator,
-                            tick,
-                            tick_sequence,
-                            &outcome,
-                            applied_actuation,
-                        );
-                        if matches!(sender.try_send(message), SendOutcome::Disconnected) {
-                            navigation_viz_tx = None;
+                    #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+                    if pending_warm_checkpoint.is_some() {
+                        // Capture has been asked to stop and all sensor/map
+                        // channels remain authoritative until drained. No new
+                        // control request or periodic motion tick may overtake
+                        // the terminal checkpoint boundary.
+                        continue;
+                    }
+                    match &mut runtime {
+                        LiveNavigationRuntime::Compatibility(runtime) => {
+                            #[cfg(feature = "actuation")]
+                            let (outcome, applied_actuation) =
+                                if let Some(driver) = runtime.physical_actuation.as_mut() {
+                                    let applied = driver
+                                        .tick_point_goal(&mut runtime.coordinator, tick, &mut clock)
+                                        .map_err(|source| {
+                                            LiveNavigationWorkerError::MpcControl { source }
+                                        })?;
+                                    let (outcome, receipt) = applied.into_parts();
+                                    (
+                                        outcome,
+                                        Some(live_applied_actuation_viz(&receipt, Some(tick))),
+                                    )
+                                } else {
+                                    let outcome =
+                                        runtime.coordinator.tick(tick, &mut clock).map_err(
+                                            |source| LiveNavigationWorkerError::Tick { source },
+                                        )?;
+                                    (outcome, None)
+                                };
+                            #[cfg(not(feature = "actuation"))]
+                            let outcome = runtime
+                                .coordinator
+                                .tick(tick, &mut clock)
+                                .map_err(|source| LiveNavigationWorkerError::Tick { source })?;
+                            #[cfg(not(feature = "actuation"))]
+                            let applied_actuation = None;
+                            // Diagnostic copies happen only after the authoritative decision and never
+                            // feed back into planning, MPC, journal admission, applied evidence, or shadow evidence.
+                            if let Some(sender) = navigation_viz_tx.as_ref() {
+                                let message = build_live_navigation_viz_message(
+                                    &runtime.coordinator,
+                                    tick,
+                                    tick_sequence,
+                                    &outcome,
+                                    applied_actuation,
+                                )
+                                .with_control_tick_timing(tick_timing);
+                                if matches!(sender.try_send(message), SendOutcome::Disconnected) {
+                                    navigation_viz_tx = None;
+                                }
+                            }
+                        }
+                        #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+                        LiveNavigationRuntime::Production(production) => {
+                            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+                            {
+                                let map_state = production.map_state().map_err(|source| {
+                                    LiveNavigationWorkerError::ProductionMapState { source }
+                                })?;
+                                run_production_console_control_period(
+                                    production,
+                                    &mut production_state,
+                                    &mut pending_warm_checkpoint,
+                                    checkpoint_bridge.as_ref().expect(
+                                        "production Nano navigation has one checkpoint bridge",
+                                    ),
+                                    running.as_ref(),
+                                    map_state,
+                                    tick,
+                                    &clock,
+                                    tick_sequence,
+                                    tick_timing,
+                                    &mut navigation_viz_tx,
+                                )?;
+                            }
+                            #[cfg(not(all(
+                                feature = "nano-agent",
+                                feature = "operator-console",
+                                unix
+                            )))]
+                            {
+                                let map_state = production.map_state().map_err(|source| {
+                                    LiveNavigationWorkerError::ProductionMapState { source }
+                                })?;
+                                let command_outcome = match production
+                                    .owner_mut()
+                                    .process_one_with_motion_start_readiness(map_state)
+                                {
+                                    Ok(outcome) => outcome,
+                                    Err(source) => {
+                                        let owner_failure =
+                                            LiveNavigationWorkerError::ProductionOwner {
+                                                source: Box::new(source),
+                                            };
+                                        if let Some(event) =
+                                            production.owner_mut().take_last_physical_state()
+                                            && let Err(source) = publish_live_physical_state_viz(
+                                                &mut navigation_viz_tx,
+                                                production.owner().coordinator(),
+                                                tick_sequence,
+                                                tick_timing,
+                                                &event,
+                                            )
+                                        {
+                                            return Err(LiveNavigationWorkerError::Multiple {
+                                                failures: vec![
+                                                    owner_failure,
+                                                    LiveNavigationWorkerError::PhysicalStateVisualization {
+                                                        source,
+                                                    },
+                                                ],
+                                            });
+                                        }
+                                        return Err(owner_failure);
+                                    }
+                                };
+                                let periodic_tick_deferred =
+                                    command_outcome.defers_periodic_motion_tick();
+                                let shutdown_requested = match command_outcome {
+                                    LiveMotionOwnerOutcome::SaveMapRequested { claimed } => {
+                                        #[cfg(all(feature = "nano-agent", unix))]
+                                        match production_state.as_mut() {
+                                            Some(state) => {
+                                                state
+                                                .map_persistence
+                                                .respond_to_claimed_save_map_with_quota(
+                                                    claimed,
+                                                    &mut state.quota,
+                                                )
+                                                .map_err(|source| {
+                                                    LiveNavigationWorkerError::ProductionSaveMap {
+                                                        source: Box::new(source),
+                                                    }
+                                                })?;
+                                            }
+                                            None => {
+                                                let response = claimed
+                                                .reject(
+                                                    AgentControlRejectionCodeV1::PersistenceFailed,
+                                                    false,
+                                                )
+                                                .err();
+                                                return Err(
+                                                LiveNavigationWorkerError::ProductionMapPersistenceUnavailable {
+                                                    response,
+                                                },
+                                            );
+                                            }
+                                        }
+                                        #[cfg(not(all(feature = "nano-agent", unix)))]
+                                    claimed
+                                        .reject(
+                                            AgentControlRejectionCodeV1::PersistenceFailed,
+                                            true,
+                                        )
+                                        .map_err(|source| {
+                                            LiveNavigationWorkerError::ProductionSaveMapResponse {
+                                                source,
+                                            }
+                                        })?;
+                                        false
+                                    }
+                                    LiveMotionOwnerOutcome::ShutdownRequested => true,
+                                    LiveMotionOwnerOutcome::Idle
+                                    | LiveMotionOwnerOutcome::ClientUnavailableBeforeClaim
+                                    | LiveMotionOwnerOutcome::StatusReplied(_)
+                                    | LiveMotionOwnerOutcome::Rejected { .. }
+                                    | LiveMotionOwnerOutcome::Completed(_)
+                                    | LiveMotionOwnerOutcome::PeriodicManualApplied
+                                    | LiveMotionOwnerOutcome::PeriodicManualStopped
+                                    | LiveMotionOwnerOutcome::AutonomousAccepted { .. }
+                                    | LiveMotionOwnerOutcome::PeriodicAutonomousApplied {
+                                        ..
+                                    }
+                                    | LiveMotionOwnerOutcome::PeriodicAutonomousStopped {
+                                        ..
+                                    }
+                                    | LiveMotionOwnerOutcome::AutonomousCompleted { .. } => false,
+                                };
+                                if shutdown_requested {
+                                    running.store(false, Ordering::SeqCst);
+                                }
+
+                                // A command can itself perform a receipt-gated
+                                // manual or autonomous tick. Transfer that evidence
+                                // before deciding whether this period still needs a
+                                // periodic tick; this prevents duplicate physical
+                                // applications in one host control period.
+                                let mut physical_state =
+                                    production.owner_mut().take_last_physical_state();
+                                if production_period_requires_motion_tick(
+                                    shutdown_requested,
+                                    periodic_tick_deferred,
+                                    physical_state.is_some(),
+                                ) {
+                                    if let Err(source) = production.owner_mut().tick_motion() {
+                                        let owner_failure =
+                                            LiveNavigationWorkerError::ProductionOwner {
+                                                source: Box::new(source),
+                                            };
+                                        if let Some(event) =
+                                            production.owner_mut().take_last_physical_state()
+                                            && let Err(source) = publish_live_physical_state_viz(
+                                                &mut navigation_viz_tx,
+                                                production.owner().coordinator(),
+                                                tick_sequence,
+                                                tick_timing,
+                                                &event,
+                                            )
+                                        {
+                                            return Err(LiveNavigationWorkerError::Multiple {
+                                            failures: vec![
+                                                owner_failure,
+                                                LiveNavigationWorkerError::PhysicalStateVisualization {
+                                                    source,
+                                                },
+                                            ],
+                                        });
+                                        }
+                                        return Err(owner_failure);
+                                    }
+                                    physical_state =
+                                        production.owner_mut().take_last_physical_state();
+                                }
+                                if let Some(event) = physical_state.as_ref() {
+                                    publish_live_physical_state_viz(
+                                        &mut navigation_viz_tx,
+                                        production.owner().coordinator(),
+                                        tick_sequence,
+                                        tick_timing,
+                                        event,
+                                    )
+                                    .map_err(|source| {
+                                        LiveNavigationWorkerError::PhysicalStateVisualization {
+                                            source,
+                                        }
+                                    })?;
+                                } else {
+                                    publish_live_navigation_viz_message(
+                                        &mut navigation_viz_tx,
+                                        LiveNavigationVizMsg::control_tick_timing_only(
+                                            tick_sequence,
+                                            tick.as_nanos(),
+                                            tick_timing,
+                                        ),
+                                    )
+                                    .map_err(|source| {
+                                        LiveNavigationWorkerError::PhysicalStateVisualization {
+                                            source,
+                                        }
+                                    })?;
+                                }
+                            }
+                        }
+                        #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+                        LiveNavigationRuntime::WheelsOffQualification(qualification) => {
+                            if let Some(evidence) =
+                                qualification.frontend_mut().poll_unexpected_exit()
+                            {
+                                return Err(
+                                    LiveNavigationWorkerError::WheelsOffQualificationFrontendExited {
+                                        evidence: Box::new(evidence),
+                                    },
+                                );
+                            }
+                            let controller_tick =
+                                qualification.controller_mut().tick().map_err(|source| {
+                                    LiveNavigationWorkerError::WheelsOffQualificationRuntime {
+                                        source: Box::new(source),
+                                    }
+                                })?;
+                            if let kiko_slam::navigation::WheelsOffQualificationRuntimeTick::CandidateStepApplied {
+                                pending,
+                            } = controller_tick
+                            {
+                                let applied_observed_at = clock
+                                    .checked_now()
+                                    .map_err(LiveNavigationWorkerError::HostClock)?;
+                                let ingress = pending
+                                    .journal_event(
+                                        coordinator_clock_epoch,
+                                        applied_observed_at,
+                                    )
+                                    .map_err(|source| {
+                                        LiveNavigationWorkerError::WheelsOffQualificationAppliedStepBoundary {
+                                            source,
+                                        }
+                                    })?;
+                                let record = qualification
+                                    .coordinator
+                                    .journal_mut()
+                                    .append(kiko_slam::navigation::NavigationIngressEvent::QualificationAppliedStep(
+                                        ingress,
+                                    ))
+                                    .map_err(|source| {
+                                        LiveNavigationWorkerError::WheelsOffQualificationAppliedStepJournal {
+                                            source,
+                                        }
+                                    })?;
+                                let journaled = pending
+                                    .bind_journal_record(ingress, record)
+                                    .map_err(|source| {
+                                        LiveNavigationWorkerError::WheelsOffQualificationAppliedStepCorrelation {
+                                            source,
+                                        }
+                                    })?;
+                                qualification
+                                    .controller_mut()
+                                    .record_journaled_applied_step(journaled)
+                                    .map_err(|source| {
+                                        LiveNavigationWorkerError::WheelsOffQualificationRuntime {
+                                            source: Box::new(source),
+                                        }
+                                    })?;
+                            }
+                            let outcome = qualification
+                                .coordinator
+                                .tick(tick, &mut clock)
+                                .map_err(|source| LiveNavigationWorkerError::Tick { source })?;
+                            qualification.observation.successful_solver_duration_ns =
+                                match outcome.decision().outcome() {
+                                    SafetyDecisionOutcome::Controller(controller) => {
+                                        let status = controller.solve_status();
+                                        checked_monotonic_duration_ns(
+                                            u128::from(status.started_at().as_nanos()),
+                                            u128::from(status.observed_at().as_nanos()),
+                                        )
+                                    }
+                                    SafetyDecisionOutcome::Stopped(_) => None,
+                                };
+                            publish_wheels_off_qualification_snapshot(
+                                qualification,
+                                &clock,
+                                tick_timing,
+                            )?;
+                            // The candidate controller is intentionally absent
+                            // from this diagnostic builder: this is the MPC
+                            // shadow decision, never a physical-output claim.
+                            publish_live_navigation_viz_message(
+                                &mut navigation_viz_tx,
+                                build_live_navigation_viz_message(
+                                    &qualification.coordinator,
+                                    tick,
+                                    tick_sequence,
+                                    &outcome,
+                                    None,
+                                )
+                                .with_control_tick_timing(tick_timing),
+                            )
+                            .map_err(|source| {
+                                LiveNavigationWorkerError::PhysicalStateVisualization { source }
+                            })?;
                         }
                     }
-                },
+                }
             }
         }
 
         Ok(())
     })();
 
-    #[cfg(feature = "actuation")]
-    let disarm_result = match physical_actuation.as_mut() {
-        Some(session) if !session.is_consumed() => session.disarm().map(|receipt| {
-            eprintln!(
-                "physical actuation disarmed: boot_id={} request_id={} acknowledged_at_host_ns={}",
-                receipt.observed_boot_id().get(),
-                receipt.request_id().get(),
-                receipt.acknowledged_at().nanos_since_clock_start(),
-            );
-        }),
-        Some(_) | None => Ok(()),
-    };
-    #[cfg(feature = "actuation")]
-    match (operation_result, disarm_result) {
-        (Ok(()), Ok(())) => {}
-        (Err(operation), Ok(())) => return Err(operation),
-        (Ok(()), Err(source)) => {
-            return Err(LiveNavigationWorkerError::Actuation {
-                phase: "shutdown disarm",
-                source,
-            });
-        }
-        (Err(operation), Err(disarm)) => {
-            return Err(LiveNavigationWorkerError::OperationAndDisarm {
-                operation: Box::new(operation),
-                disarm,
-            });
-        }
+    let mut failures = Vec::new();
+    if let Err(source) = operation_result {
+        failures.push(source);
     }
-    #[cfg(not(feature = "actuation"))]
-    operation_result?;
 
-    let finalized = coordinator
-        .into_journal()
-        .finish_with_descriptor()
-        .map_err(|source| LiveNavigationWorkerError::JournalFinalization { source })?;
-    let (file, descriptor) = finalized.into_parts();
-    file.sync_all()
-        .map_err(|source| LiveNavigationWorkerError::JournalSync { source })?;
-    Ok(LiveNavigationWorkerSuccess { descriptor })
+    #[cfg(all(feature = "nano-agent", unix))]
+    let mut prefinalized_descriptor = None;
+    #[cfg(not(all(feature = "nano-agent", unix)))]
+    let prefinalized_descriptor: Option<NavigationIngressSidecarDescriptor> = None;
+    let coordinator = match runtime {
+        LiveNavigationRuntime::Compatibility(runtime) => {
+            let LiveCompatibilityNavigationRuntime {
+                coordinator,
+                #[cfg(feature = "actuation")]
+                mut physical_actuation,
+            } = *runtime;
+            #[cfg(feature = "actuation")]
+            if let Some(session) = physical_actuation.as_mut()
+                && !session.is_consumed()
+            {
+                match session.disarm() {
+                    Ok(receipt) => {
+                        eprintln!(
+                            "physical actuation disarmed: boot_id={} request_id={} acknowledged_at_host_ns={}",
+                            receipt.observed_boot_id().get(),
+                            receipt.request_id().get(),
+                            receipt.acknowledged_at().nanos_since_clock_start(),
+                        );
+                    }
+                    Err(source) => failures.push(LiveNavigationWorkerError::Actuation {
+                        phase: "shutdown disarm",
+                        source,
+                    }),
+                }
+            }
+            Some(coordinator)
+        }
+        #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
+        LiveNavigationRuntime::Production(mut production) => {
+            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+            let mut console = production.take_console();
+            let (owner, socket_task) = production.take_terminal_parts();
+            #[cfg(not(all(feature = "nano-agent", unix)))]
+            socket_task.request_shutdown();
+            let terminal_clock = InstantHostClock::new(clock_origin);
+            let terminal_requested_at = match terminal_clock.checked_now() {
+                Ok(timestamp) => Some(timestamp),
+                Err(source) => {
+                    failures.push(LiveNavigationWorkerError::HostClock(source));
+                    None
+                }
+            };
+            let terminal = owner.shutdown();
+            #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+            let terminal_shutdown_evidence = terminal.shutdown_evidence();
+            let (coordinator, lifecycle_cleanup, controller_stop, _last_physical_state) =
+                terminal.into_parts();
+            tick_sequence = match tick_sequence.checked_add(1) {
+                Some(sequence) => sequence,
+                None => {
+                    failures.push(LiveNavigationWorkerError::TickSequenceExhausted);
+                    i64::MAX
+                }
+            };
+            let terminal_message = match &controller_stop {
+                LiveMotionTerminalStop::Confirmed(receipt) => {
+                    build_live_terminal_controller_stop_viz_message(
+                        &coordinator,
+                        tick_sequence,
+                        u64::try_from(receipt.acknowledged_at().nanos_since_clock_start()).ok(),
+                        true,
+                        "terminal_controller_disarm_confirmed",
+                        "controller_session_disarm".to_owned(),
+                        format!(
+                            "exact disarm receipt: boot_id={} request_id={} output_state={:?} controller_faults={:?}",
+                            receipt.observed_boot_id().get(),
+                            receipt.request_id().get(),
+                            receipt.output_state(),
+                            receipt.controller_faults(),
+                        ),
+                    )
+                }
+                LiveMotionTerminalStop::DisarmFailedStopConfirmed(source) => {
+                    let AgentLiveActuationDisposition::LatchFault(fault) =
+                        classify_live_actuation_error(source);
+                    debug_assert_eq!(
+                        fault.controller_stop(),
+                        AgentControllerStopKnowledge::Confirmed
+                    );
+                    build_live_terminal_controller_stop_viz_message(
+                        &coordinator,
+                        tick_sequence,
+                        terminal_requested_at.map(HostMonotonicTimestamp::as_nanos),
+                        true,
+                        "terminal_controller_disarm_error_stop_confirmed",
+                        format!("terminal_disarm_error:{:?}", fault.kind()),
+                        format!(
+                            "terminal disarm failed after the recorded shutdown-request boundary: {source}; classified_kind={:?} controller_stop={:?}; no receipt is fabricated",
+                            fault.kind(),
+                            fault.controller_stop(),
+                        ),
+                    )
+                }
+                LiveMotionTerminalStop::Uncertain(source) => {
+                    let AgentLiveActuationDisposition::LatchFault(fault) =
+                        classify_live_actuation_error(source);
+                    debug_assert_eq!(
+                        fault.controller_stop(),
+                        AgentControllerStopKnowledge::Uncertain
+                    );
+                    build_live_terminal_controller_stop_viz_message(
+                        &coordinator,
+                        tick_sequence,
+                        terminal_requested_at.map(HostMonotonicTimestamp::as_nanos),
+                        false,
+                        "terminal_controller_disarm_stop_uncertain",
+                        format!("terminal_disarm_error:{:?}", fault.kind()),
+                        format!(
+                            "terminal disarm failed after the recorded shutdown-request boundary: {source}; classified_kind={:?} controller_stop={:?}; no receipt is fabricated",
+                            fault.kind(),
+                            fault.controller_stop(),
+                        ),
+                    )
+                }
+            };
+            if let Err(source) =
+                publish_live_navigation_viz_message(&mut navigation_viz_tx, terminal_message)
+            {
+                failures.push(LiveNavigationWorkerError::PhysicalStateVisualization { source });
+            }
+            if let Some(source) = lifecycle_cleanup {
+                failures.push(LiveNavigationWorkerError::ProductionLifecycleCleanup {
+                    source: Box::new(source),
+                });
+            }
+            match controller_stop {
+                LiveMotionTerminalStop::Confirmed(receipt) => {
+                    eprintln!(
+                        "production physical owner disarmed: boot_id={} request_id={} acknowledged_at_host_ns={}",
+                        receipt.observed_boot_id().get(),
+                        receipt.request_id().get(),
+                        receipt.acknowledged_at().nanos_since_clock_start(),
+                    );
+                }
+                LiveMotionTerminalStop::DisarmFailedStopConfirmed(source)
+                | LiveMotionTerminalStop::Uncertain(source) => {
+                    failures.push(LiveNavigationWorkerError::ProductionControllerStop { source });
+                }
+            }
+            #[cfg(all(feature = "nano-agent", unix))]
+            {
+                let (descriptor, finalized_map_identity) =
+                    match finalize_live_navigation_coordinator(coordinator) {
+                        Ok(finalized) => (
+                            Some(finalized.descriptor),
+                            finalized.final_map_identity.map(|identity| {
+                                NanoFinalizedJournalMapIdentity::new(
+                                    identity.map_epoch_id,
+                                    identity.revision,
+                                )
+                            }),
+                        ),
+                        Err(source) => {
+                            failures.push(source);
+                            (None, None)
+                        }
+                    };
+                if let Some(pending) = pending_warm_checkpoint.take() {
+                    let bridge = checkpoint_bridge
+                        .as_ref()
+                        .expect("production Nano checkpoint request retains its bridge");
+                    let navigation_publishable = failures.is_empty() && descriptor.is_some();
+                    if bridge
+                        .request
+                        .send(NanoDatasetCheckpointRequest {
+                            descriptor,
+                            navigation_publishable,
+                        })
+                        .is_err()
+                    {
+                        let response = if pending.console_response_pending {
+                            pending
+                                .claimed
+                                .reject(AgentControlRejectionCodeV1::PersistenceFailed, false)
+                        } else {
+                            pending.claimed.reject_after_wire_delivery(
+                                AgentControlRejectionCodeV1::PersistenceFailed,
+                                false,
+                            )
+                        };
+                        failures.push(
+                            LiveNavigationWorkerError::WarmCheckpointRequestChannelDisconnected,
+                        );
+                        if let Err(source) = response {
+                            failures.push(
+                                LiveNavigationWorkerError::WarmCheckpointDatasetNotPublishedResponse {
+                                    source: Some(source),
+                                },
+                            );
+                        }
+                    } else {
+                        let remaining = bridge
+                            .checkpoint_deadline
+                            .get()
+                            .copied()
+                            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                            .unwrap_or(Duration::ZERO);
+                        match bridge.finalization.recv_timeout(remaining) {
+                            Ok(NanoDatasetCheckpointFinalization::Published) => {
+                                match production_state.as_mut() {
+                                    Some(state) => {
+                                        let response = state
+                                            .map_persistence
+                                            .respond_to_claimed_quiescent_warm_checkpoint_with_quota(
+                                                pending.claimed,
+                                                &bridge.dataset_directory,
+                                                finalized_map_identity,
+                                                &mut state.quota,
+                                                !pending.console_response_pending,
+                                            );
+                                        match response {
+                                            Ok(receipt) => {
+                                                eprintln!(
+                                                    "terminal warm checkpoint selected: dataset={} occupancy={} selection={} map_epoch={} revision={} content_binding={}; current_camera_localized=false",
+                                                    receipt.dataset_directory().display(),
+                                                    receipt.occupancy_snapshot_path().display(),
+                                                    receipt.selection_path().display(),
+                                                    receipt
+                                                        .map_identity()
+                                                        .map_epoch_id()
+                                                        .as_u64(),
+                                                    receipt.map_identity().revision(),
+                                                    receipt.dataset_content_binding_status(),
+                                                );
+                                            }
+                                            Err(source) => failures.push(
+                                                LiveNavigationWorkerError::ProductionWarmCheckpoint {
+                                                    source: Box::new(source),
+                                                },
+                                            ),
+                                        }
+                                    }
+                                    None => failures.push(
+                                        LiveNavigationWorkerError::ProductionMapPersistenceUnavailable {
+                                            response: pending
+                                                .claimed
+                                                .reject(
+                                                    AgentControlRejectionCodeV1::PersistenceFailed,
+                                                    false,
+                                                )
+                                                .err(),
+                                        },
+                                    ),
+                                }
+                            }
+                            Ok(NanoDatasetCheckpointFinalization::Rejected) => {
+                                let response = if pending.console_response_pending {
+                                    pending.claimed.reject(
+                                        AgentControlRejectionCodeV1::PersistenceFailed,
+                                        false,
+                                    )
+                                } else {
+                                    pending.claimed.reject_after_wire_delivery(
+                                        AgentControlRejectionCodeV1::PersistenceFailed,
+                                        false,
+                                    )
+                                };
+                                if let Err(source) = response {
+                                    failures.push(
+                                        LiveNavigationWorkerError::WarmCheckpointDatasetNotPublishedResponse {
+                                            source: Some(source),
+                                        },
+                                    );
+                                }
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                let response = if pending.console_response_pending {
+                                    pending.claimed.reject(
+                                        AgentControlRejectionCodeV1::PersistenceFailed,
+                                        false,
+                                    )
+                                } else {
+                                    pending.claimed.reject_after_wire_delivery(
+                                        AgentControlRejectionCodeV1::PersistenceFailed,
+                                        false,
+                                    )
+                                };
+                                failures.push(
+                                    LiveNavigationWorkerError::WarmCheckpointFinalizationTimedOut,
+                                );
+                                if let Err(source) = response {
+                                    failures.push(
+                                        LiveNavigationWorkerError::WarmCheckpointDatasetNotPublishedResponse {
+                                            source: Some(source),
+                                        },
+                                    );
+                                }
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                let response = if pending.console_response_pending {
+                                    pending.claimed.reject(
+                                        AgentControlRejectionCodeV1::PersistenceFailed,
+                                        false,
+                                    )
+                                } else {
+                                    pending.claimed.reject_after_wire_delivery(
+                                        AgentControlRejectionCodeV1::PersistenceFailed,
+                                        false,
+                                    )
+                                };
+                                failures.push(
+                                    LiveNavigationWorkerError::WarmCheckpointFinalizationChannelDisconnected,
+                                );
+                                if let Err(source) = response {
+                                    failures.push(
+                                        LiveNavigationWorkerError::WarmCheckpointDatasetNotPublishedResponse {
+                                            source: Some(source),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if pending.console_response_pending {
+                        let terminal_response_id = match console.adapter.as_mut() {
+                            Some(adapter) => match adapter.complete_save_map_response() {
+                                Ok(
+                                    OperatorConsoleProcessDisposition::ResponseCompleted {
+                                        downstream_request_id,
+                                    }
+                                    | OperatorConsoleProcessDisposition::ResponseRejected {
+                                        downstream_request_id,
+                                    },
+                                ) => Some(downstream_request_id),
+                                Ok(_) => {
+                                    failures.push(
+                                        LiveNavigationWorkerError::ProductionConsoleAdapter {
+                                            source: OperatorConsoleRuntimeAdapterError::OwnerOutcomeMismatch,
+                                        },
+                                    );
+                                    None
+                                }
+                                Err(source) => {
+                                    failures.push(
+                                        LiveNavigationWorkerError::ProductionConsoleAdapter {
+                                            source,
+                                        },
+                                    );
+                                    None
+                                }
+                            },
+                            None => None,
+                        };
+                        if let Some(response_id) = terminal_response_id {
+                            let observation_started = Instant::now();
+                            let mut response_observed = false;
+                            let mut frontend_remained_live = true;
+                            while observation_started.elapsed()
+                                < NANO_OPERATOR_CONSOLE_RESPONSE_OBSERVATION_GRACE
+                            {
+                                let observed = console.adapter.as_ref().is_some_and(|adapter| {
+                                    adapter
+                                        .handle()
+                                        .response_record_was_http_observed(response_id)
+                                });
+                                if observed {
+                                    response_observed = true;
+                                    break;
+                                }
+                                if let Some(evidence) = console
+                                    .frontend
+                                    .as_mut()
+                                    .and_then(NanoOperatorConsoleFrontend::poll_unexpected_exit)
+                                {
+                                    frontend_remained_live = false;
+                                    failures.push(
+                                        LiveNavigationWorkerError::ProductionConsoleFrontendExited {
+                                            evidence: Box::new(evidence),
+                                        },
+                                    );
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            if !response_observed && frontend_remained_live {
+                                eprintln!(
+                                    "operator-console terminal response {} remained retrievable for the bounded {} ms poll grace; client observation is unproven",
+                                    response_id.get(),
+                                    NANO_OPERATOR_CONSOLE_RESPONSE_OBSERVATION_GRACE.as_millis(),
+                                );
+                            } else if !response_observed {
+                                eprintln!(
+                                    "operator-console terminal response {} client observation is unproven because the HTTP owner exited during the poll grace",
+                                    response_id.get(),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if let Some(adapter) = console.adapter.take() {
+                    let outcome =
+                        adapter.shutdown_with_terminal_evidence(terminal_shutdown_evidence);
+                    eprintln!("operator console terminalization: {outcome:?}");
+                }
+                if let Some(frontend) = console.frontend.as_mut() {
+                    let evidence = frontend.shutdown();
+                    let retains_live_http_owner = evidence.retains_live_http_owner();
+                    if !evidence.is_clean() {
+                        failures.push(
+                            LiveNavigationWorkerError::ProductionConsoleFrontendShutdown {
+                                evidence: Box::new(evidence),
+                            },
+                        );
+                    }
+                    if !retains_live_http_owner {
+                        console.frontend.take();
+                    }
+                }
+                socket_task.request_shutdown();
+                match socket_task.shutdown() {
+                    Ok(exit) => {
+                        if let Some(source) = abnormal_production_socket_exit(exit) {
+                            failures.push(source);
+                        }
+                    }
+                    Err(source) => {
+                        failures.push(LiveNavigationWorkerError::ProductionSocketJoin { source });
+                    }
+                }
+                prefinalized_descriptor = descriptor;
+                None
+            }
+            #[cfg(not(all(feature = "nano-agent", unix)))]
+            {
+                match socket_task.shutdown() {
+                    Ok(exit) => {
+                        if let Some(source) = abnormal_production_socket_exit(exit) {
+                            failures.push(source);
+                        }
+                    }
+                    Err(source) => {
+                        failures.push(LiveNavigationWorkerError::ProductionSocketJoin { source });
+                    }
+                }
+                Some(coordinator)
+            }
+        }
+        #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+        LiveNavigationRuntime::WheelsOffQualification(mut qualification) => {
+            qualification.frontend_mut().request_shutdown();
+            let (mut controller, mut frontend) = qualification.take_terminal_parts();
+            if let Err(source) = controller.shutdown() {
+                failures.push(LiveNavigationWorkerError::WheelsOffQualificationRuntime {
+                    source: Box::new(source),
+                });
+            }
+            let evidence = frontend.shutdown();
+            let http_clean = evidence.http().is_ok_and(|exit| {
+                exit.graceful_shutdown
+                    && !exit.forced_shutdown
+                    && !exit.server_error
+                    && !exit.clock_faulted
+            });
+            let capability_clean = matches!(
+                evidence.capability(),
+                kiko_slam::navigation::QualificationCapabilityShutdownEvidence::Cleaned(
+                    kiko_slam::navigation::OperatorConsoleCapabilityCleanupEvidence::ExactEntryRemovedAndParentSynced
+                )
+            );
+            if !http_clean || !capability_clean {
+                failures.push(
+                    LiveNavigationWorkerError::WheelsOffQualificationFrontendShutdown {
+                        evidence: Box::new(evidence),
+                    },
+                );
+            }
+            Some(qualification.coordinator)
+        }
+    };
+
+    let descriptor = match coordinator {
+        Some(coordinator) => match finalize_live_navigation_coordinator(coordinator) {
+            Ok(finalized) => Some(finalized.into_descriptor()),
+            Err(source) => {
+                failures.push(source);
+                None
+            }
+        },
+        None => prefinalized_descriptor,
+    };
+    combine_live_navigation_failures(failures)?;
+    Ok(LiveNavigationWorkerSuccess {
+        descriptor: descriptor.expect("a failure-free finalization returns a descriptor"),
+    })
 }
 
 #[cfg(feature = "record")]
@@ -4493,9 +9796,12 @@ enum LiveThreadError {
         generation: command_mapper::DenseCommandGenerationError,
         inference: TrackerError,
     },
-    TrackerInitialization {
-        source: TrackerInitError,
+    #[cfg(all(feature = "nano-agent", unix))]
+    WarmStartRelocalization {
+        source: NanoWarmStartRelocalizationError,
     },
+    #[cfg(all(feature = "nano-agent", unix))]
+    WarmStartRelocalizationIncomplete,
     FrameProcessingPanic {
         detail: String,
     },
@@ -4571,9 +9877,14 @@ impl std::fmt::Display for LiveThreadError {
                 f,
                 "live dense command sequencing failed: {generation}; inference pipeline is also unavailable: {inference}"
             ),
-            LiveThreadError::TrackerInitialization { source } => {
-                write!(f, "tracker initialization failed: {source}")
+            #[cfg(all(feature = "nano-agent", unix))]
+            LiveThreadError::WarmStartRelocalization { source } => {
+                write!(f, "warm-start live relocalization failed: {source}")
             }
+            #[cfg(all(feature = "nano-agent", unix))]
+            LiveThreadError::WarmStartRelocalizationIncomplete => f.write_str(
+                "fresh-camera relocalization did not complete before the inference input closed",
+            ),
             LiveThreadError::FrameProcessingPanic { detail } => {
                 write!(f, "inference panic while processing frame: {detail}")
             }
@@ -4603,7 +9914,10 @@ impl std::error::Error for LiveThreadError {
             Self::DenseCommandGenerationAndInferenceUnavailable { generation, .. } => {
                 Some(generation)
             }
-            Self::TrackerInitialization { source } => Some(source),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmStartRelocalization { source } => Some(source),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmStartRelocalizationIncomplete => None,
             Self::RerunConnect { source } => Some(source),
             Self::FrameProcessingPanic { .. } => None,
         }
@@ -4631,18 +9945,91 @@ impl From<LiveDenseRouteError> for LiveThreadError {
     }
 }
 
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Debug)]
+enum LiveAccessoryError {
+    PreparationInterrupted(NanoLivePreparationInterrupted),
+    #[cfg(feature = "nano-wheels-off-qualification")]
+    Start(NanoAccessoryWorkerStartError),
+    TerminalFault(NanoAccessoryTerminalFault),
+    FaultMonitor(NanoAccessoryFaultWaitError),
+    FrameIngress(NanoAccessoryFrameSubmitOutcome),
+    ShutdownJoin(NanoAccessoryWorkerJoinError),
+    UnexpectedExit(Box<NanoAccessoryWorkerExit>),
+    EyeReleaseUnverified,
+    HeadHoldPreservingReleaseUnverified,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::fmt::Display for LiveAccessoryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreparationInterrupted(source) => source.fmt(formatter),
+            #[cfg(feature = "nano-wheels-off-qualification")]
+            Self::Start(source) => write!(formatter, "accessory startup failed: {source}"),
+            Self::TerminalFault(source) => write!(formatter, "{source}"),
+            Self::FaultMonitor(source) => {
+                write!(formatter, "accessory fault monitor failed: {source}")
+            }
+            Self::FrameIngress(outcome) => {
+                write!(formatter, "RGB accessory ingress failed: {outcome:?}")
+            }
+            Self::ShutdownJoin(source) => {
+                write!(formatter, "accessory shutdown join failed: {source}")
+            }
+            Self::UnexpectedExit(exit) => {
+                write!(formatter, "accessory worker exited unexpectedly: {exit:?}")
+            }
+            Self::EyeReleaseUnverified => {
+                formatter.write_str("eye release could not be verified during accessory shutdown")
+            }
+            Self::HeadHoldPreservingReleaseUnverified => formatter.write_str(
+                "the head hold-preserving ownership release could not be verified during accessory shutdown",
+            ),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::error::Error for LiveAccessoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PreparationInterrupted(source) => Some(source),
+            #[cfg(feature = "nano-wheels-off-qualification")]
+            Self::Start(source) => Some(source),
+            Self::TerminalFault(source) => Some(source),
+            Self::FaultMonitor(source) => Some(source),
+            Self::ShutdownJoin(source) => Some(source),
+            Self::FrameIngress(_)
+            | Self::UnexpectedExit(_)
+            | Self::EyeReleaseUnverified
+            | Self::HeadHoldPreservingReleaseUnverified => None,
+        }
+    }
+}
+
 #[cfg(feature = "record")]
 #[derive(Debug)]
 enum LiveWorkerFailure {
     Capture(LiveCaptureError),
     Inference(LiveThreadError),
-    InferencePanic { detail: String },
+    InferencePanic {
+        detail: String,
+    },
     Occupancy(OccupancyRuntimeError),
-    OccupancyPanic { detail: String },
+    OccupancyPanic {
+        detail: String,
+    },
     Navigation(LiveNavigationWorkerError),
-    NavigationPanic { detail: String },
+    NavigationPanic {
+        detail: String,
+    },
     DatasetFinalization(DatasetError),
     DatasetAbort(DatasetError),
+    #[cfg(all(feature = "nano-agent", unix))]
+    WarmCheckpointCoordination(NanoDatasetCheckpointCoordinationError),
+    #[cfg(all(feature = "nano-agent", unix))]
+    Accessory(LiveAccessoryError),
 }
 
 #[cfg(feature = "record")]
@@ -4671,6 +10058,10 @@ impl std::fmt::Display for LiveWorkerFailure {
                     "unpublished live navigation dataset abort failed: {source}"
                 )
             }
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointCoordination(source) => source.fmt(f),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::Accessory(source) => write!(f, "live accessory owner failed: {source}"),
         }
     }
 }
@@ -4684,12 +10075,52 @@ impl std::error::Error for LiveWorkerFailure {
             Self::Occupancy(source) => Some(source),
             Self::Navigation(source) => Some(source),
             Self::DatasetFinalization(source) | Self::DatasetAbort(source) => Some(source),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::WarmCheckpointCoordination(source) => Some(source),
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::Accessory(source) => Some(source),
             Self::InferencePanic { .. }
             | Self::OccupancyPanic { .. }
             | Self::NavigationPanic { .. } => None,
         }
     }
 }
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NanoDatasetCheckpointCoordinationError {
+    MissingBridge,
+    RequestTimedOut,
+    RequestChannelDisconnected,
+    MissingDatasetOwner,
+    FinalizationResponseChannelDisconnected,
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+impl std::fmt::Display for NanoDatasetCheckpointCoordinationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingBridge => {
+                "terminal warm checkpoint was requested without a dataset coordination bridge"
+            }
+            Self::RequestTimedOut => {
+                "terminal warm checkpoint timed out waiting for the finalized navigation journal"
+            }
+            Self::RequestChannelDisconnected => {
+                "terminal warm checkpoint navigation worker exited before transferring its finalized journal"
+            }
+            Self::MissingDatasetOwner => {
+                "terminal warm checkpoint has no live session dataset owner"
+            }
+            Self::FinalizationResponseChannelDisconnected => {
+                "terminal warm checkpoint navigation worker exited before receiving dataset publication evidence"
+            }
+        })
+    }
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+impl std::error::Error for NanoDatasetCheckpointCoordinationError {}
 
 /// A terminal Rerun worker problem is diagnostic evidence, never an
 /// authoritative robot-owner failure. Keeping it outside [`LiveWorkerFailure`]
@@ -4749,41 +10180,151 @@ impl std::error::Error for LiveRunError {
     }
 }
 
+#[cfg(feature = "record")]
+#[derive(Debug)]
+struct LiveThreadSpawnError {
+    name: &'static str,
+    source: std::io::Error,
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for LiveThreadSpawnError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "failed to spawn required live worker thread {:?}: {}",
+            self.name, self.source
+        )
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for LiveThreadSpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[cfg(feature = "record")]
+fn spawn_live_thread<T, F>(
+    name: &'static str,
+    worker: F,
+) -> Result<std::thread::JoinHandle<T>, LiveThreadSpawnError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(worker)
+        .map_err(|source| LiveThreadSpawnError { name, source })
+}
+
 #[cfg(any(feature = "record", test))]
-struct LiveThreadExitGuard(Arc<AtomicBool>);
+struct LiveThreadExitGuard {
+    running: Arc<AtomicBool>,
+    #[cfg(all(feature = "nano-agent", unix))]
+    quiescent_checkpoint_requested: Option<Arc<AtomicBool>>,
+}
+
+#[cfg(any(feature = "record", test))]
+impl LiveThreadExitGuard {
+    fn new(running: Arc<AtomicBool>) -> Self {
+        Self {
+            running,
+            #[cfg(all(feature = "nano-agent", unix))]
+            quiescent_checkpoint_requested: None,
+        }
+    }
+
+    #[cfg(all(feature = "record", feature = "nano-agent", unix))]
+    fn checkpoint_aware(
+        running: Arc<AtomicBool>,
+        quiescent_checkpoint_requested: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            running,
+            quiescent_checkpoint_requested: Some(quiescent_checkpoint_requested),
+        }
+    }
+}
 
 #[cfg(any(feature = "record", test))]
 impl Drop for LiveThreadExitGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        #[cfg(all(feature = "nano-agent", unix))]
+        if self
+            .quiescent_checkpoint_requested
+            .as_ref()
+            .is_some_and(|requested| requested.load(Ordering::Acquire))
+        {
+            return;
+        }
+        self.running.store(false, Ordering::SeqCst);
     }
 }
 
 #[cfg(feature = "record")]
 #[derive(Debug)]
 enum LiveCaptureError {
-    LeftImage { source: ImageError },
-    RightImage { source: ImageError },
-    LeftFrame { source: FrameError },
-    RightFrame { source: FrameError },
-    PairingInput { source: PairingInputError },
-    StereoObservation { source: StereoObservationError },
-    DatasetWrite { source: RecordCaptureError },
-    Depth { source: DepthError },
-    DepthFrame { source: RectifiedLeftDepthError },
-    DepthObservation { source: DepthObservationError },
-    Imu { source: ImuError },
-    ImuSample { source: InertialValueError },
-    ImuOrdering { source: InertialOrderingError },
+    #[cfg(all(feature = "nano-agent", unix))]
+    RgbImage {
+        source: ImageError,
+    },
+    LeftImage {
+        source: ImageError,
+    },
+    RightImage {
+        source: ImageError,
+    },
+    LeftFrame {
+        source: FrameError,
+    },
+    RightFrame {
+        source: FrameError,
+    },
+    PairingInput {
+        source: PairingInputError,
+    },
+    StereoObservation {
+        source: StereoObservationError,
+    },
+    DatasetWrite {
+        source: RecordCaptureError,
+    },
+    Depth {
+        source: DepthError,
+    },
+    DepthFrame {
+        source: RectifiedLeftDepthError,
+    },
+    DepthObservation {
+        source: DepthObservationError,
+    },
+    Imu {
+        source: ImuError,
+    },
+    ImuSample {
+        source: InertialValueError,
+    },
+    ImuOrdering {
+        source: InertialOrderingError,
+    },
     ImuRouteDisconnected,
-    HostTimestamp { source: HostMonotonicRangeError },
-    DeviceClose { source: DeviceCloseFailure },
+    HostTimestamp {
+        source: HostMonotonicRangeError,
+    },
+    DeviceClose {
+        source: DeviceCloseFailure,
+    },
 }
 
 #[cfg(feature = "record")]
 impl std::fmt::Display for LiveCaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::RgbImage { source } => write!(f, "RGB camera capture failed: {source}"),
             Self::LeftImage { source } => write!(f, "left camera capture failed: {source}"),
             Self::RightImage { source } => write!(f, "right camera capture failed: {source}"),
             Self::LeftFrame { source } => {
@@ -4822,6 +10363,8 @@ impl std::fmt::Display for LiveCaptureError {
 impl std::error::Error for LiveCaptureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::RgbImage { source } => Some(source),
             Self::LeftImage { source } | Self::RightImage { source } => Some(source),
             Self::LeftFrame { source } | Self::RightFrame { source } => Some(source),
             Self::PairingInput { source } => Some(source),
@@ -4879,6 +10422,7 @@ fn drain_depth_batch(rx: &DropReceiver<DepthImage>) -> Vec<DepthImage> {
 struct ActiveLiveNavigation {
     coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
     control_period: ControlPeriodNs,
+    dataset_directory: PathBuf,
     dataset_writer: PairedDatasetWriter,
     dataset_handle: DatasetWriterHandle,
     #[cfg(feature = "actuation")]
@@ -4951,10 +10495,13 @@ fn activate_live_navigation(
         mpc_config,
         solver_budget,
         safety,
+        #[cfg(unix)]
+        dataset_storage_limits,
         #[cfg(feature = "actuation")]
         actuation,
     } = runtime.into_parts();
     let meta = build_meta(mono_config, depth_config, imu_config, oak_provenance);
+    let dataset_directory = dataset_path.clone();
     let imu_metadata = ImuStreamMetadata::new(
         device_session,
         ImuExtrinsicProvenance::uncalibrated_unknown(),
@@ -4963,6 +10510,27 @@ fn activate_live_navigation(
         backpressure: Backpressure::Block,
         ..DatasetWriterConfig::default()
     };
+    #[cfg(unix)]
+    let (dataset_writer, dataset_handle) = match dataset_storage_limits {
+        Some(storage_limits) => DatasetWriter::create_paired_with_imu_config_and_storage_limits(
+            &dataset_path,
+            &meta,
+            calibration,
+            pairing_window,
+            imu_metadata,
+            writer_config,
+            storage_limits,
+        )?,
+        None => DatasetWriter::create_paired_with_imu_config(
+            &dataset_path,
+            &meta,
+            calibration,
+            pairing_window,
+            imu_metadata,
+            writer_config,
+        )?,
+    };
+    #[cfg(not(unix))]
     let (dataset_writer, dataset_handle) = DatasetWriter::create_paired_with_imu_config(
         &dataset_path,
         &meta,
@@ -4972,12 +10540,32 @@ fn activate_live_navigation(
         writer_config,
     )?;
     let journal_path = dataset_path.join(NAVIGATION_INGRESS_STREAM_FILE);
-    let journal_file = match OpenOptions::new()
+    #[cfg(unix)]
+    let quota_bound_journal = match dataset_writer.storage_quota() {
+        Some(_) => match dataset_writer.create_quota_bound_navigation_ingress_file() {
+            Ok((file, quota)) => Some((file, quota)),
+            Err(source) => {
+                return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
+            }
+        },
+        None => None,
+    };
+    #[cfg(unix)]
+    let journal_file_result = match quota_bound_journal.as_ref() {
+        Some((file, _)) => file.try_clone(),
+        None => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&journal_path),
+    };
+    #[cfg(not(unix))]
+    let journal_file_result = OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
-        .open(&journal_path)
-    {
+        .open(&journal_path);
+    let journal_file = match journal_file_result {
         Ok(file) => file,
         Err(source) => {
             return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
@@ -4989,7 +10577,19 @@ fn activate_live_navigation(
             return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
         }
     };
-    let journal = match NavigationIngressWriter::new(journal_file, recording_id, ingress_capacity) {
+    #[cfg(unix)]
+    let journal_result = match quota_bound_journal {
+        Some((_original_file, quota)) => NavigationIngressWriter::new_with_dataset_storage_quota(
+            journal_file,
+            recording_id,
+            ingress_capacity,
+            quota,
+        ),
+        None => NavigationIngressWriter::new(journal_file, recording_id, ingress_capacity),
+    };
+    #[cfg(not(unix))]
+    let journal_result = NavigationIngressWriter::new(journal_file, recording_id, ingress_capacity);
+    let journal = match journal_result {
         Ok(journal) => journal,
         Err(source) => {
             return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
@@ -5023,6 +10623,7 @@ fn activate_live_navigation(
     Ok(ActiveLiveNavigation {
         coordinator,
         control_period,
+        dataset_directory,
         dataset_writer,
         dataset_handle,
         #[cfg(feature = "actuation")]
@@ -5031,7 +10632,1713 @@ fn activate_live_navigation(
 }
 
 #[cfg(feature = "record")]
-fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
+enum LiveRerunTarget {
+    Connect,
+    #[cfg(all(feature = "nano-agent", unix))]
+    ServeLoopback {
+        bind: std::net::SocketAddr,
+        memory_limit_bytes: u64,
+    },
+}
+
+#[cfg(all(feature = "record", feature = "actuation"))]
+enum PreparedLiveMotionSelection {
+    Compatibility,
+    #[cfg(all(feature = "nano-agent", unix))]
+    Production(Box<LiveProductionMotionInput>),
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualification(Box<LiveWheelsOffQualificationMotionInput>),
+}
+
+#[cfg(feature = "record")]
+enum LiveOccupancyWorkerStartup {
+    Fresh(OccupancyRuntimeConfig),
+    #[cfg(all(feature = "nano-agent", unix))]
+    ContinuedReplay {
+        runtime: Box<OccupancyRuntime>,
+        initial_snapshot: TimedOccupancySnapshot,
+    },
+}
+
+#[cfg(feature = "record")]
+struct PreparedLiveSession {
+    device: Device,
+    device_session: DeviceSessionId,
+    mono_config: MonoConfig,
+    depth_config: Option<DepthConfig>,
+    imu_config: Option<ImuConfig>,
+    depth_queue_capacity: Option<ChannelCapacity>,
+    depth_ring_capacity: DepthRingCapacity,
+    imu_session: Option<DeviceSessionId>,
+    imu_queue_capacity: Option<ChannelCapacity>,
+    dense_requested: bool,
+    dense_data_capacity: ChannelCapacity,
+    dense_control_capacity: ChannelCapacity,
+    pairing_window: PairingWindowNs,
+    pairer: StereoPairer,
+    calibration: Calibration,
+    rectified_left_intrinsics: OakIntrinsics,
+    prepared_navigation_runtime: Option<PreparedLiveNavigationRuntime>,
+    inference: InferenceConfig,
+    pair_queue_depth: usize,
+    viz_queue_depth: usize,
+    rerun_decimation: VizDecimation,
+    rerun_finish_timeout: Duration,
+    rerun_target: LiveRerunTarget,
+    oak_provenance: OakRuntimeProvenance,
+    #[cfg(feature = "actuation")]
+    motion: PreparedLiveMotionSelection,
+    #[cfg(all(feature = "nano-agent", unix))]
+    accessory: Option<NanoAccessoryWorker>,
+    #[cfg(all(feature = "nano-agent", unix))]
+    production_state: Option<NanoProductionStateOwners>,
+    #[cfg(all(feature = "nano-agent", unix))]
+    warm_start_replay: Option<Box<NanoDatasetReplayRequired>>,
+}
+
+/// Owns the admitted zero-only controller and already-held head while the
+/// common live runtime still has fallible setup to perform. On any early
+/// return, controller stop is attempted before accessory shutdown.
+#[cfg(all(feature = "nano-agent", unix))]
+struct NanoLiveSetupGuard {
+    motion: Option<PreparedLiveMotionSelection>,
+    accessory: Option<NanoAccessoryWorker>,
+    production_state: Option<NanoProductionStateOwners>,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl NanoLiveSetupGuard {
+    fn new(
+        motion: PreparedLiveMotionSelection,
+        accessory: Option<NanoAccessoryWorker>,
+        production_state: Option<NanoProductionStateOwners>,
+    ) -> Self {
+        Self {
+            motion: Some(motion),
+            accessory,
+            production_state,
+        }
+    }
+
+    fn take_motion(&mut self) -> PreparedLiveMotionSelection {
+        self.motion
+            .take()
+            .expect("live setup transfers one motion selection")
+    }
+
+    fn take_production_state(&mut self) -> Option<NanoProductionStateOwners> {
+        self.production_state.take()
+    }
+
+    fn take_accessory(&mut self) -> Option<NanoAccessoryWorker> {
+        self.accessory.take()
+    }
+
+    fn require_accessory_healthy_if_present(
+        &self,
+        running: &AtomicBool,
+    ) -> Result<(), LiveAccessoryError> {
+        if !running.load(Ordering::Acquire) {
+            return Err(LiveAccessoryError::PreparationInterrupted(
+                NanoLivePreparationInterrupted,
+            ));
+        }
+        let Some(accessory) = self.accessory.as_ref() else {
+            return Ok(());
+        };
+        match accessory.try_terminal_fault() {
+            Ok(None) => Ok(()),
+            Ok(Some(fault)) => Err(LiveAccessoryError::TerminalFault(fault)),
+            Err(source) => Err(LiveAccessoryError::FaultMonitor(source)),
+        }
+    }
+
+    #[cfg(feature = "nano-wheels-off-qualification")]
+    fn require_fresh_qualification_attestation(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(PreparedLiveMotionSelection::WheelsOffQualification(input)) =
+            self.motion.as_mut()
+        {
+            input.require_fresh_attended_motion_attestation()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl Drop for NanoLiveSetupGuard {
+    fn drop(&mut self) {
+        // Dropping an unused production motion input invokes its explicit
+        // abort-before-owner path. Do this before removing natural hold.
+        drop(self.motion.take());
+        let Some(accessory) = self.accessory.take() else {
+            return;
+        };
+        match accessory.shutdown() {
+            Ok(NanoAccessoryWorkerExit::Shutdown {
+                terminal_fault,
+                evidence,
+            }) => {
+                if terminal_fault.is_some()
+                    || !evidence.eye().release_verified()
+                    || !evidence.head().hold_preserving_release_completed()
+                {
+                    eprintln!(
+                        "early live setup accessory shutdown was not fully healthy: terminal_fault={terminal_fault:?} eye_release_verified={} head_hold_preserving_release_completed={}",
+                        evidence.eye().release_verified(),
+                        evidence.head().hold_preserving_release_completed()
+                    );
+                }
+            }
+            Ok(exit) => {
+                eprintln!("early live setup accessory worker exited unexpectedly: {exit:?}");
+            }
+            Err(source) => {
+                eprintln!("early live setup accessory shutdown join failed: {source}");
+            }
+        }
+    }
+}
+
+/// Keeps the natural hold coupled to the production base owner until every
+/// remaining worker thread has been created. If a later thread spawn unwinds,
+/// the shared stop is asserted, the navigation owner is joined (and therefore
+/// stops the controller), and only then are the accessories shut down.
+#[cfg(all(feature = "nano-agent", unix))]
+struct NanoPostNavigationSetupGuard {
+    running: Arc<AtomicBool>,
+    navigation:
+        Option<thread::JoinHandle<Result<LiveNavigationWorkerSuccess, LiveNavigationWorkerError>>>,
+    accessory: Option<NanoAccessoryWorker>,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl NanoPostNavigationSetupGuard {
+    fn new(
+        running: Arc<AtomicBool>,
+        navigation: Option<
+            thread::JoinHandle<Result<LiveNavigationWorkerSuccess, LiveNavigationWorkerError>>,
+        >,
+        accessory: Option<NanoAccessoryWorker>,
+    ) -> Self {
+        Self {
+            running,
+            navigation,
+            accessory,
+        }
+    }
+
+    fn into_parts(
+        mut self,
+    ) -> (
+        Option<thread::JoinHandle<Result<LiveNavigationWorkerSuccess, LiveNavigationWorkerError>>>,
+        Option<NanoAccessoryWorker>,
+    ) {
+        let navigation = self.navigation.take();
+        let accessory = self.accessory.take();
+        (navigation, accessory)
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl Drop for NanoPostNavigationSetupGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.navigation.take() {
+            match handle.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(source)) => {
+                    eprintln!("post-navigation setup cleanup observed owner failure: {source}");
+                }
+                Err(payload) => eprintln!(
+                    "post-navigation setup cleanup observed owner panic: {}",
+                    kiko_slam::panic_payload_to_string(payload.as_ref())
+                ),
+            }
+        }
+        let Some(accessory) = self.accessory.take() else {
+            return;
+        };
+        match accessory.shutdown() {
+            Ok(NanoAccessoryWorkerExit::Shutdown {
+                terminal_fault,
+                evidence,
+            }) => {
+                if terminal_fault.is_some()
+                    || !evidence.eye().release_verified()
+                    || !evidence.head().hold_preserving_release_completed()
+                {
+                    eprintln!(
+                        "post-navigation setup accessory shutdown was not fully healthy: terminal_fault={terminal_fault:?} eye_release_verified={} head_hold_preserving_release_completed={}",
+                        evidence.eye().release_verified(),
+                        evidence.head().hold_preserving_release_completed()
+                    );
+                }
+            }
+            Ok(exit) => {
+                eprintln!("post-navigation setup accessory worker exited unexpectedly: {exit:?}");
+            }
+            Err(source) => {
+                eprintln!("post-navigation setup accessory shutdown join failed: {source}");
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Debug)]
+enum NanoPreOwnerControllerStop {
+    Confirmed(DisarmReceipt),
+    Uncertain(LiveActuationError),
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Debug)]
+enum NanoPreOwnerOakClose {
+    Confirmed,
+    Uncertain(OakCloseError),
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Debug)]
+enum NanoPreOwnerAccessoryShutdown {
+    NotStarted,
+    Completed {
+        terminal_fault: Option<NanoAccessoryTerminalFault>,
+        eye_release_verified: bool,
+        head_hold_preserving_release_completed: bool,
+    },
+    UnexpectedExit(Box<NanoAccessoryWorkerExit>),
+    JoinUncertain(NanoAccessoryWorkerJoinError),
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Debug)]
+struct NanoLivePreparationError {
+    primary: Box<dyn std::error::Error>,
+    controller_stop: NanoPreOwnerControllerStop,
+    accessory_shutdown: NanoPreOwnerAccessoryShutdown,
+    oak_close: NanoPreOwnerOakClose,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::fmt::Display for NanoLivePreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Nano live preparation failed: {}", self.primary)?;
+        match &self.controller_stop {
+            NanoPreOwnerControllerStop::Confirmed(receipt) => write!(
+                formatter,
+                "; controller stop confirmed at {} ns",
+                receipt.acknowledged_at().nanos_since_clock_start()
+            )?,
+            NanoPreOwnerControllerStop::Uncertain(source) => {
+                write!(formatter, "; controller stop uncertain: {source}")?
+            }
+        }
+        match &self.accessory_shutdown {
+            NanoPreOwnerAccessoryShutdown::NotStarted => {}
+            NanoPreOwnerAccessoryShutdown::Completed {
+                terminal_fault,
+                eye_release_verified,
+                head_hold_preserving_release_completed,
+            } => write!(
+                formatter,
+                "; accessory shutdown completed (terminal_fault={terminal_fault:?}, eye_release_verified={eye_release_verified}, head_hold_preserving_release_completed={head_hold_preserving_release_completed})"
+            )?,
+            NanoPreOwnerAccessoryShutdown::UnexpectedExit(exit) => write!(
+                formatter,
+                "; accessory shutdown returned unexpected exit: {exit:?}"
+            )?,
+            NanoPreOwnerAccessoryShutdown::JoinUncertain(source) => {
+                write!(formatter, "; accessory shutdown join uncertain: {source}")?
+            }
+        }
+        match &self.oak_close {
+            NanoPreOwnerOakClose::Confirmed => formatter.write_str("; OAK close confirmed"),
+            NanoPreOwnerOakClose::Uncertain(source) => {
+                write!(formatter, "; OAK close uncertain: {source}")
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::error::Error for NanoLivePreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+struct NanoPreOwnerResources {
+    runtime: Option<PreparedNanoProductionRuntime>,
+    accessory: Option<NanoAccessoryWorker>,
+    oak: Option<Device>,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl NanoPreOwnerResources {
+    fn new(
+        runtime: PreparedNanoProductionRuntime,
+        accessory: NanoAccessoryWorker,
+        oak: Device,
+    ) -> Self {
+        Self {
+            runtime: Some(runtime),
+            accessory: Some(accessory),
+            oak: Some(oak),
+        }
+    }
+
+    fn cleanup(
+        &mut self,
+    ) -> (
+        NanoPreOwnerControllerStop,
+        NanoPreOwnerAccessoryShutdown,
+        NanoPreOwnerOakClose,
+    ) {
+        let controller_stop = match self
+            .runtime
+            .take()
+            .expect("pre-owner runtime is cleaned exactly once")
+            .abort_before_owner()
+        {
+            Ok(receipt) => NanoPreOwnerControllerStop::Confirmed(receipt),
+            Err(source) => NanoPreOwnerControllerStop::Uncertain(source),
+        };
+        let accessory_shutdown = match self.accessory.take() {
+            None => NanoPreOwnerAccessoryShutdown::NotStarted,
+            Some(accessory) => match accessory.shutdown() {
+                Ok(NanoAccessoryWorkerExit::Shutdown {
+                    terminal_fault,
+                    evidence,
+                }) => NanoPreOwnerAccessoryShutdown::Completed {
+                    terminal_fault,
+                    eye_release_verified: evidence.eye().release_verified(),
+                    head_hold_preserving_release_completed: evidence
+                        .head()
+                        .hold_preserving_release_completed(),
+                },
+                Ok(exit) => NanoPreOwnerAccessoryShutdown::UnexpectedExit(Box::new(exit)),
+                Err(source) => NanoPreOwnerAccessoryShutdown::JoinUncertain(source),
+            },
+        };
+        let oak_close = match self
+            .oak
+            .take()
+            .expect("pre-owner OAK is closed exactly once")
+            .close()
+        {
+            Ok(()) => NanoPreOwnerOakClose::Confirmed,
+            Err(source) => NanoPreOwnerOakClose::Uncertain(source),
+        };
+        (controller_stop, accessory_shutdown, oak_close)
+    }
+
+    fn fail_box<T>(
+        mut self,
+        primary: Box<dyn std::error::Error>,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let (controller_stop, accessory_shutdown, oak_close) = self.cleanup();
+        Err(Box::new(NanoLivePreparationError {
+            primary,
+            controller_stop,
+            accessory_shutdown,
+            oak_close,
+        }))
+    }
+
+    fn into_parts(mut self) -> (PreparedNanoProductionRuntime, NanoAccessoryWorker, Device) {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("pre-owner runtime transfers exactly once");
+        let accessory = self
+            .accessory
+            .take()
+            .expect("started accessory owner transfers exactly once");
+        let oak = self
+            .oak
+            .take()
+            .expect("pre-owner OAK transfers exactly once");
+        (runtime, accessory, oak)
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl Drop for NanoPreOwnerResources {
+    fn drop(&mut self) {
+        if self.runtime.is_none() && self.accessory.is_none() && self.oak.is_none() {
+            return;
+        }
+        let (controller_stop, accessory_shutdown, oak_close) = self.cleanup();
+        eprintln!(
+            "Nano pre-owner resources unwound: controller_stop={controller_stop:?} accessory_shutdown={accessory_shutdown:?} oak_close={oak_close:?}"
+        );
+    }
+}
+
+/// Owns a bootstrap-confirmed stopped candidate controller while the common
+/// Nano software stack is still being prepared. Unlike production admission,
+/// this owner never contains an armed session: failure drops the sole
+/// reacquisition token, shuts down accessories, and closes OAK while retaining
+/// the exact bootstrap stop receipt in the returned error.
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+struct NanoQualificationPreOwnerResources {
+    stopped_controller: Option<kiko_slam::navigation::StoppedWheelsOffCandidateController>,
+    initial_zero: Option<AppliedCommandReceipt>,
+    initial_stop: Option<DisarmReceipt>,
+    limits: kiko_slam::navigation::WheelsOffCandidateLimits,
+    runtime_service_interval: kiko_slam::navigation::WheelsOffCandidateRuntimeServiceInterval,
+    accessory: Option<NanoAccessoryWorker>,
+    oak: Option<Device>,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl NanoQualificationPreOwnerResources {
+    fn new(
+        stopped_controller: kiko_slam::navigation::StoppedWheelsOffCandidateController,
+        initial_zero: AppliedCommandReceipt,
+        initial_stop: DisarmReceipt,
+        limits: kiko_slam::navigation::WheelsOffCandidateLimits,
+        runtime_service_interval: kiko_slam::navigation::WheelsOffCandidateRuntimeServiceInterval,
+        oak: Device,
+    ) -> Self {
+        Self {
+            stopped_controller: Some(stopped_controller),
+            initial_zero: Some(initial_zero),
+            initial_stop: Some(initial_stop),
+            limits,
+            runtime_service_interval,
+            accessory: None,
+            oak: Some(oak),
+        }
+    }
+
+    fn fail_box<T>(
+        mut self,
+        primary: Box<dyn std::error::Error>,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let initial_stop = self
+            .initial_stop
+            .take()
+            .expect("qualification bootstrap stop receipt is consumed once");
+        let _ = self.initial_zero.take();
+        drop(self.stopped_controller.take());
+        let accessory_shutdown = match self.accessory.take() {
+            None => NanoPreOwnerAccessoryShutdown::NotStarted,
+            Some(accessory) => match accessory.shutdown() {
+                Ok(NanoAccessoryWorkerExit::Shutdown {
+                    terminal_fault,
+                    evidence,
+                }) => NanoPreOwnerAccessoryShutdown::Completed {
+                    terminal_fault,
+                    eye_release_verified: evidence.eye().release_verified(),
+                    head_hold_preserving_release_completed: evidence
+                        .head()
+                        .hold_preserving_release_completed(),
+                },
+                Ok(exit) => NanoPreOwnerAccessoryShutdown::UnexpectedExit(Box::new(exit)),
+                Err(source) => NanoPreOwnerAccessoryShutdown::JoinUncertain(source),
+            },
+        };
+        let oak_close = match self
+            .oak
+            .take()
+            .expect("qualification pre-owner OAK is closed exactly once")
+            .close()
+        {
+            Ok(()) => NanoPreOwnerOakClose::Confirmed,
+            Err(source) => NanoPreOwnerOakClose::Uncertain(source),
+        };
+        Err(Box::new(NanoQualificationLivePreparationError {
+            primary,
+            initial_stop,
+            accessory_shutdown,
+            oak_close,
+        }))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn into_parts(
+        mut self,
+    ) -> (
+        kiko_slam::navigation::StoppedWheelsOffCandidateController,
+        AppliedCommandReceipt,
+        DisarmReceipt,
+        kiko_slam::navigation::WheelsOffCandidateLimits,
+        kiko_slam::navigation::WheelsOffCandidateRuntimeServiceInterval,
+        NanoAccessoryWorker,
+        Device,
+    ) {
+        (
+            self.stopped_controller
+                .take()
+                .expect("qualification stopped token transfers exactly once"),
+            self.initial_zero
+                .take()
+                .expect("qualification initial zero transfers exactly once"),
+            self.initial_stop
+                .take()
+                .expect("qualification initial stop transfers exactly once"),
+            self.limits,
+            self.runtime_service_interval,
+            self.accessory
+                .take()
+                .expect("qualification accessory transfers exactly once"),
+            self.oak
+                .take()
+                .expect("qualification OAK transfers exactly once"),
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl Drop for NanoQualificationPreOwnerResources {
+    fn drop(&mut self) {
+        if self.stopped_controller.is_none()
+            && self.initial_zero.is_none()
+            && self.initial_stop.is_none()
+            && self.accessory.is_none()
+            && self.oak.is_none()
+        {
+            return;
+        }
+        let initial_stop = self.initial_stop.take();
+        let _ = self.initial_zero.take();
+        drop(self.stopped_controller.take());
+        let accessory_shutdown = self.accessory.take().map(NanoAccessoryWorker::shutdown);
+        let oak_close = self.oak.take().map(Device::close);
+        eprintln!(
+            "qualification pre-owner resources unwound from an exact bootstrap stop: stop_request_id={:?} accessory_shutdown={accessory_shutdown:?} oak_close={oak_close:?}",
+            initial_stop
+                .as_ref()
+                .map(|receipt| receipt.request_id().get()),
+        );
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+struct NanoQualificationLivePreparationError {
+    primary: Box<dyn std::error::Error>,
+    initial_stop: DisarmReceipt,
+    accessory_shutdown: NanoPreOwnerAccessoryShutdown,
+    oak_close: NanoPreOwnerOakClose,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::fmt::Display for NanoQualificationLivePreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Nano wheels-off qualification preparation failed: {}; controller remained stopped by exact request {} on boot {}",
+            self.primary,
+            self.initial_stop.request_id().get(),
+            self.initial_stop.observed_boot_id().get(),
+        )?;
+        write!(
+            formatter,
+            "; accessory shutdown: {:?}; OAK close: {:?}",
+            self.accessory_shutdown, self.oak_close,
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::error::Error for NanoQualificationLivePreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
+/// Production admits map publication and its exact map byte/headroom policy
+/// as one process-lifetime capability. Keeping these owners inseparable makes
+/// a quota-free production map save path unrepresentable after startup.
+#[cfg(all(feature = "nano-agent", unix))]
+struct NanoProductionStateOwners {
+    map_persistence: NanoMapPersistenceOwner,
+    quota: NanoStateQuotaOwner,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl NanoProductionStateOwners {
+    fn admit(
+        roots: &kiko_slam::navigation::NanoBootstrapRoots,
+        storage: &NanoLaunchStorage,
+        map_config: &NanoMapPersistenceConfig,
+        map_limits: OccupancyMapLimits,
+    ) -> Result<Self, NanoProductionStateAdmissionError> {
+        let launch_destination = roots.state_root().join(storage.map_snapshot().as_path());
+        let policy_destination = map_config.save_snapshot_path().as_path();
+        if launch_destination != policy_destination {
+            return Err(NanoProductionStateAdmissionError::MapDestinationMismatch {
+                launch_destination,
+                policy_destination: policy_destination.to_path_buf(),
+            });
+        }
+
+        // Map quota admission creates only the parsed map parent. Persistence
+        // then requires that exact parent to exist and independently admits it.
+        let quota = NanoStateQuotaOwner::admit(roots, storage)
+            .map_err(NanoProductionStateAdmissionError::Quota)?;
+        let map_persistence = NanoMapPersistenceOwner::try_new(roots, map_config, map_limits)
+            .map_err(NanoProductionStateAdmissionError::MapPersistence)?;
+        Ok(Self {
+            map_persistence,
+            quota,
+        })
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Debug)]
+enum NanoProductionStateAdmissionError {
+    MapDestinationMismatch {
+        launch_destination: PathBuf,
+        policy_destination: PathBuf,
+    },
+    Quota(NanoStateQuotaAdmissionError),
+    MapPersistence(NanoMapPersistencePathError),
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::fmt::Display for NanoProductionStateAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MapDestinationMismatch {
+                launch_destination,
+                policy_destination,
+            } => write!(
+                formatter,
+                "launch map destination {} does not equal admitted agent-policy destination {}",
+                launch_destination.display(),
+                policy_destination.display()
+            ),
+            Self::Quota(source) => {
+                write!(formatter, "Nano map-storage admission failed: {source}")
+            }
+            Self::MapPersistence(source) => {
+                write!(formatter, "Nano map persistence admission failed: {source}")
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::error::Error for NanoProductionStateAdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MapDestinationMismatch { .. } => None,
+            Self::Quota(source) => Some(source),
+            Self::MapPersistence(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+struct NanoLiveSoftwarePreparation {
+    device_session: DeviceSessionId,
+    queue_size: usize,
+    queue_capacity: ChannelCapacity,
+    dense_control_capacity: ChannelCapacity,
+    mono_config: MonoConfig,
+    depth_config: DepthConfig,
+    imu_config: ImuConfig,
+    pairing_window: PairingWindowNs,
+    pairer: StereoPairer,
+    calibration: Calibration,
+    rectified_left_intrinsics: OakIntrinsics,
+    navigation: PreparedLiveNavigationRuntime,
+    inference: InferenceConfig,
+    rerun_decimation: VizDecimation,
+    rerun_finish_timeout: Duration,
+    rerun_target: LiveRerunTarget,
+    production_state: NanoProductionStateOwners,
+    warm_start_replay: Option<Box<NanoDatasetReplayRequired>>,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+struct NanoCommonLiveSoftwareInput<'config> {
+    roots: &'config NanoBootstrapRoots,
+    graph: &'config NanoOakStreamGraph,
+    storage: &'config NanoLaunchStorage,
+    occupancy: &'config NanoLaunchOccupancy,
+    inference_policy: &'config NanoLaunchInference,
+    rerun: NanoLaunchRerun,
+    onnx_runtime_library: &'config [u8],
+    superpoint_model: &'config [u8],
+    lightglue_model: &'config [u8],
+    stereo: NanoBootstrapStereoEvidence,
+    live: ParsedNanoLiveConfiguration,
+    map_persistence: &'config NanoMapPersistenceConfig,
+    stream_epoch: StreamEpochId,
+}
+
+/// Construct the OAK/SLAM/occupancy/inference half shared by production and
+/// the separately compiled qualifier. This helper has no physical-actuation
+/// input. Callers retain their own linear controller token throughout every
+/// fallible model and persistence operation.
+#[cfg(all(feature = "nano-agent", unix))]
+fn prepare_nano_common_live_software(
+    input: NanoCommonLiveSoftwareInput<'_>,
+    mut require_accessory_healthy: impl FnMut() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<NanoLiveSoftwarePreparation, Box<dyn std::error::Error>> {
+    require_accessory_healthy()?;
+    let graph_config = input.graph.device_config();
+    let mono_config = graph_config.mono.ok_or(NanoLiveGraphInvariantError::Mono)?;
+    let depth_config = graph_config
+        .depth
+        .ok_or(NanoLiveGraphInvariantError::Depth)?;
+    let imu_config = graph_config.imu.ok_or(NanoLiveGraphInvariantError::Imu)?;
+    let queue_size = usize::try_from(input.graph.queue_size())?;
+    let queue_capacity = ChannelCapacity::try_from(queue_size)?;
+    let dense_control_capacity = ChannelCapacity::try_from(64_usize)?;
+    let device_session = DeviceSessionId::try_new(1)?;
+
+    let pairing_window = PairingWindowNs::try_from_u64(DEFAULT_PAIRING_WINDOW_NS)?;
+    let mut pairer = StereoPairer::new_with_max_pending(pairing_window, queue_size)?;
+    let rectified_left_intrinsics = input.stereo.left.intrinsics();
+    pairer.push_left(oak_to_frame(input.stereo.left, SensorId::StereoLeft)?)?;
+    pairer.push_right(oak_to_frame(input.stereo.right, SensorId::StereoRight)?)?;
+
+    let dataset_path = input
+        .roots
+        .state_root()
+        .join(input.storage.navigation_dataset_directory().as_path())
+        .join(format!("session-{:016x}", input.stream_epoch.get()));
+    let dataset_limits = input.storage.navigation_dataset_limits();
+    let storage_limits = DatasetStorageLimits::try_new(
+        dataset_limits.maximum_bytes(),
+        dataset_limits.maximum_files(),
+        dataset_limits.minimum_free_bytes_after_write(),
+        dataset_limits.terminal_reserve_bytes(),
+        input.storage.maximum_map_snapshot_bytes(),
+        MAX_PRODUCTION_DATASET_MANIFEST_BYTES,
+        MAX_NANO_WARM_SELECTION_BYTES,
+    )?;
+    let mut navigation = prepare_live_navigation_runtime_from_parsed(
+        input.live.navigation,
+        None,
+        dataset_path,
+        input.live.occupancy_host_policy,
+        device_session,
+    )?;
+    navigation.bind_production_dataset_storage(
+        storage_limits,
+        dataset_limits.maximum_ingress_records(),
+    )?;
+
+    let map_limits = OccupancyMapLimits::try_new(input.occupancy.geometry().cell_count())?;
+    let production_state = NanoProductionStateOwners::admit(
+        input.roots,
+        input.storage,
+        input.map_persistence,
+        map_limits,
+    )?;
+    let warm_start_replay = match production_state.map_persistence.load_warm_start()? {
+        NanoMapWarmStartLoad::Disabled => None,
+        NanoMapWarmStartLoad::DatasetReplayRequired(replay) => Some(replay),
+    };
+
+    require_accessory_healthy()?;
+    let runtime = kiko_slam::pin_ort_runtime_from_memory(input.onnx_runtime_library)?;
+    let superpoint_backend = input.inference_policy.superpoint_backend().runtime();
+    let lightglue_backend = input.inference_policy.lightglue_backend().runtime();
+    require_accessory_healthy()?;
+    let superpoint_left = SuperPoint::new_from_memory_with_backend(
+        input.superpoint_model,
+        runtime,
+        superpoint_backend,
+    )?;
+    require_accessory_healthy()?;
+    let superpoint_right = SuperPoint::new_from_memory_with_backend(
+        input.superpoint_model,
+        runtime,
+        superpoint_backend,
+    )?;
+    require_accessory_healthy()?;
+    let lightglue =
+        LightGlue::new_from_memory_with_backend(input.lightglue_model, runtime, lightglue_backend)?;
+    require_accessory_healthy()?;
+    let inference = InferenceConfig {
+        superpoint_left,
+        superpoint_right,
+        lightglue,
+        key_limit: KeypointLimit::try_from(usize::try_from(
+            input.inference_policy.maximum_keypoints(),
+        )?)?,
+        downscale: DownscaleFactor::try_from(usize::try_from(
+            input.inference_policy.downscale_factor(),
+        )?)?,
+    };
+
+    Ok(NanoLiveSoftwarePreparation {
+        device_session,
+        queue_size,
+        queue_capacity,
+        dense_control_capacity,
+        mono_config,
+        depth_config,
+        imu_config,
+        pairing_window,
+        pairer,
+        calibration: input.stereo.calibration,
+        rectified_left_intrinsics,
+        navigation,
+        inference,
+        rerun_decimation: VizDecimation::try_from(usize::try_from(input.rerun.decimation())?)?,
+        rerun_finish_timeout: Duration::from_millis(input.rerun.flush_timeout_ms()),
+        rerun_target: LiveRerunTarget::ServeLoopback {
+            bind: input.rerun.bind(),
+            memory_limit_bytes: input.rerun.memory_limit_bytes(),
+        },
+        production_state,
+        warm_start_replay,
+    })
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Debug)]
+enum NanoStreamEpochError {
+    EntropyOpen(std::io::Error),
+    EntropyRead(std::io::Error),
+    NonzeroCandidateExhausted { attempts: usize },
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::fmt::Display for NanoStreamEpochError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EntropyOpen(source) => {
+                write!(formatter, "could not open the OS random source: {source}")
+            }
+            Self::EntropyRead(source) => {
+                write!(formatter, "could not read the OS random source: {source}")
+            }
+            Self::NonzeroCandidateExhausted { attempts } => write!(
+                formatter,
+                "OS randomness produced only the reserved zero stream epoch in {attempts} attempts"
+            ),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::error::Error for NanoStreamEpochError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::EntropyOpen(source) | Self::EntropyRead(source) => Some(source),
+            Self::NonzeroCandidateExhausted { .. } => None,
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+const MAX_NANO_STREAM_EPOCH_ATTEMPTS: usize = 8;
+
+#[cfg(all(feature = "nano-agent", unix))]
+fn fresh_nano_stream_epoch_from(
+    entropy: &mut impl Read,
+    maximum_attempts: usize,
+) -> Result<StreamEpochId, NanoStreamEpochError> {
+    for _ in 0..maximum_attempts {
+        let mut bytes = [0_u8; std::mem::size_of::<u64>()];
+        entropy
+            .read_exact(&mut bytes)
+            .map_err(NanoStreamEpochError::EntropyRead)?;
+        if let Ok(epoch) = StreamEpochId::try_new(u64::from_ne_bytes(bytes)) {
+            return Ok(epoch);
+        }
+    }
+    Err(NanoStreamEpochError::NonzeroCandidateExhausted {
+        attempts: maximum_attempts,
+    })
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+fn fresh_nano_stream_epoch() -> Result<StreamEpochId, NanoStreamEpochError> {
+    let mut entropy = File::open("/dev/urandom").map_err(NanoStreamEpochError::EntropyOpen)?;
+    fresh_nano_stream_epoch_from(&mut entropy, MAX_NANO_STREAM_EPOCH_ATTEMPTS)
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NanoLiveGraphInvariantError {
+    Mono,
+    Depth,
+    Imu,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::fmt::Display for NanoLiveGraphInvariantError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "parsed Nano OAK graph violated its mandatory-stream invariant: {self:?}"
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::error::Error for NanoLiveGraphInvariantError {}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NanoWarmStartOccupancyUnavailable;
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::fmt::Display for NanoWarmStartOccupancyUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "admitted Nano warm start has no live occupancy configuration to replay into",
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::error::Error for NanoWarmStartOccupancyUnavailable {}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NanoLivePreparationInterrupted;
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::fmt::Display for NanoLivePreparationInterrupted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "Nano live preparation was interrupted by shutdown or controller-owner failure",
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::error::Error for NanoLivePreparationInterrupted {}
+
+#[cfg(all(feature = "nano-agent", unix))]
+fn require_pre_owner_accessory_healthy(
+    resources: &NanoPreOwnerResources,
+    running: &AtomicBool,
+) -> Result<(), LiveAccessoryError> {
+    if !running.load(Ordering::Acquire) {
+        return Err(LiveAccessoryError::PreparationInterrupted(
+            NanoLivePreparationInterrupted,
+        ));
+    }
+    let accessory = resources
+        .accessory
+        .as_ref()
+        .expect("software preparation begins only after accessory readiness");
+    match accessory.try_terminal_fault() {
+        Ok(None) => Ok(()),
+        Ok(Some(fault)) => Err(LiveAccessoryError::TerminalFault(fault)),
+        Err(source) => Err(LiveAccessoryError::FaultMonitor(source)),
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn require_qualification_pre_owner_accessory_healthy(
+    resources: &NanoQualificationPreOwnerResources,
+    running: &AtomicBool,
+) -> Result<(), LiveAccessoryError> {
+    if !running.load(Ordering::Acquire) {
+        return Err(LiveAccessoryError::PreparationInterrupted(
+            NanoLivePreparationInterrupted,
+        ));
+    }
+    let accessory = resources
+        .accessory
+        .as_ref()
+        .expect("qualification software preparation starts after accessory readiness");
+    match accessory.try_terminal_fault() {
+        Ok(None) => Ok(()),
+        Ok(Some(fault)) => Err(LiveAccessoryError::TerminalFault(fault)),
+        Err(source) => Err(LiveAccessoryError::FaultMonitor(source)),
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+const MAX_QUALIFICATION_ATTESTATION_LINE_BYTES: usize = 96;
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Clone, Copy, Debug)]
+struct AttendedWheelsOffPreflight;
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+enum AttendedWheelsOffAttestationError {
+    TtyRequired,
+    Input(std::io::Error),
+    Output(std::io::Error),
+    EndOfInput,
+    LineTooLong { maximum_bytes: usize },
+    InvalidUtf8,
+    PhraseMismatch { expected: &'static str },
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::fmt::Display for AttendedWheelsOffAttestationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TtyRequired => formatter
+                .write_str("wheels-off qualification requires attended terminal input and output"),
+            Self::Input(source) => write!(formatter, "could not read qualification TTY: {source}"),
+            Self::Output(source) => {
+                write!(
+                    formatter,
+                    "could not write qualification TTY prompt: {source}"
+                )
+            }
+            Self::EndOfInput => formatter.write_str(
+                "qualification TTY closed before every physical precondition was confirmed",
+            ),
+            Self::LineTooLong { maximum_bytes } => write!(
+                formatter,
+                "qualification TTY response exceeded {maximum_bytes} bytes"
+            ),
+            Self::InvalidUtf8 => {
+                formatter.write_str("qualification TTY response was not valid UTF-8")
+            }
+            Self::PhraseMismatch { expected } => write!(
+                formatter,
+                "qualification physical precondition was not confirmed; expected exact phrase {expected:?}"
+            ),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::error::Error for AttendedWheelsOffAttestationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Input(source) | Self::Output(source) => Some(source),
+            Self::TtyRequired
+            | Self::EndOfInput
+            | Self::LineTooLong { .. }
+            | Self::InvalidUtf8
+            | Self::PhraseMismatch { .. } => None,
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn read_bounded_tty_line(
+    input: &mut impl BufRead,
+) -> Result<String, AttendedWheelsOffAttestationError> {
+    let mut output = Vec::with_capacity(48);
+    loop {
+        let available = input
+            .fill_buf()
+            .map_err(AttendedWheelsOffAttestationError::Input)?;
+        if available.is_empty() {
+            return Err(AttendedWheelsOffAttestationError::EndOfInput);
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if output.len().saturating_add(newline) > MAX_QUALIFICATION_ATTESTATION_LINE_BYTES {
+                return Err(AttendedWheelsOffAttestationError::LineTooLong {
+                    maximum_bytes: MAX_QUALIFICATION_ATTESTATION_LINE_BYTES,
+                });
+            }
+            output.extend_from_slice(&available[..newline]);
+            input.consume(newline + 1);
+            if output.last() == Some(&b'\r') {
+                output.pop();
+            }
+            return String::from_utf8(output)
+                .map_err(|_| AttendedWheelsOffAttestationError::InvalidUtf8);
+        }
+        if output.len().saturating_add(available.len()) > MAX_QUALIFICATION_ATTESTATION_LINE_BYTES {
+            return Err(AttendedWheelsOffAttestationError::LineTooLong {
+                maximum_bytes: MAX_QUALIFICATION_ATTESTATION_LINE_BYTES,
+            });
+        }
+        output.extend_from_slice(available);
+        let consumed = available.len();
+        input.consume(consumed);
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn prompt_exact_attended_phrase(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    explanation: &str,
+    expected: &'static str,
+) -> Result<(), AttendedWheelsOffAttestationError> {
+    writeln!(output, "{explanation}")
+        .and_then(|()| write!(output, "Type {expected:?}: "))
+        .and_then(|()| output.flush())
+        .map_err(AttendedWheelsOffAttestationError::Output)?;
+    let actual = read_bounded_tty_line(input)?;
+    if actual != expected {
+        return Err(AttendedWheelsOffAttestationError::PhraseMismatch { expected });
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn require_attended_wheels_off_preflight()
+-> Result<AttendedWheelsOffPreflight, AttendedWheelsOffAttestationError> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    if !stdin.is_terminal() || !stdout.is_terminal() {
+        return Err(AttendedWheelsOffAttestationError::TtyRequired);
+    }
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    prompt_exact_attended_phrase(
+        &mut input,
+        &mut output,
+        "Confirm that both drive wheels are physically removed. Software cannot observe this.",
+        "WHEELS REMOVED",
+    )?;
+    prompt_exact_attended_phrase(
+        &mut input,
+        &mut output,
+        "Confirm that the head is physically supported before the natural-hold actor starts.",
+        "HEAD SUPPORTED",
+    )?;
+    prompt_exact_attended_phrase(
+        &mut input,
+        &mut output,
+        "Confirm that an independent physical power cut is immediately reachable.",
+        "POWER CUT REACHABLE",
+    )?;
+    Ok(AttendedWheelsOffPreflight)
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn require_fresh_attended_motion_attestation(
+    _preflight: &AttendedWheelsOffPreflight,
+) -> Result<kiko_slam::navigation::OperatorClaimedWheelsOffAttestation, Box<dyn std::error::Error>>
+{
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    if !stdin.is_terminal() || !stdout.is_terminal() {
+        return Err(Box::new(AttendedWheelsOffAttestationError::TtyRequired));
+    }
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    prompt_exact_attended_phrase(
+        &mut input,
+        &mut output,
+        "The full software stack is ready. Reconfirm all three physical conditions immediately before the short motion qualification window.",
+        "WHEELS OFF HEAD SUPPORTED POWER CUT READY",
+    )?;
+    Ok(
+        kiko_slam::navigation::OperatorClaimedWheelsOffAttestation::try_new(
+            true,
+            true,
+            true,
+            Instant::now(),
+        )?,
+    )
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn prepare_nano_wheels_off_qualification_live_session(
+    bootstrap: kiko_slam::navigation::PreparedNanoWheelsOffQualificationBootstrap,
+    preflight: AttendedWheelsOffPreflight,
+    stream_epoch: StreamEpochId,
+    capture_clock_origin: Instant,
+    running: &AtomicBool,
+) -> Result<PreparedLiveSession, Box<dyn std::error::Error>> {
+    let oak_provenance =
+        OakRuntimeProvenance::from_nano_wheels_off_qualification_bootstrap(&bootstrap);
+    let kiko_slam::navigation::PreparedNanoWheelsOffQualificationBootstrap {
+        roots,
+        launch,
+        assets,
+        manifest: _,
+        policy,
+        calibration: _,
+        plant: _,
+        artifact_hashes: _,
+        accessory_evidence: _,
+        oak_connected_identity: _,
+        oak_usb_transport: _,
+        depthai_build_metadata: _,
+        stereo,
+        live,
+        exact_inventory_admission: _,
+        candidate_limits,
+        candidate_runtime_service_interval,
+        initial_zero,
+        initial_stop,
+        stopped_controller,
+        oak,
+    } = bootstrap;
+    let mut resources = NanoQualificationPreOwnerResources::new(
+        stopped_controller,
+        initial_zero,
+        initial_stop,
+        candidate_limits,
+        candidate_runtime_service_interval,
+        oak,
+    );
+
+    // The candidate controller is already exactly stopped. Natural head hold
+    // and expression ownership are established before the expensive common
+    // model stack; every later failure retains the bootstrap stop evidence.
+    let accessory_config = (|| -> Result<NanoAccessoryWorkerConfig, Box<dyn std::error::Error>> {
+        let health_period = NanoAccessoryHealthPeriod::try_from_duration(Duration::from_secs(1))?;
+        Ok(NanoAccessoryWorkerConfig::from_manifest_bound_policy(
+            &policy,
+            stream_epoch,
+            health_period,
+        )?)
+    })();
+    let accessory_config = match accessory_config {
+        Ok(config) => config,
+        Err(primary) => return resources.fail_box(primary),
+    };
+    resources.accessory = match NanoAccessoryWorker::start(accessory_config) {
+        Ok(accessory) => Some(accessory),
+        Err(source) => {
+            return resources.fail_box(Box::new(LiveAccessoryError::Start(source)));
+        }
+    };
+
+    let software = prepare_nano_common_live_software(
+        NanoCommonLiveSoftwareInput {
+            roots: &roots,
+            graph: launch.launch().oak(),
+            storage: launch.launch().storage(),
+            occupancy: launch.launch().occupancy(),
+            inference_policy: launch.launch().inference(),
+            rerun: launch.launch().rerun(),
+            onnx_runtime_library: assets.onnx_runtime_library.bytes(),
+            superpoint_model: assets.superpoint_model.bytes(),
+            lightglue_model: assets.lightglue_model.bytes(),
+            stereo,
+            live,
+            map_persistence: policy.map_persistence(),
+            stream_epoch,
+        },
+        || {
+            require_qualification_pre_owner_accessory_healthy(&resources, running)
+                .map_err(|source| Box::new(source) as Box<dyn std::error::Error>)
+        },
+    );
+    let software = match software {
+        Ok(software) => software,
+        Err(primary) => return resources.fail_box(primary),
+    };
+
+    let operator_console = policy.control().operator_console();
+    let profile = kiko_slam::navigation::WheelsOffQualificationControlProfile::parse(
+        candidate_limits.effective_max_abs_pwm_percent(),
+        candidate_limits.manual_test_magnitude_timer_pwm_percent(),
+        u64::try_from(candidate_limits.manual_deadman().as_millis())?,
+    )?;
+    let frontend_config = kiko_slam::navigation::WheelsOffQualificationFrontendConfig::parse(
+        operator_console.bind_address(),
+        operator_console.capability_path().as_path().to_path_buf(),
+        AgentControlMonotonicOrigin::new(
+            capture_clock_origin,
+            HostMonotonicTimestamp::from_nanos(0),
+        ),
+        operator_console.deadman_tick(),
+    )?;
+    let initial_health = ConsoleSubsystemHealth {
+        stm32: Some(ConsoleHealth::Ready),
+        head: Some(
+            if policy
+                .head()
+                .return_to_natural_and_hold_continuously()
+                .is_some()
+            {
+                ConsoleHealth::Ready
+            } else {
+                ConsoleHealth::Unavailable
+            },
+        ),
+        eyes: Some(if policy.eye().static_runtime().is_some() {
+            ConsoleHealth::Ready
+        } else {
+            ConsoleHealth::Unavailable
+        }),
+        oak: Some(ConsoleHealth::Degraded),
+    };
+    let accessory_health = resources
+        .accessory
+        .as_ref()
+        .expect("successful accessory startup retains its sole owner")
+        .health_observer();
+    let (
+        stopped_controller,
+        initial_zero,
+        initial_stop,
+        limits,
+        runtime_service_interval,
+        accessory,
+        device,
+    ) = resources.into_parts();
+    debug_assert_eq!(limits, candidate_limits);
+
+    Ok(PreparedLiveSession {
+        device,
+        device_session: software.device_session,
+        mono_config: software.mono_config,
+        depth_config: Some(software.depth_config),
+        imu_config: Some(software.imu_config),
+        depth_queue_capacity: Some(software.queue_capacity),
+        depth_ring_capacity: DepthRingCapacity::from_queue_capacity(software.queue_capacity),
+        imu_session: Some(software.device_session),
+        imu_queue_capacity: Some(software.queue_capacity),
+        dense_requested: true,
+        dense_data_capacity: software.queue_capacity,
+        dense_control_capacity: software.dense_control_capacity,
+        pairing_window: software.pairing_window,
+        pairer: software.pairer,
+        calibration: software.calibration,
+        rectified_left_intrinsics: software.rectified_left_intrinsics,
+        prepared_navigation_runtime: Some(software.navigation),
+        inference: software.inference,
+        pair_queue_depth: software.queue_size,
+        viz_queue_depth: software.queue_size,
+        rerun_decimation: software.rerun_decimation,
+        rerun_finish_timeout: software.rerun_finish_timeout,
+        rerun_target: software.rerun_target,
+        oak_provenance,
+        motion: PreparedLiveMotionSelection::WheelsOffQualification(Box::new(
+            LiveWheelsOffQualificationMotionInput::new(
+                stopped_controller,
+                initial_zero,
+                initial_stop,
+                limits,
+                runtime_service_interval,
+                preflight,
+                profile,
+                frontend_config,
+                initial_health,
+                accessory_health,
+            ),
+        )),
+        accessory: Some(accessory),
+        production_state: Some(software.production_state),
+        warm_start_replay: software.warm_start_replay,
+    })
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+fn prepare_nano_live_session(
+    bootstrap: PreparedNanoBootstrap,
+    stream_epoch: StreamEpochId,
+    running: &AtomicBool,
+) -> Result<PreparedLiveSession, Box<dyn std::error::Error>> {
+    let oak_provenance = OakRuntimeProvenance::from_nano_bootstrap(&bootstrap);
+    let PreparedNanoBootstrap {
+        roots,
+        launch,
+        assets,
+        accessory_evidence: _,
+        oak_connected_identity: _,
+        oak_usb_transport: _,
+        depthai_build_metadata: _,
+        calibration: _,
+        stereo,
+        live,
+        runtime,
+        accessory,
+        oak,
+    } = bootstrap;
+    let resources = NanoPreOwnerResources::new(runtime, accessory, oak);
+
+    let map_persistence = resources
+        .runtime
+        .as_ref()
+        .expect("pre-owner runtime remains present during map admission")
+        .startup()
+        .policy
+        .map_persistence();
+    let software = prepare_nano_common_live_software(
+        NanoCommonLiveSoftwareInput {
+            roots: &roots,
+            graph: launch.launch().oak(),
+            storage: launch.launch().storage(),
+            occupancy: launch.launch().occupancy(),
+            inference_policy: launch.launch().inference(),
+            rerun: launch.launch().rerun(),
+            onnx_runtime_library: assets.onnx_runtime_library.bytes(),
+            superpoint_model: assets.superpoint_model.bytes(),
+            lightglue_model: assets.lightglue_model.bytes(),
+            stereo,
+            live,
+            map_persistence,
+            stream_epoch,
+        },
+        || {
+            require_pre_owner_accessory_healthy(&resources, running)
+                .map_err(|source| Box::new(source) as Box<dyn std::error::Error>)
+        },
+    );
+    let software = match software {
+        Ok(software) => software,
+        Err(primary) => return resources.fail_box(primary),
+    };
+
+    let accessory_health = resources
+        .accessory
+        .as_ref()
+        .expect("successful accessory startup retains its sole owner")
+        .health_observer();
+    let (runtime, accessory, device) = resources.into_parts();
+    Ok(PreparedLiveSession {
+        device,
+        device_session: software.device_session,
+        mono_config: software.mono_config,
+        depth_config: Some(software.depth_config),
+        imu_config: Some(software.imu_config),
+        depth_queue_capacity: Some(software.queue_capacity),
+        depth_ring_capacity: DepthRingCapacity::from_queue_capacity(software.queue_capacity),
+        imu_session: Some(software.device_session),
+        imu_queue_capacity: Some(software.queue_capacity),
+        dense_requested: true,
+        dense_data_capacity: software.queue_capacity,
+        dense_control_capacity: software.dense_control_capacity,
+        pairing_window: software.pairing_window,
+        pairer: software.pairer,
+        calibration: software.calibration,
+        rectified_left_intrinsics: software.rectified_left_intrinsics,
+        prepared_navigation_runtime: Some(software.navigation),
+        inference: software.inference,
+        pair_queue_depth: software.queue_size,
+        viz_queue_depth: software.queue_size,
+        rerun_decimation: software.rerun_decimation,
+        rerun_finish_timeout: software.rerun_finish_timeout,
+        rerun_target: software.rerun_target,
+        oak_provenance,
+        motion: PreparedLiveMotionSelection::Production(Box::new(
+            LiveProductionMotionInput::from_admitted(runtime, accessory_health),
+        )),
+        accessory: Some(accessory),
+        production_state: Some(software.production_state),
+        warm_start_replay: software.warm_start_replay,
+    })
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+struct NanoControllerOwnerExitGuard {
+    running: Arc<AtomicBool>,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl NanoControllerOwnerExitGuard {
+    fn new(running: Arc<AtomicBool>) -> Self {
+        Self { running }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl Drop for NanoControllerOwnerExitGuard {
+    fn drop(&mut self) {
+        // This guard also runs while unwinding a task panic. No controller
+        // owner exit—clean, failed, or panicked—may leave the rest of the
+        // production process believing physical ownership is still healthy.
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn run_nano_wheels_off_qualification(
+    args: NanoWheelsOffQualificationArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let running = install_live_shutdown_handler()?;
+    // No device, serial port, listener, or controller owner is opened before
+    // the attended physical preflight succeeds.
+    let preflight = require_attended_wheels_off_preflight()?;
+    let capture_clock_origin = Instant::now();
+    let navigation_clock_epoch = NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(0));
+    let stream_epoch = fresh_nano_stream_epoch()?;
+    let request = kiko_slam::navigation::QualificationBootstrapRequest::try_new(
+        args.deployment_root,
+        args.state_root,
+        args.launch_config,
+        capture_clock_origin,
+        running.as_ref(),
+    )?;
+    let async_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    let owned_bootstrap = async_runtime
+        .block_on(kiko_slam::navigation::bootstrap_nano_wheels_off_qualification(request))?;
+    let (bootstrap, controller_owner, controller_owner_shutdown_timeout) =
+        owned_bootstrap.into_parts();
+    let (request_controller_shutdown, controller_shutdown) = tokio::sync::oneshot::channel();
+    let controller_running = Arc::clone(&running);
+    let controller_task = async_runtime.spawn(async move {
+        let _exit_guard = NanoControllerOwnerExitGuard::new(controller_running);
+        controller_owner
+            .run_until_shutdown(controller_shutdown, controller_owner_shutdown_timeout)
+            .await
+    });
+
+    let operation = prepare_nano_wheels_off_qualification_live_session(
+        bootstrap,
+        preflight,
+        stream_epoch,
+        capture_clock_origin,
+        running.as_ref(),
+    )
+    .and_then(|prepared| {
+        run_prepared_live_session(
+            prepared,
+            running,
+            capture_clock_origin,
+            navigation_clock_epoch,
+        )
+    });
+    let _ = request_controller_shutdown.send(());
+    let controller = async_runtime.block_on(controller_task);
+    drop(async_runtime);
+    finish_nano_controller_owner(operation, controller)
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+fn run_nano_agent(args: NanoAgentArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let running = install_live_shutdown_handler()?;
+    let capture_clock_origin = Instant::now();
+    let navigation_clock_epoch = NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(0));
+    let readiness_epoch = ReadinessEpoch::try_new(1)?;
+    let stream_epoch = fresh_nano_stream_epoch()?;
+    let request = NanoBootstrapRequest::try_new(
+        args.deployment_root,
+        args.state_root,
+        args.launch_config,
+        stream_epoch,
+        capture_clock_origin,
+        navigation_clock_epoch,
+        readiness_epoch,
+        running.as_ref(),
+    )?;
+    // One dedicated async worker keeps the sole serial/UDP controller owner
+    // progressing while the host SLAM pipeline runs on its bounded native
+    // worker threads.
+    let async_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    let owned_bootstrap = async_runtime.block_on(bootstrap_nano_production(request))?;
+    let (bootstrap, controller_owner, controller_owner_shutdown_timeout) =
+        owned_bootstrap.into_parts();
+    let (request_controller_shutdown, controller_shutdown) = tokio::sync::oneshot::channel();
+    let controller_running = Arc::clone(&running);
+    let controller_task = async_runtime.spawn(async move {
+        let _exit_guard = NanoControllerOwnerExitGuard::new(controller_running);
+        controller_owner
+            .run_until_shutdown(controller_shutdown, controller_owner_shutdown_timeout)
+            .await
+    });
+
+    let operation =
+        prepare_nano_live_session(bootstrap, stream_epoch, running.as_ref()).and_then(|prepared| {
+            run_prepared_live_session(
+                prepared,
+                running,
+                capture_clock_origin,
+                navigation_clock_epoch,
+            )
+        });
+    let _ = request_controller_shutdown.send(());
+    let controller = async_runtime.block_on(controller_task);
+    drop(async_runtime);
+    finish_nano_controller_owner(operation, controller)
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Debug)]
+enum NanoControllerOwnerRunError {
+    Terminated(V2ControllerOwnerTerminationError),
+    TaskJoin(tokio::task::JoinError),
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::fmt::Display for NanoControllerOwnerRunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Terminated(source) => source.fmt(formatter),
+            Self::TaskJoin(source) => {
+                write!(formatter, "controller-owner task join failed: {source}")
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::error::Error for NanoControllerOwnerRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Terminated(source) => Some(source),
+            Self::TaskJoin(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Debug)]
+struct NanoOperationAndControllerOwnerError {
+    operation: Box<dyn std::error::Error>,
+    controller: NanoControllerOwnerRunError,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::fmt::Display for NanoOperationAndControllerOwnerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Nano operation failed: {}; controller-owner termination also failed: {}",
+            self.operation, self.controller
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::error::Error for NanoOperationAndControllerOwnerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.operation.as_ref())
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+fn finish_nano_controller_owner(
+    operation: Result<(), Box<dyn std::error::Error>>,
+    controller: Result<Result<(), V2ControllerOwnerTerminationError>, tokio::task::JoinError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let controller = match controller {
+        Ok(Ok(())) => None,
+        Ok(Err(source)) => Some(NanoControllerOwnerRunError::Terminated(source)),
+        Err(source) => Some(NanoControllerOwnerRunError::TaskJoin(source)),
+    };
+    match (operation, controller) {
+        (Ok(()), None) => Ok(()),
+        (Err(operation), None) => Err(operation),
+        (Ok(()), Some(controller)) => Err(Box::new(controller)),
+        (Err(operation), Some(controller)) => Err(Box::new(NanoOperationAndControllerOwnerError {
+            operation,
+            controller,
+        })),
+    }
+}
+
+#[cfg(feature = "record")]
+fn install_live_shutdown_handler() -> Result<Arc<AtomicBool>, ctrlc::Error> {
+    let running = Arc::new(AtomicBool::new(true));
+    let signal_running = Arc::clone(&running);
+    ctrlc::set_handler(move || {
+        eprintln!("\nreceived shutdown signal, stopping...");
+        signal_running.store(false, Ordering::SeqCst);
+    })?;
+    Ok(running)
+}
+
+#[cfg(feature = "record")]
+fn prepare_compatibility_live_session(
+    args: LiveArgs,
+    running: &AtomicBool,
+) -> Result<PreparedLiveSession, Box<dyn std::error::Error>> {
     #[cfg(feature = "actuation")]
     let (navigation_actuation_config, navigation_arm_robot) = (
         args.navigation_actuation_config.clone(),
@@ -5047,12 +12354,6 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         navigation_arm_robot,
     )?
     .load()?;
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        eprintln!("\nreceived ctrl+c, stopping...");
-        r.store(false, Ordering::SeqCst);
-    })?;
 
     let mono_config = MonoConfig {
         width: args.camera.width,
@@ -5122,38 +12423,134 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut device = Device::connect(args.camera.oak_device_id.as_str(), config)?;
     let oak_provenance = inspect_oak_runtime(&device, "live")?;
-    let operation = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let pairing_window = load_pairing_window()?;
-        let pairer_max_pending = load_pairer_max_pending_per_side()?;
-        let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending)?;
-        let StereoBootstrap {
-            calibration,
-            rectified_left_intrinsics,
-        } = bootstrap_stereo(&mut device, &mono_config, running.as_ref(), &mut pairer)?;
-        let capture_clock_origin = Instant::now();
-        let navigation_clock_epoch =
-            NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(0));
-        let rectified = RectifiedStereo::from_calibration(&calibration)?;
-        let runtime_depth_camera = DepthCameraModel::new(
-            rectified.left(),
-            rectified.dimensions(),
-            DepthToTrackingCamera::identity(),
-        );
-        let mut prepared_navigation_runtime = prepare_live_navigation_runtime(
-            navigation_request,
-            runtime_depth_camera,
-            device_session,
-        )?;
-        let navigation_enabled = prepared_navigation_runtime.is_some();
+    let pairing_window = load_pairing_window()?;
+    let pairer_max_pending = load_pairer_max_pending_per_side()?;
+    let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending)?;
+    let StereoBootstrap {
+        calibration,
+        rectified_left_intrinsics,
+    } = bootstrap_stereo(&mut device, &mono_config, running, &mut pairer)?;
+    let rectified = RectifiedStereo::from_calibration(&calibration)?;
+    let runtime_depth_camera = DepthCameraModel::new(
+        rectified.left(),
+        rectified.dimensions(),
+        DepthToTrackingCamera::identity(),
+    );
+    let prepared_navigation_runtime =
+        prepare_live_navigation_runtime(navigation_request, runtime_depth_camera, device_session)?;
+    let inference = InferenceConfig::from_args(&args.inference)?;
+    let pair_queue_depth = env_usize("KIKO_LIVE_PAIR_QUEUE_DEPTH")?.unwrap_or(12);
+    let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH")?.unwrap_or(12);
+    let dense_data_capacity =
+        ChannelCapacity::try_from(env_usize("KIKO_DENSE_DATA_QUEUE_DEPTH")?.unwrap_or(4))?;
+    let dense_control_capacity =
+        ChannelCapacity::try_from(env_usize("KIKO_DENSE_CTRL_QUEUE_DEPTH")?.unwrap_or(64))?;
 
-        let pair_queue_depth = env_usize("KIKO_LIVE_PAIR_QUEUE_DEPTH")?.unwrap_or(12);
+    Ok(PreparedLiveSession {
+        device,
+        device_session,
+        mono_config,
+        depth_config,
+        imu_config,
+        depth_queue_capacity,
+        depth_ring_capacity,
+        imu_session,
+        imu_queue_capacity,
+        dense_requested,
+        dense_data_capacity,
+        dense_control_capacity,
+        pairing_window,
+        pairer,
+        calibration,
+        rectified_left_intrinsics,
+        prepared_navigation_runtime,
+        inference,
+        pair_queue_depth,
+        viz_queue_depth,
+        rerun_decimation: args.rerun_decimation.get(),
+        rerun_finish_timeout: args.rerun_finish_timeout_ms.get(),
+        rerun_target: LiveRerunTarget::Connect,
+        oak_provenance,
+        #[cfg(feature = "actuation")]
+        motion: PreparedLiveMotionSelection::Compatibility,
+        #[cfg(all(feature = "nano-agent", unix))]
+        accessory: None,
+        #[cfg(all(feature = "nano-agent", unix))]
+        production_state: None,
+        #[cfg(all(feature = "nano-agent", unix))]
+        warm_start_replay: None,
+    })
+}
+
+#[cfg(feature = "record")]
+fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let running = install_live_shutdown_handler()?;
+    let prepared = prepare_compatibility_live_session(args, running.as_ref())?;
+    let capture_clock_origin = Instant::now();
+    let navigation_clock_epoch = NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(0));
+    run_prepared_live_session(
+        prepared,
+        running,
+        capture_clock_origin,
+        navigation_clock_epoch,
+    )
+}
+
+#[cfg(feature = "record")]
+fn run_prepared_live_session(
+    prepared: PreparedLiveSession,
+    running: Arc<AtomicBool>,
+    capture_clock_origin: Instant,
+    navigation_clock_epoch: NavigationClockEpoch,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let PreparedLiveSession {
+        mut device,
+        device_session,
+        mono_config,
+        depth_config,
+        imu_config,
+        depth_queue_capacity,
+        depth_ring_capacity,
+        imu_session,
+        imu_queue_capacity,
+        dense_requested,
+        dense_data_capacity,
+        dense_control_capacity,
+        pairing_window,
+        mut pairer,
+        calibration,
+        rectified_left_intrinsics,
+        mut prepared_navigation_runtime,
+        inference,
+        pair_queue_depth,
+        viz_queue_depth,
+        rerun_decimation,
+        rerun_finish_timeout,
+        rerun_target,
+        oak_provenance,
+        #[cfg(feature = "actuation")]
+        motion,
+        #[cfg(all(feature = "nano-agent", unix))]
+        accessory,
+        #[cfg(all(feature = "nano-agent", unix))]
+        production_state,
+        #[cfg(all(feature = "nano-agent", unix))]
+        warm_start_replay,
+    } = prepared;
+    let depth_enabled = depth_config.is_some();
+    let operation = (|| -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(all(feature = "nano-agent", unix))]
+        let mut nano_setup_guard = NanoLiveSetupGuard::new(motion, accessory, production_state);
+        let rectified = RectifiedStereo::from_calibration(&calibration)?;
+        let navigation_enabled = prepared_navigation_runtime.is_some();
         let pair_capacity = ChannelCapacity::try_from(pair_queue_depth)?;
         let (pair_tx, pair_rx, pair_stats) =
             bounded_channel::<StereoObservation>(pair_capacity, DropPolicy::DropOldest);
 
-        let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH")?.unwrap_or(12);
         let viz_capacity = ChannelCapacity::try_from(viz_queue_depth)?;
         let (viz_tx, viz_rx, viz_stats) = bounded_channel(viz_capacity, DropPolicy::DropNewest);
+        let (rgb_viz_tx, rgb_viz_rx, rgb_viz_stats) =
+            bounded_channel(ChannelCapacity::try_from(1_usize)?, DropPolicy::DropOldest);
         let (depth_tx, depth_rx, mut navigation_depth_rx, depth_stats_handle) =
             if let Some(depth_capacity) = depth_queue_capacity {
                 let (depth_tx, depth_routes, depth_stats) =
@@ -5177,7 +12574,6 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 _ => unreachable!("IMU session and queue capacity are derived together"),
             };
 
-        let inference = InferenceConfig::from_args(&args.inference)?;
         let InferenceConfig {
             superpoint_left,
             superpoint_right,
@@ -5221,10 +12617,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         // Dense reconstruction channels and worker thread.
         let dense_enabled = depth_enabled && dense_requested;
         let dense_capacities = if dense_enabled {
-            Some((
-                ChannelCapacity::try_from(env_usize("KIKO_DENSE_DATA_QUEUE_DEPTH")?.unwrap_or(4))?,
-                ChannelCapacity::try_from(env_usize("KIKO_DENSE_CTRL_QUEUE_DEPTH")?.unwrap_or(64))?,
-            ))
+            Some((dense_data_capacity, dense_control_capacity))
         } else {
             None
         };
@@ -5243,6 +12636,77 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
+        #[cfg(all(feature = "nano-agent", unix))]
+        nano_setup_guard.require_accessory_healthy_if_present(running.as_ref())?;
+        let tracker = SlamTracker::try_new(
+            superpoint_left,
+            superpoint_right,
+            lightglue,
+            rectified,
+            tracker_config,
+        )?;
+        report_tracker_runtime(&tracker_config, &tracker);
+        #[cfg(all(feature = "nano-agent", unix))]
+        nano_setup_guard.require_accessory_healthy_if_present(running.as_ref())?;
+
+        #[cfg(all(feature = "nano-agent", unix))]
+        let (tracker, occupancy_startup, dense_generation, warm_relocalization_gate) =
+            match warm_start_replay {
+                Some(required) => {
+                    let occupancy_config =
+                        occupancy_config.ok_or(NanoWarmStartOccupancyUnavailable)?;
+                    let parts = replay_nano_warm_start(
+                        *required,
+                        tracker,
+                        occupancy_config,
+                        NanoWarmStartReplayConfig::default(),
+                    )?
+                    .into_parts();
+                    let kiko_slam::navigation::NanoWarmStartReplayRuntimeParts {
+                        tracker,
+                        occupancy,
+                        dense_generation,
+                        initial_snapshot,
+                        relocalization_gate,
+                        receipt,
+                    } = parts;
+                    eprintln!(
+                        "warm start: exact replay matched occupancy={} dataset={} selected_map_epoch={} selected_map_revision={} stereo_pairs={} replay_events={} replay_map_corrections={} replay_map={:?}; live_localized=false; dataset_content_binding={}",
+                        receipt.occupancy_snapshot_path().display(),
+                        receipt.slam_dataset_directory_path().display(),
+                        receipt.selected_map_epoch_id().as_u64(),
+                        receipt.selected_map_revision(),
+                        receipt.processed_stereo_pairs(),
+                        receipt.replay_diagnostic_events(),
+                        receipt.replay_map_corrections(),
+                        receipt.final_replay_map(),
+                        receipt.dataset_content_binding_status(),
+                    );
+                    (
+                        tracker,
+                        Some(LiveOccupancyWorkerStartup::ContinuedReplay {
+                            runtime: Box::new(occupancy),
+                            initial_snapshot,
+                        }),
+                        dense_generation,
+                        Some(relocalization_gate),
+                    )
+                }
+                None => (
+                    tracker,
+                    occupancy_config.map(LiveOccupancyWorkerStartup::Fresh),
+                    command_mapper::DenseCommandGeneration::default(),
+                    None,
+                ),
+            };
+        #[cfg(all(feature = "nano-agent", unix))]
+        nano_setup_guard.require_accessory_healthy_if_present(running.as_ref())?;
+        #[cfg(not(all(feature = "nano-agent", unix)))]
+        let (tracker, occupancy_startup, dense_generation) = (
+            tracker,
+            occupancy_config.map(LiveOccupancyWorkerStartup::Fresh),
+            command_mapper::DenseCommandGeneration::default(),
+        );
 
         // Use one FIFO so reset/rebuild commands cannot overtake or be overtaken
         // by causally adjacent integrations and removals. The data quota reserves
@@ -5261,7 +12725,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         let (navigation_viz_tx, navigation_viz_rx, navigation_viz_stats_handle) =
             if navigation_enabled {
                 let (tx, rx, stats) =
-                    bounded_channel(ChannelCapacity::try_from(4_usize)?, DropPolicy::DropNewest);
+                    bounded_channel(ChannelCapacity::try_from(4_usize)?, DropPolicy::DropOldest);
                 (Some(tx), Some(rx), Some(stats))
             } else {
                 (None, None, None)
@@ -5295,6 +12759,11 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut depth_ring = DepthRingBuffer::try_new(depth_ring_capacity.get())?;
+        // All expensive model, tracker, warm-start, and queue construction is
+        // complete. Only now request the short-lived physical claim that can
+        // be consumed by the candidate controller owner.
+        #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+        nano_setup_guard.require_fresh_qualification_attestation()?;
         // Dataset creation is intentionally the final fallible setup boundary.
         // From this point every exit path consumes its handle through either
         // bound finalization or abort_without_manifest.
@@ -5318,41 +12787,104 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         let navigation_actuation_config = active_navigation
             .as_ref()
             .and_then(|active| active.actuation.clone());
+        #[cfg(feature = "actuation")]
+        #[cfg(all(feature = "nano-agent", unix))]
+        let selected_motion = nano_setup_guard.take_motion();
+        #[cfg(all(feature = "actuation", not(all(feature = "nano-agent", unix))))]
+        let selected_motion = motion;
+        #[cfg(feature = "actuation")]
+        let mut navigation_worker_motion = Some(match selected_motion {
+            PreparedLiveMotionSelection::Compatibility => {
+                LiveNavigationWorkerMotion::compatibility(navigation_actuation_config)
+            }
+            #[cfg(all(feature = "nano-agent", unix))]
+            PreparedLiveMotionSelection::Production(input) => {
+                LiveNavigationWorkerMotion::Production(input)
+            }
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            PreparedLiveMotionSelection::WheelsOffQualification(input) => {
+                LiveNavigationWorkerMotion::WheelsOffQualification(input)
+            }
+        });
         let (
             navigation_coordinator,
             navigation_control_period,
+            _navigation_dataset_directory,
             navigation_dataset_writer,
             navigation_dataset_handle,
         ) = match active_navigation {
             Some(active) => (
                 Some(active.coordinator),
                 Some(active.control_period),
+                Some(active.dataset_directory),
                 Some(active.dataset_writer),
                 Some(active.dataset_handle),
             ),
-            None => (None, None, None, None),
+            None => (None, None, None, None, None),
         };
+        #[cfg(all(feature = "nano-agent", unix))]
+        let mut navigation_dataset_handle = navigation_dataset_handle;
 
-        let dense_handle = if let (Some(config), Some(command_rx), stats_tx, snapshot_tx) = (
-            occupancy_config,
+        #[cfg(all(feature = "nano-agent", unix))]
+        let quiescent_checkpoint_requested = Arc::new(AtomicBool::new(false));
+        #[cfg(all(feature = "nano-agent", unix))]
+        let (mut checkpoint_worker_bridge, mut checkpoint_main_bridge) =
+            match _navigation_dataset_directory.as_ref() {
+                Some(dataset_directory) => {
+                    let (worker, main) = nano_dataset_checkpoint_bridge(
+                        Arc::clone(&quiescent_checkpoint_requested),
+                        dataset_directory.clone(),
+                    );
+                    (Some(worker), Some(main))
+                }
+                None => (None, None),
+            };
+
+        let dense_handle = if let (Some(startup), Some(command_rx), stats_tx, snapshot_tx) = (
+            occupancy_startup,
             dense_command_rx_for_worker.take(),
             dense_stats_tx_for_worker.take(),
             occupancy_snapshot_tx_for_worker.take(),
         ) {
             let dense_running = Arc::clone(&running);
-            Some(thread::spawn(move || {
-                let _exit_guard = LiveThreadExitGuard(dense_running);
-                kiko_slam::dense::occupancy_runtime::run_occupancy_worker(
-                    config,
-                    &command_rx,
-                    stats_tx.as_ref(),
-                    snapshot_tx,
-                )
-            }))
+            #[cfg(all(feature = "nano-agent", unix))]
+            let dense_checkpoint_requested = Arc::clone(&quiescent_checkpoint_requested);
+            Some(spawn_live_thread("kiko-occupancy", move || {
+                #[cfg(all(feature = "nano-agent", unix))]
+                let _exit_guard = LiveThreadExitGuard::checkpoint_aware(
+                    dense_running,
+                    dense_checkpoint_requested,
+                );
+                #[cfg(not(all(feature = "nano-agent", unix)))]
+                let _exit_guard = LiveThreadExitGuard::new(dense_running);
+                match startup {
+                    LiveOccupancyWorkerStartup::Fresh(config) => {
+                        kiko_slam::dense::occupancy_runtime::run_occupancy_worker(
+                            config,
+                            &command_rx,
+                            stats_tx.as_ref(),
+                            snapshot_tx,
+                        )
+                    }
+                    #[cfg(all(feature = "nano-agent", unix))]
+                    LiveOccupancyWorkerStartup::ContinuedReplay {
+                        runtime,
+                        initial_snapshot,
+                    } => kiko_slam::dense::occupancy_runtime::run_occupancy_worker_from_runtime(
+                        *runtime,
+                        Some(initial_snapshot),
+                        &command_rx,
+                        stats_tx.as_ref(),
+                        snapshot_tx,
+                    ),
+                }
+            })?)
         } else {
             None
         };
 
+        #[cfg(all(feature = "nano-agent", unix))]
+        let navigation_production_state = nano_setup_guard.take_production_state();
         let navigation_handle = match navigation_coordinator {
             Some(coordinator) => {
                 let control_period = navigation_control_period
@@ -5370,13 +12902,20 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     .take()
                     .expect("enabled navigation requires a dense map route");
                 let navigation_running = Arc::clone(&running);
-                Some(thread::spawn(move || {
+                Some(spawn_live_thread("kiko-navigation", move || {
                     run_live_navigation_worker(
                         coordinator,
                         control_period,
+                        navigation_clock_epoch,
                         capture_clock_origin,
                         #[cfg(feature = "actuation")]
-                        navigation_actuation_config,
+                        navigation_worker_motion
+                            .take()
+                            .expect("enabled navigation consumes one motion selection"),
+                        #[cfg(all(feature = "nano-agent", unix))]
+                        navigation_production_state,
+                        #[cfg(all(feature = "nano-agent", unix))]
+                        checkpoint_worker_bridge.take(),
                         navigation_running,
                         visual_rx,
                         depth_rx,
@@ -5385,461 +12924,675 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         navigation_map_viz_tx,
                         navigation_viz_tx,
                     )
-                }))
+                })?)
             }
             None => None,
         };
+        #[cfg(all(feature = "nano-agent", unix))]
+        let post_navigation_setup_guard = NanoPostNavigationSetupGuard::new(
+            Arc::clone(&running),
+            navigation_handle,
+            nano_setup_guard.take_accessory(),
+        );
 
         let inference_running = Arc::clone(&running);
-        let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
-            let _exit_guard = LiveThreadExitGuard(inference_running);
-            let mut tracker = SlamTracker::try_new(
-                superpoint_left,
-                superpoint_right,
-                lightglue,
-                rectified,
-                tracker_config,
-            )
-            .map_err(|source| LiveThreadError::TrackerInitialization { source })?;
-            report_tracker_runtime(&tracker_config, &tracker);
-            let depth_rx = depth_rx;
-            let depth_enabled_for_diagnostics = depth_rx.is_some();
-            let mut dense_generation = command_mapper::DenseCommandGeneration::default();
-            let mut dense_command_tx = dense_command_tx;
-            let dense_stats_rx = dense_stats_rx;
-            let mut dense_active = dense_enabled;
-            let mut dense_integrations_dropped_newest: u64 = 0;
-            let mut depth_reorder_warnings_seen: u64 = 0;
-            let mut viz_tx = Some(viz_tx);
-            let navigation_visual_tx = navigation_visual_tx;
+        #[cfg(all(feature = "nano-agent", unix))]
+        let inference_checkpoint_requested = Arc::clone(&quiescent_checkpoint_requested);
+        let inference_handle = spawn_live_thread(
+            "kiko-inference",
+            move || -> Result<(), LiveThreadError> {
+                #[cfg(all(feature = "nano-agent", unix))]
+                let _exit_guard = LiveThreadExitGuard::checkpoint_aware(
+                    Arc::clone(&inference_running),
+                    inference_checkpoint_requested,
+                );
+                #[cfg(not(all(feature = "nano-agent", unix)))]
+                let _exit_guard = LiveThreadExitGuard::new(Arc::clone(&inference_running));
+                let mut tracker = tracker;
+                let depth_rx = depth_rx;
+                let depth_enabled_for_diagnostics = depth_rx.is_some();
+                let mut dense_generation = dense_generation;
+                #[cfg(all(feature = "nano-agent", unix))]
+                let mut warm_relocalization_gate = warm_relocalization_gate;
+                let mut dense_command_tx = dense_command_tx;
+                let dense_stats_rx = dense_stats_rx;
+                let mut dense_active = dense_enabled;
+                let mut dense_integrations_dropped_newest: u64 = 0;
+                let mut depth_reorder_warnings_seen: u64 = 0;
+                let mut viz_tx = Some(viz_tx);
+                let navigation_visual_tx = navigation_visual_tx;
 
-            for observation in pair_rx.iter() {
-                let pending_visual = if navigation_visual_tx.is_some() {
-                    Some(
-                        PendingVisualAttemptIngress::from_observation(
-                            navigation_clock_epoch,
-                            &observation,
+                for observation in pair_rx.iter() {
+                    let pending_visual = if navigation_visual_tx.is_some() {
+                        Some(
+                            PendingVisualAttemptIngress::from_observation(
+                                navigation_clock_epoch,
+                                &observation,
+                            )
+                            .map_err(|source| LiveThreadError::VisualIngressBoundary { source })?,
                         )
-                        .map_err(|source| LiveThreadError::VisualIngressBoundary { source })?,
-                    )
-                } else {
-                    None
-                };
-                let left = observation.pair().left().clone();
-                let right = observation.pair().right().clone();
-                let timestamp = left.timestamp();
-                let depth_batch = depth_rx.as_ref().map(drain_depth_batch).unwrap_or_default();
-                let depth = depth_batch.last().cloned();
-                for depth_image in depth_batch {
-                    depth_ring.push(depth_image);
-                }
-                let reorder_warnings = depth_ring.reorder_warnings();
-                if reorder_warnings > depth_reorder_warnings_seen {
-                    depth_reorder_warnings_seen = reorder_warnings;
-                    eprintln!(
-                        "depth ring observed out-of-order timestamps (count={depth_reorder_warnings_seen})"
-                    );
-                }
-                let process_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tracker.process(observation.into_pair())
-                }));
-                match process_result {
-                    Ok(Ok(mut output)) => {
-                        if let (Some(sender), Some(pending)) =
-                            (navigation_visual_tx.as_ref(), pending_visual)
-                        {
-                            let admission = visual_admission_from_output(pending, &output)
+                    } else {
+                        None
+                    };
+                    let left = observation.pair().left().clone();
+                    let right = observation.pair().right().clone();
+                    let timestamp = left.timestamp();
+                    let depth_batch = depth_rx.as_ref().map(drain_depth_batch).unwrap_or_default();
+                    let depth = depth_batch.last().cloned();
+                    for depth_image in depth_batch {
+                        depth_ring.push(depth_image);
+                    }
+                    let reorder_warnings = depth_ring.reorder_warnings();
+                    if reorder_warnings > depth_reorder_warnings_seen {
+                        depth_reorder_warnings_seen = reorder_warnings;
+                        eprintln!(
+                            "depth ring observed out-of-order timestamps (count={depth_reorder_warnings_seen})"
+                        );
+                    }
+                    let process_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            tracker.process(observation.into_pair())
+                        }));
+                    match process_result {
+                        Ok(Ok(mut output)) => {
+                            #[cfg(all(feature = "nano-agent", unix))]
+                            let warm_localized = match warm_relocalization_gate.take() {
+                                None => true,
+                                Some(gate) => match gate.observe(&output).map_err(|source| {
+                                    LiveThreadError::WarmStartRelocalization { source }
+                                })? {
+                                    NanoWarmStartRelocalizationTransition::Awaiting(next) => {
+                                        warm_relocalization_gate = Some(next);
+                                        false
+                                    }
+                                    NanoWarmStartRelocalizationTransition::Localized(evidence) => {
+                                        eprintln!(
+                                            "warm start: fresh-camera relocalization proven against replay_map={:?} by candidate={:?}, current_map={:?}",
+                                            evidence.replay_map(),
+                                            evidence.candidate(),
+                                            evidence.localization().map_snapshot(),
+                                        );
+                                        true
+                                    }
+                                },
+                            };
+                            #[cfg(not(all(feature = "nano-agent", unix)))]
+                            let warm_localized = true;
+                            if let (Some(sender), Some(pending)) =
+                                (navigation_visual_tx.as_ref(), pending_visual)
+                            {
+                                let admission = if warm_localized {
+                                    visual_admission_from_output(pending, &output)
+                                } else {
+                                    VisualAdmission::no_localization(
+                                        pending.complete(VisualAttemptOutcome::NoLocalization),
+                                    )
+                                    .map_err(LiveVisualAdmissionBuildError::Admission)
+                                }
                                 .map_err(|source| LiveThreadError::VisualAdmissionBuild {
                                     source,
                                 })?;
-                            route_visual_admission(sender, admission).map_err(|source| {
-                                LiveThreadError::VisualAdmissionRoute { source }
-                            })?;
-                        }
-                        // Map tracker output to dense commands.
-                        let pose_updates = tracker.take_pending_dense_pose_updates();
-                        let dense_stats = if dense_active {
-                            let cmds = command_mapper::map_output_to_dense_commands(
-                                &output,
-                                pose_updates,
-                                |keyframe_id| tracker.keyframe_pose(keyframe_id),
-                                &depth_ring,
-                                timestamp,
-                                &mut dense_generation,
-                            )?;
-                            for cmd in cmds {
-                                if let Some(ref tx) = dense_command_tx {
-                                    let command_class = if matches!(
-                                        &cmd,
-                                        dense::DenseCommand::IntegrateKeyframe { .. }
-                                    ) {
-                                        LiveDenseCommandClass::IntegrationData
-                                    } else {
-                                        LiveDenseCommandClass::OrderedControl
-                                    };
-                                    match classify_live_dense_route(
-                                        tx.route(cmd),
-                                        command_class,
-                                        LiveDenseRouteContext::TrackerOutput,
-                                    )? {
-                                        LiveDenseRouteDisposition::Enqueued => {}
-                                        LiveDenseRouteDisposition::IntegrationDroppedNewest => {
-                                            dense_integrations_dropped_newest =
-                                                dense_integrations_dropped_newest.saturating_add(1);
-                                        }
-                                        LiveDenseRouteDisposition::Disconnected => {
-                                            if navigation_enabled {
-                                                return Err(
-                                                    LiveThreadError::RequiredDenseUnavailable {
-                                                        reason: "dense command consumer disconnected",
-                                                    },
-                                                );
+                                route_visual_admission(sender, admission).map_err(|source| {
+                                    LiveThreadError::VisualAdmissionRoute { source }
+                                })?;
+                            }
+                            // Map tracker output to dense commands.
+                            let pose_updates = tracker.take_pending_dense_pose_updates();
+                            let dense_stats = if dense_active {
+                                let cmds = command_mapper::map_output_to_dense_commands(
+                                    &output,
+                                    pose_updates,
+                                    |keyframe_id| tracker.keyframe_pose(keyframe_id),
+                                    &depth_ring,
+                                    timestamp,
+                                    &mut dense_generation,
+                                )?;
+                                for cmd in cmds {
+                                    if let Some(ref tx) = dense_command_tx {
+                                        let command_class = if matches!(
+                                            &cmd,
+                                            dense::DenseCommand::IntegrateKeyframe { .. }
+                                        ) {
+                                            LiveDenseCommandClass::IntegrationData
+                                        } else {
+                                            LiveDenseCommandClass::OrderedControl
+                                        };
+                                        match classify_live_dense_route(
+                                            tx.route(cmd),
+                                            command_class,
+                                            LiveDenseRouteContext::TrackerOutput,
+                                        )? {
+                                            LiveDenseRouteDisposition::Enqueued => {}
+                                            LiveDenseRouteDisposition::IntegrationDroppedNewest => {
+                                                dense_integrations_dropped_newest =
+                                                    dense_integrations_dropped_newest
+                                                        .saturating_add(1);
                                             }
-                                            dense_active = false;
-                                            dense_command_tx = None;
-                                            eprintln!(
-                                                "dense ordered command queue disconnected; disabling dense"
-                                            );
-                                            break;
+                                            LiveDenseRouteDisposition::Disconnected => {
+                                                if navigation_enabled {
+                                                    return Err(
+                                                        LiveThreadError::RequiredDenseUnavailable {
+                                                            reason: "dense command consumer disconnected",
+                                                        },
+                                                    );
+                                                }
+                                                dense_active = false;
+                                                dense_command_tx = None;
+                                                eprintln!(
+                                                    "dense ordered command queue disconnected; disabling dense"
+                                                );
+                                                break;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            // Drain latest dense stats for viz.
-                            dense_stats_rx
-                                .as_ref()
-                                .and_then(|rx| std::iter::from_fn(|| rx.try_recv().ok()).last())
-                        } else {
-                            None
-                        };
-                        if let Some(ref stats) = dense_stats
-                            && stats.state == ReconState::Down
-                        {
-                            if navigation_enabled {
-                                return Err(LiveThreadError::RequiredDenseUnavailable {
-                                    reason: "dense runtime entered Down state",
-                                });
-                            }
-                            dense_active = false;
-                            dense_command_tx = None;
-                            eprintln!("dense worker entered Down state; disabling dense");
-                        }
-
-                        if depth_enabled_for_diagnostics {
-                            output.diagnostics_mut().depth_reorder_warnings =
-                                Some(depth_reorder_warnings_seen);
-                        }
-                        let mut packet = None;
-                        let mut points = None;
-                        if let Some(matches) = output.take_stereo_matches() {
-                            if let Some(keyframe) = output.keyframe() {
-                                points = Some(keyframe.landmarks().to_vec());
-                            }
-                            packet = Some(
-                                VizPacket::try_new(left.clone(), right.clone(), matches).map_err(
-                                    |source| LiveThreadError::VisualizationPacket { source },
-                                )?,
-                            );
-                        }
-                        let msg = LiveVizMsg {
-                            left,
-                            right,
-                            depth,
-                            packet,
-                            points,
-                            output,
-                            dense_stats,
-                        };
-                        if let Some(sender) = viz_tx.as_ref()
-                            && matches!(sender.try_send(msg), SendOutcome::Disconnected)
-                        {
-                            eprintln!(
-                                "live visualization consumer disconnected; continuing authoritative tracking and occupancy"
-                            );
-                            viz_tx = None;
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        let requires_pipeline_shutdown = err.requires_pipeline_shutdown();
-                        if let (Some(sender), Some(pending)) =
-                            (navigation_visual_tx.as_ref(), pending_visual)
-                        {
-                            let admission = if requires_pipeline_shutdown {
-                                VisualAdmission::fatal_failure(
-                                    pending.complete(VisualAttemptOutcome::FatalFailure),
-                                )
+                                // Drain latest dense stats for viz.
+                                dense_stats_rx
+                                    .as_ref()
+                                    .and_then(|rx| std::iter::from_fn(|| rx.try_recv().ok()).last())
                             } else {
-                                VisualAdmission::recoverable_failure(
-                                    pending.complete(VisualAttemptOutcome::RecoverableFailure),
-                                )
-                            }
-                            .map_err(|source| {
-                                LiveThreadError::VisualAdmissionBuild {
-                                    source: LiveVisualAdmissionBuildError::Admission(source),
+                                None
+                            };
+                            if let Some(ref stats) = dense_stats
+                                && stats.state == ReconState::Down
+                            {
+                                if navigation_enabled {
+                                    return Err(LiveThreadError::RequiredDenseUnavailable {
+                                        reason: "dense runtime entered Down state",
+                                    });
                                 }
-                            })?;
-                            route_visual_admission(sender, admission).map_err(|source| {
-                                LiveThreadError::VisualAdmissionRoute { source }
-                            })?;
+                                dense_active = false;
+                                dense_command_tx = None;
+                                eprintln!("dense worker entered Down state; disabling dense");
+                            }
+
+                            if depth_enabled_for_diagnostics {
+                                output.diagnostics_mut().depth_reorder_warnings =
+                                    Some(depth_reorder_warnings_seen);
+                            }
+                            let mut packet = None;
+                            let mut points = None;
+                            if let Some(matches) = output.take_stereo_matches() {
+                                if let Some(keyframe) = output.keyframe() {
+                                    points = Some(keyframe.landmarks().to_vec());
+                                }
+                                packet = Some(
+                                    VizPacket::try_new(left.clone(), right.clone(), matches)
+                                        .map_err(|source| LiveThreadError::VisualizationPacket {
+                                            source,
+                                        })?,
+                                );
+                            }
+                            let msg = LiveVizMsg {
+                                left,
+                                right,
+                                depth,
+                                packet,
+                                points,
+                                output,
+                                dense_stats,
+                            };
+                            if let Some(sender) = viz_tx.as_ref()
+                                && matches!(sender.try_send(msg), SendOutcome::Disconnected)
+                            {
+                                eprintln!(
+                                    "live visualization consumer disconnected; continuing authoritative tracking and occupancy"
+                                );
+                                viz_tx = None;
+                            }
                         }
-                        if dense_active {
-                            let pose_updates = tracker.take_pending_dense_pose_updates();
-                            let pose_update_command =
-                                match command_mapper::apply_pose_updates_command(
-                                    pose_updates,
-                                    timestamp,
-                                    &mut dense_generation,
-                                ) {
-                                    Ok(command) => command,
-                                    Err(generation) if requires_pipeline_shutdown => {
-                                        return Err(LiveThreadError::DenseCommandGenerationAndInferenceUnavailable {
+                        Ok(Err(err)) => {
+                            let requires_pipeline_shutdown = err.requires_pipeline_shutdown();
+                            if let (Some(sender), Some(pending)) =
+                                (navigation_visual_tx.as_ref(), pending_visual)
+                            {
+                                let admission = if requires_pipeline_shutdown {
+                                    VisualAdmission::fatal_failure(
+                                        pending.complete(VisualAttemptOutcome::FatalFailure),
+                                    )
+                                } else {
+                                    VisualAdmission::recoverable_failure(
+                                        pending.complete(VisualAttemptOutcome::RecoverableFailure),
+                                    )
+                                }
+                                .map_err(|source| LiveThreadError::VisualAdmissionBuild {
+                                    source: LiveVisualAdmissionBuildError::Admission(source),
+                                })?;
+                                route_visual_admission(sender, admission).map_err(|source| {
+                                    LiveThreadError::VisualAdmissionRoute { source }
+                                })?;
+                            }
+                            if dense_active {
+                                let pose_updates = tracker.take_pending_dense_pose_updates();
+                                let pose_update_command =
+                                    match command_mapper::apply_pose_updates_command(
+                                        pose_updates,
+                                        timestamp,
+                                        &mut dense_generation,
+                                    ) {
+                                        Ok(command) => command,
+                                        Err(generation) if requires_pipeline_shutdown => {
+                                            return Err(LiveThreadError::DenseCommandGenerationAndInferenceUnavailable {
                                             generation,
                                             inference: err,
                                         });
-                                    }
-                                    Err(generation) => return Err(generation.into()),
-                                };
-                            if let Some(pose_update_command) = pose_update_command
-                                && let Some(ref tx) = dense_command_tx
-                            {
-                                let route = classify_live_dense_route(
-                                    tx.route(pose_update_command),
-                                    LiveDenseCommandClass::OrderedControl,
-                                    LiveDenseRouteContext::PoseUpdateAfterTrackerError,
-                                );
-                                let disposition = match route {
-                                    Ok(disposition) => disposition,
-                                    Err(routing) if requires_pipeline_shutdown => {
-                                        return Err(
+                                        }
+                                        Err(generation) => return Err(generation.into()),
+                                    };
+                                if let Some(pose_update_command) = pose_update_command
+                                    && let Some(ref tx) = dense_command_tx
+                                {
+                                    let route = classify_live_dense_route(
+                                        tx.route(pose_update_command),
+                                        LiveDenseCommandClass::OrderedControl,
+                                        LiveDenseRouteContext::PoseUpdateAfterTrackerError,
+                                    );
+                                    let disposition = match route {
+                                        Ok(disposition) => disposition,
+                                        Err(routing) if requires_pipeline_shutdown => {
+                                            return Err(
                                             LiveThreadError::DenseCommandRouteAndInferenceUnavailable {
                                                 routing,
                                                 inference: err,
                                             },
                                         );
-                                    }
-                                    Err(routing) => return Err(routing.into()),
-                                };
-                                match disposition {
-                                    LiveDenseRouteDisposition::Enqueued => {}
-                                    LiveDenseRouteDisposition::Disconnected => {
-                                        if navigation_enabled {
-                                            let reason = "dense command consumer disconnected after tracker failure";
-                                            return if requires_pipeline_shutdown {
-                                                Err(LiveThreadError::RequiredDenseAndInferenceUnavailable {
+                                        }
+                                        Err(routing) => return Err(routing.into()),
+                                    };
+                                    match disposition {
+                                        LiveDenseRouteDisposition::Enqueued => {}
+                                        LiveDenseRouteDisposition::Disconnected => {
+                                            if navigation_enabled {
+                                                let reason = "dense command consumer disconnected after tracker failure";
+                                                return if requires_pipeline_shutdown {
+                                                    Err(LiveThreadError::RequiredDenseAndInferenceUnavailable {
                                                     reason,
                                                     inference: err,
                                                 })
-                                            } else {
-                                                Err(LiveThreadError::RequiredDenseUnavailable {
-                                                    reason,
-                                                })
-                                            };
+                                                } else {
+                                                    Err(LiveThreadError::RequiredDenseUnavailable {
+                                                        reason,
+                                                    })
+                                                };
+                                            }
+                                            dense_active = false;
+                                            dense_command_tx = None;
+                                            eprintln!(
+                                                "dense ordered command queue disconnected after tracker error; disabling dense"
+                                            );
                                         }
-                                        dense_active = false;
-                                        dense_command_tx = None;
-                                        eprintln!(
-                                            "dense ordered command queue disconnected after tracker error; disabling dense"
-                                        );
-                                    }
-                                    LiveDenseRouteDisposition::IntegrationDroppedNewest => {
-                                        unreachable!(
-                                            "ordered controls cannot be reported as integration data"
-                                        )
+                                        LiveDenseRouteDisposition::IntegrationDroppedNewest => {
+                                            unreachable!(
+                                                "ordered controls cannot be reported as integration data"
+                                            )
+                                        }
                                     }
                                 }
                             }
+                            if requires_pipeline_shutdown {
+                                return Err(LiveThreadError::InferenceUnavailable { source: err });
+                            }
+                            eprintln!("tracker error: {err}");
                         }
-                        if requires_pipeline_shutdown {
-                            return Err(LiveThreadError::InferenceUnavailable { source: err });
-                        }
-                        eprintln!("tracker error: {err}");
-                    }
-                    Err(payload) => {
-                        if let (Some(sender), Some(pending)) =
-                            (navigation_visual_tx.as_ref(), pending_visual)
-                        {
-                            let admission = VisualAdmission::fatal_failure(
-                                pending.complete(VisualAttemptOutcome::FatalFailure),
-                            )
-                            .map_err(|source| {
-                                LiveThreadError::VisualAdmissionBuild {
+                        Err(payload) => {
+                            if let (Some(sender), Some(pending)) =
+                                (navigation_visual_tx.as_ref(), pending_visual)
+                            {
+                                let admission = VisualAdmission::fatal_failure(
+                                    pending.complete(VisualAttemptOutcome::FatalFailure),
+                                )
+                                .map_err(|source| LiveThreadError::VisualAdmissionBuild {
                                     source: LiveVisualAdmissionBuildError::Admission(source),
-                                }
-                            })?;
-                            route_visual_admission(sender, admission).map_err(|source| {
-                                LiveThreadError::VisualAdmissionRoute { source }
-                            })?;
-                        }
-                        return Err(LiveThreadError::FrameProcessingPanic {
-                            detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
-                        });
-                    }
-                }
-            }
-            if dense_integrations_dropped_newest > 0 {
-                eprintln!(
-                    "dense integrations dropped_newest (inference view): {dense_integrations_dropped_newest}"
-                );
-            }
-            if depth_reorder_warnings_seen > 0 {
-                eprintln!("depth reorder warnings observed: {depth_reorder_warnings_seen}");
-            }
-            Ok(())
-        });
-
-        let decimation = args.rerun_decimation.get();
-        let rerun_finish_timeout = args.rerun_finish_timeout_ms.get();
-        let viz_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
-            let mut initialization_error = None;
-            let mut navigation_recording = None;
-            let mut sink = match rerun::RecordingStreamBuilder::new("kiko-slam-live").connect_grpc()
-            {
-                Ok(rec) => {
-                    navigation_recording = Some(rec.clone());
-                    match RerunSink::new(rec, decimation) {
-                        Ok(sink) => Some(sink),
-                        Err(source) => {
-                            eprintln!("invalid live Rerun configuration: {source}");
-                            initialization_error =
-                                Some(LiveThreadError::VisualizationConfiguration { source });
-                            None
-                        }
-                    }
-                }
-                Err(err) => {
-                    eprintln!("failed to connect to rerun viewer: {err}");
-                    initialization_error = Some(LiveThreadError::RerunConnect { source: err });
-                    None
-                }
-            };
-            let mut logging_error = None;
-            let never_frames = crossbeam_channel::never::<LiveVizMsg>();
-            let never_occupancy = crossbeam_channel::never::<TimedOccupancySnapshot>();
-            let never_navigation = crossbeam_channel::never::<LiveNavigationVizMsg>();
-            let mut frame_rx = Some(viz_rx);
-            let mut map_rx = occupancy_snapshot_rx;
-            let mut navigation_rx = navigation_viz_rx;
-            let mut navigation_context_logged = false;
-            if initialization_error.is_some() {
-                // Stop upstream visualization work immediately. Tracking and
-                // occupancy remain authoritative and shut down through their own
-                // channels; this worker still reports the typed initialization
-                // failure after any applicable Rerun finalization.
-                frame_rx = None;
-                map_rx = None;
-                navigation_rx = None;
-            }
-            while frame_rx.is_some() || map_rx.is_some() || navigation_rx.is_some() {
-                let mut close_frames = false;
-                let mut close_maps = false;
-                let mut close_navigation = false;
-                {
-                    let frame_receiver = frame_rx
-                        .as_ref()
-                        .map_or(&never_frames, kiko_slam::DropReceiver::as_receiver);
-                    let map_receiver = map_rx
-                        .as_ref()
-                        .map_or(&never_occupancy, kiko_slam::DropReceiver::as_receiver);
-                    let navigation_receiver = navigation_rx
-                        .as_ref()
-                        .map_or(&never_navigation, kiko_slam::DropReceiver::as_receiver);
-                    crossbeam_channel::select! {
-                        recv(frame_receiver) -> message => match message {
-                            Ok(message) => {
-                                if logging_error.is_none()
-                                    && let Some(sink) = sink.as_mut()
-                                    && let Err(error) = log_live_viz_message(sink, message)
-                                {
-                                    eprintln!(
-                                        "live Rerun logging failed; disconnecting visualization producers: {error}"
-                                    );
-                                    logging_error = Some(error);
-                                    close_frames = true;
-                                    close_maps = true;
-                                    close_navigation = true;
-                                }
+                                })?;
+                                route_visual_admission(sender, admission).map_err(|source| {
+                                    LiveThreadError::VisualAdmissionRoute { source }
+                                })?;
                             }
-                            Err(_) => close_frames = true,
-                        },
-                        recv(map_receiver) -> snapshot => match snapshot {
-                            Ok(snapshot) => {
-                                if logging_error.is_none()
-                                    && let Some(sink) = sink.as_mut()
-                                {
-                                    let (timestamp, snapshot) = snapshot.into_parts();
-                                    if let Err(error) = sink.log_occupancy(timestamp, snapshot) {
+                            return Err(LiveThreadError::FrameProcessingPanic {
+                                detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+                            });
+                        }
+                    }
+                }
+                #[cfg(all(feature = "nano-agent", unix))]
+                if warm_relocalization_gate.is_some() && inference_running.load(Ordering::Acquire) {
+                    return Err(LiveThreadError::WarmStartRelocalizationIncomplete);
+                }
+                if dense_integrations_dropped_newest > 0 {
+                    eprintln!(
+                        "dense integrations dropped_newest (inference view): {dense_integrations_dropped_newest}"
+                    );
+                }
+                if depth_reorder_warnings_seen > 0 {
+                    eprintln!("depth reorder warnings observed: {depth_reorder_warnings_seen}");
+                }
+                Ok(())
+            },
+        )?;
+
+        let decimation = rerun_decimation;
+        let viz_handle = spawn_live_thread(
+            "kiko-rerun",
+            move || -> Result<(), LiveThreadError> {
+                let mut initialization_error = None;
+                let mut navigation_recording = None;
+                let recording = match rerun_target {
+                    LiveRerunTarget::Connect => {
+                        rerun::RecordingStreamBuilder::new("kiko-slam-live").connect_grpc()
+                    }
+                    #[cfg(all(feature = "nano-agent", unix))]
+                    LiveRerunTarget::ServeLoopback {
+                        bind,
+                        memory_limit_bytes,
+                    } => {
+                        let address = bind.ip().to_string();
+                        eprintln!(
+                            "rerun: serving production diagnostics on {bind} with memory_limit_bytes={memory_limit_bytes}"
+                        );
+                        rerun::RecordingStreamBuilder::new("kiko-nano-agent").serve_grpc_opts(
+                            &address,
+                            bind.port(),
+                            rerun::ServerOptions {
+                                memory_limit: rerun::MemoryLimit::from_bytes(memory_limit_bytes),
+                                ..Default::default()
+                            },
+                        )
+                    }
+                };
+                let mut sink = match recording {
+                    Ok(rec) => {
+                        navigation_recording = Some(rec.clone());
+                        match RerunSink::new(rec, decimation) {
+                            Ok(sink) => Some(sink),
+                            Err(source) => {
+                                eprintln!("invalid live Rerun configuration: {source}");
+                                initialization_error =
+                                    Some(LiveThreadError::VisualizationConfiguration { source });
+                                None
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("failed to initialize live Rerun diagnostics: {err}");
+                        initialization_error = Some(LiveThreadError::RerunConnect { source: err });
+                        None
+                    }
+                };
+                let mut logging_error = None;
+                let never_frames = crossbeam_channel::never::<LiveVizMsg>();
+                let never_rgb = crossbeam_channel::never::<LiveRgbVizMsg>();
+                let never_occupancy = crossbeam_channel::never::<TimedOccupancySnapshot>();
+                let never_navigation = crossbeam_channel::never::<LiveNavigationVizMsg>();
+                let mut frame_rx = Some(viz_rx);
+                let mut rgb_rx = Some(rgb_viz_rx);
+                let mut map_rx = occupancy_snapshot_rx;
+                let mut navigation_rx = navigation_viz_rx;
+                let mut navigation_context_logged = false;
+                if initialization_error.is_some() {
+                    // Stop upstream visualization work immediately. Tracking and
+                    // occupancy remain authoritative and shut down through their own
+                    // channels; this worker still reports the typed initialization
+                    // failure after any applicable Rerun finalization.
+                    frame_rx = None;
+                    rgb_rx = None;
+                    map_rx = None;
+                    navigation_rx = None;
+                }
+                while frame_rx.is_some()
+                    || rgb_rx.is_some()
+                    || map_rx.is_some()
+                    || navigation_rx.is_some()
+                {
+                    let mut close_frames = false;
+                    let mut close_rgb = false;
+                    let mut close_maps = false;
+                    let mut close_navigation = false;
+                    {
+                        let frame_receiver = frame_rx
+                            .as_ref()
+                            .map_or(&never_frames, kiko_slam::DropReceiver::as_receiver);
+                        let rgb_receiver = rgb_rx
+                            .as_ref()
+                            .map_or(&never_rgb, kiko_slam::DropReceiver::as_receiver);
+                        let map_receiver = map_rx
+                            .as_ref()
+                            .map_or(&never_occupancy, kiko_slam::DropReceiver::as_receiver);
+                        let navigation_receiver = navigation_rx
+                            .as_ref()
+                            .map_or(&never_navigation, kiko_slam::DropReceiver::as_receiver);
+                        crossbeam_channel::select! {
+                            recv(frame_receiver) -> message => match message {
+                                Ok(message) => {
+                                    if logging_error.is_none()
+                                        && let Some(sink) = sink.as_mut()
+                                        && let Err(error) = log_live_viz_message(sink, message)
+                                    {
                                         eprintln!(
-                                            "live Rerun occupancy logging failed; disconnecting visualization producers: {error}"
+                                            "live Rerun logging failed; disconnecting visualization producers: {error}"
                                         );
                                         logging_error = Some(error);
                                         close_frames = true;
+                                        close_rgb = true;
                                         close_maps = true;
                                         close_navigation = true;
                                     }
                                 }
-                            }
-                            Err(_) => close_maps = true,
-                        },
-                        recv(navigation_receiver) -> message => match message {
-                            Ok(message) => {
-                                if logging_error.is_none()
-                                    && let Some(recording) = navigation_recording.as_ref()
-                                    && let Err(error) = log_live_navigation_viz_message(
-                                        recording,
-                                        message,
-                                        &mut navigation_context_logged,
-                                    )
-                                {
-                                    eprintln!(
-                                        "live Rerun navigation logging failed; disconnecting visualization producers: {error}"
-                                    );
-                                    logging_error = Some(error);
-                                    close_frames = true;
-                                    close_maps = true;
-                                    close_navigation = true;
+                                Err(_) => close_frames = true,
+                            },
+                            recv(rgb_receiver) -> message => match message {
+                                Ok(message) => {
+                                    if logging_error.is_none()
+                                        && let Some(recording) = navigation_recording.as_ref()
+                                        && let Err(error) = log_live_rgb_viz_message(recording, message)
+                                    {
+                                        eprintln!(
+                                            "live Rerun RGB logging failed; disconnecting visualization producers: {error}"
+                                        );
+                                        logging_error = Some(error);
+                                        close_frames = true;
+                                        close_rgb = true;
+                                        close_maps = true;
+                                        close_navigation = true;
+                                    }
                                 }
-                            }
-                            Err(_) => close_navigation = true,
-                        },
+                                Err(_) => close_rgb = true,
+                            },
+                            recv(map_receiver) -> snapshot => match snapshot {
+                                Ok(snapshot) => {
+                                    if logging_error.is_none()
+                                        && let Some(sink) = sink.as_mut()
+                                    {
+                                        let (timestamp, snapshot) = snapshot.into_parts();
+                                        if let Err(error) = sink.log_occupancy(timestamp, snapshot) {
+                                            eprintln!(
+                                                "live Rerun occupancy logging failed; disconnecting visualization producers: {error}"
+                                            );
+                                            logging_error = Some(error);
+                                            close_frames = true;
+                                            close_rgb = true;
+                                            close_maps = true;
+                                            close_navigation = true;
+                                        }
+                                    }
+                                }
+                                Err(_) => close_maps = true,
+                            },
+                            recv(navigation_receiver) -> message => match message {
+                                Ok(message) => {
+                                    if logging_error.is_none()
+                                        && let Some(recording) = navigation_recording.as_ref()
+                                        && let Err(error) = log_live_navigation_viz_message(
+                                            recording,
+                                            message,
+                                            &mut navigation_context_logged,
+                                        )
+                                    {
+                                        eprintln!(
+                                            "live Rerun navigation logging failed; disconnecting visualization producers: {error}"
+                                        );
+                                        logging_error = Some(error);
+                                        close_frames = true;
+                                        close_rgb = true;
+                                        close_maps = true;
+                                        close_navigation = true;
+                                    }
+                                }
+                                Err(_) => close_navigation = true,
+                            },
+                        }
+                    }
+                    if close_frames {
+                        frame_rx = None;
+                    }
+                    if close_rgb {
+                        rgb_rx = None;
+                    }
+                    if close_maps {
+                        map_rx = None;
+                    }
+                    if close_navigation {
+                        navigation_rx = None;
                     }
                 }
-                if close_frames {
-                    frame_rx = None;
+                drop(navigation_recording);
+                let finalization_error = sink
+                    .map(|sink| sink.finish_with_timeout(rerun_finish_timeout))
+                    .and_then(Result::err);
+                match (initialization_error, logging_error, finalization_error) {
+                    (Some(error), _, _) => Err(error),
+                    (None, Some(logging), Some(finalization)) => {
+                        Err(LiveThreadError::VisualizationLogAndFinalization {
+                            logging,
+                            finalization,
+                        })
+                    }
+                    (None, Some(source), None) => Err(LiveThreadError::VisualizationLog { source }),
+                    (None, None, Some(source)) => {
+                        Err(LiveThreadError::VisualizationFinalization { source })
+                    }
+                    (None, None, None) => Ok(()),
                 }
-                if close_maps {
-                    map_rx = None;
-                }
-                if close_navigation {
-                    navigation_rx = None;
-                }
-            }
-            drop(navigation_recording);
-            let finalization_error = sink
-                .map(|sink| sink.finish_with_timeout(rerun_finish_timeout))
-                .and_then(Result::err);
-            match (initialization_error, logging_error, finalization_error) {
-                (Some(error), _, _) => Err(error),
-                (None, Some(logging), Some(finalization)) => {
-                    Err(LiveThreadError::VisualizationLogAndFinalization {
-                        logging,
-                        finalization,
-                    })
-                }
-                (None, Some(source), None) => Err(LiveThreadError::VisualizationLog { source }),
-                (None, None, Some(source)) => {
-                    Err(LiveThreadError::VisualizationFinalization { source })
-                }
-                (None, None, None) => Ok(()),
-            }
-        });
+            },
+        )?;
 
+        #[cfg(all(feature = "nano-agent", unix))]
+        let (navigation_handle, accessory) = post_navigation_setup_guard.into_parts();
+        #[cfg(all(feature = "nano-agent", unix))]
+        let mut accessory_failures = Vec::new();
+        #[cfg(all(feature = "nano-agent", unix))]
+        let mut accessory_terminal_fault_recorded = false;
+        #[cfg(all(feature = "nano-agent", unix))]
+        let mut accessory_worker = accessory;
         let mut capture_error = None;
+        let rgb_viz_tx = Some(rgb_viz_tx);
+        #[cfg(all(feature = "nano-agent", unix))]
+        let mut rgb_viz_tx = rgb_viz_tx;
+        #[cfg(all(feature = "nano-agent", unix))]
+        let mut rgb_viz_frame_index = 0_usize;
 
         eprintln!("streaming matches... press ctrl+c to stop");
 
-        let capture_exit_guard = LiveThreadExitGuard(Arc::clone(&running));
+        #[cfg(all(feature = "nano-agent", unix))]
+        let capture_exit_guard = LiveThreadExitGuard::checkpoint_aware(
+            Arc::clone(&running),
+            Arc::clone(&quiescent_checkpoint_requested),
+        );
+        #[cfg(not(all(feature = "nano-agent", unix)))]
+        let capture_exit_guard = LiveThreadExitGuard::new(Arc::clone(&running));
         'capture: while running.load(Ordering::Relaxed) {
+            #[cfg(all(feature = "nano-agent", unix))]
+            if quiescent_checkpoint_requested.load(Ordering::Acquire) {
+                break 'capture;
+            }
             let mut got_any = false;
+
+            #[cfg(all(feature = "nano-agent", unix))]
+            if let Some(worker) = accessory_worker.as_ref() {
+                match worker.try_terminal_fault() {
+                    Ok(Some(fault)) => {
+                        accessory_terminal_fault_recorded = true;
+                        accessory_failures.push(LiveAccessoryError::TerminalFault(fault));
+                        running.store(false, Ordering::SeqCst);
+                        break 'capture;
+                    }
+                    Ok(None) => {}
+                    Err(source) => {
+                        accessory_failures.push(LiveAccessoryError::FaultMonitor(source));
+                        running.store(false, Ordering::SeqCst);
+                        break 'capture;
+                    }
+                }
+            }
+
+            #[cfg(all(feature = "nano-agent", unix))]
+            if let Some(worker) = accessory_worker.as_mut() {
+                match device.rgb(0) {
+                    Ok(frame) => {
+                        let publish_rgb_viz =
+                            rgb_viz_frame_index.is_multiple_of(rerun_decimation.get());
+                        rgb_viz_frame_index = match rgb_viz_frame_index.checked_add(1) {
+                            Some(next) => next,
+                            None => {
+                                eprintln!(
+                                    "live RGB Rerun diagnostic frame index exhausted; disabling RGB visualization"
+                                );
+                                rgb_viz_tx = None;
+                                0
+                            }
+                        };
+                        if publish_rgb_viz && let Some(sender) = rgb_viz_tx.as_ref() {
+                            match LiveRgbVizMsg::try_from_oak(&frame) {
+                                Ok(message) => {
+                                    if matches!(sender.try_send(message), SendOutcome::Disconnected)
+                                    {
+                                        rgb_viz_tx = None;
+                                    }
+                                }
+                                Err(source) => {
+                                    eprintln!(
+                                        "live RGB Rerun diagnostic disabled after an invalid frame: {source}"
+                                    );
+                                    rgb_viz_tx = None;
+                                }
+                            }
+                        }
+                        match worker.submit_rgb(frame) {
+                            NanoAccessoryFrameSubmitOutcome::Enqueued
+                            | NanoAccessoryFrameSubmitOutcome::ReplacedOlderFrame => {}
+                            NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched => {
+                                match worker.try_terminal_fault() {
+                                    Ok(Some(fault)) => {
+                                        accessory_terminal_fault_recorded = true;
+                                        accessory_failures
+                                            .push(LiveAccessoryError::TerminalFault(fault));
+                                    }
+                                    Ok(None) => {
+                                        accessory_failures.push(LiveAccessoryError::FrameIngress(
+                                            NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched,
+                                        ))
+                                    }
+                                    Err(source) => accessory_failures
+                                        .push(LiveAccessoryError::FaultMonitor(source)),
+                                }
+                                running.store(false, Ordering::SeqCst);
+                                break 'capture;
+                            }
+                            outcome @ (NanoAccessoryFrameSubmitOutcome::IngressDisconnected
+                            | NanoAccessoryFrameSubmitOutcome::ChannelPoisoned) => {
+                                accessory_failures.push(LiveAccessoryError::FrameIngress(outcome));
+                                running.store(false, Ordering::SeqCst);
+                                break 'capture;
+                            }
+                        }
+                        got_any = true;
+                    }
+                    Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
+                    Err(source) => {
+                        capture_error = Some(LiveCaptureError::RgbImage { source });
+                        break 'capture;
+                    }
+                }
+            }
 
             match device.mono_left(0) {
                 Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft) {
@@ -6032,11 +13785,18 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         drop(pair_tx);
         drop(depth_tx);
         drop(imu_tx);
+        drop(rgb_viz_tx);
         drop(navigation_dataset_writer);
         let mut live_failures = capture_error
             .into_iter()
             .map(LiveWorkerFailure::Capture)
             .collect::<Vec<_>>();
+        #[cfg(all(feature = "nano-agent", unix))]
+        live_failures.extend(
+            accessory_failures
+                .drain(..)
+                .map(LiveWorkerFailure::Accessory),
+        );
         match inference_handle.join() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => live_failures.push(LiveWorkerFailure::Inference(error)),
@@ -6056,6 +13816,133 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 Err(payload) => live_failures.push(LiveWorkerFailure::OccupancyPanic {
                     detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
                 }),
+            }
+        }
+
+        // Accessory terminal evidence is authoritative for a restart-ready
+        // checkpoint too. Collect it before deciding whether the drained
+        // dataset may be published.
+        #[cfg(all(feature = "nano-agent", unix))]
+        if let Some(worker) = accessory_worker.take() {
+            match worker.shutdown() {
+                Ok(NanoAccessoryWorkerExit::Shutdown {
+                    terminal_fault,
+                    evidence,
+                }) => {
+                    if let Some(fault) = terminal_fault
+                        && !accessory_terminal_fault_recorded
+                    {
+                        live_failures.push(LiveWorkerFailure::Accessory(
+                            LiveAccessoryError::TerminalFault(fault),
+                        ));
+                    }
+                    if !evidence.eye().release_verified() {
+                        live_failures.push(LiveWorkerFailure::Accessory(
+                            LiveAccessoryError::EyeReleaseUnverified,
+                        ));
+                    }
+                    if !evidence.head().hold_preserving_release_completed() {
+                        live_failures.push(LiveWorkerFailure::Accessory(
+                            LiveAccessoryError::HeadHoldPreservingReleaseUnverified,
+                        ));
+                    }
+                }
+                Ok(exit) => live_failures.push(LiveWorkerFailure::Accessory(
+                    LiveAccessoryError::UnexpectedExit(Box::new(exit)),
+                )),
+                Err(source) => live_failures.push(LiveWorkerFailure::Accessory(
+                    LiveAccessoryError::ShutdownJoin(source),
+                )),
+            }
+        }
+
+        // A warm SaveMap is terminal: navigation has already stopped the
+        // controller and finalized the journal, but waits here while the sole
+        // dataset owner either publishes that exact descriptor or aborts the
+        // session. This handshake occurs only after capture, inference,
+        // occupancy, and accessory owners have drained.
+        #[cfg(all(feature = "nano-agent", unix))]
+        if quiescent_checkpoint_requested.load(Ordering::Acquire) {
+            match checkpoint_main_bridge.take() {
+                Some(bridge) => {
+                    let remaining = bridge
+                        .checkpoint_deadline
+                        .get()
+                        .copied()
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                        .unwrap_or(Duration::ZERO);
+                    match bridge.request.recv_timeout(remaining) {
+                        Ok(request) => {
+                            let mut finalization = NanoDatasetCheckpointFinalization::Rejected;
+                            let publishable = live_failures.is_empty()
+                                && request.navigation_publishable
+                                && request.descriptor.is_some();
+                            if publishable {
+                                match navigation_dataset_handle.take() {
+                                    Some(handle) => {
+                                        let descriptor = request.descriptor.expect(
+                                        "publishable checkpoint request has a finalized descriptor",
+                                    );
+                                        match handle.finish_with_navigation_ingress(descriptor) {
+                                            Ok(_) => {
+                                                finalization =
+                                                    NanoDatasetCheckpointFinalization::Published;
+                                            }
+                                            Err(source) => live_failures.push(
+                                                LiveWorkerFailure::DatasetFinalization(source),
+                                            ),
+                                        }
+                                    }
+                                    None => live_failures
+                                        .push(LiveWorkerFailure::WarmCheckpointCoordination(
+                                        NanoDatasetCheckpointCoordinationError::MissingDatasetOwner,
+                                    )),
+                                }
+                            }
+                            if finalization == NanoDatasetCheckpointFinalization::Rejected
+                                && let Some(handle) = navigation_dataset_handle.take()
+                                && let Err(source) = handle.abort_without_manifest()
+                            {
+                                live_failures.push(LiveWorkerFailure::DatasetAbort(source));
+                            }
+                            if bridge.finalization.send(finalization).is_err() {
+                                live_failures.push(LiveWorkerFailure::WarmCheckpointCoordination(
+                                NanoDatasetCheckpointCoordinationError::FinalizationResponseChannelDisconnected,
+                            ));
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            live_failures.push(LiveWorkerFailure::WarmCheckpointCoordination(
+                                NanoDatasetCheckpointCoordinationError::RequestTimedOut,
+                            ));
+                            if let Some(handle) = navigation_dataset_handle.take()
+                                && let Err(source) = handle.abort_without_manifest()
+                            {
+                                live_failures.push(LiveWorkerFailure::DatasetAbort(source));
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            live_failures.push(LiveWorkerFailure::WarmCheckpointCoordination(
+                                NanoDatasetCheckpointCoordinationError::RequestChannelDisconnected,
+                            ));
+                            if let Some(handle) = navigation_dataset_handle.take()
+                                && let Err(source) = handle.abort_without_manifest()
+                            {
+                                live_failures.push(LiveWorkerFailure::DatasetAbort(source));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    live_failures.push(LiveWorkerFailure::WarmCheckpointCoordination(
+                        NanoDatasetCheckpointCoordinationError::MissingBridge,
+                    ));
+                    if let Some(handle) = navigation_dataset_handle.take()
+                        && let Err(source) = handle.abort_without_manifest()
+                    {
+                        live_failures.push(LiveWorkerFailure::DatasetAbort(source));
+                    }
+                }
             }
         }
 
@@ -6103,6 +13990,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         let pair_snapshot = pair_stats.snapshot();
         let viz_snapshot = viz_stats.snapshot();
+        let rgb_viz_snapshot = rgb_viz_stats.snapshot();
         eprintln!(
             "pair queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
             pair_snapshot.enqueued,
@@ -6116,6 +14004,13 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             viz_snapshot.dropped_oldest,
             viz_snapshot.dropped_newest,
             viz_snapshot.disconnected
+        );
+        eprintln!(
+            "RGB viz queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
+            rgb_viz_snapshot.enqueued,
+            rgb_viz_snapshot.dropped_oldest,
+            rgb_viz_snapshot.dropped_newest,
+            rgb_viz_snapshot.disconnected
         );
         if let Some(depth_stats_handle) = depth_stats_handle {
             let depth_snapshot = depth_stats_handle.snapshot();
@@ -6417,6 +14312,13 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "record", feature = "actuation"))]
+    use super::LiveNavigationWorkerMotion;
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    use super::{
+        AttendedWheelsOffAttestationError, MAX_QUALIFICATION_ATTESTATION_LINE_BYTES,
+        read_bounded_tty_line,
+    };
     use super::{
         BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, LiveDecisionVizKind,
         LiveDenseCommandClass, LiveDenseRouteContext, LiveDenseRouteDisposition,
@@ -6429,9 +14331,42 @@ mod tests {
         occupancy_depth_camera, reject_removed_ba_motion_prior, require_level_optical_world,
         take_deferred_offline_snapshot_error,
     };
+    #[cfg(feature = "record")]
+    use super::{
+        HostMonotonicRangeError, LiveNavigationWorkerError, LiveNavigationWorkerInput,
+        checked_monotonic_duration_ns, combine_live_navigation_failures, drain_entry_snapshot,
+        measure_live_control_tick_timing, select_live_navigation_worker_input,
+    };
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        unix
+    ))]
+    use super::{
+        LiveNavigationVizMsg, LivePhysicalStateVizPublishError, abnormal_production_socket_exit,
+        production_period_requires_motion_tick, publish_live_navigation_viz_message,
+    };
+    #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+    use super::{LiveSensorStream, LiveSensorStreamHealth};
+    #[cfg(all(feature = "nano-agent", unix))]
+    use super::{
+        MAX_NANO_STREAM_EPOCH_ATTEMPTS, NanoOperationAndControllerOwnerError, NanoStreamEpochError,
+        V2ControllerOwnerTerminationError, finish_nano_controller_owner,
+        fresh_nano_stream_epoch_from,
+    };
     use clap::{Parser as _, error::ErrorKind};
     use kiko_slam::dataset::{DatasetError, DepthOpticalFrame, DepthProjectionContract};
     use kiko_slam::dense::{occupancy::OccupancyError, occupancy_runtime::OccupancyRuntimeError};
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        unix
+    ))]
+    use kiko_slam::navigation::{AgentControlSocketCleanupOutcome, AgentControlSocketTaskExit};
+    #[cfg(feature = "record")]
+    use kiko_slam::{ChannelCapacity, DropPolicy, SendOutcome, bounded_channel};
     use kiko_slam::{
         DenseCommandSendOutcome, DepthImage, FrameDimensions, FrameId, InferenceError,
         PinholeIntrinsics, PipelineError, PipelineTimingError, Timestamp, TrackerError,
@@ -6445,6 +14380,603 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
     use std::time::Duration;
+    #[cfg(feature = "record")]
+    use std::time::Instant;
+
+    #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+    #[test]
+    fn live_oak_health_requires_fresh_samples_from_all_streams_and_faults_on_disconnect() {
+        let mut health = LiveSensorStreamHealth::awaiting_first_samples();
+        let first = kiko_slam::HostMonotonicTimestamp::from_nanos(100);
+        assert_eq!(
+            health.console_health(first),
+            kiko_slam::navigation::ConsoleHealth::Degraded
+        );
+        health.observe(LiveSensorStream::Visual, first);
+        health.observe(LiveSensorStream::Depth, first);
+        assert_eq!(
+            health.console_health(first),
+            kiko_slam::navigation::ConsoleHealth::Degraded
+        );
+        health.observe(LiveSensorStream::Imu, first);
+        assert_eq!(
+            health.console_health(first),
+            kiko_slam::navigation::ConsoleHealth::Ready
+        );
+        let stale = kiko_slam::HostMonotonicTimestamp::from_nanos(
+            first.as_nanos() + super::LIVE_SENSOR_CONSOLE_MAX_SAMPLE_AGE_NS + 1,
+        );
+        assert_eq!(
+            health.console_health(stale),
+            kiko_slam::navigation::ConsoleHealth::Degraded
+        );
+        let before_first = kiko_slam::HostMonotonicTimestamp::from_nanos(first.as_nanos() - 1);
+        assert_eq!(
+            health.console_health(before_first),
+            kiko_slam::navigation::ConsoleHealth::Degraded
+        );
+        health.mark_closed(LiveSensorStream::Visual);
+        assert_eq!(
+            health.console_health(first),
+            kiko_slam::navigation::ConsoleHealth::Faulted
+        );
+    }
+
+    #[cfg(all(feature = "record", feature = "nano-agent", unix))]
+    #[test]
+    fn live_rgb_diagnostics_require_exact_tightly_packed_bgr8() {
+        assert_eq!(
+            super::validate_live_rgb_viz_layout(640, 400, 1_920, 768_000),
+            Ok(())
+        );
+        assert_eq!(
+            super::validate_live_rgb_viz_layout(640, 400, 1_921, 768_400),
+            Err(super::LiveRgbVizBuildError::StrideMismatch {
+                expected: 1_920,
+                actual: 1_921,
+            })
+        );
+        assert_eq!(
+            super::validate_live_rgb_viz_layout(640, 400, 1_920, 767_999),
+            Err(super::LiveRgbVizBuildError::PixelLengthMismatch {
+                expected: 768_000,
+                actual: 767_999,
+            })
+        );
+        assert_eq!(
+            super::validate_live_rgb_viz_layout(u32::MAX, 1, u32::MAX, 0),
+            Err(super::LiveRgbVizBuildError::RowBytesOverflow { width: u32::MAX })
+        );
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn due_navigation_tick_precedes_every_ready_sensor_input() {
+        fn disconnected<T>() -> crossbeam_channel::Receiver<T> {
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            drop(sender);
+            receiver
+        }
+
+        let scheduled_at = Instant::now();
+        let (tick_sender, tick_receiver) = crossbeam_channel::bounded(1);
+        tick_sender
+            .send(scheduled_at)
+            .expect("tick fixture receiver");
+        let visual = disconnected::<super::VisualAdmission>();
+        let depth = disconnected::<super::DepthObservation>();
+        let imu = disconnected::<super::ImuReport>();
+        let map = disconnected::<super::TimedOccupancySnapshot>();
+
+        assert!(matches!(
+            select_live_navigation_worker_input(
+                &tick_receiver,
+                &visual,
+                &depth,
+                &imu,
+                &map,
+            ),
+            LiveNavigationWorkerInput::Tick(actual) if actual == scheduled_at
+        ));
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn entry_snapshot_drain_is_not_extended_by_concurrent_replenishment() {
+        let (sender, receiver) = crossbeam_channel::bounded(3);
+        for value in [1_u8, 2, 3] {
+            sender.send(value).expect("bounded fixture capacity");
+        }
+        let mut admitted = Vec::new();
+
+        let outcome = drain_entry_snapshot(&receiver, |value| {
+            admitted.push(value);
+            sender
+                .try_send(value + 10)
+                .expect("each receive frees one replacement slot");
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .expect("infallible admission");
+
+        assert_eq!(outcome.drained, 3);
+        assert!(!outcome.disconnected);
+        assert_eq!(admitted, [1, 2, 3]);
+        assert_eq!(
+            receiver.try_iter().collect::<Vec<_>>(),
+            [11, 12, 13],
+            "arrivals after entry remain for the next outer-loop selection"
+        );
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn control_tick_timing_retains_current_and_monotonic_maximum_lateness() {
+        let scheduled_at = Instant::now();
+        let first = measure_live_control_tick_timing(
+            scheduled_at,
+            scheduled_at + Duration::from_nanos(7),
+            10,
+        )
+        .expect("bounded timing fixture");
+        assert_eq!(first.current_lateness_ns, 7);
+        assert_eq!(first.maximum_lateness_ns, 10);
+
+        let second = measure_live_control_tick_timing(
+            scheduled_at,
+            scheduled_at + Duration::from_nanos(12),
+            first.maximum_lateness_ns,
+        )
+        .expect("bounded timing fixture");
+        assert_eq!(second.current_lateness_ns, 12);
+        assert_eq!(second.maximum_lateness_ns, 12);
+
+        assert!(matches!(
+            measure_live_control_tick_timing(
+                scheduled_at + Duration::from_nanos(1),
+                scheduled_at,
+                second.maximum_lateness_ns,
+            ),
+            Err(super::LiveControlTickTimingError::ScheduledAfterSelection)
+        ));
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn monotonic_duration_is_checked_for_order_and_u64_range() {
+        assert_eq!(checked_monotonic_duration_ns(7, 12), Some(5));
+        assert_eq!(checked_monotonic_duration_ns(12, 7), None);
+        assert_eq!(
+            checked_monotonic_duration_ns(0, u128::from(u64::MAX) + 1),
+            None
+        );
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        feature = "nano-agent",
+        feature = "operator-console",
+        unix
+    ))]
+    #[test]
+    fn console_pose_composition_uses_map_from_odom_and_normalizes_yaw() {
+        let pose = super::compose_console_pose_components(
+            2.0,
+            3.0,
+            std::f64::consts::FRAC_PI_4,
+            10.0,
+            20.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("finite rigid transform composition");
+
+        assert!((pose.x_m.get() - 7.0).abs() < 1.0e-12);
+        assert!((pose.y_m.get() - 22.0).abs() < 1.0e-12);
+        assert!((pose.yaw_rad.get() - 3.0 * std::f64::consts::FRAC_PI_4).abs() < 1.0e-12);
+
+        let wrapped = super::compose_console_pose_components(
+            0.0,
+            0.0,
+            3.0 * std::f64::consts::FRAC_PI_4,
+            0.0,
+            0.0,
+            3.0 * std::f64::consts::FRAC_PI_4,
+        )
+        .expect("finite wrapped yaw");
+        assert!((wrapped.yaw_rad.get() + std::f64::consts::FRAC_PI_2).abs() < 1.0e-12);
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        feature = "nano-agent",
+        feature = "operator-console",
+        unix
+    ))]
+    #[test]
+    fn console_pose_composition_rejects_nonfinite_boundary_values() {
+        assert!(matches!(
+            super::compose_console_pose_components(f64::INFINITY, 0.0, 0.0, 0.0, 0.0, 0.0,),
+            Err(super::LiveProductionConsoleProjectionError::Numeric(_))
+        ));
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        feature = "nano-agent",
+        feature = "operator-console",
+        unix
+    ))]
+    #[test]
+    fn console_mpc_odom_points_use_the_same_map_from_odom_transform() {
+        let point = super::transform_console_odom_point_components(
+            2.0,
+            3.0,
+            10.0,
+            20.0,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("finite odom-to-map point");
+
+        assert!((point.x_m.get() - 7.0).abs() < 1.0e-12);
+        assert!((point.y_m.get() - 22.0).abs() < 1.0e-12);
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        feature = "nano-agent",
+        feature = "operator-console",
+        unix
+    ))]
+    #[test]
+    fn console_hides_current_pose_and_stale_solver_path_when_localization_is_not_current() {
+        use kiko_slam::navigation::AgentLocalizationStateV1;
+
+        assert!(!super::console_localized_navigation_visible(Some(
+            AgentLocalizationStateV1::Lost,
+        )));
+        assert!(!super::console_localized_navigation_visible(Some(
+            AgentLocalizationStateV1::Unavailable,
+        )));
+        assert!(!super::console_localized_navigation_visible(None));
+        assert!(super::console_localized_navigation_visible(Some(
+            AgentLocalizationStateV1::Localized,
+        )));
+
+        assert!(!super::console_current_solver_path_visible(
+            Some(AgentLocalizationStateV1::Lost),
+            Some(10),
+        ));
+        assert!(!super::console_current_solver_path_visible(
+            Some(AgentLocalizationStateV1::Localized),
+            None,
+        ));
+        assert!(super::console_current_solver_path_visible(
+            Some(AgentLocalizationStateV1::Localized),
+            Some(10),
+        ));
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        feature = "nano-agent",
+        feature = "operator-console",
+        unix
+    ))]
+    #[test]
+    fn console_projects_actual_operator_and_agent_authority_from_the_linear_guard() {
+        use kiko_slam::navigation::{
+            ConsoleActualAuthoritySource, ConsoleSourceKind, LiveMotionAuthorityState,
+            OperatorConsoleRetainedAuthorityKind,
+        };
+        use kiko_supervisor_core::AuthorityLeaseId;
+
+        let owner = Some(LiveMotionAuthorityState::Manual {
+            lease_id: AuthorityLeaseId::try_new(7).unwrap(),
+        });
+        let console = super::project_console_actual_authority_state(
+            owner,
+            Some((
+                OperatorConsoleRetainedAuthorityKind::Manual,
+                11,
+                ConsoleSourceKind::Operator,
+            )),
+        )
+        .expect("console authority projection")
+        .expect("actual console authority");
+        assert_eq!(console.source, ConsoleActualAuthoritySource::Operator);
+        assert_eq!(console.console_downstream_request_id, Some(11));
+
+        let agent = super::project_console_actual_authority_state(
+            owner,
+            Some((
+                OperatorConsoleRetainedAuthorityKind::Manual,
+                12,
+                ConsoleSourceKind::Agent,
+            )),
+        )
+        .expect("agent authority projection")
+        .expect("actual agent authority");
+        assert_eq!(agent.source, ConsoleActualAuthoritySource::Agent);
+        assert_eq!(agent.console_downstream_request_id, Some(12));
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        feature = "nano-agent",
+        feature = "operator-console",
+        unix
+    ))]
+    #[test]
+    fn console_rejects_retained_authority_that_contradicts_the_sole_owner() {
+        use kiko_slam::navigation::{
+            AgentAutonomousMode, ConsoleSourceKind, LiveMotionAuthorityState,
+            OperatorConsoleRetainedAuthorityKind,
+        };
+        use kiko_supervisor_core::AuthorityLeaseId;
+
+        let error = super::project_console_actual_authority_state(
+            Some(LiveMotionAuthorityState::Manual {
+                lease_id: AuthorityLeaseId::try_new(7).unwrap(),
+            }),
+            Some((
+                OperatorConsoleRetainedAuthorityKind::Autonomous(AgentAutonomousMode::Explore),
+                11,
+                ConsoleSourceKind::Operator,
+            )),
+        )
+        .expect_err("mismatched authority must fail closed");
+        assert!(matches!(
+            error,
+            super::LiveProductionConsoleProjectionError::ConsoleAuthorityModeMismatch { .. }
+        ));
+
+        let error = super::project_console_actual_authority_state(
+            Some(LiveMotionAuthorityState::Manual {
+                lease_id: AuthorityLeaseId::try_new(8).unwrap(),
+            }),
+            None,
+        )
+        .expect_err("an owner token cannot outlive its unified-console guard");
+        assert!(matches!(
+            error,
+            super::LiveProductionConsoleProjectionError::OwnerAuthorityWithoutConsole { .. }
+        ));
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn timing_only_packet_cannot_update_or_clear_physical_navigation_state() {
+        let message = super::LiveNavigationVizMsg::control_tick_timing_only(
+            7,
+            11,
+            super::LiveControlTickTiming {
+                current_lateness_ns: 3,
+                maximum_lateness_ns: 5,
+            },
+        );
+
+        assert!(matches!(
+            message.kind,
+            super::LiveNavigationVizMessageKind::ControlTickTimingOnly { .. }
+        ));
+        assert!(!message.kind.updates_navigation_state());
+        assert!(message.kind.control_tick_timing().is_some());
+        assert!(message.requested_pwm.is_none());
+        assert!(message.applied_actuation.is_none());
+        assert!(message.fault_actuation.is_none());
+        assert!(message.successful_solver_duration_ns.is_none());
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        unix
+    ))]
+    #[test]
+    fn production_period_defers_manual_begin_without_weakening_later_deadman_ticks() {
+        assert!(
+            !production_period_requires_motion_tick(false, true, false),
+            "manual begin owns exactly its transition period"
+        );
+        assert!(
+            production_period_requires_motion_tick(false, false, false),
+            "the following period runs the normal missing-command deadman path"
+        );
+        assert!(
+            !production_period_requires_motion_tick(false, false, true),
+            "a command-applied tick is never duplicated"
+        );
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        unix
+    ))]
+    #[test]
+    fn terminal_transition_suppresses_the_same_period_motion_tick() {
+        assert!(
+            !production_period_requires_motion_tick(true, false, false),
+            "shutdown and warm-checkpoint transitions never start another periodic tick"
+        );
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        unix
+    ))]
+    fn physical_state_viz_message(
+        status: &'static str,
+        requested_pwm: Option<[i8; 2]>,
+        objective_cost: Option<f64>,
+    ) -> LiveNavigationVizMsg {
+        LiveNavigationVizMsg {
+            tick_sequence: 1,
+            host_timestamp_ns: Some(1),
+            goal: None,
+            goal_state: "MappingOnly".to_owned(),
+            odometry_state: None,
+            path: None,
+            local_costmap: None,
+            base_to_odom: None,
+            odom_to_map: None,
+            predicted_odom: None,
+            decision_id: None,
+            request_id: None,
+            status,
+            reason: status.to_owned(),
+            requested_pwm,
+            objective_cost,
+            shadow_record_motor_packets_sent: None,
+            applied_actuation: None,
+            fault_actuation: None,
+            diagnostic_warning: None,
+            successful_solver_duration_ns: None,
+            kind: super::LiveNavigationVizMessageKind::State {
+                control_tick_timing: None,
+            },
+        }
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        unix
+    ))]
+    #[test]
+    fn newest_physical_stop_replaces_stale_nonzero_visualization_without_fallback() {
+        let (sender, receiver, _) = bounded_channel(
+            ChannelCapacity::try_from(1_usize).expect("nonzero capacity"),
+            DropPolicy::DropOldest,
+        );
+        assert_eq!(
+            sender.try_send(physical_state_viz_message(
+                "stale_nonzero",
+                Some([40, 40]),
+                Some(3.0),
+            )),
+            SendOutcome::Enqueued
+        );
+        let mut sender = Some(sender);
+
+        publish_live_navigation_viz_message(
+            &mut sender,
+            physical_state_viz_message("lifecycle_zero_applied", Some([0, 0]), None),
+        )
+        .expect("DropOldest retains the newest physical state");
+
+        let newest = receiver
+            .as_receiver()
+            .try_recv()
+            .expect("newest physical state");
+        assert_eq!(newest.status, "lifecycle_zero_applied");
+        assert_eq!(newest.requested_pwm, Some([0, 0]));
+        assert_eq!(newest.objective_cost, None);
+        assert!(receiver.as_receiver().try_recv().is_err());
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        unix
+    ))]
+    #[test]
+    fn dropped_newest_physical_state_is_a_typed_error() {
+        let (sender, _receiver, _) = bounded_channel(
+            ChannelCapacity::try_from(1_usize).expect("nonzero capacity"),
+            DropPolicy::DropNewest,
+        );
+        assert_eq!(
+            sender.try_send(physical_state_viz_message(
+                "stale_nonzero",
+                Some([40, 40]),
+                Some(3.0),
+            )),
+            SendOutcome::Enqueued
+        );
+        let mut sender = Some(sender);
+
+        assert_eq!(
+            publish_live_navigation_viz_message(
+                &mut sender,
+                physical_state_viz_message("lifecycle_zero_applied", Some([0, 0]), None),
+            ),
+            Err(LivePhysicalStateVizPublishError::DroppedNewest)
+        );
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[tokio::test]
+    async fn nano_controller_owner_join_failure_is_never_hidden_by_operation_failure() {
+        let task = tokio::spawn(async {
+            panic!("synthetic controller-owner task panic");
+            #[allow(unreachable_code)]
+            Ok::<(), V2ControllerOwnerTerminationError>(())
+        });
+        let controller = task.await;
+        let operation: Result<(), Box<dyn std::error::Error>> =
+            Err(std::io::Error::other("synthetic operation failure").into());
+
+        let error = finish_nano_controller_owner(operation, controller)
+            .expect_err("both failures must be returned");
+        let combined = error
+            .downcast_ref::<NanoOperationAndControllerOwnerError>()
+            .expect("typed combined error");
+        assert_eq!(
+            combined.operation.to_string(),
+            "synthetic operation failure"
+        );
+        assert!(combined.controller.to_string().contains("task join failed"));
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[tokio::test]
+    async fn nano_controller_owner_exit_guard_clears_running_while_unwinding_a_task_panic() {
+        let running = Arc::new(AtomicBool::new(true));
+        let task_running = Arc::clone(&running);
+        let task = tokio::spawn(async move {
+            let _guard = super::NanoControllerOwnerExitGuard::new(task_running);
+            panic!("synthetic guarded controller-owner panic");
+        });
+
+        assert!(task.await.expect_err("task must panic").is_panic());
+        assert!(
+            !running.load(Ordering::SeqCst),
+            "controller-owner panic must synchronously revoke the shared run flag"
+        );
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[test]
+    fn nano_controller_owner_clean_join_preserves_the_operation_result() {
+        assert!(
+            finish_nano_controller_owner(Ok(()), Ok(Ok(()))).is_ok(),
+            "clean operation and owner are clean"
+        );
+        let error = finish_nano_controller_owner(
+            Err(std::io::Error::other("operation").into()),
+            Ok(Ok(())),
+        )
+        .expect_err("operation error remains authoritative");
+        assert_eq!(error.to_string(), "operation");
+    }
 
     #[test]
     fn live_navigation_clock_rejects_elapsed_time_outside_u64_without_timestamp_fallback() {
@@ -7487,7 +16019,7 @@ mod tests {
     fn live_thread_exit_guard_stops_capture() {
         let running = Arc::new(AtomicBool::new(true));
         {
-            let _guard = LiveThreadExitGuard(Arc::clone(&running));
+            let _guard = LiveThreadExitGuard::new(Arc::clone(&running));
             assert!(running.load(Ordering::SeqCst));
         }
         assert!(!running.load(Ordering::SeqCst));
@@ -7511,5 +16043,183 @@ mod tests {
             live_decision_viz_status(LiveDecisionVizKind::Stopped, true),
             "fail_closed_stop_applied"
         );
+    }
+
+    #[cfg(all(feature = "record", feature = "actuation"))]
+    #[test]
+    fn live_worker_compatibility_selection_cannot_create_a_production_owner() {
+        assert!(matches!(
+            LiveNavigationWorkerMotion::compatibility(None),
+            LiveNavigationWorkerMotion::Compatibility(actuation_config)
+                if actuation_config.is_none()
+        ));
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn live_navigation_cleanup_retains_every_independent_failure() {
+        let result = combine_live_navigation_failures(vec![
+            LiveNavigationWorkerError::TickSequenceExhausted,
+            LiveNavigationWorkerError::HostClock(HostMonotonicRangeError {
+                elapsed_ns: u128::from(u64::MAX) + 1,
+            }),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(LiveNavigationWorkerError::Multiple { failures })
+                if failures.len() == 2
+                    && matches!(
+                        failures[0],
+                        LiveNavigationWorkerError::TickSequenceExhausted
+                    )
+                    && matches!(
+                        failures[1],
+                        LiveNavigationWorkerError::HostClock(_)
+                    )
+        ));
+    }
+
+    #[cfg(all(
+        feature = "record",
+        feature = "actuation",
+        feature = "agent-runtime",
+        unix
+    ))]
+    #[test]
+    fn production_socket_cleanup_requires_removal_of_the_created_inode() {
+        assert!(
+            abnormal_production_socket_exit(AgentControlSocketTaskExit::Shutdown {
+                cleanup: AgentControlSocketCleanupOutcome::RemovedCreatedSocket,
+            })
+            .is_none()
+        );
+        assert!(matches!(
+            abnormal_production_socket_exit(AgentControlSocketTaskExit::Shutdown {
+                cleanup: AgentControlSocketCleanupOutcome::AlreadyAbsent,
+            }),
+            Some(LiveNavigationWorkerError::ProductionSocketExit { .. })
+        ));
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[test]
+    fn nano_stream_epoch_uses_bounded_nonzero_entropy() {
+        let expected = 42_u64;
+        let mut bytes = 0_u64.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(&expected.to_ne_bytes());
+        let mut entropy = std::io::Cursor::new(bytes);
+        assert_eq!(
+            fresh_nano_stream_epoch_from(&mut entropy, 2)
+                .expect("second OS-random candidate is nonzero")
+                .get(),
+            expected
+        );
+
+        let mut all_zero = std::io::Cursor::new(vec![
+            0_u8;
+            MAX_NANO_STREAM_EPOCH_ATTEMPTS
+                * std::mem::size_of::<u64>()
+        ]);
+        assert!(matches!(
+            fresh_nano_stream_epoch_from(&mut all_zero, MAX_NANO_STREAM_EPOCH_ATTEMPTS),
+            Err(NanoStreamEpochError::NonzeroCandidateExhausted {
+                attempts: MAX_NANO_STREAM_EPOCH_ATTEMPTS
+            })
+        ));
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[test]
+    fn nano_agent_cli_owns_the_three_explicit_launch_roots() {
+        let cli = Cli::try_parse_from([
+            "kiko-slam",
+            "nano-agent",
+            "--deployment-root",
+            "/opt/kiko/deployment",
+            "--launch-config",
+            "nano-agent-launch-v2.json",
+            "--state-root",
+            "/var/lib/kiko-nano-agent",
+        ])
+        .expect("production command has every explicit launch boundary");
+        let Command::NanoAgent(args) = cli.command else {
+            panic!("expected Nano agent command");
+        };
+        assert_eq!(args.deployment_root, Path::new("/opt/kiko/deployment"));
+        assert_eq!(args.launch_config, "nano-agent-launch-v2.json");
+        assert_eq!(args.state_root, Path::new("/var/lib/kiko-nano-agent"));
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn qualification_cli_has_no_physical_attestation_flag_or_environment_bypass() {
+        let cli = Cli::try_parse_from([
+            "kiko-slam",
+            "nano-wheels-off-qualification",
+            "--deployment-root",
+            "/opt/kiko/deployment",
+            "--launch-config",
+            "nano-wheels-off-qualification-launch-v1.json",
+            "--state-root",
+            "/var/lib/kiko-nano-qualification",
+        ])
+        .expect("qualification command has only deployment and state boundaries");
+        let Command::NanoWheelsOffQualification(args) = cli.command else {
+            panic!("expected wheels-off qualification command");
+        };
+        assert_eq!(args.deployment_root, Path::new("/opt/kiko/deployment"));
+        assert_eq!(
+            args.launch_config,
+            "nano-wheels-off-qualification-launch-v1.json"
+        );
+        assert_eq!(
+            args.state_root,
+            Path::new("/var/lib/kiko-nano-qualification")
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "kiko-slam",
+                "nano-wheels-off-qualification",
+                "--deployment-root",
+                "/opt/kiko/deployment",
+                "--launch-config",
+                "nano-wheels-off-qualification-launch-v1.json",
+                "--state-root",
+                "/var/lib/kiko-nano-qualification",
+                "--wheels-removed",
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn qualification_tty_line_parser_is_exact_bounded_and_crlf_aware() {
+        let mut exact = std::io::Cursor::new(b"WHEELS REMOVED\r\nnext\n".to_vec());
+        assert_eq!(
+            read_bounded_tty_line(&mut exact).expect("bounded CRLF line"),
+            "WHEELS REMOVED"
+        );
+        assert_eq!(
+            read_bounded_tty_line(&mut exact).expect("second buffered line"),
+            "next"
+        );
+
+        let mut too_long =
+            std::io::Cursor::new(vec![b'x'; MAX_QUALIFICATION_ATTESTATION_LINE_BYTES + 1]);
+        assert!(matches!(
+            read_bounded_tty_line(&mut too_long),
+            Err(AttendedWheelsOffAttestationError::LineTooLong {
+                maximum_bytes: MAX_QUALIFICATION_ATTESTATION_LINE_BYTES
+            })
+        ));
+
+        let mut invalid = std::io::Cursor::new(vec![0xff, b'\n']);
+        assert!(matches!(
+            read_bounded_tty_line(&mut invalid),
+            Err(AttendedWheelsOffAttestationError::InvalidUtf8)
+        ));
     }
 }

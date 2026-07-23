@@ -253,14 +253,18 @@ mod tests {
         assert_eq!(prepared[3].gaze_x().get(), 1_000);
         assert_eq!(prepared[3].color_rgb(), [0, 0, 255]);
         assert_eq!(prepared[4].gaze_x().get(), 1_000);
-        assert!(prepared[5..8]
-            .iter()
-            .all(|intent| intent.flags().bits() == EyeFlags::BLINK));
+        assert!(
+            prepared[5..8]
+                .iter()
+                .all(|intent| intent.flags().bits() == EyeFlags::BLINK)
+        );
         assert_eq!(prepared[8].expression(), Expression::Neutral);
         assert_eq!(prepared[8].gaze_x().get(), 0);
-        assert!(prepared
-            .iter()
-            .all(|intent| intent.brightness().get() == 1_000));
+        assert!(
+            prepared
+                .iter()
+                .all(|intent| intent.brightness().get() == 1_000)
+        );
     }
 
     #[test]

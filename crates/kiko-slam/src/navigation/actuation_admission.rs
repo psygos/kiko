@@ -1,6 +1,6 @@
 //! Exact deployment admission for a parsed navigation actuation authority.
 //!
-//! [`NavigationActuationConfigV1`] intentionally remains a weak operator
+//! [`NavigationActuationConfigV2`] intentionally remains a weak operator
 //! authority document. This module binds it to one no-follow manifest load,
 //! one exact inventory snapshot, and one exact plant artifact before the
 //! production runtime may acquire a physical driver.
@@ -16,16 +16,18 @@ use kiko_device_inventory::{
 };
 use robot_protocol::v2::ControllerCapabilities;
 
-use super::NavigationActuationConfigV1;
+use super::NavigationActuationConfigV2;
 
+#[cfg(test)]
 const SHA256_HEX_PREFIX: &str = "sha256:";
+#[cfg(test)]
 const SHA256_HEX_DIGITS: usize = 64;
 
 /// Immutable identity of the exact plant artifact admitted for actuation.
 ///
-/// The selected artifact must contain the physical dataset bytes named by the
-/// parsed plant model's `dataset_content_id`. Selecting a model JSON file whose
-/// digest differs from that dataset identity fails closed.
+/// The selected artifact is the exact serialized plant model. Its digest is
+/// independently bound by the actuation config and never reused as the
+/// physical evidence-dataset identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmittedPlantArtifactIdentity {
     artifact_root_path: PathBuf,
@@ -60,21 +62,21 @@ impl AdmittedPlantArtifactIdentity {
 /// Non-forgeable production authority for one exact parsed actuation config.
 ///
 /// Construction proves that the config's robot and controller identities
-/// match an exact admitted inventory and that its claimed physical dataset
-/// digest names the exact selected, no-follow hashed plant artifact. This is
-/// immutable startup evidence; it does not claim continuing device liveness.
+/// match an exact admitted inventory, that model evidence matches the distinct
+/// physical dataset identity, and that the separately configured plant
+/// artifact digest names the exact selected no-follow hashed artifact.
 #[derive(Debug)]
-pub struct AdmittedNavigationActuationConfigV1 {
-    config: NavigationActuationConfigV1,
+pub struct AdmittedNavigationActuationConfigV2 {
+    config: NavigationActuationConfigV2,
     manifest_source_path: PathBuf,
     manifest_content_sha256: ManifestContentSha256,
     controller_capabilities: ControllerCapabilities,
     plant_artifact: AdmittedPlantArtifactIdentity,
 }
 
-impl AdmittedNavigationActuationConfigV1 {
+impl AdmittedNavigationActuationConfigV2 {
     pub fn admit(
-        config: NavigationActuationConfigV1,
+        config: NavigationActuationConfigV2,
         loaded_manifest: &LoadedExpectedManifestV1,
         exact_inventory: &ExactInventoryAdmission,
         artifact_hashes: &ManifestArtifactHashes,
@@ -190,17 +192,17 @@ impl AdmittedNavigationActuationConfigV1 {
             });
         }
 
-        let claimed_dataset_id = config.approval().plant_dataset_content_id();
-        let claimed_dataset_sha256 = parse_canonical_sha256_id(claimed_dataset_id)
-            .ok_or(ActuationAdmissionError::PlantDatasetContentIdIsNotCanonicalSha256)?;
-        if claimed_dataset_sha256 != *hashed_plant.observed_sha256() {
-            return Err(ActuationAdmissionError::PlantDatasetContentDigestMismatch(
-                Box::new(PlantDatasetContentDigestMismatch {
-                    artifact_id: *plant_artifact_id,
-                    claimed_sha256: claimed_dataset_sha256,
-                    artifact_sha256: *hashed_plant.observed_sha256(),
-                }),
-            ));
+        let configured_plant_sha256 = config.plant_artifact_content_sha256();
+        if configured_plant_sha256.as_bytes() != hashed_plant.observed_sha256() {
+            return Err(
+                ActuationAdmissionError::ConfiguredPlantArtifactDigestMismatch(Box::new(
+                    ConfiguredPlantArtifactDigestMismatch {
+                        artifact_id: *plant_artifact_id,
+                        configured_sha256: *configured_plant_sha256.as_bytes(),
+                        observed_sha256: *hashed_plant.observed_sha256(),
+                    },
+                )),
+            );
         }
 
         Ok(Self {
@@ -218,7 +220,7 @@ impl AdmittedNavigationActuationConfigV1 {
         })
     }
 
-    pub const fn config(&self) -> &NavigationActuationConfigV1 {
+    pub const fn config(&self) -> &NavigationActuationConfigV2 {
         &self.config
     }
 
@@ -239,6 +241,10 @@ impl AdmittedNavigationActuationConfigV1 {
     }
 }
 
+/// Compatibility name for call sites that predate actuation schema V2.
+pub type AdmittedNavigationActuationConfigV1 = AdmittedNavigationActuationConfigV2;
+
+#[cfg(test)]
 fn parse_canonical_sha256_id(value: &str) -> Option<[u8; 32]> {
     let hex = value.strip_prefix(SHA256_HEX_PREFIX)?;
     if hex.len() != SHA256_HEX_DIGITS {
@@ -253,6 +259,7 @@ fn parse_canonical_sha256_id(value: &str) -> Option<[u8; 32]> {
     Some(digest)
 }
 
+#[cfg(test)]
 const fn canonical_hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -310,8 +317,7 @@ pub enum ActuationAdmissionError {
     SelectedPlantDigestMismatch {
         artifact_id: ArtifactId,
     },
-    PlantDatasetContentIdIsNotCanonicalSha256,
-    PlantDatasetContentDigestMismatch(Box<PlantDatasetContentDigestMismatch>),
+    ConfiguredPlantArtifactDigestMismatch(Box<ConfiguredPlantArtifactDigestMismatch>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -323,10 +329,10 @@ pub struct ArtifactContentMismatch {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct PlantDatasetContentDigestMismatch {
+pub struct ConfiguredPlantArtifactDigestMismatch {
     pub artifact_id: ArtifactId,
-    pub claimed_sha256: [u8; 32],
-    pub artifact_sha256: [u8; 32],
+    pub configured_sha256: [u8; 32],
+    pub observed_sha256: [u8; 32],
 }
 
 impl fmt::Display for ActuationAdmissionError {
@@ -584,7 +590,7 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "robot_id": ROBOT_ID,
             "command_endpoint": ENDPOINT,
             "navigation_config_sha256_hex": navigation_hash_hex,
@@ -594,6 +600,9 @@ mod tests {
             "actuator_config_fingerprint_hex": "22222222222222222222222222222222",
             "plant_model_id": "kiko-physical-v1",
             "plant_model_version": 1,
+            "plant_artifact_sha256_hex": canonical_sha256_id(PLANT_BYTES)
+                .strip_prefix(SHA256_HEX_PREFIX)
+                .expect("canonical prefix"),
             "operator_claimed_physical_approval": {
                 "approval_id": "approval-v1",
                 "approver_id": "operator@example.com",
@@ -619,11 +628,11 @@ mod tests {
         })
     }
 
-    fn config(dataset_content_id: String) -> NavigationActuationConfigV1 {
+    fn config(dataset_content_id: String) -> NavigationActuationConfigV2 {
         config_from_json(actuation_json(&dataset_content_id), dataset_content_id)
     }
 
-    fn config_from_json(value: Value, dataset_content_id: String) -> NavigationActuationConfigV1 {
+    fn config_from_json(value: Value, dataset_content_id: String) -> NavigationActuationConfigV2 {
         config_from_json_for_robot(value, dataset_content_id, ROBOT_ID)
     }
 
@@ -631,9 +640,9 @@ mod tests {
         value: Value,
         dataset_content_id: String,
         requested_robot_id: &str,
-    ) -> NavigationActuationConfigV1 {
+    ) -> NavigationActuationConfigV2 {
         let bytes = serde_json::to_vec(&value).expect("actuation JSON");
-        NavigationActuationConfigV1::parse_and_authorize(
+        NavigationActuationConfigV2::parse_and_authorize(
             &bytes,
             requested_robot_id,
             NAVIGATION_BYTES,
@@ -657,6 +666,10 @@ mod tests {
         ArtifactRelativePath::parse("plant/drive.bin".into()).expect("plant path")
     }
 
+    fn distinct_dataset_content_id() -> String {
+        canonical_sha256_id(b"distinct physical evidence dataset")
+    }
+
     #[test]
     fn exact_controller_manifest_and_plant_evidence_admit() {
         let fixture = Fixture::new();
@@ -664,8 +677,9 @@ mod tests {
         let inventory = fixture.inventory(loaded.manifest());
         let hashes = fixture.hashes(loaded.manifest());
         let plant_id = plant_id(loaded.manifest());
+        let dataset_content_id = distinct_dataset_content_id();
         let admitted = AdmittedNavigationActuationConfigV1::admit(
-            config(canonical_sha256_id(PLANT_BYTES)),
+            config(dataset_content_id.clone()),
             &loaded,
             &inventory,
             &hashes,
@@ -689,10 +703,26 @@ mod tests {
             admitted.plant_artifact().bytes_hashed(),
             PLANT_BYTES.len() as u64
         );
+        assert_eq!(
+            admitted
+                .config()
+                .approval()
+                .plant_dataset_content_id()
+                .as_str(),
+            dataset_content_id
+        );
+        assert_ne!(
+            admitted
+                .config()
+                .approval()
+                .plant_dataset_content_id()
+                .sha256(),
+            admitted.plant_artifact().content_sha256()
+        );
     }
 
     #[test]
-    fn in_memory_manifest_and_noncanonical_dataset_claim_fail_closed() {
+    fn in_memory_manifest_and_wrong_plant_artifact_binding_fail_closed() {
         let fixture = Fixture::new();
         let loaded_file = fixture.loaded();
         let inventory = fixture.inventory(loaded_file.manifest());
@@ -703,7 +733,7 @@ mod tests {
 
         assert_eq!(
             AdmittedNavigationActuationConfigV1::admit(
-                config(canonical_sha256_id(PLANT_BYTES)),
+                config(distinct_dataset_content_id()),
                 &loaded_slice,
                 &inventory,
                 &hashes,
@@ -713,30 +743,19 @@ mod tests {
             .expect_err("in-memory manifest must not admit"),
             ActuationAdmissionError::ManifestWasNotLoadedFromFile
         );
-        assert_eq!(
-            AdmittedNavigationActuationConfigV1::admit(
-                config("sha256:plant".into()),
-                &loaded_file,
-                &inventory,
-                &hashes,
-                &plant_id,
-                &plant_path(),
-            )
-            .expect_err("ambiguous dataset claim must not admit"),
-            ActuationAdmissionError::PlantDatasetContentIdIsNotCanonicalSha256
-        );
+        let dataset_content_id = distinct_dataset_content_id();
+        let mut wrong_artifact = actuation_json(&dataset_content_id);
+        wrong_artifact["plant_artifact_sha256_hex"] = json!("00".repeat(32));
         assert!(matches!(
             AdmittedNavigationActuationConfigV1::admit(
-                config(canonical_sha256_id(b"different physical dataset")),
+                config_from_json(wrong_artifact, dataset_content_id),
                 &loaded_file,
                 &inventory,
                 &hashes,
                 &plant_id,
                 &plant_path(),
             ),
-            Err(ActuationAdmissionError::PlantDatasetContentDigestMismatch(
-                _
-            ))
+            Err(ActuationAdmissionError::ConfiguredPlantArtifactDigestMismatch(_))
         ));
     }
 
@@ -751,7 +770,7 @@ mod tests {
             ArtifactRelativePath::parse("plant/not-drive.bin".into()).expect("wrong path");
         assert!(matches!(
             AdmittedNavigationActuationConfigV1::admit(
-                config(canonical_sha256_id(PLANT_BYTES)),
+                config(distinct_dataset_content_id()),
                 &loaded,
                 &inventory,
                 &hashes,
@@ -769,7 +788,7 @@ mod tests {
         let changed_hashes = fixture.hashes(loaded.manifest());
         assert!(matches!(
             AdmittedNavigationActuationConfigV1::admit(
-                config(canonical_sha256_id(PLANT_BYTES)),
+                config(distinct_dataset_content_id()),
                 &loaded,
                 &inventory,
                 &changed_hashes,
@@ -788,7 +807,7 @@ mod tests {
         let inventory = fixture.inventory(loaded.manifest());
         let hashes = fixture.hashes(loaded.manifest());
         let plant_id = plant_id(loaded.manifest());
-        let dataset_content_id = canonical_sha256_id(PLANT_BYTES);
+        let dataset_content_id = distinct_dataset_content_id();
 
         let mut wrong_endpoint = actuation_json(&dataset_content_id);
         wrong_endpoint["command_endpoint"] = json!("127.0.0.1:8081");
@@ -822,11 +841,11 @@ mod tests {
             }
         );
 
-        let mut wrong_uid = actuation_json(&canonical_sha256_id(PLANT_BYTES));
+        let mut wrong_uid = actuation_json(&distinct_dataset_content_id());
         wrong_uid["controller_uid_hex"] = json!("333333333333333333333333");
         assert_eq!(
             AdmittedNavigationActuationConfigV1::admit(
-                config_from_json(wrong_uid, canonical_sha256_id(PLANT_BYTES)),
+                config_from_json(wrong_uid, distinct_dataset_content_id()),
                 &loaded,
                 &inventory,
                 &hashes,
@@ -837,12 +856,12 @@ mod tests {
             ActuationAdmissionError::ControllerUidMismatch
         );
 
-        let mut wrong_fingerprint = actuation_json(&canonical_sha256_id(PLANT_BYTES));
+        let mut wrong_fingerprint = actuation_json(&distinct_dataset_content_id());
         wrong_fingerprint["actuator_config_fingerprint_hex"] =
             json!("44444444444444444444444444444444");
         assert_eq!(
             AdmittedNavigationActuationConfigV1::admit(
-                config_from_json(wrong_fingerprint, canonical_sha256_id(PLANT_BYTES)),
+                config_from_json(wrong_fingerprint, distinct_dataset_content_id()),
                 &loaded,
                 &inventory,
                 &hashes,
@@ -854,13 +873,13 @@ mod tests {
         );
 
         let other_robot = "kiko-other";
-        let mut wrong_robot = actuation_json(&canonical_sha256_id(PLANT_BYTES));
+        let mut wrong_robot = actuation_json(&distinct_dataset_content_id());
         wrong_robot["robot_id"] = json!(other_robot);
         assert_eq!(
             AdmittedNavigationActuationConfigV1::admit(
                 config_from_json_for_robot(
                     wrong_robot,
-                    canonical_sha256_id(PLANT_BYTES),
+                    distinct_dataset_content_id(),
                     other_robot,
                 ),
                 &loaded,

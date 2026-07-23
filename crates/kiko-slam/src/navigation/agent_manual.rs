@@ -86,6 +86,98 @@ enum ManualLifecycle {
     AwaitingReleaseZero { lease_id: AuthorityLeaseId },
 }
 
+/// Autonomous modes which may share the sole process-wide authority owner.
+///
+/// Manual and commissioning authority are deliberately unrepresentable here:
+/// manual has its own command/deadman lifecycle below, while commissioning is
+/// outside the live navigation runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentAutonomousMode {
+    PointGoal,
+    Explore,
+}
+
+impl AgentAutonomousMode {
+    const fn authority_mode(self) -> AuthorityMode {
+        match self {
+            Self::PointGoal => AuthorityMode::PointGoal,
+            Self::Explore => AuthorityMode::Explore,
+        }
+    }
+}
+
+/// Active autonomous lease token retained by the sole live motion owner.
+///
+/// This token is intentionally not `Clone` or `Copy`. Renewal and release
+/// consume the token so two independent continuations cannot claim the same
+/// supervisor lease.
+#[derive(Debug)]
+pub struct AgentAutonomousAuthority {
+    mode: AgentAutonomousMode,
+    lease: AuthorityLease,
+}
+
+impl AgentAutonomousAuthority {
+    pub const fn mode(&self) -> AgentAutonomousMode {
+        self.mode
+    }
+
+    pub const fn lease(&self) -> AuthorityLease {
+        self.lease
+    }
+}
+
+/// Exact supervisor continuation waiting for a newly applied grant zero.
+#[derive(Debug)]
+pub struct PendingAgentAutonomousGrant {
+    mode: AgentAutonomousMode,
+    reason: StopReason,
+}
+
+impl PendingAgentAutonomousGrant {
+    pub const fn mode(&self) -> AgentAutonomousMode {
+        self.mode
+    }
+
+    pub const fn reason(&self) -> StopReason {
+        self.reason
+    }
+}
+
+/// Exact supervisor continuation waiting for a newly applied stop zero.
+#[derive(Debug)]
+pub struct PendingAgentAutonomousStop {
+    mode: AgentAutonomousMode,
+    lease_id: Option<AuthorityLeaseId>,
+    reason: StopReason,
+}
+
+impl PendingAgentAutonomousStop {
+    pub const fn mode(&self) -> AgentAutonomousMode {
+        self.mode
+    }
+
+    pub const fn lease_id(&self) -> Option<AuthorityLeaseId> {
+        self.lease_id
+    }
+
+    pub const fn reason(&self) -> StopReason {
+        self.reason
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum AgentAutonomousRequest {
+    Granted(AgentAutonomousAuthority),
+    FreshAppliedZeroRequired(PendingAgentAutonomousGrant),
+}
+
+#[derive(Debug)]
+pub(crate) enum AgentAutonomousTick {
+    Active,
+    FreshAppliedStopRequired(PendingAgentAutonomousStop),
+}
+
 /// Sole manual state owner around the process-wide authority supervisor.
 pub struct AgentManualControlCore {
     authority: AgentAuthoritySupervisor,
@@ -107,6 +199,223 @@ impl AgentManualControlCore {
 
     pub const fn authority(&self) -> &AgentAuthoritySupervisor {
         &self.authority
+    }
+
+    /// Request a fresh autonomous lease from the stopped lifecycle state.
+    ///
+    /// Same-mode renewal is deliberately a separate operation requiring the
+    /// exact retained active token. Cross-mode transitions must first release
+    /// the old token and satisfy its stop zero, so this entry point cannot
+    /// silently hand over authority without the owner accounting for cleanup.
+    pub(crate) fn request_autonomous(
+        &mut self,
+        mode: AgentAutonomousMode,
+        duration: AuthorityDuration,
+        now: HostMonotonicTimestamp,
+    ) -> Result<AgentAutonomousRequest, AgentAutonomousControlError> {
+        self.require_manual_inactive_for_autonomy()?;
+        if !matches!(self.authority.state(), SupervisorState::ReadyStopped { .. }) {
+            return Err(AgentAutonomousControlError::AuthorityNotReady {
+                actual: self.authority.state().kind(),
+                obligation: self.authority.pending_obligation(),
+            });
+        }
+        let action = self
+            .authority
+            .request_mode(mode.authority_mode(), duration, now)
+            .map_err(AgentAutonomousControlError::Authority)?;
+        match action {
+            SupervisorAction::AuthorityGranted { lease }
+                if lease.mode() == mode.authority_mode() =>
+            {
+                Ok(AgentAutonomousRequest::Granted(AgentAutonomousAuthority {
+                    mode,
+                    lease,
+                }))
+            }
+            SupervisorAction::BaseZeroRequired {
+                reason: StopReason::ZeroEvidenceStale,
+            } => Ok(AgentAutonomousRequest::FreshAppliedZeroRequired(
+                PendingAgentAutonomousGrant {
+                    mode,
+                    reason: StopReason::ZeroEvidenceStale,
+                },
+            )),
+            action => Err(self.autonomous_invariant("request autonomous authority", action, now)),
+        }
+    }
+
+    /// Complete the exact pending autonomous grant with newly applied zero
+    /// evidence. A rejected receipt leaves the borrowed token available to the
+    /// owner for cancellation or retry.
+    pub(crate) fn complete_autonomous_grant_with_applied_zero(
+        &mut self,
+        pending: &PendingAgentAutonomousGrant,
+        result: HostCommandResult,
+        observed_at: HostMonotonicTimestamp,
+        now: HostMonotonicTimestamp,
+    ) -> Result<AgentAutonomousAuthority, AgentAutonomousControlError> {
+        self.require_manual_inactive_for_autonomy()?;
+        self.require_pending_reason("complete autonomous grant zero", pending.reason)?;
+        let action = self
+            .authority
+            .admit_applied_zero(result, observed_at, now)
+            .map_err(AgentAutonomousControlError::Authority)?;
+        match action {
+            SupervisorAction::AuthorityGranted { lease }
+                if lease.mode() == pending.mode.authority_mode() =>
+            {
+                Ok(AgentAutonomousAuthority {
+                    mode: pending.mode,
+                    lease,
+                })
+            }
+            SupervisorAction::PendingAuthorityExpired => {
+                Err(AgentAutonomousControlError::PendingAuthorityExpired)
+            }
+            action => Err(self.autonomous_invariant("complete autonomous grant zero", action, now)),
+        }
+    }
+
+    /// Renew only the exact active autonomous lease retained by the owner.
+    ///
+    /// The token is updated only after a same-ID, same-mode renewal. Any
+    /// failure leaves the prior token intact as diagnostic/cleanup evidence.
+    pub(crate) fn renew_autonomous(
+        &mut self,
+        active: &mut AgentAutonomousAuthority,
+        duration: AuthorityDuration,
+        now: HostMonotonicTimestamp,
+    ) -> Result<(), AgentAutonomousControlError> {
+        self.require_manual_inactive_for_autonomy()?;
+        self.require_exact_autonomous(active)?;
+        let action = self
+            .authority
+            .request_mode(active.mode.authority_mode(), duration, now)
+            .map_err(AgentAutonomousControlError::Authority)?;
+        match action {
+            SupervisorAction::AuthorityRenewed { lease }
+                if lease.id() == active.lease.id()
+                    && lease.mode() == active.mode.authority_mode() =>
+            {
+                active.lease = lease;
+                Ok(())
+            }
+            SupervisorAction::BaseZeroRequired {
+                reason: StopReason::AuthorityLeaseExpired,
+            } => Err(AgentAutonomousControlError::LeaseExpired {
+                pending: PendingAgentAutonomousStop {
+                    mode: active.mode,
+                    lease_id: Some(active.lease.id()),
+                    reason: StopReason::AuthorityLeaseExpired,
+                },
+            }),
+            action => Err(self.autonomous_invariant("renew autonomous authority", action, now)),
+        }
+    }
+
+    /// Advance the exact autonomous lease expiry without applying motion.
+    pub(crate) fn tick_autonomous(
+        &mut self,
+        active: &AgentAutonomousAuthority,
+        now: HostMonotonicTimestamp,
+    ) -> Result<AgentAutonomousTick, AgentAutonomousControlError> {
+        self.require_manual_inactive_for_autonomy()?;
+        self.require_exact_autonomous(active)?;
+        let action = self
+            .authority
+            .tick(now)
+            .map_err(AgentAutonomousControlError::Authority)?;
+        match action {
+            SupervisorAction::None => {
+                self.require_exact_autonomous(active)?;
+                Ok(AgentAutonomousTick::Active)
+            }
+            SupervisorAction::BaseZeroRequired {
+                reason: StopReason::AuthorityLeaseExpired,
+            } => Ok(AgentAutonomousTick::FreshAppliedStopRequired(
+                PendingAgentAutonomousStop {
+                    mode: active.mode,
+                    lease_id: Some(active.lease.id()),
+                    reason: StopReason::AuthorityLeaseExpired,
+                },
+            )),
+            action => Err(self.autonomous_invariant("tick autonomous authority", action, now)),
+        }
+    }
+
+    /// Release the exact active autonomous lease. The returned token is only
+    /// an obligation; a newly applied zero must still complete it.
+    pub(crate) fn begin_autonomous_release(
+        &mut self,
+        active: &AgentAutonomousAuthority,
+        now: HostMonotonicTimestamp,
+    ) -> Result<PendingAgentAutonomousStop, AgentAutonomousControlError> {
+        self.require_manual_inactive_for_autonomy()?;
+        self.require_exact_autonomous(active)?;
+        let action = self
+            .authority
+            .release_authority(active.lease.id(), now)
+            .map_err(AgentAutonomousControlError::Authority)?;
+        match action {
+            SupervisorAction::BaseZeroRequired {
+                reason: StopReason::AuthorityReleased,
+            } => Ok(PendingAgentAutonomousStop {
+                mode: active.mode,
+                lease_id: Some(active.lease.id()),
+                reason: StopReason::AuthorityReleased,
+            }),
+            action => Err(self.autonomous_invariant("release autonomous authority", action, now)),
+        }
+    }
+
+    /// Cancel an autonomous grant which is still waiting behind its grant
+    /// zero. The cancellation moves the zero barrier and returns a distinct
+    /// stop continuation.
+    pub(crate) fn cancel_pending_autonomous_grant(
+        &mut self,
+        pending: &PendingAgentAutonomousGrant,
+        now: HostMonotonicTimestamp,
+    ) -> Result<PendingAgentAutonomousStop, AgentAutonomousControlError> {
+        self.require_manual_inactive_for_autonomy()?;
+        self.require_pending_reason("cancel pending autonomous grant", pending.reason)?;
+        let action = self
+            .authority
+            .cancel_pending_authority(now)
+            .map_err(AgentAutonomousControlError::Authority)?;
+        match action {
+            SupervisorAction::BaseZeroRequired {
+                reason: StopReason::PendingAuthorityCancelled,
+            } => Ok(PendingAgentAutonomousStop {
+                mode: pending.mode,
+                lease_id: None,
+                reason: StopReason::PendingAuthorityCancelled,
+            }),
+            action => {
+                Err(self.autonomous_invariant("cancel pending autonomous grant", action, now))
+            }
+        }
+    }
+
+    /// Complete a release, expiry, or cancelled-grant stop continuation with
+    /// exact new zero evidence. Rejected evidence leaves the token available.
+    pub(crate) fn complete_autonomous_stop_with_applied_zero(
+        &mut self,
+        pending: &PendingAgentAutonomousStop,
+        result: HostCommandResult,
+        observed_at: HostMonotonicTimestamp,
+        now: HostMonotonicTimestamp,
+    ) -> Result<(), AgentAutonomousControlError> {
+        self.require_manual_inactive_for_autonomy()?;
+        self.require_pending_reason("complete autonomous stop zero", pending.reason)?;
+        let action = self
+            .authority
+            .admit_applied_zero(result, observed_at, now)
+            .map_err(AgentAutonomousControlError::Authority)?;
+        match action {
+            SupervisorAction::ReadyStopped => Ok(()),
+            action => Err(self.autonomous_invariant("complete autonomous stop zero", action, now)),
+        }
     }
 
     /// Conservatively project the process-wide lifecycle and this owner's
@@ -543,6 +852,71 @@ impl AgentManualControlCore {
         }
     }
 
+    fn require_manual_inactive_for_autonomy(&self) -> Result<(), AgentAutonomousControlError> {
+        if matches!(self.lifecycle, ManualLifecycle::Inactive) {
+            Ok(())
+        } else {
+            Err(AgentAutonomousControlError::ManualLifecycleConflict)
+        }
+    }
+
+    fn require_exact_autonomous(
+        &self,
+        expected: &AgentAutonomousAuthority,
+    ) -> Result<(), AgentAutonomousControlError> {
+        if expected.lease.mode() != expected.mode.authority_mode() {
+            return Err(AgentAutonomousControlError::TokenModeMismatch {
+                token_mode: expected.mode,
+                lease_mode: expected.lease.mode(),
+                obligation: self.authority.pending_obligation(),
+            });
+        }
+        let actual = self.authority.active_lease();
+        if actual == Some(expected.lease) {
+            Ok(())
+        } else {
+            Err(AgentAutonomousControlError::ActiveLeaseMismatch {
+                expected: expected.lease,
+                actual: Box::new(actual),
+                obligation: self.authority.pending_obligation(),
+            })
+        }
+    }
+
+    fn require_pending_reason(
+        &self,
+        operation: &'static str,
+        expected: StopReason,
+    ) -> Result<(), AgentAutonomousControlError> {
+        let actual = self.authority.pending_obligation();
+        if actual == (SupervisorAction::BaseZeroRequired { reason: expected }) {
+            Ok(())
+        } else {
+            Err(AgentAutonomousControlError::PendingZeroObligationMismatch {
+                operation,
+                expected,
+                actual,
+            })
+        }
+    }
+
+    fn autonomous_invariant(
+        &mut self,
+        operation: &'static str,
+        action: SupervisorAction,
+        now: HostMonotonicTimestamp,
+    ) -> AgentAutonomousControlError {
+        self.lifecycle = ManualLifecycle::Inactive;
+        let latch = self
+            .authority
+            .latch_fault(FaultKind::InternalInvariant, now);
+        AgentAutonomousControlError::UnexpectedSupervisorAction {
+            operation,
+            action,
+            latch: Box::new(latch),
+        }
+    }
+
     fn pending_authority_error(&mut self, source: AgentAuthorityError) -> AgentManualControlError {
         if !matches!(self.authority.state(), SupervisorState::AwaitingZero { .. }) {
             self.lifecycle = ManualLifecycle::Inactive;
@@ -862,7 +1236,8 @@ pub fn classify_live_actuation_error(source: &LiveActuationError) -> AgentLiveAc
         LiveActuationError::DecisionRejected { source, stop } => {
             let controller_stop = match stop {
                 LocalRejectionStop::Confirmed(_) => AgentControllerStopKnowledge::Confirmed,
-                LocalRejectionStop::Uncertain(_) | LocalRejectionStop::SessionAlreadyConsumed => {
+                LocalRejectionStop::DisarmFailed(failure) => failure.stop_knowledge().into(),
+                LocalRejectionStop::SessionAlreadyConsumed => {
                     AgentControllerStopKnowledge::Uncertain
                 }
             };
@@ -953,6 +1328,68 @@ impl ManualControlTick {
 
     pub const fn supervisor_action(self) -> SupervisorAction {
         self.supervisor_action
+    }
+}
+
+#[derive(Debug)]
+pub enum AgentAutonomousControlError {
+    ManualLifecycleConflict,
+    AuthorityNotReady {
+        actual: SupervisorStateKind,
+        obligation: SupervisorAction,
+    },
+    PendingAuthorityExpired,
+    TokenModeMismatch {
+        token_mode: AgentAutonomousMode,
+        lease_mode: AuthorityMode,
+        obligation: SupervisorAction,
+    },
+    ActiveLeaseMismatch {
+        expected: AuthorityLease,
+        actual: Box<Option<AuthorityLease>>,
+        obligation: SupervisorAction,
+    },
+    PendingZeroObligationMismatch {
+        operation: &'static str,
+        expected: StopReason,
+        actual: SupervisorAction,
+    },
+    LeaseExpired {
+        pending: PendingAgentAutonomousStop,
+    },
+    UnexpectedSupervisorAction {
+        operation: &'static str,
+        action: SupervisorAction,
+        latch: Box<Result<SupervisorAction, AgentAuthorityError>>,
+    },
+    Authority(AgentAuthorityError),
+}
+
+impl fmt::Display for AgentAutonomousControlError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "autonomous authority transition failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for AgentAutonomousControlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Authority(source) => Some(source),
+            Self::UnexpectedSupervisorAction { latch, .. } => match latch.as_ref() {
+                Ok(_) => None,
+                Err(source) => Some(source),
+            },
+            Self::ManualLifecycleConflict
+            | Self::AuthorityNotReady { .. }
+            | Self::PendingAuthorityExpired
+            | Self::TokenModeMismatch { .. }
+            | Self::ActiveLeaseMismatch { .. }
+            | Self::PendingZeroObligationMismatch { .. }
+            | Self::LeaseExpired { .. } => None,
+        }
     }
 }
 
@@ -1113,6 +1550,109 @@ mod tests {
             SupervisorAction::ReadyStopped
         );
         authority
+    }
+
+    #[test]
+    fn autonomous_grant_renew_tick_and_release_require_exact_retained_tokens_and_zeros() {
+        let mut control = AgentManualControlCore::new(ready(), Some(policy()));
+        let pending = match control
+            .request_autonomous(AgentAutonomousMode::PointGoal, duration(50), at(205))
+            .expect("stale stopped evidence creates an exact grant continuation")
+        {
+            AgentAutonomousRequest::FreshAppliedZeroRequired(pending) => pending,
+            AgentAutonomousRequest::Granted(_) => panic!("stale zero must not grant authority"),
+        };
+        assert_eq!(pending.mode(), AgentAutonomousMode::PointGoal);
+        assert_eq!(pending.reason(), StopReason::ZeroEvidenceStale);
+
+        let mut authority = control
+            .complete_autonomous_grant_with_applied_zero(&pending, host_zero(1), at(206), at(206))
+            .expect("fresh exact grant zero");
+        let lease_id = authority.lease().id();
+        assert_eq!(authority.mode(), AgentAutonomousMode::PointGoal);
+        assert_eq!(control.authority().active_lease(), Some(authority.lease()));
+        assert!(matches!(
+            control.begin_manual(at(207)),
+            Err(AgentManualControlError::AuthorityNotReady { .. })
+        ));
+
+        control
+            .renew_autonomous(&mut authority, duration(50), at(207))
+            .expect("same-token autonomous renewal");
+        assert_eq!(authority.lease().id(), lease_id);
+        assert!(matches!(
+            control
+                .tick_autonomous(&authority, at(208))
+                .expect("active autonomous tick"),
+            AgentAutonomousTick::Active
+        ));
+
+        let stop = control
+            .begin_autonomous_release(&authority, at(209))
+            .expect("exact autonomous release");
+        assert_eq!(stop.mode(), AgentAutonomousMode::PointGoal);
+        assert_eq!(stop.lease_id(), Some(lease_id));
+        assert_eq!(stop.reason(), StopReason::AuthorityReleased);
+        assert!(matches!(
+            control.complete_autonomous_stop_with_applied_zero(
+                &stop,
+                host_zero(1),
+                at(210),
+                at(210),
+            ),
+            Err(AgentAutonomousControlError::Authority(_))
+        ));
+        control
+            .complete_autonomous_stop_with_applied_zero(&stop, host_zero(2), at(211), at(211))
+            .expect("new release zero");
+        assert!(matches!(
+            control.authority().state(),
+            SupervisorState::ReadyStopped { .. }
+        ));
+    }
+
+    #[test]
+    fn pending_autonomous_grants_can_be_cancelled_or_expire_without_activating_motion() {
+        let mut control = AgentManualControlCore::new(ready(), Some(policy()));
+        let pending = match control
+            .request_autonomous(AgentAutonomousMode::Explore, duration(50), at(205))
+            .expect("stale stopped evidence")
+        {
+            AgentAutonomousRequest::FreshAppliedZeroRequired(pending) => pending,
+            AgentAutonomousRequest::Granted(_) => panic!("stale zero must not grant"),
+        };
+        let stop = control
+            .cancel_pending_autonomous_grant(&pending, at(206))
+            .expect("cancel pending grant");
+        assert_eq!(stop.mode(), AgentAutonomousMode::Explore);
+        assert_eq!(stop.lease_id(), None);
+        assert_eq!(stop.reason(), StopReason::PendingAuthorityCancelled);
+        control
+            .complete_autonomous_stop_with_applied_zero(&stop, host_zero(1), at(207), at(207))
+            .expect("cancel stop zero");
+        assert!(control.authority().active_lease().is_none());
+
+        let pending = match control
+            .request_autonomous(AgentAutonomousMode::PointGoal, duration(1), at(308))
+            .expect("stale stopped evidence")
+        {
+            AgentAutonomousRequest::FreshAppliedZeroRequired(pending) => pending,
+            AgentAutonomousRequest::Granted(_) => panic!("stale zero must not grant"),
+        };
+        assert!(matches!(
+            control.complete_autonomous_grant_with_applied_zero(
+                &pending,
+                host_zero(2),
+                at(310),
+                at(310),
+            ),
+            Err(AgentAutonomousControlError::PendingAuthorityExpired)
+        ));
+        assert!(control.authority().active_lease().is_none());
+        assert!(matches!(
+            control.authority().state(),
+            SupervisorState::ReadyStopped { .. }
+        ));
     }
 
     #[test]

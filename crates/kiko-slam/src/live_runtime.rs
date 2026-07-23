@@ -11,6 +11,8 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use crate::DeviceSessionId;
+#[cfg(unix)]
+use crate::dataset::DatasetStorageLimits;
 use crate::dense::occupancy::{
     DepthCameraModel, OccupancyConfig, OccupancyConfigError, OccupancyEvidenceModel,
     OccupancyGridGeometry, OccupancyGridGeometryError,
@@ -226,14 +228,10 @@ impl LiveOccupancyHostPolicy {
         .map_err(LiveOccupancyHostPolicyError::Geometry)?;
         let evidence = OccupancyEvidenceModel::try_new(-1, 3, -2, 2)
             .expect("fixed live occupancy evidence model is valid");
-        let maximum_keyframes = parse_live_occupancy_maximum_keyframes(
-            maximum_keyframes,
-            evidence,
-        )
-        .map_err(LiveOccupancyHostPolicyError::MaximumKeyframes)?;
-        let snapshot_cadence =
-            OccupancySnapshotCadence::try_new(snapshot_every_keyframes)
-                .map_err(LiveOccupancyHostPolicyError::SnapshotCadence)?;
+        let maximum_keyframes = parse_live_occupancy_maximum_keyframes(maximum_keyframes, evidence)
+            .map_err(LiveOccupancyHostPolicyError::MaximumKeyframes)?;
+        let snapshot_cadence = OccupancySnapshotCadence::try_new(snapshot_every_keyframes)
+            .map_err(LiveOccupancyHostPolicyError::SnapshotCadence)?;
         Ok(Self {
             geometry,
             evidence,
@@ -623,11 +621,27 @@ pub struct PreparedLiveNavigationRuntime {
     mpc_config: MpcConfigV1,
     solver_budget: SolverBudgetNs,
     safety: ShadowSafetySupervisor,
+    #[cfg(unix)]
+    dataset_storage_limits: Option<DatasetStorageLimits>,
     #[cfg(feature = "actuation")]
     actuation: Option<NavigationActuationConfigV1>,
 }
 
 impl PreparedLiveNavigationRuntime {
+    #[cfg(unix)]
+    pub fn bind_production_dataset_storage(
+        &mut self,
+        limits: DatasetStorageLimits,
+        maximum_ingress_records: usize,
+    ) -> Result<(), LiveDatasetStorageAdmissionError> {
+        let configured = self.ingress_capacity.get();
+        require_dataset_ingress_capacity(configured, maximum_ingress_records)?;
+        if self.dataset_storage_limits.replace(limits).is_some() {
+            return Err(LiveDatasetStorageAdmissionError::AlreadyBound);
+        }
+        Ok(())
+    }
+
     /// Move the authoritative global-occupancy configuration to its sole
     /// worker owner. A second call returns `None` instead of silently cloning a
     /// potentially large configuration.
@@ -648,6 +662,8 @@ impl PreparedLiveNavigationRuntime {
             mpc_config: self.mpc_config,
             solver_budget: self.solver_budget,
             safety: self.safety,
+            #[cfg(unix)]
+            dataset_storage_limits: self.dataset_storage_limits,
             #[cfg(feature = "actuation")]
             actuation: self.actuation,
         }
@@ -668,8 +684,47 @@ pub struct PreparedLiveNavigationRuntimeParts {
     pub mpc_config: MpcConfigV1,
     pub solver_budget: SolverBudgetNs,
     pub safety: ShadowSafetySupervisor,
+    #[cfg(unix)]
+    pub dataset_storage_limits: Option<DatasetStorageLimits>,
     #[cfg(feature = "actuation")]
     pub actuation: Option<NavigationActuationConfigV1>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveDatasetStorageAdmissionError {
+    IngressCapacityAboveStorageLimit { configured: usize, maximum: usize },
+    AlreadyBound,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for LiveDatasetStorageAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "live navigation dataset storage admission failed: {self:?}"
+        )
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for LiveDatasetStorageAdmissionError {}
+
+#[cfg(unix)]
+fn require_dataset_ingress_capacity(
+    configured: usize,
+    maximum: usize,
+) -> Result<(), LiveDatasetStorageAdmissionError> {
+    if configured > maximum {
+        Err(
+            LiveDatasetStorageAdmissionError::IngressCapacityAboveStorageLimit {
+                configured,
+                maximum,
+            },
+        )
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -841,6 +896,8 @@ fn assemble_live_navigation_runtime(
         mpc_config,
         solver_budget: parts.solver_budget,
         safety,
+        #[cfg(unix)]
+        dataset_storage_limits: None,
         #[cfg(feature = "actuation")]
         actuation,
     })
@@ -893,6 +950,8 @@ mod tests {
         LiveNavigationLoadError, LiveNavigationPrerequisiteError, LiveNavigationPrerequisites,
         LiveNavigationRequest, LiveOccupancyHostPolicy, LiveOccupancyHostPolicyError,
     };
+    #[cfg(unix)]
+    use super::{LiveDatasetStorageAdmissionError, require_dataset_ingress_capacity};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -931,6 +990,21 @@ mod tests {
         "1.25,-2.5"
             .parse()
             .expect("finite map-frame navigation goal")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_record_limit_is_an_upper_bound_on_the_parsed_ingress_capacity() {
+        assert_eq!(require_dataset_ingress_capacity(100, 100), Ok(()));
+        assert_eq!(
+            require_dataset_ingress_capacity(101, 100),
+            Err(
+                LiveDatasetStorageAdmissionError::IngressCapacityAboveStorageLimit {
+                    configured: 101,
+                    maximum: 100,
+                }
+            )
+        );
     }
 
     #[test]
@@ -972,9 +1046,8 @@ mod tests {
 
     #[test]
     fn occupancy_host_resources_parse_once_and_preserve_metric_geometry() {
-        let policy =
-            LiveOccupancyHostPolicy::try_new(0.05, -10.0, -5.0, 400, 300, 120_000, 300, 5)
-                .expect("bounded host occupancy policy");
+        let policy = LiveOccupancyHostPolicy::try_new(0.05, -10.0, -5.0, 400, 300, 120_000, 300, 5)
+            .expect("bounded host occupancy policy");
 
         let geometry = policy.geometry();
         assert_eq!(geometry.resolution_m(), 0.05);
@@ -987,28 +1060,15 @@ mod tests {
     #[test]
     fn occupancy_host_resources_reject_each_unrepresentable_state() {
         assert!(matches!(
-            LiveOccupancyHostPolicy::try_new(
-                f64::NAN,
-                -10.0,
-                -5.0,
-                400,
-                300,
-                120_000,
-                300,
-                5,
-            ),
+            LiveOccupancyHostPolicy::try_new(f64::NAN, -10.0, -5.0, 400, 300, 120_000, 300, 5,),
             Err(LiveOccupancyHostPolicyError::Geometry(_))
         ));
         assert!(matches!(
-            LiveOccupancyHostPolicy::try_new(
-                0.05, -10.0, -5.0, 400, 300, 120_000, 0, 5,
-            ),
+            LiveOccupancyHostPolicy::try_new(0.05, -10.0, -5.0, 400, 300, 120_000, 0, 5,),
             Err(LiveOccupancyHostPolicyError::MaximumKeyframes(_))
         ));
         assert!(matches!(
-            LiveOccupancyHostPolicy::try_new(
-                0.05, -10.0, -5.0, 400, 300, 120_000, 300, 0,
-            ),
+            LiveOccupancyHostPolicy::try_new(0.05, -10.0, -5.0, 400, 300, 120_000, 300, 0,),
             Err(LiveOccupancyHostPolicyError::SnapshotCadence(_))
         ));
     }

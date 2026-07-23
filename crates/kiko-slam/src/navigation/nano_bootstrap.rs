@@ -6,15 +6,21 @@
 //! 1. load every launch-bound input without following symlinks;
 //! 2. parse policy, manifest, controller, navigation, and actuation contracts
 //!    exactly once;
-//! 3. issue read-only head and eye identity probes;
-//! 4. open one exact OAK at SuperSpeed, retain its first stereo frames, and
+//! 3. issue finite read-only head and eye identity probes;
+//! 4. start and retain the sole manifest-bound natural-head/eye owner;
+//! 5. open one exact OAK at SuperSpeed, retain its first stereo frames, and
 //!    derive the runtime projection contract from observed intrinsics;
-//! 5. acquire the sole controller session at an acknowledged exact zero;
-//! 6. build observed inventory only from retained runtime evidence; and
-//! 7. perform production admission, leaving the supervisor disarmed.
+//! 6. exclusively start the in-process serial/UDP owner and await an exact
+//!    ready-stopped controller heartbeat;
+//! 7. acquire the sole controller session at an acknowledged exact zero;
+//! 8. build observed inventory only from retained runtime evidence; and
+//! 9. perform production admission, leaving the supervisor disarmed.
 //!
-//! No accessory actor is started here, no head torque consent is exercised,
-//! and no motion-bearing API is exposed before exact admission.
+//! No motion-bearing base API is exposed before exact admission. Once the
+//! accessory owner is ready, every later failure keeps it alive through base
+//! and OAK cleanup, then performs an explicit ownership release which issues
+//! no head torque-switch write. That release is reported without claiming the
+//! resulting physical torque state.
 
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
@@ -28,6 +34,7 @@ use kiko_device_inventory::{
     LoadedDeploymentAsset, ManifestArtifactHashes, ManifestLoadError, hash_manifest_artifacts,
     load_expected_manifest_v1_file,
 };
+use kiko_expression_core::StreamEpochId;
 use kiko_eye_runtime::{
     EyeIdentityObservation, IdentityProbeConfig, IdentityProbeError,
     SerialConfigurationEvidence as EyeSerialConfigurationEvidence, probe_serial_eye_identity,
@@ -37,24 +44,32 @@ use kiko_head_runtime::{
 };
 use kiko_supervisor_core::{ReadinessEpoch, SupervisorState};
 use oak_sys::{
-    CalibrationError as OakCalibrationError, CloseError as OakCloseError,
+    CalibrationError as OakCalibrationError, CloseError as OakCloseError, ConnectedDeviceIdentity,
     ConnectedDeviceIdentityError, DepthAiBuildMetadata, DepthAiBuildMetadataError, Device,
     ImageError, ImageFrame as OakImageFrame, StreamId as OakStreamId, UsbTransportEvidenceError,
 };
 use robot_command_client::DisarmReceipt;
 use robot_server::config::{ControllerServerConfigV1, ServerConfigError};
+use robot_server::{
+    V2ControllerOwner, V2ControllerOwnerStartError, V2ControllerOwnerTerminationError,
+};
 
 use super::actuation::LiveActuationError;
+use super::mpc::{MpcConfigV1, PlantModelJsonParseError, PlantModelV1, WheelSide};
 use super::{
-    ManifestBoundNanoAgentPolicyConfigV1, NanoAccessoryManifestBindingError,
-    NanoAgentLaunchLoadError, NanoAgentLaunchV1, NanoAgentPolicyConfigParseError,
-    NanoAgentPolicyConfigV1, NanoLaunchAssetRole, NanoLaunchBoundAssetLoadError,
-    NanoObservedInventoryBuildError, NanoObservedInventoryBuilder,
-    NanoObservedInventoryEvidenceError, NanoProductionAdmissionError,
+    AdmittedOakSuperSpeedEvidence, ControlPeriodNs, ManifestBoundNanoAgentPolicyConfigV3,
+    NanoAccessoryFaultWaitError, NanoAccessoryHealthPeriod, NanoAccessoryHealthPeriodError,
+    NanoAccessoryManifestBindingError, NanoAccessoryTerminalFault, NanoAccessoryWorker,
+    NanoAccessoryWorkerConfig, NanoAccessoryWorkerConfigError, NanoAccessoryWorkerExit,
+    NanoAccessoryWorkerJoinError, NanoAccessoryWorkerStartError, NanoAgentLaunchLoadError,
+    NanoAgentLaunchV2, NanoAgentPolicyConfigParseError, NanoAgentPolicyConfigV3,
+    NanoCalibrationArtifactParseError, NanoCalibrationArtifactV1, NanoCalibrationBindingError,
+    NanoLaunchAssetRole, NanoLaunchBoundAssetLoadError, NanoObservedInventoryBuildError,
+    NanoObservedInventoryBuilder, NanoObservedInventoryEvidenceError, NanoProductionAdmissionError,
     NanoProductionAdmissionTimeline, NanoProductionAdmissionTimelineError,
     NavigationActuationConfigV1, NavigationClockEpoch, PendingLiveMpcControlDriver,
     PreparedNanoProductionRuntime, ShadowNavigationConfigParseError, ShadowNavigationConfigV1,
-    load_nano_agent_launch_v1,
+    load_nano_agent_launch_v2,
 };
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
@@ -65,6 +80,7 @@ const MAX_NANO_BOOTSTRAP_ROOT_BYTES: usize = 1_024;
 const STEREO_POLL_TIMEOUT_MS: u32 = 50;
 const STEREO_IDLE_SLEEP: Duration = Duration::from_micros(500);
 const MAX_STEREO_BOOTSTRAP_WAIT: Duration = Duration::from_secs(15);
+const NANO_BOOTSTRAP_ACCESSORY_HEALTH_PERIOD: Duration = Duration::from_secs(1);
 
 /// Canonical service-owned input and output roots.
 ///
@@ -187,6 +203,7 @@ fn validate_absolute_root(
 pub struct NanoBootstrapRequest<'running> {
     roots: NanoBootstrapRoots,
     launch_relative_path: ArtifactRelativePath,
+    accessory_stream_epoch: StreamEpochId,
     controller_clock_origin: Instant,
     navigation_clock_epoch: NavigationClockEpoch,
     readiness_epoch: ReadinessEpoch,
@@ -199,6 +216,7 @@ impl<'running> NanoBootstrapRequest<'running> {
         deployment_root: PathBuf,
         state_root: PathBuf,
         launch_relative_path: String,
+        accessory_stream_epoch: StreamEpochId,
         controller_clock_origin: Instant,
         navigation_clock_epoch: NavigationClockEpoch,
         readiness_epoch: ReadinessEpoch,
@@ -209,6 +227,7 @@ impl<'running> NanoBootstrapRequest<'running> {
                 .map_err(NanoBootstrapRequestError::Roots)?,
             launch_relative_path: ArtifactRelativePath::parse(launch_relative_path)
                 .map_err(NanoBootstrapRequestError::LaunchRelativePath)?,
+            accessory_stream_epoch,
             controller_clock_origin,
             navigation_clock_epoch,
             readiness_epoch,
@@ -257,6 +276,7 @@ pub struct LoadedNanoBootstrapAssets {
     pub navigation_shadow_config: LoadedDeploymentAsset,
     pub physical_actuation_config: LoadedDeploymentAsset,
     pub controller_server_contract: LoadedDeploymentAsset,
+    pub calibration_artifact: LoadedDeploymentAsset,
     pub plant_artifact: LoadedDeploymentAsset,
     pub onnx_runtime_library: LoadedDeploymentAsset,
     pub superpoint_model: LoadedDeploymentAsset,
@@ -266,7 +286,7 @@ pub struct LoadedNanoBootstrapAssets {
 impl LoadedNanoBootstrapAssets {
     fn load(
         deployment_root: &Path,
-        launch: &NanoAgentLaunchV1,
+        launch: &NanoAgentLaunchV2,
     ) -> Result<Self, NanoBootstrapPrimaryError> {
         let load = |role| {
             launch
@@ -279,6 +299,7 @@ impl LoadedNanoBootstrapAssets {
             navigation_shadow_config: load(NanoLaunchAssetRole::NavigationShadowConfig)?,
             physical_actuation_config: load(NanoLaunchAssetRole::PhysicalActuationConfig)?,
             controller_server_contract: load(NanoLaunchAssetRole::ControllerServerContract)?,
+            calibration_artifact: load(NanoLaunchAssetRole::CalibrationArtifact)?,
             plant_artifact: load(NanoLaunchAssetRole::PlantArtifact)?,
             onnx_runtime_library: load(NanoLaunchAssetRole::OnnxRuntimeLibrary)?,
             superpoint_model: load(NanoLaunchAssetRole::SuperpointModel)?,
@@ -312,35 +333,63 @@ pub struct NanoBootstrapStereoEvidence {
 pub struct ParsedNanoLiveConfiguration {
     pub navigation: ShadowNavigationConfigV1,
     pub occupancy_host_policy: LiveOccupancyHostPolicy,
-    pub controller_server: ControllerServerConfigV1,
 }
 
 /// Successful cold-start handoff to the sole production runtime.
 #[must_use = "the returned OAK and controller owners require explicit lifecycle handling"]
 pub struct PreparedNanoBootstrap {
     pub roots: NanoBootstrapRoots,
-    pub launch: super::LoadedNanoAgentLaunchV1,
+    pub launch: super::LoadedNanoAgentLaunchV2,
     pub assets: LoadedNanoBootstrapAssets,
     pub accessory_evidence: NanoBootstrapAccessoryEvidence,
+    pub oak_connected_identity: ConnectedDeviceIdentity,
+    pub oak_usb_transport: AdmittedOakSuperSpeedEvidence,
     pub depthai_build_metadata: DepthAiBuildMetadata,
+    pub calibration: NanoCalibrationArtifactV1,
     pub stereo: NanoBootstrapStereoEvidence,
     pub live: ParsedNanoLiveConfiguration,
     pub runtime: PreparedNanoProductionRuntime,
+    pub accessory: NanoAccessoryWorker,
     pub oak: Device,
+}
+
+/// A fully prepared robot session plus the sole in-process STM32/UDP owner.
+///
+/// The outer state prevents callers from accidentally entering the live loop
+/// while still depending on a separately managed `robot-server` process.
+#[must_use = "split the bootstrap and supervise its controller owner for the complete live run"]
+pub struct PreparedNanoOwnedBootstrap {
+    bootstrap: PreparedNanoBootstrap,
+    controller_owner: V2ControllerOwner,
+    controller_owner_shutdown_timeout: Duration,
+}
+
+impl PreparedNanoOwnedBootstrap {
+    pub fn into_parts(self) -> (PreparedNanoBootstrap, V2ControllerOwner, Duration) {
+        (
+            self.bootstrap,
+            self.controller_owner,
+            self.controller_owner_shutdown_timeout,
+        )
+    }
 }
 
 /// Complete production bootstrap.
 ///
-/// The head and eye probes are finite, identity-only/read-only exchanges. The
-/// OAK is then opened once with the exact launch graph. Controller ownership is
-/// acquired last; every subsequent failure consumes it through an explicit
-/// disarm before attempting to close the OAK.
+/// The head and eye probes are finite, identity-only/read-only exchanges. Their
+/// ports are released before the manifest-bound accessory owner establishes
+/// the reviewed natural hold. The OAK is then opened once with the exact
+/// launch graph. The in-process serial/UDP owner and zero-only controller
+/// session are acquired last; every subsequent failure explicitly disarms the
+/// client, joins the embedded owner, closes OAK, and only then asks the
+/// accessory worker for a hold-preserving serial ownership release.
 pub async fn bootstrap_nano_production(
     request: NanoBootstrapRequest<'_>,
-) -> Result<PreparedNanoBootstrap, NanoBootstrapError> {
+) -> Result<PreparedNanoOwnedBootstrap, NanoBootstrapError> {
     let NanoBootstrapRequest {
         roots,
         launch_relative_path,
+        accessory_stream_epoch,
         controller_clock_origin,
         navigation_clock_epoch,
         readiness_epoch,
@@ -348,14 +397,14 @@ pub async fn bootstrap_nano_production(
     } = request;
 
     require_running(running).map_err(NanoBootstrapError::before_hardware)?;
-    let launch = load_nano_agent_launch_v1(roots.deployment_root(), launch_relative_path).map_err(
+    let launch = load_nano_agent_launch_v2(roots.deployment_root(), launch_relative_path).map_err(
         |source| NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::LaunchLoad(source)),
     )?;
     let assets = LoadedNanoBootstrapAssets::load(roots.deployment_root(), launch.launch())
         .map_err(NanoBootstrapError::before_hardware)?;
 
     let policy =
-        NanoAgentPolicyConfigV1::parse_json(assets.agent_policy.bytes()).map_err(|source| {
+        NanoAgentPolicyConfigV3::parse_json(assets.agent_policy.bytes()).map_err(|source| {
             NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::AgentPolicy(source))
         })?;
     require_policy_paths_within_deployment(&roots, &policy)
@@ -385,6 +434,23 @@ pub async fn bootstrap_nano_production(
     .map_err(|source| {
         NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::ArtifactHash(source))
     })?;
+    bind_calibration_artifact(
+        &roots,
+        launch.launch(),
+        &assets.calibration_artifact,
+        &policy,
+        loaded_manifest.manifest(),
+        &artifact_hashes,
+    )
+    .map_err(NanoBootstrapPrimaryError::CalibrationArtifactSelection)
+    .map_err(NanoBootstrapError::before_hardware)?;
+    let calibration = NanoCalibrationArtifactV1::parse_json(assets.calibration_artifact.bytes())
+        .map_err(NanoBootstrapPrimaryError::CalibrationArtifact)
+        .map_err(NanoBootstrapError::before_hardware)?;
+    calibration
+        .require_manifest_oak_mxid(loaded_manifest.manifest().oak().mxid().as_str())
+        .map_err(NanoBootstrapPrimaryError::CalibrationBinding)
+        .map_err(NanoBootstrapError::before_hardware)?;
     let selected_plant = select_plant_artifact(
         &roots,
         launch.launch(),
@@ -394,6 +460,9 @@ pub async fn bootstrap_nano_production(
         &artifact_hashes,
     )
     .map_err(NanoBootstrapError::before_hardware)?;
+    let plant_artifact_model = PlantModelV1::parse_json(assets.plant_artifact.bytes())
+        .map_err(NanoBootstrapPrimaryError::PlantArtifactModel)
+        .map_err(NanoBootstrapError::before_hardware)?;
 
     let controller_server = ControllerServerConfigV1::parse_json(
         assets.controller_server_contract.bytes(),
@@ -429,45 +498,131 @@ pub async fn bootstrap_nano_production(
             })?;
     require_running(running).map_err(NanoBootstrapError::before_hardware)?;
 
-    let mut oak = Device::connect(
-        loaded_manifest.manifest().oak().mxid().as_str(),
-        launch.launch().oak().device_config(),
+    // The finite probes above have released their read-only serial sessions.
+    // Establish the sole manifest-bound head/eye owner before the potentially
+    // slow OAK and STM32 admission below. Readiness proves the reviewed
+    // natural return plus an immediate exact-target health transaction.
+    let accessory_health_period =
+        NanoAccessoryHealthPeriod::try_from_duration(NANO_BOOTSTRAP_ACCESSORY_HEALTH_PERIOD)
+            .map_err(|source| {
+                NanoBootstrapError::before_hardware(
+                    NanoBootstrapPrimaryError::AccessoryHealthPeriod(source),
+                )
+            })?;
+    let accessory_config = NanoAccessoryWorkerConfig::from_manifest_bound_policy(
+        &probe_policy,
+        accessory_stream_epoch,
+        accessory_health_period,
     )
     .map_err(|source| {
-        NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::OakConnect(source))
+        NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::AccessoryConfig(source))
     })?;
+    let accessory = NanoAccessoryWorker::start(accessory_config).map_err(|source| {
+        NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::AccessoryStart(source))
+    })?;
+    if let Err(primary) = require_early_accessory_healthy(&accessory, running) {
+        return Err(NanoBootstrapError::before_hardware(primary).with_accessory_shutdown(accessory));
+    }
 
-    let connected = match prepare_connected_oak(
-        &mut oak,
-        launch.launch(),
-        assets.navigation_shadow_config.bytes(),
-        assets.physical_actuation_config.bytes(),
-        &controller_server,
-        loaded_manifest.manifest().robot_id().as_str(),
-        running,
+    let mut oak = match Device::connect(
+        loaded_manifest.manifest().oak().mxid().as_str(),
+        launch.launch().oak().device_config(),
     ) {
-        Ok(connected) => connected,
-        Err(primary) => return Err(close_oak_after_failure(primary, oak)),
+        Ok(oak) => oak,
+        Err(source) => {
+            return Err(NanoBootstrapError::before_hardware(
+                NanoBootstrapPrimaryError::OakConnect(source),
+            )
+            .with_accessory_shutdown(accessory));
+        }
     };
+
+    let connected_request = ConnectedOakRequest {
+        launch: launch.launch(),
+        navigation_bytes: assets.navigation_shadow_config.bytes(),
+        actuation_bytes: assets.physical_actuation_config.bytes(),
+        calibration: &calibration,
+        accessory: &accessory,
+        plant_artifact_model,
+        controller_server: &controller_server,
+        robot_id: loaded_manifest.manifest().robot_id().as_str(),
+        running,
+    };
+    let connected = match prepare_connected_oak(&mut oak, connected_request) {
+        Ok(connected) => connected,
+        Err(primary) => {
+            return Err(close_oak_after_failure(primary, oak).with_accessory_shutdown(accessory));
+        }
+    };
+    if let Err(primary) = require_early_accessory_healthy(&accessory, running) {
+        return Err(close_oak_after_failure(primary, oak).with_accessory_shutdown(accessory));
+    }
+
+    let controller_serial_device = controller_server.serial_device().to_path_buf();
+    let controller_owner_shutdown_timeout = controller_server.coordinated_shutdown_budget();
+    let controller_owner = match V2ControllerOwner::start(
+        controller_server,
+        launch.launch().controller_server().command_udp_endpoint(),
+    )
+    .await
+    {
+        Ok(owner) => owner,
+        Err(source) => {
+            return Err(close_oak_after_failure(
+                NanoBootstrapPrimaryError::ControllerOwnerStart(source),
+                oak,
+            )
+            .with_accessory_shutdown(accessory));
+        }
+    };
+    if let Err(primary) = require_early_accessory_healthy(&accessory, running) {
+        return Err(cleanup_after_owner_failure(
+            primary,
+            controller_owner,
+            controller_owner_shutdown_timeout,
+            oak,
+        )
+        .await
+        .with_accessory_shutdown(accessory));
+    }
 
     let (pending, initial_zero) =
         match PendingLiveMpcControlDriver::acquire(&connected.actuation, controller_clock_origin) {
             Ok(acquired) => acquired,
             Err(source) => {
-                return Err(close_oak_after_failure(
+                return Err(cleanup_after_owner_failure(
                     NanoBootstrapPrimaryError::ControllerAcquire(source),
+                    controller_owner,
+                    controller_owner_shutdown_timeout,
                     oak,
-                ));
+                )
+                .await
+                .with_accessory_shutdown(accessory));
             }
         };
+    if let Err(primary) = require_early_accessory_healthy(&accessory, running) {
+        return Err(cleanup_after_pending_failure(
+            primary,
+            pending,
+            controller_owner,
+            controller_owner_shutdown_timeout,
+            oak,
+        )
+        .await
+        .with_accessory_shutdown(accessory));
+    }
     let acquisition = match pending.verified_controller_acquisition() {
         Ok(acquisition) => acquisition,
         Err(source) => {
             return Err(cleanup_after_pending_failure(
                 NanoBootstrapPrimaryError::ControllerEvidence(source),
                 pending,
+                controller_owner,
+                controller_owner_shutdown_timeout,
                 oak,
-            ));
+            )
+            .await
+            .with_accessory_shutdown(accessory));
         }
     };
 
@@ -476,8 +631,12 @@ pub async fn bootstrap_nano_production(
         return Err(cleanup_after_pending_failure(
             NanoBootstrapPrimaryError::ObservedInventoryEvidence(source),
             pending,
+            controller_owner,
+            controller_owner_shutdown_timeout,
             oak,
-        ));
+        )
+        .await
+        .with_accessory_shutdown(accessory));
     }
     let opened_identity = match oak.connected_identity() {
         Ok(identity) => identity,
@@ -485,18 +644,27 @@ pub async fn bootstrap_nano_production(
             return Err(cleanup_after_pending_failure(
                 NanoBootstrapPrimaryError::OakConnectedIdentity(source),
                 pending,
+                controller_owner,
+                controller_owner_shutdown_timeout,
                 oak,
-            ));
+            )
+            .await
+            .with_accessory_shutdown(accessory));
         }
     };
+    let retained_opened_identity = opened_identity.clone();
     let usb_transport = match oak.usb_transport_evidence() {
         Ok(evidence) => *evidence,
         Err(source) => {
             return Err(cleanup_after_pending_failure(
                 NanoBootstrapPrimaryError::OakUsbTransport(source),
                 pending,
+                controller_owner,
+                controller_owner_shutdown_timeout,
                 oak,
-            ));
+            )
+            .await
+            .with_accessory_shutdown(accessory));
         }
     };
     if let Err(source) = observed.observe_oak(
@@ -507,36 +675,56 @@ pub async fn bootstrap_nano_production(
         return Err(cleanup_after_pending_failure(
             NanoBootstrapPrimaryError::ObservedInventoryEvidence(source),
             pending,
+            controller_owner,
+            controller_owner_shutdown_timeout,
             oak,
-        ));
+        )
+        .await
+        .with_accessory_shutdown(accessory));
     }
-    if let Err(source) = observed.observe_stm32(controller_server.serial_device(), acquisition) {
+    if let Err(source) = observed.observe_stm32(&controller_serial_device, acquisition) {
         return Err(cleanup_after_pending_failure(
             NanoBootstrapPrimaryError::ObservedInventoryEvidence(source),
             pending,
+            controller_owner,
+            controller_owner_shutdown_timeout,
             oak,
-        ));
+        )
+        .await
+        .with_accessory_shutdown(accessory));
     }
     if let Err(source) = observed.observe_head(&head) {
         return Err(cleanup_after_pending_failure(
             NanoBootstrapPrimaryError::ObservedInventoryEvidence(source),
             pending,
+            controller_owner,
+            controller_owner_shutdown_timeout,
             oak,
-        ));
+        )
+        .await
+        .with_accessory_shutdown(accessory));
     }
     if let Err(source) = observed.observe_eye(&eye_serial, eye_identity) {
         return Err(cleanup_after_pending_failure(
             NanoBootstrapPrimaryError::ObservedInventoryEvidence(source),
             pending,
+            controller_owner,
+            controller_owner_shutdown_timeout,
             oak,
-        ));
+        )
+        .await
+        .with_accessory_shutdown(accessory));
     }
     if let Err(source) = observed.observe_artifacts(&artifact_hashes) {
         return Err(cleanup_after_pending_failure(
             NanoBootstrapPrimaryError::ObservedInventoryEvidence(source),
             pending,
+            controller_owner,
+            controller_owner_shutdown_timeout,
             oak,
-        ));
+        )
+        .await
+        .with_accessory_shutdown(accessory));
     }
     let observed = match observed.build() {
         Ok(observed) => observed,
@@ -544,15 +732,28 @@ pub async fn bootstrap_nano_production(
             return Err(cleanup_after_pending_failure(
                 NanoBootstrapPrimaryError::ObservedInventoryBuild(source),
                 pending,
+                controller_owner,
+                controller_owner_shutdown_timeout,
                 oak,
-            ));
+            )
+            .await
+            .with_accessory_shutdown(accessory));
         }
     };
+    let oak_usb_transport = observed.oak_super_speed();
 
     let readiness_admitted_at = match timestamp_since(controller_clock_origin) {
         Ok(timestamp) => timestamp,
         Err(primary) => {
-            return Err(cleanup_after_pending_failure(primary, pending, oak));
+            return Err(cleanup_after_pending_failure(
+                primary,
+                pending,
+                controller_owner,
+                controller_owner_shutdown_timeout,
+                oak,
+            )
+            .await
+            .with_accessory_shutdown(accessory));
         }
     };
     let timeline = match NanoProductionAdmissionTimeline::try_new(
@@ -566,10 +767,26 @@ pub async fn bootstrap_nano_production(
             return Err(cleanup_after_pending_failure(
                 NanoBootstrapPrimaryError::AdmissionTimeline(source),
                 pending,
+                controller_owner,
+                controller_owner_shutdown_timeout,
                 oak,
-            ));
+            )
+            .await
+            .with_accessory_shutdown(accessory));
         }
     };
+
+    if let Err(primary) = require_early_accessory_healthy(&accessory, running) {
+        return Err(cleanup_after_pending_failure(
+            primary,
+            pending,
+            controller_owner,
+            controller_owner_shutdown_timeout,
+            oak,
+        )
+        .await
+        .with_accessory_shutdown(accessory));
+    }
 
     let runtime = match PreparedNanoProductionRuntime::admit(
         policy,
@@ -585,12 +802,18 @@ pub async fn bootstrap_nano_production(
     ) {
         Ok(runtime) => runtime,
         Err(source) => {
+            let controller_owner =
+                shutdown_controller_owner(controller_owner, controller_owner_shutdown_timeout)
+                    .await;
             let oak_close = close_oak(oak);
             return Err(NanoBootstrapError {
                 primary: Box::new(NanoBootstrapPrimaryError::ProductionAdmission(source)),
                 controller: NanoBootstrapControllerDisposition::AdmissionErrorRetainsStop,
+                controller_owner,
                 oak_close,
-            });
+                accessory: NanoBootstrapAccessoryDisposition::NotStarted,
+            }
+            .with_accessory_shutdown(accessory));
         }
     };
 
@@ -598,24 +821,31 @@ pub async fn bootstrap_nano_production(
         runtime.startup().authority.state(),
         SupervisorState::Disarmed { .. }
     ));
-    Ok(PreparedNanoBootstrap {
-        roots,
-        launch,
-        assets,
-        accessory_evidence: NanoBootstrapAccessoryEvidence {
-            head,
-            eye_serial,
-            eye_identity,
+    Ok(PreparedNanoOwnedBootstrap {
+        bootstrap: PreparedNanoBootstrap {
+            roots,
+            launch,
+            assets,
+            accessory_evidence: NanoBootstrapAccessoryEvidence {
+                head,
+                eye_serial,
+                eye_identity,
+            },
+            oak_connected_identity: retained_opened_identity,
+            oak_usb_transport,
+            depthai_build_metadata: connected.depthai_build_metadata,
+            calibration,
+            stereo: connected.stereo,
+            live: ParsedNanoLiveConfiguration {
+                navigation: connected.navigation,
+                occupancy_host_policy: connected.occupancy_host_policy,
+            },
+            runtime,
+            accessory,
+            oak,
         },
-        depthai_build_metadata: connected.depthai_build_metadata,
-        stereo: connected.stereo,
-        live: ParsedNanoLiveConfiguration {
-            navigation: connected.navigation,
-            occupancy_host_policy: connected.occupancy_host_policy,
-            controller_server,
-        },
-        runtime,
-        oak,
+        controller_owner,
+        controller_owner_shutdown_timeout,
     })
 }
 
@@ -627,30 +857,62 @@ struct ConnectedOakPreparation {
     actuation: NavigationActuationConfigV1,
 }
 
+struct ConnectedOakRequest<'a> {
+    launch: &'a NanoAgentLaunchV2,
+    navigation_bytes: &'a [u8],
+    actuation_bytes: &'a [u8],
+    calibration: &'a NanoCalibrationArtifactV1,
+    accessory: &'a NanoAccessoryWorker,
+    plant_artifact_model: PlantModelV1,
+    controller_server: &'a ControllerServerConfigV1,
+    robot_id: &'a str,
+    running: &'a AtomicBool,
+}
+
 fn prepare_connected_oak(
     oak: &mut Device,
-    launch: &NanoAgentLaunchV1,
-    navigation_bytes: &[u8],
-    actuation_bytes: &[u8],
-    controller_server: &ControllerServerConfigV1,
-    robot_id: &str,
-    running: &AtomicBool,
+    request: ConnectedOakRequest<'_>,
 ) -> Result<ConnectedOakPreparation, NanoBootstrapPrimaryError> {
+    let ConnectedOakRequest {
+        launch,
+        navigation_bytes,
+        actuation_bytes,
+        calibration,
+        accessory,
+        plant_artifact_model,
+        controller_server,
+        robot_id,
+        running,
+    } = request;
     let connected_identity = oak
         .connected_identity()
         .map_err(NanoBootstrapPrimaryError::OakConnectedIdentity)?;
     if connected_identity.mxid().is_empty() {
         return Err(NanoBootstrapPrimaryError::EmptyOpenedOakMxid);
     }
+    calibration
+        .require_connected_oak_mxid(connected_identity.mxid())
+        .map_err(NanoBootstrapPrimaryError::CalibrationBinding)?;
     let _usb = oak
         .usb_transport_evidence()
         .map_err(NanoBootstrapPrimaryError::OakUsbTransport)?;
     let depthai_build_metadata =
         oak_sys::depthai_build_metadata().map_err(NanoBootstrapPrimaryError::DepthAiBuild)?;
-    let stereo = bootstrap_stereo(oak, launch, running)?;
-    let navigation =
-        ShadowNavigationConfigV1::parse_json(navigation_bytes, stereo.runtime_depth_camera)
-            .map_err(NanoBootstrapPrimaryError::ShadowNavigation)?;
+    let stereo = bootstrap_stereo_while(oak, launch.oak(), running, || {
+        require_early_accessory_healthy(accessory, running)
+    })?;
+    calibration
+        .require_observed_stereo(&stereo.calibration)
+        .map_err(NanoBootstrapPrimaryError::CalibrationBinding)?;
+    let navigation = ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+        navigation_bytes,
+        stereo.runtime_depth_camera,
+        plant_artifact_model,
+    )
+    .map_err(NanoBootstrapPrimaryError::ShadowNavigation)?;
+    calibration
+        .require_navigation(&navigation)
+        .map_err(NanoBootstrapPrimaryError::CalibrationBinding)?;
     let occupancy_host_policy = launch.occupancy().host_policy();
     let actuation = NavigationActuationConfigV1::parse_and_authorize(
         actuation_bytes,
@@ -661,7 +923,16 @@ fn prepare_connected_oak(
         navigation.control_period(),
     )
     .map_err(NanoBootstrapPrimaryError::Actuation)?;
-    bind_controller_contract_to_actuation(launch, controller_server, &actuation)?;
+    calibration
+        .require_actuation_approval(&actuation)
+        .map_err(NanoBootstrapPrimaryError::CalibrationBinding)?;
+    bind_controller_contract_to_actuation(
+        launch,
+        controller_server,
+        &actuation,
+        navigation.mpc_solver().config(),
+        navigation.control_period(),
+    )?;
     Ok(ConnectedOakPreparation {
         depthai_build_metadata,
         stereo,
@@ -671,16 +942,27 @@ fn prepare_connected_oak(
     })
 }
 
-fn bootstrap_stereo(
+#[cfg(feature = "nano-wheels-off-qualification")]
+pub(super) fn bootstrap_stereo(
     oak: &mut Device,
-    launch: &NanoAgentLaunchV1,
+    oak_graph: &super::NanoOakStreamGraph,
     running: &AtomicBool,
+) -> Result<NanoBootstrapStereoEvidence, NanoBootstrapPrimaryError> {
+    bootstrap_stereo_while(oak, oak_graph, running, || Ok(()))
+}
+
+fn bootstrap_stereo_while(
+    oak: &mut Device,
+    oak_graph: &super::NanoOakStreamGraph,
+    running: &AtomicBool,
+    mut require_healthy: impl FnMut() -> Result<(), NanoBootstrapPrimaryError>,
 ) -> Result<NanoBootstrapStereoEvidence, NanoBootstrapPrimaryError> {
     let started = Instant::now();
     let mut left = None;
     let mut right = None;
     while left.is_none() || right.is_none() {
         require_running(running)?;
+        require_healthy()?;
         if started.elapsed() >= MAX_STEREO_BOOTSTRAP_WAIT {
             return Err(NanoBootstrapPrimaryError::StereoTimedOut {
                 maximum_wait: MAX_STEREO_BOOTSTRAP_WAIT,
@@ -714,18 +996,19 @@ fn bootstrap_stereo(
         }
     }
     require_running(running)?;
+    require_healthy()?;
 
     let left = left.expect("loop exits only with a left frame");
     let right = right.expect("loop exits only with a right frame");
     validate_stereo_frame(
         NanoBootstrapStereoSide::Left,
         &left,
-        launch.oak().rectified_stereo(),
+        oak_graph.rectified_stereo(),
     )?;
     validate_stereo_frame(
         NanoBootstrapStereoSide::Right,
         &right,
-        launch.oak().rectified_stereo(),
+        oak_graph.rectified_stereo(),
     )?;
     let baseline_m = oak
         .stereo_baseline_m()
@@ -819,13 +1102,13 @@ fn validate_stereo_frame(
     Ok(())
 }
 
-fn derive_required_probe_configs(
-    policy: &ManifestBoundNanoAgentPolicyConfigV1,
+pub(super) fn derive_required_probe_configs(
+    policy: &ManifestBoundNanoAgentPolicyConfigV3,
 ) -> Result<(HeadProbeConfig, IdentityProbeConfig), NanoBootstrapPrimaryError> {
     let head = policy
         .head()
-        .natural_hold()
-        .ok_or(NanoBootstrapPrimaryError::NaturalHeadHoldRequired)?;
+        .return_to_natural_and_hold_continuously()
+        .ok_or(NanoBootstrapPrimaryError::ContinuousNaturalHeadHoldRequired)?;
     let eye = policy
         .eye()
         .static_runtime()
@@ -838,7 +1121,7 @@ fn derive_required_probe_configs(
 
 fn require_policy_paths_within_deployment(
     roots: &NanoBootstrapRoots,
-    policy: &NanoAgentPolicyConfigV1,
+    policy: &NanoAgentPolicyConfigV3,
 ) -> Result<(), NanoBootstrapPrimaryError> {
     require_path_within_deployment(
         NanoBootstrapDeploymentPathKind::Manifest,
@@ -888,11 +1171,168 @@ struct SelectedPlantArtifact {
     relative_path: ArtifactRelativePath,
 }
 
+fn bind_calibration_artifact(
+    roots: &NanoBootstrapRoots,
+    launch: &NanoAgentLaunchV2,
+    loaded: &LoadedDeploymentAsset,
+    policy: &NanoAgentPolicyConfigV3,
+    manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
+    hashes: &ManifestArtifactHashes,
+) -> Result<(), NanoCalibrationArtifactSelectionError> {
+    let requested = launch.calibration_artifact().artifact_id().as_str();
+    let expected = manifest
+        .artifacts()
+        .iter()
+        .find(|artifact| {
+            artifact.kind() == ArtifactKind::Calibration
+                && artifact.artifact_id().as_str() == requested
+        })
+        .ok_or_else(|| NanoCalibrationArtifactSelectionError::NotInManifest {
+            artifact_id: requested.to_owned(),
+        })?;
+    if expected.sha256().as_bytes() != loaded.content_sha256().as_bytes() {
+        return Err(
+            NanoCalibrationArtifactSelectionError::LaunchManifestDigestMismatch {
+                artifact_id: requested.to_owned(),
+                launch_sha256: *loaded.content_sha256().as_bytes(),
+                manifest_sha256: *expected.sha256().as_bytes(),
+            },
+        );
+    }
+    let binding = policy
+        .inventory()
+        .artifact_bindings()
+        .iter()
+        .find(|binding| {
+            binding.kind() == ArtifactKind::Calibration
+                && binding.artifact_id().as_str() == requested
+        })
+        .ok_or_else(
+            || NanoCalibrationArtifactSelectionError::PolicyBindingMissing {
+                artifact_id: requested.to_owned(),
+            },
+        )?;
+    let hashed = hashes
+        .iter()
+        .find(|artifact| {
+            artifact.kind() == ArtifactKind::Calibration
+                && artifact.artifact_id().as_str() == requested
+        })
+        .ok_or_else(
+            || NanoCalibrationArtifactSelectionError::ObservedHashMissing {
+                artifact_id: requested.to_owned(),
+            },
+        )?;
+    if hashed.observed_sha256() != loaded.content_sha256().as_bytes() {
+        return Err(
+            NanoCalibrationArtifactSelectionError::LaunchObservedDigestMismatch {
+                artifact_id: requested.to_owned(),
+                launch_sha256: *loaded.content_sha256().as_bytes(),
+                observed_sha256: *hashed.observed_sha256(),
+            },
+        );
+    }
+    let deployed_relative = calibration_deployment_relative_path(
+        roots.deployment_root(),
+        policy.inventory().artifact_root_path().as_path(),
+        binding.relative_path(),
+    )?;
+    if &deployed_relative != launch.calibration_artifact().asset().relative_path() {
+        return Err(
+            NanoCalibrationArtifactSelectionError::DeploymentPathMismatch {
+                artifact_id: requested.to_owned(),
+                launch: launch
+                    .calibration_artifact()
+                    .asset()
+                    .relative_path()
+                    .clone(),
+                policy: deployed_relative,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn calibration_deployment_relative_path(
+    deployment_root: &Path,
+    artifact_root: &Path,
+    artifact_relative_path: &ArtifactRelativePath,
+) -> Result<ArtifactRelativePath, NanoCalibrationArtifactSelectionError> {
+    let root_relative = artifact_root.strip_prefix(deployment_root).map_err(|_| {
+        NanoCalibrationArtifactSelectionError::ArtifactRootOutsideDeployment {
+            deployment_root: deployment_root.to_path_buf(),
+            configured: artifact_root.to_path_buf(),
+        }
+    })?;
+    let combined = root_relative.join(artifact_relative_path.as_path());
+    let combined = combined.to_str().ok_or_else(|| {
+        NanoCalibrationArtifactSelectionError::DeploymentPathNotUtf8 {
+            path: combined.clone(),
+        }
+    })?;
+    ArtifactRelativePath::parse(combined.to_owned())
+        .map_err(NanoCalibrationArtifactSelectionError::DeploymentRelativePath)
+}
+
+#[derive(Debug)]
+pub enum NanoCalibrationArtifactSelectionError {
+    NotInManifest {
+        artifact_id: String,
+    },
+    PolicyBindingMissing {
+        artifact_id: String,
+    },
+    ObservedHashMissing {
+        artifact_id: String,
+    },
+    LaunchManifestDigestMismatch {
+        artifact_id: String,
+        launch_sha256: [u8; 32],
+        manifest_sha256: [u8; 32],
+    },
+    LaunchObservedDigestMismatch {
+        artifact_id: String,
+        launch_sha256: [u8; 32],
+        observed_sha256: [u8; 32],
+    },
+    DeploymentPathMismatch {
+        artifact_id: String,
+        launch: ArtifactRelativePath,
+        policy: ArtifactRelativePath,
+    },
+    ArtifactRootOutsideDeployment {
+        deployment_root: PathBuf,
+        configured: PathBuf,
+    },
+    DeploymentPathNotUtf8 {
+        path: PathBuf,
+    },
+    DeploymentRelativePath(ArtifactRelativePathError),
+}
+
+impl fmt::Display for NanoCalibrationArtifactSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "calibration artifact launch/manifest/policy binding failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for NanoCalibrationArtifactSelectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DeploymentRelativePath(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
 fn select_plant_artifact(
     roots: &NanoBootstrapRoots,
-    launch: &NanoAgentLaunchV1,
+    launch: &NanoAgentLaunchV2,
     launch_plant: &LoadedDeploymentAsset,
-    policy: &NanoAgentPolicyConfigV1,
+    policy: &NanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
     hashes: &ManifestArtifactHashes,
 ) -> Result<SelectedPlantArtifact, NanoBootstrapPrimaryError> {
@@ -987,7 +1427,7 @@ fn deployment_relative_artifact_path(
 }
 
 fn bind_controller_contract_to_manifest(
-    launch: &NanoAgentLaunchV1,
+    launch: &NanoAgentLaunchV2,
     server: &ControllerServerConfigV1,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
 ) -> Result<(), NanoBootstrapPrimaryError> {
@@ -1030,9 +1470,11 @@ fn bind_controller_contract_to_manifest(
 }
 
 fn bind_controller_contract_to_actuation(
-    launch: &NanoAgentLaunchV1,
+    launch: &NanoAgentLaunchV2,
     server: &ControllerServerConfigV1,
     actuation: &NavigationActuationConfigV1,
+    mpc: MpcConfigV1,
+    control_period: ControlPeriodNs,
 ) -> Result<(), NanoBootstrapPrimaryError> {
     let launch_endpoint = launch.controller_server().command_udp_endpoint();
     let actuation_endpoint = actuation.command_endpoint().socket_addr();
@@ -1066,14 +1508,93 @@ fn bind_controller_contract_to_actuation(
     if server.actuator_config_fingerprint() != actuation.actuator_config_fingerprint() {
         return Err(NanoBootstrapPrimaryError::ActuationControllerFingerprintMismatch);
     }
+    bind_mpc_pwm_to_controller_envelope(server.expected_max_abs_pwm_percent().get(), mpc)?;
+    bind_navigation_cadence_to_controller(
+        control_period.as_duration(),
+        server.minimum_host_command_interval(),
+        Duration::from_nanos(actuation.scheduling_guard_ns().get()),
+    )?;
     Ok(())
 }
 
-fn require_running(running: &AtomicBool) -> Result<(), NanoBootstrapPrimaryError> {
+fn bind_navigation_cadence_to_controller(
+    control_period: Duration,
+    controller_minimum_interval: Duration,
+    scheduling_margin: Duration,
+) -> Result<(), NanoBootstrapPrimaryError> {
+    let required_exclusive_lower_bound = controller_minimum_interval
+        .checked_add(scheduling_margin)
+        .ok_or(NanoBootstrapPrimaryError::ActuationCadenceArithmeticOverflow)?;
+    if control_period <= required_exclusive_lower_bound {
+        return Err(
+            NanoBootstrapPrimaryError::ActuationControlPeriodHasNoControllerRateMargin {
+                control_period,
+                controller_minimum_interval,
+                scheduling_margin,
+                required_exclusive_lower_bound,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn bind_mpc_pwm_to_controller_envelope(
+    controller_max_abs_percent: u8,
+    mpc: MpcConfigV1,
+) -> Result<(), NanoBootstrapPrimaryError> {
+    for (wheel, (configured_min, configured_max)) in [
+        (WheelSide::Left, mpc.left_pwm_bounds_percent()),
+        (WheelSide::Right, mpc.right_pwm_bounds_percent()),
+    ] {
+        bind_one_mpc_pwm_range(
+            wheel,
+            configured_min,
+            configured_max,
+            controller_max_abs_percent,
+        )?;
+    }
+    Ok(())
+}
+
+fn bind_one_mpc_pwm_range(
+    wheel: WheelSide,
+    configured_min_percent: i8,
+    configured_max_percent: i8,
+    controller_max_abs_percent: u8,
+) -> Result<(), NanoBootstrapPrimaryError> {
+    let controller_max = i16::from(controller_max_abs_percent);
+    if i16::from(configured_min_percent) < -controller_max
+        || i16::from(configured_max_percent) > controller_max
+    {
+        return Err(
+            NanoBootstrapPrimaryError::ActuationMpcPwmOutsideControllerEnvelope {
+                wheel,
+                configured_min_percent,
+                configured_max_percent,
+                controller_max_abs_percent,
+            },
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn require_running(running: &AtomicBool) -> Result<(), NanoBootstrapPrimaryError> {
     if running.load(Ordering::Acquire) {
         Ok(())
     } else {
         Err(NanoBootstrapPrimaryError::Interrupted)
+    }
+}
+
+fn require_early_accessory_healthy(
+    accessory: &NanoAccessoryWorker,
+    running: &AtomicBool,
+) -> Result<(), NanoBootstrapPrimaryError> {
+    require_running(running)?;
+    match accessory.try_terminal_fault() {
+        Ok(None) => Ok(()),
+        Ok(Some(fault)) => Err(NanoBootstrapPrimaryError::AccessoryTerminalFault(fault)),
+        Err(source) => Err(NanoBootstrapPrimaryError::AccessoryFaultMonitor(source)),
     }
 }
 
@@ -1114,14 +1635,18 @@ impl ExplicitBootstrapClose for Device {
     }
 }
 
+#[cfg(test)]
 type ControllerCleanupResult<Controller> = Result<
     <Controller as ExplicitBootstrapDisarm>::Receipt,
     <Controller as ExplicitBootstrapDisarm>::Error,
 >;
+#[cfg(test)]
 type OakCleanupResult<Oak> = Result<(), <Oak as ExplicitBootstrapClose>::Error>;
+#[cfg(test)]
 type BootstrapCleanupResult<Controller, Oak> =
     (ControllerCleanupResult<Controller>, OakCleanupResult<Oak>);
 
+#[cfg(test)]
 fn collect_failure_cleanup<Controller, Oak>(
     controller: Controller,
     oak: Oak,
@@ -1135,22 +1660,56 @@ where
     (stop, close)
 }
 
-fn cleanup_after_pending_failure(
+async fn cleanup_after_pending_failure(
     primary: NanoBootstrapPrimaryError,
     pending: PendingLiveMpcControlDriver,
+    controller_owner: V2ControllerOwner,
+    controller_owner_shutdown_timeout: Duration,
     oak: Device,
 ) -> NanoBootstrapError {
-    let (stop, close) = collect_failure_cleanup(pending, oak);
+    let stop = pending.explicit_disarm();
+    let controller_owner =
+        shutdown_controller_owner(controller_owner, controller_owner_shutdown_timeout).await;
+    let close = oak.explicit_close();
     NanoBootstrapError {
         primary: Box::new(primary),
         controller: match stop {
             Ok(receipt) => NanoBootstrapControllerDisposition::ConfirmedStopped(receipt),
             Err(source) => NanoBootstrapControllerDisposition::StopUncertain(source),
         },
+        controller_owner,
         oak_close: match close {
             Ok(()) => NanoBootstrapOakCloseDisposition::ConfirmedClosed,
             Err(source) => NanoBootstrapOakCloseDisposition::CloseUncertain(source),
         },
+        accessory: NanoBootstrapAccessoryDisposition::NotStarted,
+    }
+}
+
+async fn cleanup_after_owner_failure(
+    primary: NanoBootstrapPrimaryError,
+    controller_owner: V2ControllerOwner,
+    controller_owner_shutdown_timeout: Duration,
+    oak: Device,
+) -> NanoBootstrapError {
+    let controller_owner =
+        shutdown_controller_owner(controller_owner, controller_owner_shutdown_timeout).await;
+    NanoBootstrapError {
+        primary: Box::new(primary),
+        controller: NanoBootstrapControllerDisposition::NotAcquired,
+        controller_owner,
+        oak_close: close_oak(oak),
+        accessory: NanoBootstrapAccessoryDisposition::NotStarted,
+    }
+}
+
+async fn shutdown_controller_owner(
+    controller_owner: V2ControllerOwner,
+    shutdown_timeout: Duration,
+) -> NanoBootstrapControllerOwnerDisposition {
+    match controller_owner.shutdown(shutdown_timeout).await {
+        Ok(()) => NanoBootstrapControllerOwnerDisposition::ConfirmedStopped,
+        Err(source) => NanoBootstrapControllerOwnerDisposition::StopUncertain(source),
     }
 }
 
@@ -1158,7 +1717,9 @@ fn close_oak_after_failure(primary: NanoBootstrapPrimaryError, oak: Device) -> N
     NanoBootstrapError {
         primary: Box::new(primary),
         controller: NanoBootstrapControllerDisposition::NotAcquired,
+        controller_owner: NanoBootstrapControllerOwnerDisposition::NotStarted,
         oak_close: close_oak(oak),
+        accessory: NanoBootstrapAccessoryDisposition::NotStarted,
     }
 }
 
@@ -1173,7 +1734,9 @@ fn close_oak(oak: Device) -> NanoBootstrapOakCloseDisposition {
 pub struct NanoBootstrapError {
     primary: Box<NanoBootstrapPrimaryError>,
     controller: NanoBootstrapControllerDisposition,
+    controller_owner: NanoBootstrapControllerOwnerDisposition,
     oak_close: NanoBootstrapOakCloseDisposition,
+    accessory: NanoBootstrapAccessoryDisposition,
 }
 
 impl NanoBootstrapError {
@@ -1181,8 +1744,19 @@ impl NanoBootstrapError {
         Self {
             primary: Box::new(primary),
             controller: NanoBootstrapControllerDisposition::NotAcquired,
+            controller_owner: NanoBootstrapControllerOwnerDisposition::NotStarted,
             oak_close: NanoBootstrapOakCloseDisposition::NotOpened,
+            accessory: NanoBootstrapAccessoryDisposition::NotStarted,
         }
+    }
+
+    fn with_accessory_shutdown(mut self, accessory: NanoAccessoryWorker) -> Self {
+        debug_assert!(matches!(
+            self.accessory,
+            NanoBootstrapAccessoryDisposition::NotStarted
+        ));
+        self.accessory = NanoBootstrapAccessoryDisposition::shutdown(accessory);
+        self
     }
 
     pub const fn primary(&self) -> &NanoBootstrapPrimaryError {
@@ -1193,8 +1767,16 @@ impl NanoBootstrapError {
         &self.controller
     }
 
+    pub const fn controller_owner(&self) -> &NanoBootstrapControllerOwnerDisposition {
+        &self.controller_owner
+    }
+
     pub const fn oak_close(&self) -> &NanoBootstrapOakCloseDisposition {
         &self.oak_close
+    }
+
+    pub const fn accessory(&self) -> &NanoBootstrapAccessoryDisposition {
+        &self.accessory
     }
 }
 
@@ -1208,8 +1790,8 @@ impl fmt::Display for NanoBootstrapError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "Nano bootstrap failed: {}; {}; {}",
-            self.primary, self.controller, self.oak_close
+            "Nano bootstrap failed: {}; {}; {}; {}; {}",
+            self.primary, self.controller, self.controller_owner, self.oak_close, self.accessory
         )
     }
 }
@@ -1217,6 +1799,94 @@ impl fmt::Display for NanoBootstrapError {
 impl std::error::Error for NanoBootstrapError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.primary.as_ref())
+    }
+}
+
+pub enum NanoBootstrapAccessoryDisposition {
+    NotStarted,
+    ShutdownCompleted {
+        terminal_fault: Option<NanoAccessoryTerminalFault>,
+        eye_release_verified: bool,
+        head_hold_preserving_release_completed: bool,
+    },
+    UnexpectedExit(Box<NanoAccessoryWorkerExit>),
+    JoinUncertain(NanoAccessoryWorkerJoinError),
+}
+
+impl NanoBootstrapAccessoryDisposition {
+    fn shutdown(accessory: NanoAccessoryWorker) -> Self {
+        match accessory.shutdown() {
+            Ok(NanoAccessoryWorkerExit::Shutdown {
+                terminal_fault,
+                evidence,
+            }) => Self::ShutdownCompleted {
+                terminal_fault,
+                eye_release_verified: evidence.eye().release_verified(),
+                head_hold_preserving_release_completed: evidence
+                    .head()
+                    .hold_preserving_release_completed(),
+            },
+            Ok(exit) => Self::UnexpectedExit(Box::new(exit)),
+            Err(source) => Self::JoinUncertain(source),
+        }
+    }
+}
+
+impl fmt::Debug for NanoBootstrapAccessoryDisposition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for NanoBootstrapAccessoryDisposition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotStarted => formatter.write_str("accessory owner was not started"),
+            Self::ShutdownCompleted {
+                terminal_fault,
+                eye_release_verified,
+                head_hold_preserving_release_completed,
+            } => write!(
+                formatter,
+                "accessory owner shutdown completed (terminal_fault={terminal_fault:?}, eye_release_verified={eye_release_verified}, head_hold_preserving_release_completed={head_hold_preserving_release_completed})"
+            ),
+            Self::UnexpectedExit(exit) => {
+                write!(
+                    formatter,
+                    "accessory owner returned unexpected exit: {exit:?}"
+                )
+            }
+            Self::JoinUncertain(source) => {
+                write!(
+                    formatter,
+                    "accessory owner shutdown join uncertain: {source}"
+                )
+            }
+        }
+    }
+}
+
+pub enum NanoBootstrapControllerOwnerDisposition {
+    NotStarted,
+    ConfirmedStopped,
+    StopUncertain(V2ControllerOwnerTerminationError),
+}
+
+impl fmt::Debug for NanoBootstrapControllerOwnerDisposition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl fmt::Display for NanoBootstrapControllerOwnerDisposition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotStarted => formatter.write_str("controller owner was not started"),
+            Self::ConfirmedStopped => formatter.write_str("controller owner shutdown confirmed"),
+            Self::StopUncertain(source) => {
+                write!(formatter, "controller owner shutdown uncertain: {source}")
+            }
+        }
     }
 }
 
@@ -1297,9 +1967,12 @@ pub enum NanoBootstrapPrimaryError {
     },
     Manifest(ManifestLoadError),
     AccessoryManifestBinding(NanoAccessoryManifestBindingError),
-    NaturalHeadHoldRequired,
+    ContinuousNaturalHeadHoldRequired,
     Kep2EyeRequired,
     ArtifactHash(ArtifactHashError),
+    CalibrationArtifactSelection(NanoCalibrationArtifactSelectionError),
+    CalibrationArtifact(NanoCalibrationArtifactParseError),
+    CalibrationBinding(NanoCalibrationBindingError),
     PlantArtifactNotInManifest {
         artifact_id: String,
     },
@@ -1328,6 +2001,7 @@ pub enum NanoBootstrapPrimaryError {
         path: PathBuf,
     },
     PlantDeploymentRelativePath(ArtifactRelativePathError),
+    PlantArtifactModel(PlantModelJsonParseError),
     ControllerServerContract(ServerConfigError),
     ControllerSerialMismatch {
         server: PathBuf,
@@ -1349,6 +2023,11 @@ pub enum NanoBootstrapPrimaryError {
     },
     HeadProbe(Box<SerialHeadProbeError>),
     EyeProbe(IdentityProbeError),
+    AccessoryHealthPeriod(NanoAccessoryHealthPeriodError),
+    AccessoryConfig(NanoAccessoryWorkerConfigError),
+    AccessoryStart(NanoAccessoryWorkerStartError),
+    AccessoryTerminalFault(NanoAccessoryTerminalFault),
+    AccessoryFaultMonitor(NanoAccessoryFaultWaitError),
     OakConnect(oak_sys::ConnectionError),
     OakConnectedIdentity(ConnectedDeviceIdentityError),
     EmptyOpenedOakMxid,
@@ -1395,6 +2074,20 @@ pub enum NanoBootstrapPrimaryError {
         actuation: u32,
     },
     ActuationControllerFingerprintMismatch,
+    ActuationMpcPwmOutsideControllerEnvelope {
+        wheel: WheelSide,
+        configured_min_percent: i8,
+        configured_max_percent: i8,
+        controller_max_abs_percent: u8,
+    },
+    ActuationCadenceArithmeticOverflow,
+    ActuationControlPeriodHasNoControllerRateMargin {
+        control_period: Duration,
+        controller_minimum_interval: Duration,
+        scheduling_margin: Duration,
+        required_exclusive_lower_bound: Duration,
+    },
+    ControllerOwnerStart(V2ControllerOwnerStartError),
     ControllerAcquire(LiveActuationError),
     ControllerEvidence(LiveActuationError),
     ObservedInventoryEvidence(NanoObservedInventoryEvidenceError),
@@ -1421,10 +2114,18 @@ impl std::error::Error for NanoBootstrapPrimaryError {
             Self::Manifest(source) => Some(source),
             Self::AccessoryManifestBinding(source) => Some(source),
             Self::ArtifactHash(source) => Some(source),
+            Self::CalibrationArtifactSelection(source) => Some(source),
+            Self::CalibrationArtifact(source) => Some(source),
+            Self::CalibrationBinding(source) => Some(source),
             Self::PlantDeploymentRelativePath(source) => Some(source),
+            Self::PlantArtifactModel(source) => Some(source),
             Self::ControllerServerContract(source) => Some(source),
             Self::HeadProbe(source) => Some(source.as_ref()),
             Self::EyeProbe(source) => Some(source),
+            Self::AccessoryHealthPeriod(source) => Some(source),
+            Self::AccessoryConfig(source) => Some(source),
+            Self::AccessoryStart(source) => Some(source),
+            Self::AccessoryFaultMonitor(source) => Some(source),
             Self::OakConnect(source) => Some(source),
             Self::OakConnectedIdentity(source) => Some(source),
             Self::OakUsbTransport(source) => Some(source),
@@ -1435,6 +2136,7 @@ impl std::error::Error for NanoBootstrapPrimaryError {
             Self::Stereo(source) => Some(source),
             Self::ShadowNavigation(source) => Some(source),
             Self::Actuation(source) => Some(source),
+            Self::ControllerOwnerStart(source) => Some(source),
             Self::ControllerAcquire(source) | Self::ControllerEvidence(source) => Some(source),
             Self::ObservedInventoryEvidence(source) => Some(source),
             Self::ObservedInventoryBuild(source) => Some(source),
@@ -1444,7 +2146,7 @@ impl std::error::Error for NanoBootstrapPrimaryError {
             | Self::MonotonicTimestampOverflow { .. }
             | Self::PolicyPathOutsideDeployment { .. }
             | Self::PolicyPathAliasesDeploymentRoot { .. }
-            | Self::NaturalHeadHoldRequired
+            | Self::ContinuousNaturalHeadHoldRequired
             | Self::Kep2EyeRequired
             | Self::PlantArtifactNotInManifest { .. }
             | Self::PlantArtifactBindingMissing { .. }
@@ -1459,6 +2161,7 @@ impl std::error::Error for NanoBootstrapPrimaryError {
             | Self::ControllerFirmwareBuildMismatch { .. }
             | Self::ControllerFingerprintMismatch
             | Self::ControllerEndpointMismatch { .. }
+            | Self::AccessoryTerminalFault(_)
             | Self::EmptyOpenedOakMxid
             | Self::StereoTimedOut { .. }
             | Self::StereoUnexpectedStream { .. }
@@ -1468,7 +2171,10 @@ impl std::error::Error for NanoBootstrapPrimaryError {
             | Self::ActuationControllerUidMismatch
             | Self::ActuationControllerFirmwareAbiMismatch { .. }
             | Self::ActuationControllerFirmwareBuildMismatch { .. }
-            | Self::ActuationControllerFingerprintMismatch => None,
+            | Self::ActuationControllerFingerprintMismatch
+            | Self::ActuationCadenceArithmeticOverflow
+            | Self::ActuationControlPeriodHasNoControllerRateMargin { .. }
+            | Self::ActuationMpcPwmOutsideControllerEnvelope { .. } => None,
         }
     }
 }
@@ -1508,6 +2214,25 @@ mod tests {
             NanoBootstrapRoots::try_new("/opt/kiko/deployment".into(), "/opt/kiko".into()),
             Err(NanoBootstrapRootError::OverlappingRoots { .. })
         ));
+    }
+
+    #[test]
+    fn bootstrap_request_retains_the_exact_accessory_stream_epoch() {
+        let running = AtomicBool::new(true);
+        let stream_epoch = StreamEpochId::try_new(41).expect("non-zero epoch");
+        let request = NanoBootstrapRequest::try_new(
+            "/opt/kiko/deployment".into(),
+            "/var/lib/kiko".into(),
+            "launch.json".into(),
+            stream_epoch,
+            Instant::now(),
+            NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(0)),
+            ReadinessEpoch::try_new(1).expect("non-zero readiness epoch"),
+            &running,
+        )
+        .expect("valid bootstrap request");
+
+        assert_eq!(request.accessory_stream_epoch, stream_epoch);
     }
 
     #[derive(Clone)]
@@ -1598,5 +2323,56 @@ mod tests {
             require_running(&running),
             Err(NanoBootstrapPrimaryError::Interrupted)
         ));
+    }
+
+    #[test]
+    fn mpc_pwm_ranges_must_fit_the_exact_admitted_controller_cap() {
+        assert!(bind_one_mpc_pwm_range(WheelSide::Left, -30, 30, 30).is_ok());
+        for (wheel, minimum, maximum) in [(WheelSide::Left, -31, 30), (WheelSide::Right, -30, 31)] {
+            assert!(matches!(
+                bind_one_mpc_pwm_range(wheel, minimum, maximum, 30),
+                Err(
+                    NanoBootstrapPrimaryError::ActuationMpcPwmOutsideControllerEnvelope {
+                        wheel: actual_wheel,
+                        configured_min_percent,
+                        configured_max_percent,
+                        controller_max_abs_percent: 30,
+                    }
+                ) if actual_wheel == wheel
+                    && configured_min_percent == minimum
+                    && configured_max_percent == maximum
+            ));
+        }
+    }
+
+    #[test]
+    fn navigation_cadence_strictly_exceeds_controller_interval_plus_margin() {
+        let controller_minimum = Duration::from_millis(10);
+        let scheduling_margin = Duration::from_millis(5);
+        assert!(
+            bind_navigation_cadence_to_controller(
+                Duration::from_nanos(15_000_001),
+                controller_minimum,
+                scheduling_margin,
+            )
+            .is_ok()
+        );
+        for control_period in [Duration::from_millis(15), Duration::from_nanos(14_999_999)] {
+            assert!(matches!(
+                bind_navigation_cadence_to_controller(
+                    control_period,
+                    controller_minimum,
+                    scheduling_margin,
+                ),
+                Err(
+                    NanoBootstrapPrimaryError::ActuationControlPeriodHasNoControllerRateMargin {
+                        control_period: actual,
+                        required_exclusive_lower_bound,
+                        ..
+                    }
+                ) if actual == control_period
+                    && required_exclusive_lower_bound == Duration::from_millis(15)
+            ));
+        }
     }
 }

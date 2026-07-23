@@ -10,10 +10,13 @@
 //!
 //! Every optional subsystem is represented by an explicit tagged state. A
 //! missing JSON field is therefore an error rather than an implicit default.
-//! RGB scene motion can own only KEP2 eyes and the head policy is fixed to a
-//! natural hold at redundantly observed present positions.
+//! RGB scene motion can own only KEP2 eyes. An enabled head policy is one
+//! config-bound return to Kiko's reviewed natural target followed by an active
+//! hold against that exact target; an observed startup pose is never
+//! re-labelled as natural.
 
 use std::fmt;
+use std::net::{AddrParseError, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -37,9 +40,13 @@ use kiko_eye_runtime::{
 use kiko_head_protocol::{
     ADAPTER_DTR_ASSERTED, ADAPTER_RTS_ASSERTED, BUS_BAUD_RATE_BPS, HeadJoint,
 };
+#[cfg(test)]
+use kiko_head_runtime::ConfiguredHeadPoseBoundsError;
 use kiko_head_runtime::{
-    ConfigParseError as HeadConfigParseError, HeadRuntimeConfig, HeadRuntimeConfigInput,
-    PhysicalTorqueEnableConsent,
+    ConfigParseError as HeadConfigParseError, HeadHoldTarget, HeadProbeConfig,
+    HeadProbeConfigInput, HeadRuntimeConfig, PhysicalHeadMotionConsent,
+    PhysicalTorqueEnableConsent, ReturnToTargetConfig, ReturnToTargetConfigInput,
+    ReturnToTargetConfigParseError,
 };
 use kiko_supervisor_core::{
     AuthorityDuration, SupervisorConfig, SupervisorConfigError, TimeValueError,
@@ -50,12 +57,20 @@ use super::mpc::{BoundedId, PlantModelV1};
 use super::{
     AgentControlRuntimeQueueCapacity, AgentControlRuntimeQueueCapacityError,
     AgentControlSocketConfig, AgentControlSocketPath, AgentControlSocketPathError,
-    AgentControlSocketTimeoutError, AgentControlSocketTimeouts, MANUAL_DRIVE_CONFIG_V1,
+    AgentControlSocketTimeoutError, AgentControlSocketTimeouts, FrontierExplorerConfig,
+    FrontierExplorerConfigError, FrontierYawScanBudgetError, FrontierYawScanBudgetV1,
+    FrontierYawTurnDirectionV1, MANUAL_DRIVE_CONFIG_V1, MAX_NANO_OCCUPANCY_CELLS,
     ManualDriveConfigParseError, ManualDriveConfigV1, ManualDriveConfigV1Dto,
 };
 
 /// The only supported Nano-agent policy-component schema.
-pub const NANO_AGENT_POLICY_CONFIG_V1: u32 = 1;
+///
+/// Version 1 described the retired observed-pose hold policy. It is never
+/// reinterpreted as this config-bound return-and-continuous-hold contract.
+/// Version 2 did not configure the production operator console. It is rejected
+/// rather than silently acquiring a network listener, capability-file path, or
+/// deadman schedule from runtime defaults.
+pub const NANO_AGENT_POLICY_CONFIG_V3: u32 = 3;
 
 /// Nested camera-to-head gaze-geometry schema retained independently of the
 /// surrounding Nano policy schema.
@@ -77,6 +92,9 @@ pub const MAX_NANO_AGENT_AUTHORITY_LEASE_MS: u64 = 60_000;
 /// manual stream into an effectively unbounded command hold.
 pub const MAX_NANO_AGENT_MANUAL_WINDOW_MS: u64 = 60_000;
 
+/// Maximum total wall-clock budget for one selected point-goal request.
+pub const MAX_NANO_AGENT_POINT_GOAL_RUNTIME_MS: u64 = 24 * 60 * 60 * 1_000;
+
 /// Maximum freshness window for one RGB observation.
 pub const MAX_NANO_AGENT_RGB_FRAME_FRESHNESS_MS: u64 = 5_000;
 
@@ -89,10 +107,38 @@ pub const MAX_NANO_AGENT_EXPLORE_GOALS: u32 = 10_000;
 /// Maximum absolute map coordinate admitted for an exploration boundary.
 pub const MAX_NANO_AGENT_ABS_EXPLORE_BOUNDARY_M: f64 = 10_000.0;
 
+/// Maximum UTF-8 bytes in the per-boot operator-console capability path.
+pub const MAX_NANO_OPERATOR_CONSOLE_CAPABILITY_PATH_BYTES: usize = 1_024;
+
+/// Tightest admitted operator-console deadman scheduler period.
+pub const MIN_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS: u64 = 5;
+
+/// Loosest admitted operator-console deadman scheduler period.
+pub const MAX_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS: u64 = 100;
+
+/// The only target qualified by the recorded Fable return-to-natural run.
+///
+/// Values are raw bow/curl/yaw/roll encoder ticks. This is not a geometric
+/// servo calibration and changing it requires new reviewed physical evidence.
+pub const KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS: [u16; 4] = [2_155, 2_545, 2_943, 2_876];
+
+/// Exact per-joint union of the evidenced Fable return-start envelope and the
+/// reviewed natural target minus its 20-tick readback tolerance.
+pub const KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS: [u16; 4] = [2_135, 2_525, 2_842, 2_856];
+
+/// Exact per-joint union of the evidenced Fable return-start envelope and the
+/// reviewed natural target plus its 20-tick readback tolerance.
+pub const KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS: [u16; 4] = [2_227, 2_592, 2_963, 2_922];
+
+/// The only torque envelope qualified by the recorded Fable natural return.
+///
+/// Values are bow/curl/yaw/roll permille of each servo's configured maximum.
+pub const KIKO_REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE: [u16; 4] = [600, 400, 400, 400];
+
 /// A fully parsed runtime policy component. Construction is possible only
 /// through [`Self::parse_json`].
 #[derive(Clone, Debug, PartialEq)]
-pub struct NanoAgentPolicyConfigV1 {
+pub struct NanoAgentPolicyConfigV3 {
     control: NanoAgentControlConfig,
     inventory: NanoAgentInventoryConfig,
     map_persistence: NanoMapPersistenceConfig,
@@ -103,7 +149,7 @@ pub struct NanoAgentPolicyConfigV1 {
     live_mode_policy: NanoLiveModePolicy,
 }
 
-impl NanoAgentPolicyConfigV1 {
+impl NanoAgentPolicyConfigV3 {
     /// Parse one exact JSON document into runtime-native domain types.
     ///
     /// This operation does not open the referenced manifest, artifacts, map,
@@ -118,15 +164,15 @@ impl NanoAgentPolicyConfigV1 {
         }
 
         let mut deserializer = serde_json::Deserializer::from_slice(json);
-        let dto = NanoAgentPolicyConfigV1Dto::deserialize(&mut deserializer)
+        let dto = NanoAgentPolicyConfigV3Dto::deserialize(&mut deserializer)
             .map_err(NanoAgentPolicyConfigParseError::JsonDecode)?;
         deserializer
             .end()
             .map_err(NanoAgentPolicyConfigParseError::JsonTrailingData)?;
-        if dto.schema_version != NANO_AGENT_POLICY_CONFIG_V1 {
+        if dto.schema_version != NANO_AGENT_POLICY_CONFIG_V3 {
             return Err(NanoAgentPolicyConfigParseError::UnsupportedSchemaVersion {
                 actual: dto.schema_version,
-                supported: NANO_AGENT_POLICY_CONFIG_V1,
+                supported: NANO_AGENT_POLICY_CONFIG_V3,
             });
         }
 
@@ -137,8 +183,10 @@ impl NanoAgentPolicyConfigV1 {
         let eye = parse_eye(dto.eye)?;
         let head = parse_head(dto.head)?;
 
-        if let (ParsedNanoEyePolicy::Kep2(eye), ParsedNanoHeadPolicy::NaturalHold(head)) =
-            (&eye, &head)
+        if let (
+            ParsedNanoEyePolicy::Kep2(eye),
+            ParsedNanoHeadPolicy::ReturnToNaturalAndHoldContinuously(head),
+        ) = (&eye, &head)
             && eye.device().path() == head.runtime().device().path()
         {
             return Err(NanoAgentPolicyConfigParseError::DuplicateAccessorySerialPath);
@@ -146,6 +194,25 @@ impl NanoAgentPolicyConfigV1 {
 
         let rgb_expression = parse_rgb_expression(dto.rgb_expression, &eye)?;
         let live_mode_policy = parse_live_mode_policy(dto.live_mode_policy, supervisor)?;
+        if let Some(manual) = live_mode_policy.manual().config() {
+            let drive = manual.drive();
+            let requested_forward = control
+                .operator_console()
+                .manual_command_forward_velocity_mps();
+            let requested_yaw = control.operator_console().manual_command_yaw_rate_rad_s();
+            if requested_forward > drive.maximum_abs_forward_velocity_mps()
+                || requested_yaw > drive.maximum_abs_yaw_rate_rad_s()
+            {
+                return Err(
+                    NanoAgentPolicyConfigParseError::OperatorConsoleManualCommandOutsideEnvelope {
+                        requested_forward_velocity_mps: requested_forward,
+                        maximum_forward_velocity_mps: drive.maximum_abs_forward_velocity_mps(),
+                        requested_yaw_rate_rad_s: requested_yaw,
+                        maximum_yaw_rate_rad_s: drive.maximum_abs_yaw_rate_rad_s(),
+                    },
+                );
+            }
+        }
 
         Ok(Self {
             control,
@@ -180,7 +247,10 @@ impl NanoAgentPolicyConfigV1 {
     /// Whether this parsed document requests natural head hold. Actor
     /// configuration is intentionally unavailable before manifest binding.
     pub const fn head_enabled(&self) -> bool {
-        matches!(self.head, ParsedNanoHeadPolicy::NaturalHold(_))
+        matches!(
+            self.head,
+            ParsedNanoHeadPolicy::ReturnToNaturalAndHoldContinuously(_)
+        )
     }
 
     pub const fn rgb_expression(&self) -> &NanoRgbExpressionPolicy {
@@ -201,10 +271,10 @@ impl NanoAgentPolicyConfigV1 {
     pub fn bind_accessories_to_manifest(
         self,
         manifest: &DeviceInventoryManifestV1,
-    ) -> Result<ManifestBoundNanoAgentPolicyConfigV1, NanoAccessoryManifestBindingError> {
+    ) -> Result<ManifestBoundNanoAgentPolicyConfigV3, NanoAccessoryManifestBindingError> {
         let eye = bind_eye_to_manifest(self.eye, manifest)?;
         let head = bind_head_to_manifest(self.head, manifest)?;
-        Ok(ManifestBoundNanoAgentPolicyConfigV1 {
+        Ok(ManifestBoundNanoAgentPolicyConfigV3 {
             control: self.control,
             inventory: self.inventory,
             map_persistence: self.map_persistence,
@@ -220,7 +290,7 @@ impl NanoAgentPolicyConfigV1 {
 /// Runtime policy whose accessory choices exactly match one parsed expected
 /// manifest. Only this type exposes actor-owned configurations.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ManifestBoundNanoAgentPolicyConfigV1 {
+pub struct ManifestBoundNanoAgentPolicyConfigV3 {
     control: NanoAgentControlConfig,
     inventory: NanoAgentInventoryConfig,
     map_persistence: NanoMapPersistenceConfig,
@@ -231,7 +301,7 @@ pub struct ManifestBoundNanoAgentPolicyConfigV1 {
     live_mode_policy: NanoLiveModePolicy,
 }
 
-impl ManifestBoundNanoAgentPolicyConfigV1 {
+impl ManifestBoundNanoAgentPolicyConfigV3 {
     pub const fn control(&self) -> &NanoAgentControlConfig {
         &self.control
     }
@@ -264,8 +334,8 @@ impl ManifestBoundNanoAgentPolicyConfigV1 {
         &self.live_mode_policy
     }
 
-    pub fn into_parts(self) -> NanoAgentPolicyPartsV1 {
-        NanoAgentPolicyPartsV1 {
+    pub fn into_parts(self) -> NanoAgentPolicyPartsV3 {
+        NanoAgentPolicyPartsV3 {
             control: self.control,
             inventory: self.inventory,
             map_persistence: self.map_persistence,
@@ -280,7 +350,7 @@ impl ManifestBoundNanoAgentPolicyConfigV1 {
 
 /// Owned policy parts returned only after manifest accessory binding.
 #[derive(Clone, Debug, PartialEq)]
-pub struct NanoAgentPolicyPartsV1 {
+pub struct NanoAgentPolicyPartsV3 {
     pub control: NanoAgentControlConfig,
     pub inventory: NanoAgentInventoryConfig,
     pub map_persistence: NanoMapPersistenceConfig,
@@ -296,6 +366,7 @@ pub struct NanoAgentPolicyPartsV1 {
 pub struct NanoAgentControlConfig {
     socket: AgentControlSocketConfig,
     runtime_queue_capacity: AgentControlRuntimeQueueCapacity,
+    operator_console: NanoOperatorConsoleConfig,
 }
 
 impl NanoAgentControlConfig {
@@ -307,8 +378,81 @@ impl NanoAgentControlConfig {
         self.runtime_queue_capacity
     }
 
-    pub fn into_parts(self) -> (AgentControlSocketConfig, AgentControlRuntimeQueueCapacity) {
-        (self.socket, self.runtime_queue_capacity)
+    pub const fn operator_console(&self) -> &NanoOperatorConsoleConfig {
+        &self.operator_console
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        AgentControlSocketConfig,
+        AgentControlRuntimeQueueCapacity,
+        NanoOperatorConsoleConfig,
+    ) {
+        (
+            self.socket,
+            self.runtime_queue_capacity,
+            self.operator_console,
+        )
+    }
+}
+
+/// Parsed production operator-console transport and deadman schedule.
+///
+/// The capability file is constrained to the exact lexical parent of the
+/// control socket so startup can admit one private runtime directory for both
+/// local-control identities. Parsing does not claim that parent exists, is
+/// symlink-free, or has safe ownership/mode; the runtime must prove those
+/// filesystem properties before either endpoint becomes live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NanoOperatorConsoleConfig {
+    bind_address: SocketAddr,
+    capability_path: NanoConfiguredAbsolutePath,
+    deadman_tick: Duration,
+    manual_command_forward_mm_per_s: NonZeroU32,
+    manual_command_yaw_millirad_per_s: NonZeroU32,
+}
+
+impl NanoOperatorConsoleConfig {
+    pub const fn bind_address(&self) -> SocketAddr {
+        self.bind_address
+    }
+
+    pub const fn capability_path(&self) -> &NanoConfiguredAbsolutePath {
+        &self.capability_path
+    }
+
+    pub const fn deadman_tick(&self) -> Duration {
+        self.deadman_tick
+    }
+
+    /// Body-forward arrow/WASD command magnitude, converted exactly once from
+    /// the integer millimetres-per-second JSON boundary into SI.
+    pub fn manual_command_forward_velocity_mps(&self) -> f64 {
+        f64::from(self.manual_command_forward_mm_per_s.get()) / 1_000.0
+    }
+
+    /// Arrow/WASD yaw command magnitude, converted exactly once from the
+    /// integer milliradians-per-second JSON boundary into SI.
+    pub fn manual_command_yaw_rate_rad_s(&self) -> f64 {
+        f64::from(self.manual_command_yaw_millirad_per_s.get()) / 1_000.0
+    }
+
+    #[cfg(all(test, feature = "nano-agent", unix))]
+    pub(crate) fn for_test(
+        bind_address: SocketAddr,
+        capability_path: PathBuf,
+        deadman_tick: Duration,
+    ) -> Self {
+        Self {
+            bind_address,
+            capability_path: NanoConfiguredAbsolutePath(capability_path),
+            deadman_tick,
+            manual_command_forward_mm_per_s: NonZeroU32::new(100)
+                .expect("static test command is nonzero"),
+            manual_command_yaw_millirad_per_s: NonZeroU32::new(100)
+                .expect("static test command is nonzero"),
+        }
     }
 }
 
@@ -421,47 +565,81 @@ impl NanoManifestBoundEyePolicy {
     }
 }
 
-/// Head actor configuration and the explicit consent required to energise it.
+/// One config-bound return to Kiko's reviewed natural target followed by
+/// continuous actor ownership until coordinated shutdown or fault.
+///
+/// No hold duration or lease exists in this production type. The two
+/// independent physical consents authorize the initial torque and motion.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NanoNaturalHeadHoldConfig {
-    runtime: HeadRuntimeConfig,
+pub struct NanoContinuousNaturalHeadHoldConfig {
+    return_to_target: ReturnToTargetConfig,
     torque_consent: PhysicalTorqueEnableConsent,
+    motion_consent: PhysicalHeadMotionConsent,
 }
 
-impl NanoNaturalHeadHoldConfig {
+impl NanoContinuousNaturalHeadHoldConfig {
+    /// Runtime transport/tuning retained inside the inseparable return plan.
+    ///
+    /// This accessor exists for read-only admission probes; callers cannot
+    /// reconstruct a different target, bounds, or travel plan from it.
     pub const fn runtime(&self) -> &HeadRuntimeConfig {
-        &self.runtime
+        self.return_to_target.runtime()
+    }
+
+    pub const fn return_config(&self) -> &ReturnToTargetConfig {
+        &self.return_to_target
+    }
+
+    /// Typed target which post-return health evidence must report.
+    pub const fn required_hold_target(&self) -> HeadHoldTarget {
+        HeadHoldTarget::ReviewedReturn(self.return_to_target.target())
     }
 
     pub const fn torque_consent(&self) -> PhysicalTorqueEnableConsent {
         self.torque_consent
     }
 
-    pub fn into_parts(self) -> (HeadRuntimeConfig, PhysicalTorqueEnableConsent) {
-        (self.runtime, self.torque_consent)
+    pub const fn motion_consent(&self) -> PhysicalHeadMotionConsent {
+        self.motion_consent
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ReturnToTargetConfig,
+        PhysicalTorqueEnableConsent,
+        PhysicalHeadMotionConsent,
+    ) {
+        (
+            self.return_to_target,
+            self.torque_consent,
+            self.motion_consent,
+        )
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ParsedNanoHeadPolicy {
     Disabled,
-    NaturalHold(NanoNaturalHeadHoldConfig),
+    ReturnToNaturalAndHoldContinuously(NanoContinuousNaturalHeadHoldConfig),
 }
 
-/// Manifest-bound head selection. There is no expressive-offset variant and
-/// the natural-hold actor value is exposed only after exact manifest
-/// agreement.
+/// Manifest-bound head selection. There is no observed-pose-only or
+/// expressive-offset variant. The return plan is exposed only after exact
+/// manifest agreement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NanoManifestBoundHeadPolicy {
     Disabled,
-    NaturalHold(NanoNaturalHeadHoldConfig),
+    ReturnToNaturalAndHoldContinuously(NanoContinuousNaturalHeadHoldConfig),
 }
 
 impl NanoManifestBoundHeadPolicy {
-    pub const fn natural_hold(&self) -> Option<&NanoNaturalHeadHoldConfig> {
+    pub const fn return_to_natural_and_hold_continuously(
+        &self,
+    ) -> Option<&NanoContinuousNaturalHeadHoldConfig> {
         match self {
             Self::Disabled => None,
-            Self::NaturalHold(config) => Some(config),
+            Self::ReturnToNaturalAndHoldContinuously(config) => Some(config),
         }
     }
 }
@@ -611,18 +789,18 @@ fn bind_head_to_manifest(
                 manifest_expected: true,
             })
         }
-        (ParsedNanoHeadPolicy::NaturalHold(_), None) => {
+        (ParsedNanoHeadPolicy::ReturnToNaturalAndHoldContinuously(_), None) => {
             Err(NanoAccessoryManifestBindingError::PresenceMismatch {
                 accessory: NanoAccessoryKind::Head,
                 runtime_enabled: true,
                 manifest_expected: false,
             })
         }
-        (ParsedNanoHeadPolicy::NaturalHold(runtime), Some(expected)) => {
-            if runtime.runtime().device().path() != expected.serial_path().as_str() {
+        (ParsedNanoHeadPolicy::ReturnToNaturalAndHoldContinuously(config), Some(expected)) => {
+            if config.runtime().device().path() != expected.serial_path().as_str() {
                 return Err(NanoAccessoryManifestBindingError::SerialPathMismatch {
                     accessory: NanoAccessoryKind::Head,
-                    runtime_path: runtime.runtime().device().path().into(),
+                    runtime_path: config.runtime().device().path().into(),
                     manifest_path: expected.serial_path().as_str().into(),
                 });
             }
@@ -651,7 +829,7 @@ fn bind_head_to_manifest(
                     },
                 );
             }
-            Ok(NanoManifestBoundHeadPolicy::NaturalHold(runtime))
+            Ok(NanoManifestBoundHeadPolicy::ReturnToNaturalAndHoldContinuously(config))
         }
     }
 }
@@ -709,10 +887,14 @@ pub enum NanoAgentStartupMode {
 }
 
 /// Permission for a mode reached only through the local control API.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NanoMotionModePolicy {
     Disabled,
-    ControlApi { authority_lease: AuthorityDuration },
+    ControlApi {
+        authority_lease: AuthorityDuration,
+        maximum_runtime: Duration,
+        arrival_tolerance_m: f64,
+    },
 }
 
 /// Manual authority and the only envelope accepted by the manual ingress
@@ -860,7 +1042,28 @@ impl NanoMotionModePolicy {
     pub const fn authority_lease(self) -> Option<AuthorityDuration> {
         match self {
             Self::Disabled => None,
-            Self::ControlApi { authority_lease } => Some(authority_lease),
+            Self::ControlApi {
+                authority_lease, ..
+            } => Some(authority_lease),
+        }
+    }
+
+    pub const fn maximum_runtime(self) -> Option<Duration> {
+        match self {
+            Self::Disabled => None,
+            Self::ControlApi {
+                maximum_runtime, ..
+            } => Some(maximum_runtime),
+        }
+    }
+
+    pub const fn arrival_tolerance_m(self) -> Option<f64> {
+        match self {
+            Self::Disabled => None,
+            Self::ControlApi {
+                arrival_tolerance_m,
+                ..
+            } => Some(arrival_tolerance_m),
         }
     }
 }
@@ -942,6 +1145,10 @@ pub struct NanoFrontierExploreConfig {
     boundary_m: NanoExploreBoundaryMeters,
     maximum_runtime: Duration,
     maximum_frontier_goals: NonZeroU32,
+    arrival_tolerance_m: f64,
+    explorer: FrontierExplorerConfig,
+    yaw_scan_budget: FrontierYawScanBudgetV1,
+    yaw_turn_direction: FrontierYawTurnDirectionV1,
 }
 
 impl NanoFrontierExploreConfig {
@@ -959,6 +1166,22 @@ impl NanoFrontierExploreConfig {
 
     pub const fn maximum_frontier_goals(self) -> NonZeroU32 {
         self.maximum_frontier_goals
+    }
+
+    pub const fn arrival_tolerance_m(self) -> f64 {
+        self.arrival_tolerance_m
+    }
+
+    pub const fn explorer(self) -> FrontierExplorerConfig {
+        self.explorer
+    }
+
+    pub const fn yaw_scan_budget(self) -> FrontierYawScanBudgetV1 {
+        self.yaw_scan_budget
+    }
+
+    pub const fn yaw_turn_direction(self) -> FrontierYawTurnDirectionV1 {
+        self.yaw_turn_direction
     }
 }
 
@@ -1003,6 +1226,42 @@ impl NanoLiveModePolicy {
     pub const fn frontier_explore(self) -> NanoFrontierExplorePolicy {
         self.frontier_explore
     }
+
+    #[cfg(all(test, feature = "actuation"))]
+    pub(crate) fn autonomous_for_test(
+        authority_lease: AuthorityDuration,
+        point_goal_maximum_runtime: Duration,
+        arrival_tolerance_m: f64,
+        maximum_frontier_goals: NonZeroU32,
+    ) -> Self {
+        Self {
+            startup: NanoAgentStartupMode::DisarmedMapOnly,
+            manual: NanoManualModePolicy::Disabled,
+            point_goal: NanoMotionModePolicy::ControlApi {
+                authority_lease,
+                maximum_runtime: point_goal_maximum_runtime,
+                arrival_tolerance_m,
+            },
+            frontier_explore: NanoFrontierExplorePolicy::ControlApi(NanoFrontierExploreConfig {
+                authority_lease,
+                boundary_m: NanoExploreBoundaryMeters::try_new(-5.0, -5.0, 5.0, 5.0)
+                    .expect("test exploration boundary"),
+                maximum_runtime: Duration::from_secs(60),
+                maximum_frontier_goals,
+                arrival_tolerance_m,
+                explorer: FrontierExplorerConfig::try_new(0.0, 1_024, 1_024, 8_192)
+                    .expect("test frontier resources"),
+                yaw_scan_budget: FrontierYawScanBudgetV1::try_new(
+                    1.0,
+                    std::f64::consts::TAU,
+                    0.1,
+                    5_000_000_000,
+                )
+                .expect("test frontier yaw budget"),
+                yaw_turn_direction: FrontierYawTurnDirectionV1::CounterClockwise,
+            }),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1020,6 +1279,29 @@ pub enum NanoAgentPolicyConfigParseError {
     ControlSocketPath(AgentControlSocketPathError),
     ControlSocketTimeout(AgentControlSocketTimeoutError),
     ControlRuntimeQueue(AgentControlRuntimeQueueCapacityError),
+    OperatorConsoleBindAddress {
+        source: AddrParseError,
+    },
+    OperatorConsoleBindAddressNotLoopback {
+        actual: SocketAddr,
+    },
+    OperatorConsoleBindPortZero {
+        actual: SocketAddr,
+    },
+    OperatorConsoleDeadmanTick {
+        source: NanoOperatorConsoleDeadmanTickError,
+    },
+    OperatorConsoleManualCommandZero {
+        field: &'static str,
+    },
+    OperatorConsoleManualCommandOutsideEnvelope {
+        requested_forward_velocity_mps: f64,
+        maximum_forward_velocity_mps: f64,
+        requested_yaw_rate_rad_s: f64,
+        maximum_yaw_rate_rad_s: f64,
+    },
+    OperatorConsoleCapabilityPathCollidesWithControlSocket,
+    OperatorConsoleCapabilityPathOutsideControlSocketParent,
     AbsolutePath {
         field: NanoAgentPathField,
         source: NanoAbsolutePathError,
@@ -1027,7 +1309,29 @@ pub enum NanoAgentPolicyConfigParseError {
     ArtifactBindings(ArtifactFileBindingParseError),
     WarmStartPathRoleCollision,
     Eye(EyeConfigParseError),
-    Head(HeadConfigParseError),
+    HeadProbe(HeadConfigParseError),
+    HeadReturn(ReturnToTargetConfigParseError),
+    ReviewedNaturalHeadTargetMismatch {
+        configured_ticks: [u16; 4],
+        required_ticks: [u16; 4],
+    },
+    ReviewedNaturalHoldEnvelopeOutsideStartupWindow {
+        joint: HeadJoint,
+        configured_minimum_ticks: u16,
+        configured_maximum_ticks: u16,
+        required_minimum_ticks: u16,
+        required_maximum_ticks: u16,
+    },
+    ReviewedNaturalHeadStartBoundsMismatch {
+        configured_minimum_ticks: [u16; 4],
+        configured_maximum_ticks: [u16; 4],
+        required_minimum_ticks: [u16; 4],
+        required_maximum_ticks: [u16; 4],
+    },
+    ReviewedNaturalHeadTorqueMismatch {
+        configured_permille: [u16; 4],
+        required_permille: [u16; 4],
+    },
     DuplicateAccessorySerialPath,
     RgbExpressionRequiresEye,
     RgbSamplingGeometry(SamplingGeometryError),
@@ -1084,6 +1388,13 @@ pub enum NanoAgentPolicyConfigParseError {
     MotionPolicyRequiresActuationFeature {
         mode: NanoConfiguredMotionMode,
     },
+    GoalArrivalTolerance {
+        mode: NanoConfiguredMotionMode,
+        value_m: f64,
+    },
+    PointGoalRuntime {
+        source: NanoBoundedMillisecondsError,
+    },
     ExploreBoundary {
         source: NanoExploreBoundaryError,
     },
@@ -1095,6 +1406,15 @@ pub enum NanoAgentPolicyConfigParseError {
         minimum: u32,
         maximum: u32,
     },
+    ExploreGridCellLimit {
+        actual: usize,
+        maximum: usize,
+    },
+    ExploreResources(FrontierExplorerConfigError),
+    ExploreYawScanDuration {
+        source: NanoBoundedMillisecondsError,
+    },
+    ExploreYawScanBudget(FrontierYawScanBudgetError),
 }
 
 impl fmt::Display for NanoAgentPolicyConfigParseError {
@@ -1113,10 +1433,13 @@ impl std::error::Error for NanoAgentPolicyConfigParseError {
             Self::ControlSocketPath(source) => Some(source),
             Self::ControlSocketTimeout(source) => Some(source),
             Self::ControlRuntimeQueue(source) => Some(source),
+            Self::OperatorConsoleBindAddress { source } => Some(source),
+            Self::OperatorConsoleDeadmanTick { source } => Some(source),
             Self::AbsolutePath { source, .. } => Some(source),
             Self::ArtifactBindings(source) => Some(source),
             Self::Eye(source) => Some(source),
-            Self::Head(source) => Some(source),
+            Self::HeadProbe(source) => Some(source),
+            Self::HeadReturn(source) => Some(source),
             Self::RgbSamplingGeometry(source) => Some(source),
             Self::RgbActiveFraction(source) | Self::RgbBrightness(source) => Some(source),
             Self::RgbMotionThreshold(source) => Some(source),
@@ -1126,16 +1449,30 @@ impl std::error::Error for NanoAgentPolicyConfigParseError {
             | Self::ModeAuthorityLease { source, .. }
             | Self::ManualCommandAge { source }
             | Self::ManualDeadman { source }
-            | Self::ExploreRuntime { source } => Some(source),
+            | Self::PointGoalRuntime { source }
+            | Self::ExploreRuntime { source }
+            | Self::ExploreYawScanDuration { source } => Some(source),
             Self::RgbFrameFreshnessDomain(source) => Some(source),
             Self::SupervisorTimeDomain { source, .. }
             | Self::ModeAuthorityLeaseTimeDomain { source, .. } => Some(source),
             Self::SupervisorConfig(source) => Some(source),
             Self::ManualDrive(source) => Some(source),
             Self::ExploreBoundary { source } => Some(source),
+            Self::ExploreResources(source) => Some(source),
+            Self::ExploreYawScanBudget(source) => Some(source),
             Self::InputTooLarge { .. }
             | Self::UnsupportedSchemaVersion { .. }
+            | Self::OperatorConsoleBindAddressNotLoopback { .. }
+            | Self::OperatorConsoleBindPortZero { .. }
+            | Self::OperatorConsoleManualCommandZero { .. }
+            | Self::OperatorConsoleManualCommandOutsideEnvelope { .. }
+            | Self::OperatorConsoleCapabilityPathCollidesWithControlSocket
+            | Self::OperatorConsoleCapabilityPathOutsideControlSocketParent
             | Self::WarmStartPathRoleCollision
+            | Self::ReviewedNaturalHeadTargetMismatch { .. }
+            | Self::ReviewedNaturalHoldEnvelopeOutsideStartupWindow { .. }
+            | Self::ReviewedNaturalHeadStartBoundsMismatch { .. }
+            | Self::ReviewedNaturalHeadTorqueMismatch { .. }
             | Self::DuplicateAccessorySerialPath
             | Self::RgbExpressionRequiresEye
             | Self::UnsupportedRgbGazeGeometrySchemaVersion { .. }
@@ -1143,13 +1480,16 @@ impl std::error::Error for NanoAgentPolicyConfigParseError {
             | Self::RgbFreshnessDoesNotCoverEyeRoundTrip { .. }
             | Self::ModeAuthorityLeaseExceedsSupervisor { .. }
             | Self::MotionPolicyRequiresActuationFeature { .. }
-            | Self::ExploreGoalCount { .. } => None,
+            | Self::GoalArrivalTolerance { .. }
+            | Self::ExploreGoalCount { .. }
+            | Self::ExploreGridCellLimit { .. } => None,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NanoAgentPathField {
+    OperatorConsoleCapability,
     Manifest,
     ArtifactRoot,
     MapSaveSnapshot,
@@ -1206,6 +1546,23 @@ impl fmt::Display for NanoBoundedMillisecondsError {
 
 impl std::error::Error for NanoBoundedMillisecondsError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NanoOperatorConsoleDeadmanTickError {
+    OutsideInclusiveRange {
+        actual_ms: u64,
+        minimum_ms: u64,
+        maximum_ms: u64,
+    },
+}
+
+impl fmt::Display for NanoOperatorConsoleDeadmanTickError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid operator-console deadman tick: {self:?}")
+    }
+}
+
+impl std::error::Error for NanoOperatorConsoleDeadmanTickError {}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NanoExploreBoundaryError {
     NonFinite {
@@ -1252,14 +1609,91 @@ fn parse_control(
         Duration::from_millis(dto.read_timeout_ms),
         Duration::from_millis(dto.write_timeout_ms),
         Duration::from_millis(dto.runtime_response_timeout_ms),
+        Duration::from_millis(dto.terminal_response_timeout_ms),
     )
     .map_err(NanoAgentPolicyConfigParseError::ControlSocketTimeout)?;
     let runtime_queue_capacity =
         AgentControlRuntimeQueueCapacity::try_new(usize::from(dto.runtime_queue_capacity))
             .map_err(NanoAgentPolicyConfigParseError::ControlRuntimeQueue)?;
+    let operator_console = parse_operator_console(dto.operator_console, &path)?;
     Ok(NanoAgentControlConfig {
         socket: AgentControlSocketConfig::new(path, timeouts),
         runtime_queue_capacity,
+        operator_console,
+    })
+}
+
+fn parse_operator_console(
+    dto: NanoOperatorConsoleConfigDto,
+    control_socket_path: &AgentControlSocketPath,
+) -> Result<NanoOperatorConsoleConfig, NanoAgentPolicyConfigParseError> {
+    let bind_address = dto
+        .bind_address
+        .parse::<SocketAddr>()
+        .map_err(|source| NanoAgentPolicyConfigParseError::OperatorConsoleBindAddress { source })?;
+    if !bind_address.ip().is_loopback() {
+        return Err(
+            NanoAgentPolicyConfigParseError::OperatorConsoleBindAddressNotLoopback {
+                actual: bind_address,
+            },
+        );
+    }
+    if bind_address.port() == 0 {
+        return Err(
+            NanoAgentPolicyConfigParseError::OperatorConsoleBindPortZero {
+                actual: bind_address,
+            },
+        );
+    }
+
+    let capability_path = parse_absolute_path(
+        NanoAgentPathField::OperatorConsoleCapability,
+        dto.capability_path,
+        MAX_NANO_OPERATOR_CONSOLE_CAPABILITY_PATH_BYTES,
+    )?;
+    if capability_path.as_path() == control_socket_path.as_path() {
+        return Err(
+            NanoAgentPolicyConfigParseError::OperatorConsoleCapabilityPathCollidesWithControlSocket,
+        );
+    }
+    if capability_path.as_path().parent() != control_socket_path.as_path().parent() {
+        return Err(
+            NanoAgentPolicyConfigParseError::OperatorConsoleCapabilityPathOutsideControlSocketParent,
+        );
+    }
+
+    if !(MIN_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS..=MAX_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS)
+        .contains(&dto.deadman_tick_ms)
+    {
+        return Err(
+            NanoAgentPolicyConfigParseError::OperatorConsoleDeadmanTick {
+                source: NanoOperatorConsoleDeadmanTickError::OutsideInclusiveRange {
+                    actual_ms: dto.deadman_tick_ms,
+                    minimum_ms: MIN_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS,
+                    maximum_ms: MAX_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS,
+                },
+            },
+        );
+    }
+    let manual_command_forward_mm_per_s = NonZeroU32::new(dto.manual_command_forward_mm_per_s)
+        .ok_or(
+            NanoAgentPolicyConfigParseError::OperatorConsoleManualCommandZero {
+                field: "control.operator_console.manual_command_forward_mm_per_s",
+            },
+        )?;
+    let manual_command_yaw_millirad_per_s = NonZeroU32::new(dto.manual_command_yaw_millirad_per_s)
+        .ok_or(
+            NanoAgentPolicyConfigParseError::OperatorConsoleManualCommandZero {
+                field: "control.operator_console.manual_command_yaw_millirad_per_s",
+            },
+        )?;
+
+    Ok(NanoOperatorConsoleConfig {
+        bind_address,
+        capability_path,
+        deadman_tick: Duration::from_millis(dto.deadman_tick_ms),
+        manual_command_forward_mm_per_s,
+        manual_command_yaw_millirad_per_s,
     })
 }
 
@@ -1375,7 +1809,7 @@ fn parse_head(
 ) -> Result<ParsedNanoHeadPolicy, NanoAgentPolicyConfigParseError> {
     match dto {
         NanoHeadPolicyDto::Disabled => Ok(ParsedNanoHeadPolicy::Disabled),
-        NanoHeadPolicyDto::NaturalHold {
+        NanoHeadPolicyDto::ReturnToNaturalAndHoldContinuously {
             device_path,
             response_timeout_ms,
             write_timeout_ms,
@@ -1384,28 +1818,101 @@ fn parse_head(
             noise_budget_bytes,
             redundant_read_tolerance_ticks,
             readback_tolerance_ticks,
+            final_target_tolerance_ticks,
+            path_corridor_tolerance_ticks,
+            direction_regression_tolerance_ticks,
             goal_speed_ticks_per_second,
             torque_limit_permille,
-            physical_torque_consent: NanoPhysicalTorqueConsentDto::NaturalHoldAtObservedPose,
-        } => HeadRuntimeConfig::parse(HeadRuntimeConfigInput {
-            device_path,
-            response_timeout_ms,
-            write_timeout_ms,
-            arming_freshness_ms,
-            write_attempts,
-            noise_budget_bytes,
-            redundant_read_tolerance_ticks,
-            readback_tolerance_ticks,
-            goal_speed_ticks_per_second,
-            torque_limit_permille,
-        })
-        .map(|runtime| {
-            ParsedNanoHeadPolicy::NaturalHold(NanoNaturalHeadHoldConfig {
-                runtime,
-                torque_consent: PhysicalTorqueEnableConsent::explicitly_granted(),
+            minimum_start_ticks,
+            maximum_start_ticks,
+            reviewed_natural_target_ticks,
+            maximum_travel_ticks,
+            physical_torque_consent:
+                NanoPhysicalTorqueConsentDto::EnableForReviewedNaturalReturnAndHold,
+            physical_motion_consent: NanoPhysicalHeadMotionConsentDto::ReturnToReviewedNaturalTarget,
+        } => {
+            let probe = HeadProbeConfig::parse(HeadProbeConfigInput {
+                device_path,
+                response_timeout_ms,
+                request_timeout_ms: write_timeout_ms,
+                noise_budget_bytes,
             })
-        })
-        .map_err(NanoAgentPolicyConfigParseError::Head),
+            .map_err(NanoAgentPolicyConfigParseError::HeadProbe)?;
+            let return_to_target = ReturnToTargetConfig::parse(
+                &probe,
+                ReturnToTargetConfigInput {
+                    write_timeout_ms,
+                    arming_freshness_ms,
+                    write_attempts,
+                    redundant_read_tolerance_ticks,
+                    readback_tolerance_ticks,
+                    final_target_tolerance_ticks,
+                    path_corridor_tolerance_ticks,
+                    direction_regression_tolerance_ticks,
+                    goal_speed_ticks_per_second,
+                    torque_limit_permille,
+                    minimum_start_ticks,
+                    maximum_start_ticks,
+                    target_ticks: reviewed_natural_target_ticks,
+                    maximum_travel_ticks,
+                },
+            )
+            .map_err(NanoAgentPolicyConfigParseError::HeadReturn)?;
+            if reviewed_natural_target_ticks != KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS {
+                return Err(
+                    NanoAgentPolicyConfigParseError::ReviewedNaturalHeadTargetMismatch {
+                        configured_ticks: reviewed_natural_target_ticks,
+                        required_ticks: KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS,
+                    },
+                );
+            }
+            for joint in HeadJoint::ALL {
+                let index = joint as usize;
+                let target = reviewed_natural_target_ticks[index];
+                let required_minimum_ticks = target.saturating_sub(readback_tolerance_ticks);
+                let required_maximum_ticks = target.saturating_add(readback_tolerance_ticks);
+                if minimum_start_ticks[index] > required_minimum_ticks
+                    || maximum_start_ticks[index] < required_maximum_ticks
+                {
+                    return Err(
+                        NanoAgentPolicyConfigParseError::ReviewedNaturalHoldEnvelopeOutsideStartupWindow {
+                            joint,
+                            configured_minimum_ticks: minimum_start_ticks[index],
+                            configured_maximum_ticks: maximum_start_ticks[index],
+                            required_minimum_ticks,
+                            required_maximum_ticks,
+                        },
+                    );
+                }
+            }
+            if minimum_start_ticks != KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS
+                || maximum_start_ticks != KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS
+            {
+                return Err(
+                    NanoAgentPolicyConfigParseError::ReviewedNaturalHeadStartBoundsMismatch {
+                        configured_minimum_ticks: minimum_start_ticks,
+                        configured_maximum_ticks: maximum_start_ticks,
+                        required_minimum_ticks: KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS,
+                        required_maximum_ticks: KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS,
+                    },
+                );
+            }
+            if torque_limit_permille != KIKO_REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE {
+                return Err(
+                    NanoAgentPolicyConfigParseError::ReviewedNaturalHeadTorqueMismatch {
+                        configured_permille: torque_limit_permille,
+                        required_permille: KIKO_REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE,
+                    },
+                );
+            }
+            Ok(ParsedNanoHeadPolicy::ReturnToNaturalAndHoldContinuously(
+                NanoContinuousNaturalHeadHoldConfig {
+                    return_to_target,
+                    torque_consent: PhysicalTorqueEnableConsent::explicitly_granted(),
+                    motion_consent: PhysicalHeadMotionConsent::explicitly_granted(),
+                },
+            ))
+        }
     }
 }
 
@@ -1548,6 +2055,16 @@ fn parse_live_mode_policy(
             boundary_maximum_y_m,
             maximum_runtime_ms,
             maximum_frontier_goals,
+            arrival_tolerance_m,
+            clearance_from_known_obstacles_m,
+            maximum_grid_cells,
+            maximum_expanded_cells,
+            maximum_open_set_entries,
+            maximum_abs_yaw_rate_rad_s,
+            yaw_travel_limit_exclusive_rad,
+            maximum_scan_origin_displacement_m,
+            maximum_scan_duration_ms,
+            yaw_turn_direction,
         } => {
             if !cfg!(feature = "actuation") {
                 return Err(
@@ -1580,11 +2097,45 @@ fn parse_live_mode_policy(
                     maximum: MAX_NANO_AGENT_EXPLORE_GOALS,
                 });
             };
+            let arrival_tolerance_m = parse_goal_arrival_tolerance(
+                NanoConfiguredMotionMode::FrontierExplore,
+                arrival_tolerance_m,
+            )?;
+            let maximum_grid_cells = maximum_grid_cells as usize;
+            if maximum_grid_cells > MAX_NANO_OCCUPANCY_CELLS {
+                return Err(NanoAgentPolicyConfigParseError::ExploreGridCellLimit {
+                    actual: maximum_grid_cells,
+                    maximum: MAX_NANO_OCCUPANCY_CELLS,
+                });
+            }
+            let explorer = FrontierExplorerConfig::try_new(
+                clearance_from_known_obstacles_m,
+                maximum_grid_cells,
+                maximum_expanded_cells as usize,
+                maximum_open_set_entries as usize,
+            )
+            .map_err(NanoAgentPolicyConfigParseError::ExploreResources)?;
+            let maximum_scan_duration_ns = parse_bounded_milliseconds(
+                maximum_scan_duration_ms,
+                MAX_NANO_AGENT_EXPLORE_RUNTIME_MS,
+            )
+            .map_err(|source| NanoAgentPolicyConfigParseError::ExploreYawScanDuration { source })?;
+            let yaw_scan_budget = FrontierYawScanBudgetV1::try_new(
+                maximum_abs_yaw_rate_rad_s,
+                yaw_travel_limit_exclusive_rad,
+                maximum_scan_origin_displacement_m,
+                maximum_scan_duration_ns,
+            )
+            .map_err(NanoAgentPolicyConfigParseError::ExploreYawScanBudget)?;
             NanoFrontierExplorePolicy::ControlApi(NanoFrontierExploreConfig {
                 authority_lease,
                 boundary_m,
                 maximum_runtime: Duration::from_nanos(maximum_runtime_ns),
                 maximum_frontier_goals,
+                arrival_tolerance_m,
+                explorer,
+                yaw_scan_budget,
+                yaw_turn_direction: yaw_turn_direction.into_domain(),
             })
         }
     };
@@ -1652,16 +2203,40 @@ fn parse_motion_mode_policy(
 ) -> Result<NanoMotionModePolicy, NanoAgentPolicyConfigParseError> {
     match dto {
         NanoMotionModePolicyDto::Disabled => Ok(NanoMotionModePolicy::Disabled),
-        NanoMotionModePolicyDto::ControlApi { authority_lease_ms } => {
+        NanoMotionModePolicyDto::ControlApi {
+            authority_lease_ms,
+            maximum_runtime_ms,
+            arrival_tolerance_m,
+        } => {
             if !cfg!(feature = "actuation") {
                 return Err(
                     NanoAgentPolicyConfigParseError::MotionPolicyRequiresActuationFeature { mode },
                 );
             }
-            parse_mode_authority_lease(mode, authority_lease_ms, supervisor)
-                .map(|authority_lease| NanoMotionModePolicy::ControlApi { authority_lease })
+            let authority_lease = parse_mode_authority_lease(mode, authority_lease_ms, supervisor)?;
+            let maximum_runtime_ns = parse_bounded_milliseconds(
+                maximum_runtime_ms,
+                MAX_NANO_AGENT_POINT_GOAL_RUNTIME_MS,
+            )
+            .map_err(|source| NanoAgentPolicyConfigParseError::PointGoalRuntime { source })?;
+            let arrival_tolerance_m = parse_goal_arrival_tolerance(mode, arrival_tolerance_m)?;
+            Ok(NanoMotionModePolicy::ControlApi {
+                authority_lease,
+                maximum_runtime: Duration::from_nanos(maximum_runtime_ns),
+                arrival_tolerance_m,
+            })
         }
     }
+}
+
+fn parse_goal_arrival_tolerance(
+    mode: NanoConfiguredMotionMode,
+    value_m: f64,
+) -> Result<f64, NanoAgentPolicyConfigParseError> {
+    if !value_m.is_finite() || value_m <= 0.0 {
+        return Err(NanoAgentPolicyConfigParseError::GoalArrivalTolerance { mode, value_m });
+    }
+    Ok(value_m)
 }
 
 fn parse_mode_authority_lease(
@@ -1750,7 +2325,7 @@ fn parse_bounded_milliseconds(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoAgentPolicyConfigV1Dto {
+struct NanoAgentPolicyConfigV3Dto {
     schema_version: u32,
     control: NanoAgentControlConfigDto,
     inventory: NanoAgentInventoryConfigDto,
@@ -1769,7 +2344,19 @@ struct NanoAgentControlConfigDto {
     read_timeout_ms: u64,
     write_timeout_ms: u64,
     runtime_response_timeout_ms: u64,
+    terminal_response_timeout_ms: u64,
     runtime_queue_capacity: u16,
+    operator_console: NanoOperatorConsoleConfigDto,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NanoOperatorConsoleConfigDto {
+    bind_address: String,
+    capability_path: String,
+    deadman_tick_ms: u64,
+    manual_command_forward_mm_per_s: u32,
+    manual_command_yaw_millirad_per_s: u32,
 }
 
 #[derive(Deserialize)]
@@ -1843,7 +2430,7 @@ enum NanoEyePolicyDto {
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 enum NanoHeadPolicyDto {
     Disabled,
-    NaturalHold {
+    ReturnToNaturalAndHoldContinuously {
         device_path: String,
         response_timeout_ms: u64,
         write_timeout_ms: u64,
@@ -1852,16 +2439,30 @@ enum NanoHeadPolicyDto {
         noise_budget_bytes: u16,
         redundant_read_tolerance_ticks: u16,
         readback_tolerance_ticks: u16,
+        final_target_tolerance_ticks: u16,
+        path_corridor_tolerance_ticks: u16,
+        direction_regression_tolerance_ticks: u16,
         goal_speed_ticks_per_second: u16,
         torque_limit_permille: [u16; 4],
+        minimum_start_ticks: [u16; 4],
+        maximum_start_ticks: [u16; 4],
+        reviewed_natural_target_ticks: [u16; 4],
+        maximum_travel_ticks: [u16; 4],
         physical_torque_consent: NanoPhysicalTorqueConsentDto,
+        physical_motion_consent: NanoPhysicalHeadMotionConsentDto,
     },
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum NanoPhysicalTorqueConsentDto {
-    NaturalHoldAtObservedPose,
+    EnableForReviewedNaturalReturnAndHold,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NanoPhysicalHeadMotionConsentDto {
+    ReturnToReviewedNaturalTarget,
 }
 
 #[derive(Deserialize)]
@@ -1940,7 +2541,27 @@ enum NanoAgentStartupModeDto {
 #[serde(tag = "permission", rename_all = "snake_case", deny_unknown_fields)]
 enum NanoMotionModePolicyDto {
     Disabled,
-    ControlApi { authority_lease_ms: u64 },
+    ControlApi {
+        authority_lease_ms: u64,
+        maximum_runtime_ms: u64,
+        arrival_tolerance_m: f64,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NanoFrontierYawTurnDirectionDto {
+    CounterClockwise,
+    Clockwise,
+}
+
+impl NanoFrontierYawTurnDirectionDto {
+    const fn into_domain(self) -> FrontierYawTurnDirectionV1 {
+        match self {
+            Self::CounterClockwise => FrontierYawTurnDirectionV1::CounterClockwise,
+            Self::Clockwise => FrontierYawTurnDirectionV1::Clockwise,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1955,6 +2576,16 @@ enum NanoFrontierExplorePolicyDto {
         boundary_maximum_y_m: f64,
         maximum_runtime_ms: u64,
         maximum_frontier_goals: u32,
+        arrival_tolerance_m: f64,
+        clearance_from_known_obstacles_m: f64,
+        maximum_grid_cells: u32,
+        maximum_expanded_cells: u32,
+        maximum_open_set_entries: u32,
+        maximum_abs_yaw_rate_rad_s: f64,
+        yaw_travel_limit_exclusive_rad: f64,
+        maximum_scan_origin_displacement_m: f64,
+        maximum_scan_duration_ms: u64,
+        yaw_turn_direction: NanoFrontierYawTurnDirectionDto,
     },
 }
 
@@ -2008,13 +2639,21 @@ mod tests {
 
     fn valid_value() -> Value {
         let value = json!({
-            "schema_version": NANO_AGENT_POLICY_CONFIG_V1,
+            "schema_version": NANO_AGENT_POLICY_CONFIG_V3,
             "control": {
                 "socket_path": "/tmp/kiko-agent/control.sock",
                 "read_timeout_ms": 100,
                 "write_timeout_ms": 100,
                 "runtime_response_timeout_ms": 500,
-                "runtime_queue_capacity": 8
+                "terminal_response_timeout_ms": 300000,
+                "runtime_queue_capacity": 8,
+                "operator_console": {
+                    "bind_address": "127.0.0.1:9877",
+                    "capability_path": "/tmp/kiko-agent/operator-console.capability",
+                    "deadman_tick_ms": 20,
+                    "manual_command_forward_mm_per_s": 100,
+                    "manual_command_yaw_millirad_per_s": 500
+                }
             },
             "inventory": {
                 "manifest_path": "/opt/kiko/config/device-manifest.json",
@@ -2054,7 +2693,7 @@ mod tests {
                 "intent_lease_ms": 100
             },
             "head": {
-                "mode": "natural_hold",
+                "mode": "return_to_natural_and_hold_continuously",
                 "device_path": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14031114-if00",
                 "response_timeout_ms": 100,
                 "write_timeout_ms": 100,
@@ -2063,9 +2702,17 @@ mod tests {
                 "noise_budget_bytes": 32,
                 "redundant_read_tolerance_ticks": 10,
                 "readback_tolerance_ticks": 20,
-                "goal_speed_ticks_per_second": 100,
+                "final_target_tolerance_ticks": 20,
+                "path_corridor_tolerance_ticks": 20,
+                "direction_regression_tolerance_ticks": 20,
+                "goal_speed_ticks_per_second": 50,
                 "torque_limit_permille": [600, 400, 400, 400],
-                "physical_torque_consent": "natural_hold_at_observed_pose"
+                "minimum_start_ticks": [2135, 2525, 2842, 2856],
+                "maximum_start_ticks": [2227, 2592, 2963, 2922],
+                "reviewed_natural_target_ticks": [2155, 2545, 2943, 2876],
+                "maximum_travel_ticks": [80, 64, 128, 64],
+                "physical_torque_consent": "enable_for_reviewed_natural_return_and_hold",
+                "physical_motion_consent": "return_to_reviewed_natural_target"
             },
             "rgb_expression": {
                 "mode": "scene_motion",
@@ -2099,7 +2746,9 @@ mod tests {
                 },
                 "point_goal": {
                     "permission": "control_api",
-                    "authority_lease_ms": 1000
+                    "authority_lease_ms": 1000,
+                    "maximum_runtime_ms": 600000,
+                    "arrival_tolerance_m": 0.1
                 },
                 "frontier_explore": {
                     "permission": "control_api",
@@ -2109,7 +2758,17 @@ mod tests {
                     "boundary_maximum_x_m": 20.0,
                     "boundary_maximum_y_m": 10.0,
                     "maximum_runtime_ms": 600000,
-                    "maximum_frontier_goals": 100
+                    "maximum_frontier_goals": 100,
+                    "arrival_tolerance_m": 0.1,
+                    "clearance_from_known_obstacles_m": 0.2,
+                    "maximum_grid_cells": 4000000,
+                    "maximum_expanded_cells": 4000000,
+                    "maximum_open_set_entries": 32000000,
+                    "maximum_abs_yaw_rate_rad_s": 1.0,
+                    "yaw_travel_limit_exclusive_rad": std::f64::consts::TAU,
+                    "maximum_scan_origin_displacement_m": 0.05,
+                    "maximum_scan_duration_ms": 1000,
+                    "yaw_turn_direction": "clockwise"
                 }
             }
         });
@@ -2184,8 +2843,8 @@ mod tests {
         .into_manifest()
     }
 
-    fn parse(value: &Value) -> Result<NanoAgentPolicyConfigV1, NanoAgentPolicyConfigParseError> {
-        NanoAgentPolicyConfigV1::parse_json(
+    fn parse(value: &Value) -> Result<NanoAgentPolicyConfigV3, NanoAgentPolicyConfigParseError> {
+        NanoAgentPolicyConfigV3::parse_json(
             &serde_json::to_vec(value).expect("serialize test fixture"),
         )
     }
@@ -2194,6 +2853,46 @@ mod tests {
     fn valid_document_constructs_native_runtime_domains() {
         let parsed = parse(&valid_value()).expect("valid Nano agent config");
         assert_eq!(parsed.control().runtime_queue_capacity().get(), 8);
+        assert_eq!(
+            parsed.control().socket().timeouts().runtime_response(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            parsed.control().socket().timeouts().terminal_response(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            parsed.control().operator_console().bind_address(),
+            "127.0.0.1:9877"
+                .parse::<SocketAddr>()
+                .expect("test address")
+        );
+        assert_eq!(
+            parsed
+                .control()
+                .operator_console()
+                .capability_path()
+                .as_path(),
+            Path::new("/tmp/kiko-agent/operator-console.capability")
+        );
+        assert_eq!(
+            parsed.control().operator_console().deadman_tick(),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            parsed
+                .control()
+                .operator_console()
+                .manual_command_forward_velocity_mps(),
+            0.1
+        );
+        assert_eq!(
+            parsed
+                .control()
+                .operator_console()
+                .manual_command_yaw_rate_rad_s(),
+            0.5
+        );
         assert_eq!(parsed.inventory().artifact_bindings().len(), 2);
         assert!(parsed.eye_enabled());
         assert!(parsed.head_enabled());
@@ -2230,7 +2929,303 @@ mod tests {
             assert_eq!(manual.drive().maximum_abs_yaw_rate_rad_s(), 1.0);
             assert_eq!(manual.drive().maximum_command_age_ns(), 100_000_000);
             assert_eq!(manual.drive().deadman_timeout_ns(), 250_000_000);
+
+            let point_goal = parsed.live_mode_policy().point_goal();
+            assert_eq!(
+                point_goal
+                    .authority_lease()
+                    .expect("point-goal authority")
+                    .as_nanos(),
+                1_000_000_000
+            );
+            assert_eq!(point_goal.maximum_runtime(), Some(Duration::from_secs(600)));
+            assert_eq!(point_goal.arrival_tolerance_m(), Some(0.1));
+
+            let frontier = parsed
+                .live_mode_policy()
+                .frontier_explore()
+                .config()
+                .expect("frontier control API policy");
+            assert_eq!(frontier.authority_lease().as_nanos(), 1_000_000_000);
+            assert_eq!(frontier.maximum_runtime(), Duration::from_secs(600));
+            assert_eq!(frontier.maximum_frontier_goals().get(), 100);
+            assert_eq!(frontier.arrival_tolerance_m(), 0.1);
+            assert_eq!(frontier.explorer().maximum_grid_cells(), 4_000_000);
+            assert_eq!(frontier.explorer().maximum_expanded_cells(), 4_000_000);
+            assert_eq!(frontier.explorer().maximum_open_set_entries(), 32_000_000);
+            assert_eq!(
+                frontier.yaw_scan_budget().maximum_duration_ns().get(),
+                1_000_000_000
+            );
+            assert_eq!(
+                frontier.yaw_turn_direction(),
+                FrontierYawTurnDirectionV1::Clockwise
+            );
         }
+    }
+
+    #[test]
+    fn operator_console_requires_one_complete_unknown_field_free_object() {
+        let mut missing_object = valid_value();
+        missing_object["control"]
+            .as_object_mut()
+            .expect("control object")
+            .remove("operator_console");
+        assert!(matches!(
+            parse(&missing_object),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+
+        for required_field in [
+            "bind_address",
+            "capability_path",
+            "deadman_tick_ms",
+            "manual_command_forward_mm_per_s",
+            "manual_command_yaw_millirad_per_s",
+        ] {
+            let mut missing_field = valid_value();
+            missing_field["control"]["operator_console"]
+                .as_object_mut()
+                .expect("operator-console object")
+                .remove(required_field);
+            assert!(
+                matches!(
+                    parse(&missing_field),
+                    Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+                ),
+                "accepted missing operator-console field {required_field}"
+            );
+        }
+
+        let mut unknown = valid_value();
+        unknown["control"]["operator_console"]
+            .as_object_mut()
+            .expect("operator-console object")
+            .insert("allow_remote".to_owned(), json!(false));
+        assert!(matches!(
+            parse(&unknown),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+    }
+
+    #[test]
+    fn operator_console_admits_only_explicit_stable_loopback_addresses() {
+        for address in ["127.0.0.1:1", "127.255.255.254:65535", "[::1]:9877"] {
+            let mut value = valid_value();
+            value["control"]["operator_console"]["bind_address"] = json!(address);
+            assert_eq!(
+                parse(&value)
+                    .expect("loopback address")
+                    .control()
+                    .operator_console()
+                    .bind_address(),
+                address.parse::<SocketAddr>().expect("fixture address")
+            );
+        }
+
+        for address in ["0.0.0.0:9877", "192.0.2.1:9877", "[::]:9877"] {
+            let mut value = valid_value();
+            value["control"]["operator_console"]["bind_address"] = json!(address);
+            assert!(matches!(
+                parse(&value),
+                Err(NanoAgentPolicyConfigParseError::OperatorConsoleBindAddressNotLoopback { .. })
+            ));
+        }
+
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let mut value = valid_value();
+            value["control"]["operator_console"]["bind_address"] = json!(address);
+            assert!(matches!(
+                parse(&value),
+                Err(NanoAgentPolicyConfigParseError::OperatorConsoleBindPortZero { .. })
+            ));
+        }
+
+        let mut hostname = valid_value();
+        hostname["control"]["operator_console"]["bind_address"] = json!("localhost:9877");
+        assert!(matches!(
+            parse(&hostname),
+            Err(NanoAgentPolicyConfigParseError::OperatorConsoleBindAddress { .. })
+        ));
+    }
+
+    #[test]
+    fn operator_console_capability_is_canonical_and_shares_the_control_parent() {
+        for invalid in [
+            "operator-console.capability",
+            "/tmp/kiko-agent/../operator-console.capability",
+            "/tmp//kiko-agent/operator-console.capability",
+            "/tmp/kiko-agent/./operator-console.capability",
+            "/",
+        ] {
+            let mut value = valid_value();
+            value["control"]["operator_console"]["capability_path"] = json!(invalid);
+            assert!(matches!(
+                parse(&value),
+                Err(NanoAgentPolicyConfigParseError::AbsolutePath {
+                    field: NanoAgentPathField::OperatorConsoleCapability,
+                    ..
+                })
+            ));
+        }
+
+        let mut other_parent = valid_value();
+        other_parent["control"]["operator_console"]["capability_path"] =
+            json!("/tmp/other/operator-console.capability");
+        assert!(matches!(
+            parse(&other_parent),
+            Err(
+                NanoAgentPolicyConfigParseError::OperatorConsoleCapabilityPathOutsideControlSocketParent
+            )
+        ));
+
+        let mut collision = valid_value();
+        collision["control"]["operator_console"]["capability_path"] =
+            collision["control"]["socket_path"].clone();
+        assert!(matches!(
+            parse(&collision),
+            Err(
+                NanoAgentPolicyConfigParseError::OperatorConsoleCapabilityPathCollidesWithControlSocket
+            )
+        ));
+    }
+
+    #[test]
+    fn operator_console_deadman_tick_is_exact_integer_milliseconds_in_range() {
+        for milliseconds in [
+            MIN_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS,
+            MAX_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS,
+        ] {
+            let mut value = valid_value();
+            value["control"]["operator_console"]["deadman_tick_ms"] = json!(milliseconds);
+            assert_eq!(
+                parse(&value)
+                    .expect("boundary tick")
+                    .control()
+                    .operator_console()
+                    .deadman_tick(),
+                Duration::from_millis(milliseconds)
+            );
+        }
+
+        for milliseconds in [
+            MIN_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS - 1,
+            MAX_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS + 1,
+        ] {
+            let mut value = valid_value();
+            value["control"]["operator_console"]["deadman_tick_ms"] = json!(milliseconds);
+            assert!(matches!(
+                parse(&value),
+                Err(NanoAgentPolicyConfigParseError::OperatorConsoleDeadmanTick {
+                    source:
+                        NanoOperatorConsoleDeadmanTickError::OutsideInclusiveRange {
+                            actual_ms,
+                            minimum_ms: MIN_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS,
+                            maximum_ms: MAX_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS,
+                        },
+                }) if actual_ms == milliseconds
+            ));
+        }
+
+        let mut fractional = valid_value();
+        fractional["control"]["operator_console"]["deadman_tick_ms"] = json!(5.5);
+        assert!(matches!(
+            parse(&fractional),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+    }
+
+    #[cfg(feature = "actuation")]
+    #[test]
+    fn operator_console_manual_step_is_nonzero_and_inside_the_manual_envelope() {
+        for field in [
+            "manual_command_forward_mm_per_s",
+            "manual_command_yaw_millirad_per_s",
+        ] {
+            let mut zero = valid_value();
+            zero["control"]["operator_console"][field] = json!(0);
+            assert!(matches!(
+                parse(&zero),
+                Err(NanoAgentPolicyConfigParseError::OperatorConsoleManualCommandZero {
+                    field: actual,
+                }) if actual.ends_with(field)
+            ));
+        }
+
+        let mut excessive_forward = valid_value();
+        excessive_forward["control"]["operator_console"]["manual_command_forward_mm_per_s"] =
+            json!(351);
+        assert!(matches!(
+            parse(&excessive_forward),
+            Err(
+                NanoAgentPolicyConfigParseError::OperatorConsoleManualCommandOutsideEnvelope {
+                    requested_forward_velocity_mps,
+                    maximum_forward_velocity_mps: 0.35,
+                    ..
+                }
+            ) if (requested_forward_velocity_mps - 0.351).abs() < f64::EPSILON
+        ));
+
+        let mut excessive_yaw = valid_value();
+        excessive_yaw["control"]["operator_console"]["manual_command_yaw_millirad_per_s"] =
+            json!(1_001);
+        assert!(matches!(
+            parse(&excessive_yaw),
+            Err(
+                NanoAgentPolicyConfigParseError::OperatorConsoleManualCommandOutsideEnvelope {
+                    requested_yaw_rate_rad_s,
+                    maximum_yaw_rate_rad_s: 1.0,
+                    ..
+                }
+            ) if (requested_yaw_rate_rad_s - 1.001).abs() < f64::EPSILON
+        ));
+    }
+
+    #[test]
+    fn earlier_policy_versions_are_not_reinterpreted_as_schema_v3() {
+        let mut retired_v1 = valid_value();
+        retired_v1["schema_version"] = json!(1);
+        assert!(matches!(
+            parse(&retired_v1),
+            Err(NanoAgentPolicyConfigParseError::UnsupportedSchemaVersion {
+                actual: 1,
+                supported: NANO_AGENT_POLICY_CONFIG_V3,
+            })
+        ));
+
+        let mut retired_v2 = valid_value();
+        retired_v2["schema_version"] = json!(2);
+        assert!(matches!(
+            parse(&retired_v2),
+            Err(NanoAgentPolicyConfigParseError::UnsupportedSchemaVersion {
+                actual: 2,
+                supported: NANO_AGENT_POLICY_CONFIG_V3,
+            })
+        ));
+    }
+
+    #[test]
+    fn retired_version_one_observed_pose_hold_document_is_rejected() {
+        let mut retired_v1 = valid_value();
+        retired_v1["schema_version"] = json!(1);
+        retired_v1["head"] = json!({
+            "mode": "natural_hold",
+            "device_path": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14031114-if00",
+            "response_timeout_ms": 100,
+            "write_timeout_ms": 100,
+            "arming_freshness_ms": 250,
+            "write_attempts": 2,
+            "noise_budget_bytes": 32,
+            "redundant_read_tolerance_ticks": 10,
+            "readback_tolerance_ticks": 20,
+            "goal_speed_ticks_per_second": 50,
+            "torque_limit_permille": [100, 100, 100, 100],
+            "physical_torque_consent": "natural_hold_at_observed_pose"
+        });
+        assert!(matches!(
+            parse(&retired_v1),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
     }
 
     #[test]
@@ -2309,7 +3304,10 @@ mod tests {
             eye.device().path(),
             "/dev/serial/by-id/usb-kiko_kiko-eyes_1-if00"
         );
-        let head = bound.head().natural_hold().expect("bound head runtime");
+        let head = bound
+            .head()
+            .return_to_natural_and_hold_continuously()
+            .expect("bound head return");
         assert_eq!(
             head.runtime().device().path(),
             "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14031114-if00"
@@ -2317,6 +3315,195 @@ mod tests {
         assert_eq!(
             head.torque_consent(),
             PhysicalTorqueEnableConsent::explicitly_granted()
+        );
+        assert_eq!(
+            head.motion_consent(),
+            PhysicalHeadMotionConsent::explicitly_granted()
+        );
+        assert_eq!(
+            head.required_hold_target(),
+            HeadHoldTarget::ReviewedReturn(head.return_config().target())
+        );
+        assert_eq!(
+            head.return_config()
+                .target()
+                .positions()
+                .map(|tick| tick.get()),
+            KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS
+        );
+        assert_eq!(
+            head.return_config()
+                .start_bounds()
+                .minimum(HeadJoint::Bow)
+                .get(),
+            2_135
+        );
+        assert_eq!(
+            head.return_config()
+                .start_bounds()
+                .maximum(HeadJoint::Roll)
+                .get(),
+            2_922
+        );
+        let configured_minimums =
+            HeadJoint::ALL.map(|joint| head.return_config().start_bounds().minimum(joint).get());
+        let configured_maximums =
+            HeadJoint::ALL.map(|joint| head.return_config().start_bounds().maximum(joint).get());
+        assert_eq!(
+            configured_minimums,
+            KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS
+        );
+        assert_eq!(
+            configured_maximums,
+            KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS
+        );
+        for (index, target) in KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS
+            .into_iter()
+            .enumerate()
+        {
+            assert!(configured_minimums[index] <= target.saturating_sub(20));
+            assert!(configured_maximums[index] >= target.saturating_add(20));
+        }
+        for (index, observed) in [2_154, 2_544, 2_946, 2_873].into_iter().enumerate() {
+            assert!(configured_minimums[index] <= observed);
+            assert!(configured_maximums[index] >= observed);
+        }
+        assert_eq!(
+            HeadJoint::ALL.map(|joint| { head.runtime().torque_limits().for_joint(joint).get() }),
+            KIKO_REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE
+        );
+    }
+
+    #[test]
+    fn natural_return_requires_bounded_start_and_travel_policy() {
+        let mut missing = valid_value();
+        missing["head"]
+            .as_object_mut()
+            .expect("head object")
+            .remove("minimum_start_ticks");
+        assert!(matches!(
+            parse(&missing),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+
+        let mut descending = valid_value();
+        descending["head"]["minimum_start_ticks"] = json!([2228, 2560, 2842, 2890]);
+        descending["head"]["maximum_start_ticks"] = json!([2227, 2592, 2874, 2922]);
+        assert!(matches!(
+            parse(&descending),
+            Err(NanoAgentPolicyConfigParseError::HeadReturn(
+                ReturnToTargetConfigParseError::StartBounds(
+                    ConfiguredHeadPoseBoundsError::Descending {
+                        joint: HeadJoint::Bow,
+                        ..
+                    }
+                )
+            ))
+        ));
+
+        let mut travel_too_short = valid_value();
+        travel_too_short["head"]["maximum_travel_ticks"] = json!([71, 64, 128, 64]);
+        assert!(matches!(
+            parse(&travel_too_short),
+            Err(NanoAgentPolicyConfigParseError::HeadReturn(
+                ReturnToTargetConfigParseError::TravelAboveMaximum {
+                    joint: HeadJoint::Bow,
+                    required_ticks: 72,
+                    maximum_ticks: 71,
+                }
+            ))
+        ));
+
+        let mut excludes_reviewed_hold = valid_value();
+        excludes_reviewed_hold["head"]["minimum_start_ticks"] = json!([2136, 2525, 2842, 2856]);
+        assert!(matches!(
+            parse(&excludes_reviewed_hold),
+            Err(
+                NanoAgentPolicyConfigParseError::ReviewedNaturalHoldEnvelopeOutsideStartupWindow {
+                    joint: HeadJoint::Bow,
+                    configured_minimum_ticks: 2_136,
+                    required_minimum_ticks: 2_135,
+                    ..
+                }
+            )
+        ));
+
+        let mut silently_widened = valid_value();
+        silently_widened["head"]["minimum_start_ticks"] = json!([2134, 2525, 2842, 2856]);
+        assert!(matches!(
+            parse(&silently_widened),
+            Err(
+                NanoAgentPolicyConfigParseError::ReviewedNaturalHeadStartBoundsMismatch {
+                    configured_minimum_ticks: [2_134, 2_525, 2_842, 2_856],
+                    required_minimum_ticks: KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS,
+                    required_maximum_ticks: KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn natural_return_is_bound_to_reviewed_target_torque_and_fixed_motion_policy() {
+        let mut wrong_target = valid_value();
+        wrong_target["head"]["reviewed_natural_target_ticks"] = json!([2_156, 2_545, 2_943, 2_876]);
+        assert!(matches!(
+            parse(&wrong_target),
+            Err(
+                NanoAgentPolicyConfigParseError::ReviewedNaturalHeadTargetMismatch {
+                    configured_ticks: [2_156, 2_545, 2_943, 2_876],
+                    required_ticks: KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS,
+                }
+            )
+        ));
+
+        let mut wrong_torque = valid_value();
+        wrong_torque["head"]["torque_limit_permille"] = json!([599, 400, 400, 400]);
+        assert!(matches!(
+            parse(&wrong_torque),
+            Err(
+                NanoAgentPolicyConfigParseError::ReviewedNaturalHeadTorqueMismatch {
+                    configured_permille: [599, 400, 400, 400],
+                    required_permille: KIKO_REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE,
+                }
+            )
+        ));
+
+        for fixed_runtime_field in [
+            "position_step_ticks",
+            "control_period_ms",
+            "no_progress_timeout_ms",
+            "motion_timeout_ms",
+            "telemetry_set_max_age_ms",
+            "maximum_hold_ms",
+        ] {
+            let mut caller_supplied_constant = valid_value();
+            caller_supplied_constant["head"][fixed_runtime_field] = json!(1);
+            assert!(
+                matches!(
+                    parse(&caller_supplied_constant),
+                    Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+                ),
+                "weak policy must not override fixed runtime field {fixed_runtime_field}"
+            );
+        }
+
+        assert_eq!(kiko_head_runtime::HEAD_RETURN_POSITION_STEP_TICKS, 50);
+        assert_eq!(
+            kiko_head_runtime::HEAD_RETURN_CONTROL_PERIOD,
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            kiko_head_runtime::HEAD_RETURN_NO_PROGRESS_TIMEOUT,
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            kiko_head_runtime::HEAD_RETURN_MOTION_TIMEOUT,
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            kiko_head_runtime::HEAD_RETURN_TELEMETRY_SET_MAX_AGE,
+            Duration::from_millis(100)
         );
     }
 
@@ -2458,12 +3645,12 @@ mod tests {
     fn duplicate_unknown_missing_and_trailing_json_are_rejected() {
         let canonical = serde_json::to_string(&valid_value()).expect("fixture JSON");
         let duplicate = canonical.replacen(
-            "\"schema_version\":1",
-            "\"schema_version\":1,\"schema_version\":1",
+            "\"schema_version\":3",
+            "\"schema_version\":3,\"schema_version\":3",
             1,
         );
         assert!(matches!(
-            NanoAgentPolicyConfigV1::parse_json(duplicate.as_bytes()),
+            NanoAgentPolicyConfigV3::parse_json(duplicate.as_bytes()),
             Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
         ));
 
@@ -2487,7 +3674,7 @@ mod tests {
         let mut trailing = serde_json::to_vec(&valid_value()).expect("fixture JSON");
         trailing.extend_from_slice(b" true");
         assert!(matches!(
-            NanoAgentPolicyConfigV1::parse_json(&trailing),
+            NanoAgentPolicyConfigV3::parse_json(&trailing),
             Err(NanoAgentPolicyConfigParseError::JsonTrailingData(_))
         ));
     }
@@ -2518,7 +3705,7 @@ mod tests {
     fn input_and_all_path_classes_are_bounded_and_canonical() {
         let oversized = vec![b' '; MAX_NANO_AGENT_POLICY_CONFIG_JSON_BYTES + 1];
         assert!(matches!(
-            NanoAgentPolicyConfigV1::parse_json(&oversized),
+            NanoAgentPolicyConfigV3::parse_json(&oversized),
             Err(NanoAgentPolicyConfigParseError::InputTooLarge { .. })
         ));
 
@@ -2624,6 +3811,68 @@ mod tests {
             .remove("physical_torque_consent");
         assert!(matches!(
             parse(&missing_consent),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+
+        let mut missing_motion_consent = valid_value();
+        missing_motion_consent["head"]
+            .as_object_mut()
+            .expect("head")
+            .remove("physical_motion_consent");
+        assert!(matches!(
+            parse(&missing_motion_consent),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+
+        let mut legacy_torque_consent = valid_value();
+        legacy_torque_consent["head"]["physical_torque_consent"] =
+            json!("natural_hold_at_observed_pose");
+        assert!(matches!(
+            parse(&legacy_torque_consent),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+
+        let mut ambiguous_motion_consent = valid_value();
+        ambiguous_motion_consent["head"]["physical_motion_consent"] = json!("motion_allowed");
+        assert!(matches!(
+            parse(&ambiguous_motion_consent),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+
+        let mut legacy_observed_hold = valid_value();
+        legacy_observed_hold["head"] = json!({
+            "mode": "natural_hold",
+            "device_path": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14031114-if00",
+            "response_timeout_ms": 100,
+            "write_timeout_ms": 100,
+            "arming_freshness_ms": 250,
+            "write_attempts": 2,
+            "noise_budget_bytes": 32,
+            "redundant_read_tolerance_ticks": 10,
+            "readback_tolerance_ticks": 20,
+            "goal_speed_ticks_per_second": 50,
+            "torque_limit_permille": [600, 400, 400, 400],
+            "minimum_pose_ticks": [2140, 2530, 2920, 2850],
+            "maximum_pose_ticks": [2172, 2560, 2970, 2900],
+            "physical_torque_consent": "natural_hold_at_observed_pose"
+        });
+        assert!(matches!(
+            parse(&legacy_observed_hold),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+
+        let mut finite_hold_mode = valid_value();
+        finite_hold_mode["head"]["mode"] = json!("return_to_natural_and_hold");
+        assert!(matches!(
+            parse(&finite_hold_mode),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+
+        let mut ambiguous_legacy_bounds = valid_value();
+        ambiguous_legacy_bounds["head"]["minimum_pose_ticks"] =
+            ambiguous_legacy_bounds["head"]["minimum_start_ticks"].clone();
+        assert!(matches!(
+            parse(&ambiguous_legacy_bounds),
             Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
         ));
 
@@ -2791,7 +4040,65 @@ mod tests {
 
     #[cfg(feature = "actuation")]
     #[test]
+    fn point_goal_runtime_is_required_positive_and_bounded_without_arithmetic_wrap() {
+        let mut missing = valid_value();
+        missing["live_mode_policy"]["point_goal"]
+            .as_object_mut()
+            .expect("point-goal policy object")
+            .remove("maximum_runtime_ms");
+        assert!(matches!(
+            parse(&missing),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+
+        let mut zero = valid_value();
+        zero["live_mode_policy"]["point_goal"]["maximum_runtime_ms"] = json!(0);
+        assert!(matches!(
+            parse(&zero),
+            Err(NanoAgentPolicyConfigParseError::PointGoalRuntime {
+                source: NanoBoundedMillisecondsError::Zero,
+            })
+        ));
+
+        for invalid_ms in [MAX_NANO_AGENT_POINT_GOAL_RUNTIME_MS + 1, u64::MAX] {
+            let mut too_large = valid_value();
+            too_large["live_mode_policy"]["point_goal"]["maximum_runtime_ms"] = json!(invalid_ms);
+            assert!(matches!(
+                parse(&too_large),
+                Err(NanoAgentPolicyConfigParseError::PointGoalRuntime {
+                    source: NanoBoundedMillisecondsError::TooLarge {
+                        actual_ms,
+                        maximum_ms: MAX_NANO_AGENT_POINT_GOAL_RUNTIME_MS,
+                    },
+                }) if actual_ms == invalid_ms
+            ));
+        }
+
+        let mut exact_maximum = valid_value();
+        exact_maximum["live_mode_policy"]["point_goal"]["maximum_runtime_ms"] =
+            json!(MAX_NANO_AGENT_POINT_GOAL_RUNTIME_MS);
+        assert_eq!(
+            parse(&exact_maximum)
+                .expect("exact maximum point-goal runtime")
+                .live_mode_policy()
+                .point_goal()
+                .maximum_runtime(),
+            Some(Duration::from_millis(MAX_NANO_AGENT_POINT_GOAL_RUNTIME_MS))
+        );
+    }
+
+    #[cfg(feature = "actuation")]
+    #[test]
     fn exploration_requires_finite_ordered_bounds_and_finite_resources() {
+        for mode in ["point_goal", "frontier_explore"] {
+            let mut zero_tolerance = valid_value();
+            zero_tolerance["live_mode_policy"][mode]["arrival_tolerance_m"] = json!(0.0);
+            assert!(matches!(
+                parse(&zero_tolerance),
+                Err(NanoAgentPolicyConfigParseError::GoalArrivalTolerance { value_m: 0.0, .. })
+            ));
+        }
+
         let mut reversed = valid_value();
         reversed["live_mode_policy"]["frontier_explore"]["boundary_minimum_x_m"] = json!(20.0);
         assert!(matches!(
@@ -2814,6 +4121,51 @@ mod tests {
         assert!(matches!(
             parse(&too_long),
             Err(NanoAgentPolicyConfigParseError::ExploreRuntime { .. })
+        ));
+
+        let mut oversized_grid = valid_value();
+        oversized_grid["live_mode_policy"]["frontier_explore"]["maximum_grid_cells"] =
+            json!(MAX_NANO_OCCUPANCY_CELLS + 1);
+        assert!(matches!(
+            parse(&oversized_grid),
+            Err(NanoAgentPolicyConfigParseError::ExploreGridCellLimit {
+                actual,
+                maximum,
+            }) if actual == MAX_NANO_OCCUPANCY_CELLS + 1
+                && maximum == MAX_NANO_OCCUPANCY_CELLS
+        ));
+
+        let mut expanded_exceeds_grid = valid_value();
+        expanded_exceeds_grid["live_mode_policy"]["frontier_explore"]["maximum_expanded_cells"] =
+            json!(4_000_001);
+        assert!(matches!(
+            parse(&expanded_exceeds_grid),
+            Err(NanoAgentPolicyConfigParseError::ExploreResources(
+                FrontierExplorerConfigError::ExpandedCellsExceedGridLimit { .. }
+            ))
+        ));
+
+        let mut zero_yaw_rate = valid_value();
+        zero_yaw_rate["live_mode_policy"]["frontier_explore"]["maximum_abs_yaw_rate_rad_s"] =
+            json!(0.0);
+        assert!(matches!(
+            parse(&zero_yaw_rate),
+            Err(NanoAgentPolicyConfigParseError::ExploreYawScanBudget(
+                FrontierYawScanBudgetError::NotPositive {
+                    field: "maximum_abs_yaw_rate_rad_s",
+                    ..
+                }
+            ))
+        ));
+
+        let mut zero_scan_duration = valid_value();
+        zero_scan_duration["live_mode_policy"]["frontier_explore"]["maximum_scan_duration_ms"] =
+            json!(0);
+        assert!(matches!(
+            parse(&zero_scan_duration),
+            Err(NanoAgentPolicyConfigParseError::ExploreYawScanDuration {
+                source: NanoBoundedMillisecondsError::Zero,
+            })
         ));
     }
 
@@ -2864,21 +4216,21 @@ mod tests {
     #[cfg(not(feature = "actuation"))]
     #[test]
     fn motion_policies_require_an_actuation_capable_build() {
-        for (field, mode) in [("point_goal", NanoConfiguredMotionMode::PointGoal)] {
-            let mut value = valid_value();
-            value["live_mode_policy"][field] = json!({
-                "permission": "control_api",
-                "authority_lease_ms": 500
-            });
-            assert!(matches!(
-                parse(&value),
-                Err(
-                    NanoAgentPolicyConfigParseError::MotionPolicyRequiresActuationFeature {
-                        mode: actual
-                    }
-                ) if actual == mode
-            ));
-        }
+        let mut value = valid_value();
+        value["live_mode_policy"]["point_goal"] = json!({
+            "permission": "control_api",
+            "authority_lease_ms": 500,
+            "maximum_runtime_ms": 1000,
+            "arrival_tolerance_m": 0.1
+        });
+        assert!(matches!(
+            parse(&value),
+            Err(
+                NanoAgentPolicyConfigParseError::MotionPolicyRequiresActuationFeature {
+                    mode: NanoConfiguredMotionMode::PointGoal
+                }
+            )
+        ));
 
         let mut value = valid_value();
         value["live_mode_policy"]["manual"] = json!({
@@ -2907,7 +4259,17 @@ mod tests {
             "boundary_maximum_x_m": 1.0,
             "boundary_maximum_y_m": 1.0,
             "maximum_runtime_ms": 1000,
-            "maximum_frontier_goals": 1
+            "maximum_frontier_goals": 1,
+            "arrival_tolerance_m": 0.1,
+            "clearance_from_known_obstacles_m": 0.2,
+            "maximum_grid_cells": 100,
+            "maximum_expanded_cells": 100,
+            "maximum_open_set_entries": 800,
+            "maximum_abs_yaw_rate_rad_s": 1.0,
+            "yaw_travel_limit_exclusive_rad": std::f64::consts::TAU,
+            "maximum_scan_origin_displacement_m": 0.05,
+            "maximum_scan_duration_ms": 500,
+            "yaw_turn_direction": "clockwise"
         });
         assert!(matches!(
             parse(&value),

@@ -5,6 +5,8 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+#[cfg(feature = "nano-agent")]
+use std::time::Duration;
 use std::time::Instant;
 
 /// Minimum 3D-2D correspondences needed for PnP pose estimation.
@@ -21,6 +23,8 @@ const MAP_CULL_MIN_OBSERVATIONS_ENV: &str = "KIKO_MAP_CULL_MIN_OBSERVATIONS";
 const TRACK_TRACE_ENV: &str = "KIKO_TRACK_TRACE";
 const EIGENPLACES_MODEL_ENV: &str = "KIKO_EIGENPLACES_MODEL";
 
+#[cfg(feature = "nano-agent")]
+use crate::StereoCalibration;
 use crate::loop_closure::{
     DescriptorSource, GlobalDescriptorError, KeyframeDatabase, KeyframeDatabaseError,
     LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError, LoopVerificationError,
@@ -643,9 +647,14 @@ impl DescriptorWorker {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DescriptorStats {
     pub submitted: u64,
+    /// Worker responses consumed by the tracker, including stale and failed
+    /// responses. This is distinct from `applied` and permits an exact replay
+    /// drain barrier without inferring in-flight work from queue emptiness.
+    pub responses: u64,
     pub dropped_full: u64,
     pub dropped_disconnected: u64,
     pub applied: u64,
+    pub stale: u64,
     pub worker_failures: u64,
     pub respawn_count: u32,
     pub panics: u64,
@@ -994,6 +1003,9 @@ enum BackendResponse {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BackendStats {
     pub submitted: u64,
+    /// Worker responses consumed by the tracker. Failed submissions are not
+    /// counted, so `submitted - responses` is the exact outstanding set.
+    pub responses: u64,
     pub dropped_full: u64,
     pub dropped_disconnected: u64,
     pub applied: u64,
@@ -2085,6 +2097,127 @@ pub struct SystemHealth {
     pub degradation: DegradationLevel,
 }
 
+/// Exact asynchronous drain result retained by persisted-map replay.
+///
+/// These diagnostics occurred while reconstructing the historical map and
+/// must not be relabelled as events from the first fresh live frame.
+#[cfg(feature = "nano-agent")]
+pub(crate) struct DatasetReplayTrackerQuiescence {
+    map_snapshot: MapSnapshot,
+    pose_updates: Vec<KeyframePoseUpdate>,
+    events: Vec<DiagnosticEvent>,
+    map_corrections: Vec<MapCorrectionApplied>,
+}
+
+#[cfg(feature = "nano-agent")]
+impl DatasetReplayTrackerQuiescence {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        MapSnapshot,
+        Vec<KeyframePoseUpdate>,
+        Vec<DiagnosticEvent>,
+        Vec<MapCorrectionApplied>,
+    ) {
+        (
+            self.map_snapshot,
+            self.pose_updates,
+            self.events,
+            self.map_corrections,
+        )
+    }
+}
+
+#[derive(Debug)]
+#[cfg(feature = "nano-agent")]
+pub enum DatasetReplayTrackerQuiesceError {
+    CounterInconsistent {
+        subsystem: &'static str,
+        submitted: u64,
+        responses: u64,
+    },
+    TimedOut {
+        backend_outstanding: u64,
+        descriptor_outstanding: u64,
+    },
+    Tracker(TrackerError),
+}
+
+#[cfg(feature = "nano-agent")]
+impl std::fmt::Display for DatasetReplayTrackerQuiesceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CounterInconsistent {
+                subsystem,
+                submitted,
+                responses,
+            } => write!(
+                formatter,
+                "{subsystem} replay drain consumed {responses} responses for only {submitted} submitted requests"
+            ),
+            Self::TimedOut {
+                backend_outstanding,
+                descriptor_outstanding,
+            } => write!(
+                formatter,
+                "dataset replay did not quiesce before its deadline (backend outstanding={backend_outstanding}, descriptor outstanding={descriptor_outstanding})"
+            ),
+            Self::Tracker(source) => {
+                write!(
+                    formatter,
+                    "dataset replay tracker finalization failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl std::error::Error for DatasetReplayTrackerQuiesceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Tracker(source) => Some(source),
+            Self::CounterInconsistent { .. } | Self::TimedOut { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "nano-agent")]
+pub enum DatasetReplayRelocalizationArmError {
+    ReplayMapChanged {
+        replay: MapSnapshot,
+        current: MapSnapshot,
+    },
+    RelocalizationDisabled,
+    EmptySparseMap,
+    EmptyRelocalizationDatabase,
+}
+
+#[cfg(feature = "nano-agent")]
+impl std::fmt::Display for DatasetReplayRelocalizationArmError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReplayMapChanged { replay, current } => write!(
+                formatter,
+                "cannot arm live relocalization after replay: replay map {replay:?} changed to {current:?}"
+            ),
+            Self::RelocalizationDisabled => formatter.write_str(
+                "cannot arm live relocalization after replay because tracker relocalization is disabled",
+            ),
+            Self::EmptySparseMap => formatter.write_str(
+                "cannot arm live relocalization after replay because the sparse map has no keyframes",
+            ),
+            Self::EmptyRelocalizationDatabase => formatter.write_str(
+                "cannot arm live relocalization after replay because its place database is empty",
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl std::error::Error for DatasetReplayRelocalizationArmError {}
+
 impl SystemHealth {
     fn from_components(
         tracking: TrackingHealth,
@@ -2588,6 +2721,134 @@ impl SlamTracker {
         )
     }
 
+    #[cfg(feature = "nano-agent")]
+    pub(crate) fn exactly_matches_dataset_calibration(
+        &self,
+        calibration: &StereoCalibration,
+    ) -> bool {
+        self.triangulator.exactly_matches_calibration(calibration)
+    }
+
+    /// Drain every successfully submitted asynchronous replay request before
+    /// sparse-map and occupancy evidence are captured together.
+    ///
+    /// Queue emptiness is not a completion barrier because one worker may be
+    /// processing an item after dequeue. The submitted/consumed counters
+    /// instead account for that in-flight item exactly.
+    #[cfg(feature = "nano-agent")]
+    pub(crate) fn quiesce_dataset_replay(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<DatasetReplayTrackerQuiescence, DatasetReplayTrackerQuiesceError> {
+        let started = Instant::now();
+        loop {
+            self.drain_backend_responses()
+                .map_err(DatasetReplayTrackerQuiesceError::Tracker)?;
+            self.drain_descriptor_responses()
+                .map_err(DatasetReplayTrackerQuiesceError::Tracker)?;
+
+            let backend_outstanding = self
+                .backend_stats
+                .submitted
+                .checked_sub(self.backend_stats.responses)
+                .ok_or(DatasetReplayTrackerQuiesceError::CounterInconsistent {
+                    subsystem: "backend",
+                    submitted: self.backend_stats.submitted,
+                    responses: self.backend_stats.responses,
+                })?;
+            let descriptor_outstanding = self
+                .descriptor_stats
+                .submitted
+                .checked_sub(self.descriptor_stats.responses)
+                .ok_or(DatasetReplayTrackerQuiesceError::CounterInconsistent {
+                    subsystem: "descriptor",
+                    submitted: self.descriptor_stats.submitted,
+                    responses: self.descriptor_stats.responses,
+                })?;
+            if backend_outstanding == 0 && descriptor_outstanding == 0 {
+                break;
+            }
+
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Err(DatasetReplayTrackerQuiesceError::TimedOut {
+                    backend_outstanding,
+                    descriptor_outstanding,
+                });
+            }
+            thread::sleep(Duration::from_millis(1).min(timeout.saturating_sub(elapsed)));
+        }
+
+        if let Err(error) = self.process_pending_loop_closure() {
+            match error {
+                LoopDetectError::DescriptorMatchFailed(source)
+                | LoopDetectError::VerificationFailed(LoopVerificationError::Map(source)) => {
+                    return Err(DatasetReplayTrackerQuiesceError::Tracker(source.into()));
+                }
+                LoopDetectError::VerificationFailed(LoopVerificationError::InvariantViolation(
+                    message,
+                )) => {
+                    return Err(DatasetReplayTrackerQuiesceError::Tracker(
+                        TrackerError::InvariantViolation(message),
+                    ));
+                }
+                LoopDetectError::Pose(source) => {
+                    return Err(DatasetReplayTrackerQuiesceError::Tracker(source.into()));
+                }
+                rejection => eprintln!("replay final loop closure: {rejection}"),
+            }
+        }
+
+        Ok(DatasetReplayTrackerQuiescence {
+            map_snapshot: self.map.snapshot(),
+            pose_updates: self.take_pending_dense_pose_updates(),
+            events: self.drain_events(),
+            map_corrections: self.drain_map_corrections(),
+        })
+    }
+
+    /// Force a fresh-camera place-recognition transition after exact replay.
+    ///
+    /// Retaining the final replay pose and merely accepting the first live
+    /// tracking result would conflate historical pose with current robot pose.
+    /// This transition keeps the sparse map but clears incremental motion
+    /// state and requires the existing multi-frame relocalization verifier.
+    #[cfg(feature = "nano-agent")]
+    pub(crate) fn arm_live_relocalization_after_replay(
+        &mut self,
+        replay_map: MapSnapshot,
+    ) -> Result<(), DatasetReplayRelocalizationArmError> {
+        let current = self.map.snapshot();
+        if current != replay_map {
+            return Err(DatasetReplayRelocalizationArmError::ReplayMapChanged {
+                replay: replay_map,
+                current,
+            });
+        }
+        if self.config.relocalization_config().is_none() {
+            return Err(DatasetReplayRelocalizationArmError::RelocalizationDisabled);
+        }
+        if self.map.num_keyframes() == 0 {
+            return Err(DatasetReplayRelocalizationArmError::EmptySparseMap);
+        }
+        if self.loop_db.as_ref().is_none_or(KeyframeDatabase::is_empty) {
+            return Err(DatasetReplayRelocalizationArmError::EmptyRelocalizationDatabase);
+        }
+
+        self.state = TrackerState::Relocalizing(RelocalizationSession {
+            attempts: 0,
+            phase: RelocalizationPhase::Searching,
+        });
+        self.ba.reset();
+        self.last_incremental_ba_stamp = None;
+        self.incremental_ba_anchor_keyframe = None;
+        self.pending_loop = None;
+        self.loop_streak.clear();
+        self.consecutive_tracking_failures = 0;
+        self.emit_event(DiagnosticEvent::RelocalizationStarted);
+        Ok(())
+    }
+
     pub fn apply_loop_closure(&mut self, verified: VerifiedLoop) -> Result<(), TrackerError> {
         // The optimizer reveals correction cardinality only after its
         // transactional map commit. Fail closed by requiring provenance
@@ -2868,6 +3129,10 @@ impl SlamTracker {
             let Some(response) = response else {
                 break;
             };
+            self.descriptor_stats.responses =
+                self.descriptor_stats.responses.checked_add(1).ok_or(
+                    TrackerError::InvariantViolation("descriptor response counter exhausted"),
+                )?;
             match response {
                 DescriptorWorkerResponse::Descriptor(response) => {
                     let Some(loop_db) = self.loop_db.as_mut() else {
@@ -2880,7 +3145,10 @@ impl SlamTracker {
                             self.descriptor_stats.applied =
                                 self.descriptor_stats.applied.saturating_add(1);
                         }
-                        DescriptorApplyDisposition::Stale => {}
+                        DescriptorApplyDisposition::Stale => {
+                            self.descriptor_stats.stale =
+                                self.descriptor_stats.stale.saturating_add(1);
+                        }
                     }
                 }
                 DescriptorWorkerResponse::Failure {
@@ -3080,6 +3348,9 @@ impl SlamTracker {
             let Some(response) = response else {
                 break;
             };
+            self.backend_stats.responses = self.backend_stats.responses.checked_add(1).ok_or(
+                TrackerError::InvariantViolation("backend response counter exhausted"),
+            )?;
             match response {
                 BackendResponse::Correction(correction) => {
                     if correction.source_snapshot != self.map.snapshot() {

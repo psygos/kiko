@@ -21,15 +21,15 @@
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(feature = "operator-console")]
+use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc::{
-    self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
-};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -58,9 +58,12 @@ pub const MAX_AGENT_CONTROL_RUNTIME_QUEUE_CAPACITY: usize = 64;
 const FRAME_LENGTH_BYTES: usize = 4;
 const MIN_SOCKET_TIMEOUT: Duration = Duration::from_millis(1);
 const MAX_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+const MIN_TERMINAL_SOCKET_TIMEOUT: Duration = Duration::from_secs(4);
+const MAX_TERMINAL_SOCKET_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const AGENT_CONTROL_SOCKET_THREAD_NAME: &str = "kiko-agent-control";
 const AGENT_CONTROL_SOCKET_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const AGENT_CONTROL_SOCKET_CANCELLATION_POLL: Duration = Duration::from_millis(5);
+const AGENT_CONTROL_RUNTIME_PRIORITY_POLL: Duration = Duration::from_millis(1);
 
 /// Exact absolute pathname for one local control socket.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,22 +185,29 @@ pub struct AgentControlSocketTimeouts {
     read: Duration,
     write: Duration,
     runtime_response: Duration,
+    terminal_response: Duration,
 }
 
 impl AgentControlSocketTimeouts {
-    /// Parse three nonzero deadlines, each in the inclusive range 1 ms..=30 s.
+    /// Parse the ordinary bounded deadlines plus the distinct terminal
+    /// `save_map` deadline. Terminal persistence may drain capture, finalize
+    /// and synchronize a dataset, and hash the selected replay inputs, so it
+    /// must not inherit the short ordinary command budget.
     pub fn try_new(
         read: Duration,
         write: Duration,
         runtime_response: Duration,
+        terminal_response: Duration,
     ) -> Result<Self, AgentControlSocketTimeoutError> {
         validate_timeout(AgentControlTimeoutKind::Read, read)?;
         validate_timeout(AgentControlTimeoutKind::Write, write)?;
         validate_timeout(AgentControlTimeoutKind::RuntimeResponse, runtime_response)?;
+        validate_terminal_timeout(terminal_response)?;
         Ok(Self {
             read,
             write,
             runtime_response,
+            terminal_response,
         })
     }
 
@@ -211,6 +221,18 @@ impl AgentControlSocketTimeouts {
 
     pub const fn runtime_response(self) -> Duration {
         self.runtime_response
+    }
+
+    pub const fn terminal_response(self) -> Duration {
+        self.terminal_response
+    }
+
+    const fn response_timeout_for(self, command: AgentControlCommandV1) -> Duration {
+        if matches!(command, AgentControlCommandV1::SaveMap) {
+            self.terminal_response
+        } else {
+            self.runtime_response
+        }
     }
 }
 
@@ -229,12 +251,25 @@ fn validate_timeout(
     Ok(())
 }
 
+fn validate_terminal_timeout(value: Duration) -> Result<(), AgentControlSocketTimeoutError> {
+    if !(MIN_TERMINAL_SOCKET_TIMEOUT..=MAX_TERMINAL_SOCKET_TIMEOUT).contains(&value) {
+        return Err(AgentControlSocketTimeoutError {
+            kind: AgentControlTimeoutKind::TerminalResponse,
+            actual: value,
+            minimum: MIN_TERMINAL_SOCKET_TIMEOUT,
+            maximum: MAX_TERMINAL_SOCKET_TIMEOUT,
+        });
+    }
+    Ok(())
+}
+
 /// Deadline named by a timeout configuration error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentControlTimeoutKind {
     Read,
     Write,
     RuntimeResponse,
+    TerminalResponse,
 }
 
 /// Invalid connection deadline.
@@ -377,12 +412,201 @@ impl std::error::Error for AgentControlRuntimeQueueCapacityError {}
 #[derive(Debug)]
 pub struct AgentControlRuntimeSender {
     inner: SyncSender<AgentControlDispatch>,
+    priority: Option<SyncSender<AgentControlDispatch>>,
 }
 
 /// Runtime-side receiver for parsed requests.
 #[derive(Debug)]
 pub struct AgentControlRuntimeReceiver {
     inner: Receiver<AgentControlDispatch>,
+    priority: Option<Receiver<AgentControlDispatch>>,
+}
+
+/// Opaque, non-clone capability for the unified console's already-typed
+/// in-process lane.
+///
+/// The only public constructor is
+/// [`AgentControlSocketTask::bind_and_spawn_with_typed_ingress`], which creates
+/// this capability beside the sole socket owner and runtime receiver. Its
+/// submission and correlation operations remain navigation-private inside the
+/// production console adapter.
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "operator-console"
+))]
+#[derive(Debug)]
+pub struct AgentControlTypedIngress {
+    normal: SyncSender<AgentControlDispatch>,
+    priority: SyncSender<AgentControlDispatch>,
+    next_key: Option<NonZeroU64>,
+}
+
+/// Process-local identity for one typed in-process submission.
+///
+/// Socket request IDs are caller-controlled and may numerically collide with
+/// console request IDs. This key comes only from the sole non-clone typed
+/// ingress and therefore remains a distinct correlation namespace through
+/// claim, physical application, and response completion.
+#[cfg(feature = "operator-console")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct AgentControlTypedRequestKey(NonZeroU64);
+
+#[cfg(feature = "operator-console")]
+impl AgentControlTypedRequestKey {
+    #[cfg(test)]
+    pub(crate) fn for_test(raw: u64) -> Self {
+        Self(NonZeroU64::new(raw).expect("typed request test key must be nonzero"))
+    }
+}
+
+/// Completion rendezvous for one already-typed in-process submission.
+///
+/// The claim and response channels are capacity one, so the single-threaded
+/// live owner never blocks waiting for the submitting adapter to run. The
+/// adapter must still observe the exact response before completing its own
+/// request token.
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "operator-console"
+))]
+#[derive(Debug)]
+pub(crate) struct AgentControlTypedSubmission {
+    request_id: AgentControlRequestId,
+    typed_request_key: AgentControlTypedRequestKey,
+    claim: Receiver<()>,
+    response: Receiver<AgentControlResponseV1>,
+}
+
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "operator-console"
+))]
+impl AgentControlTypedSubmission {
+    pub const fn request_id(&self) -> AgentControlRequestId {
+        self.request_id
+    }
+
+    pub const fn typed_request_key(&self) -> AgentControlTypedRequestKey {
+        self.typed_request_key
+    }
+
+    pub fn try_take_claim(&self) -> Result<(), AgentControlTypedSubmissionPollError> {
+        self.claim.try_recv().map_err(|source| match source {
+            TryRecvError::Empty => AgentControlTypedSubmissionPollError::Pending,
+            TryRecvError::Disconnected => AgentControlTypedSubmissionPollError::ClaimDisconnected,
+        })
+    }
+
+    pub fn try_take_response(
+        &self,
+    ) -> Result<AgentControlResponseV1, AgentControlTypedSubmissionPollError> {
+        self.response.try_recv().map_err(|source| match source {
+            TryRecvError::Empty => AgentControlTypedSubmissionPollError::Pending,
+            TryRecvError::Disconnected => {
+                AgentControlTypedSubmissionPollError::ResponseDisconnected
+            }
+        })
+    }
+}
+
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "operator-console"
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentControlTypedSubmissionPollError {
+    Pending,
+    ClaimDisconnected,
+    ResponseDisconnected,
+}
+
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "operator-console"
+))]
+#[derive(Debug)]
+pub(crate) enum AgentControlTypedSubmitError {
+    CorrelationExhausted,
+    QueueFull {
+        submission: AgentControlTypedSubmission,
+    },
+    RuntimeDisconnected {
+        submission: AgentControlTypedSubmission,
+    },
+}
+
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "operator-console"
+))]
+impl AgentControlTypedIngress {
+    fn allocate_key(
+        &mut self,
+    ) -> Result<AgentControlTypedRequestKey, AgentControlTypedSubmitError> {
+        let raw = self
+            .next_key
+            .take()
+            .ok_or(AgentControlTypedSubmitError::CorrelationExhausted)?;
+        self.next_key = raw.get().checked_add(1).and_then(NonZeroU64::new);
+        Ok(AgentControlTypedRequestKey(raw))
+    }
+
+    /// Reserve one process-local identity for a direct safety operation that
+    /// bypasses every bounded dispatch queue.
+    pub(crate) fn reserve_direct_safety_key(
+        &mut self,
+    ) -> Result<AgentControlTypedRequestKey, AgentControlTypedSubmitError> {
+        self.allocate_key()
+    }
+
+    /// Submit one domain request that was already parsed by a trusted
+    /// in-process boundary. No JSON serialization or second parser is used.
+    pub(crate) fn try_submit(
+        &mut self,
+        request: AgentControlRequestV1,
+        received_at: HostMonotonicTimestamp,
+    ) -> Result<AgentControlTypedSubmission, AgentControlTypedSubmitError> {
+        let request_id = request.request_id();
+        let typed_request_key = self.allocate_key()?;
+        let (claim_sender, claim_receiver) = mpsc::sync_channel(1);
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        let (_wire_delivery_sender, wire_delivery_receiver) = mpsc::sync_channel(0);
+        let dispatch = AgentControlDispatch {
+            request,
+            received_at,
+            typed_request_key: Some(typed_request_key),
+            terminal_response_deadline: None,
+            claim: claim_sender,
+            response: response_sender,
+            wire_delivery: wire_delivery_receiver,
+        };
+        let submission = AgentControlTypedSubmission {
+            request_id,
+            typed_request_key,
+            claim: claim_receiver,
+            response: response_receiver,
+        };
+        let sender = if request_is_priority(request.command()) {
+            &self.priority
+        } else {
+            &self.normal
+        };
+        match sender.try_send(dispatch) {
+            Ok(()) => Ok(submission),
+            Err(TrySendError::Full(_)) => {
+                Err(AgentControlTypedSubmitError::QueueFull { submission })
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                Err(AgentControlTypedSubmitError::RuntimeDisconnected { submission })
+            }
+        }
+    }
 }
 
 /// Construct the bounded handoff queue used by exactly one socket server.
@@ -391,9 +615,84 @@ pub fn agent_control_runtime_queue(
 ) -> (AgentControlRuntimeSender, AgentControlRuntimeReceiver) {
     let (sender, receiver) = mpsc::sync_channel(capacity.get());
     (
-        AgentControlRuntimeSender { inner: sender },
-        AgentControlRuntimeReceiver { inner: receiver },
+        AgentControlRuntimeSender {
+            inner: sender,
+            priority: None,
+        },
+        AgentControlRuntimeReceiver {
+            inner: receiver,
+            priority: None,
+        },
     )
+}
+
+#[cfg(all(
+    test,
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "operator-console"
+))]
+pub(crate) fn agent_control_test_runtime_with_typed_ingress(
+    capacity: AgentControlRuntimeQueueCapacity,
+) -> (
+    AgentControlRuntimeSender,
+    AgentControlRuntimeReceiver,
+    AgentControlTypedIngress,
+) {
+    let (mut sender, mut receiver) = agent_control_runtime_queue(capacity);
+    let (priority, priority_receiver) = mpsc::sync_channel(capacity.get());
+    receiver.priority = Some(priority_receiver);
+    sender.priority = Some(priority.clone());
+    let ingress = AgentControlTypedIngress {
+        normal: sender.inner.clone(),
+        priority,
+        next_key: NonZeroU64::new(1),
+    };
+    (sender, receiver, ingress)
+}
+
+fn request_is_priority(command: AgentControlCommandV1) -> bool {
+    matches!(
+        command,
+        AgentControlCommandV1::Stop
+            | AgentControlCommandV1::Disarm
+            | AgentControlCommandV1::MapOnly
+            | AgentControlCommandV1::ManualStop(_)
+            | AgentControlCommandV1::Shutdown
+    )
+}
+
+impl AgentControlRuntimeSender {
+    fn try_send(
+        &self,
+        dispatch: AgentControlDispatch,
+    ) -> Result<(), AgentControlRuntimeTrySendError> {
+        if request_is_priority(dispatch.request().command())
+            && let Some(priority) = self.priority.as_ref()
+        {
+            return priority
+                .try_send(dispatch)
+                .map_err(AgentControlRuntimeTrySendError::from);
+        }
+        self.inner
+            .try_send(dispatch)
+            .map_err(AgentControlRuntimeTrySendError::from)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentControlRuntimeTrySendError {
+    Full,
+    Disconnected,
+}
+
+impl From<TrySendError<AgentControlDispatch>> for AgentControlRuntimeTrySendError {
+    fn from(source: TrySendError<AgentControlDispatch>) -> Self {
+        match source {
+            TrySendError::Full(_) => Self::Full,
+            TrySendError::Disconnected(_) => Self::Disconnected,
+        }
+    }
 }
 
 #[cfg(all(test, feature = "agent-runtime", feature = "actuation"))]
@@ -404,18 +703,62 @@ pub(crate) fn enqueue_agent_control_test_request(
 ) -> JoinHandle<Option<AgentControlResponseV1>> {
     let (claim_sender, claim_receiver) = mpsc::sync_channel(0);
     let (response_sender, response_receiver) = mpsc::sync_channel(0);
+    let (wire_delivery_sender, wire_delivery_receiver) = mpsc::sync_channel(1);
     sender
         .inner
         .try_send(AgentControlDispatch {
             request,
             received_at,
+            #[cfg(feature = "operator-console")]
+            typed_request_key: None,
+            terminal_response_deadline: None,
             claim: claim_sender,
             response: response_sender,
+            wire_delivery: wire_delivery_receiver,
         })
         .expect("test runtime queue has capacity");
     thread::spawn(move || {
         claim_receiver.recv().ok()?;
-        response_receiver.recv().ok()
+        let response = response_receiver.recv().ok()?;
+        // Most test callers exercise the ordinary response API, which is
+        // allowed to drop the delivery receiver. A failed acknowledgement is
+        // therefore not a failed response for this general helper.
+        let _ = wire_delivery_sender.send(());
+        Some(response)
+    })
+}
+
+#[cfg(all(
+    test,
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "operator-console"
+))]
+pub(crate) fn enqueue_agent_control_test_request_through_runtime_lanes(
+    sender: &AgentControlRuntimeSender,
+    request: AgentControlRequestV1,
+    received_at: HostMonotonicTimestamp,
+) -> JoinHandle<Option<AgentControlResponseV1>> {
+    let (claim_sender, claim_receiver) = mpsc::sync_channel(0);
+    let (response_sender, response_receiver) = mpsc::sync_channel(0);
+    let (wire_delivery_sender, wire_delivery_receiver) = mpsc::sync_channel(1);
+    sender
+        .try_send(AgentControlDispatch {
+            request,
+            received_at,
+            #[cfg(feature = "operator-console")]
+            typed_request_key: None,
+            terminal_response_deadline: None,
+            claim: claim_sender,
+            response: response_sender,
+            wire_delivery: wire_delivery_receiver,
+        })
+        .expect("test runtime lane has capacity");
+    thread::spawn(move || {
+        claim_receiver.recv().ok()?;
+        let response = response_receiver.recv().ok()?;
+        let _ = wire_delivery_sender.send(());
+        Some(response)
     })
 }
 
@@ -427,13 +770,18 @@ pub(crate) fn enqueue_agent_control_test_request_with_expired_response(
 ) -> JoinHandle<()> {
     let (claim_sender, claim_receiver) = mpsc::sync_channel(0);
     let (response_sender, response_receiver) = mpsc::sync_channel(0);
+    let (_wire_delivery_sender, wire_delivery_receiver) = mpsc::sync_channel(1);
     sender
         .inner
         .try_send(AgentControlDispatch {
             request,
             received_at,
+            #[cfg(feature = "operator-console")]
+            typed_request_key: None,
+            terminal_response_deadline: None,
             claim: claim_sender,
             response: response_sender,
+            wire_delivery: wire_delivery_receiver,
         })
         .expect("test runtime queue has capacity");
     thread::spawn(move || {
@@ -442,12 +790,48 @@ pub(crate) fn enqueue_agent_control_test_request_with_expired_response(
     })
 }
 
+#[cfg(all(test, feature = "agent-runtime", feature = "actuation"))]
+pub(crate) fn enqueue_agent_control_test_request_with_failed_wire_delivery(
+    sender: &AgentControlRuntimeSender,
+    request: AgentControlRequestV1,
+    received_at: HostMonotonicTimestamp,
+) -> JoinHandle<Option<AgentControlResponseV1>> {
+    let (claim_sender, claim_receiver) = mpsc::sync_channel(0);
+    let (response_sender, response_receiver) = mpsc::sync_channel(0);
+    let (wire_delivery_sender, wire_delivery_receiver) = mpsc::sync_channel(1);
+    sender
+        .inner
+        .try_send(AgentControlDispatch {
+            request,
+            received_at,
+            #[cfg(feature = "operator-console")]
+            typed_request_key: None,
+            terminal_response_deadline: None,
+            claim: claim_sender,
+            response: response_sender,
+            wire_delivery: wire_delivery_receiver,
+        })
+        .expect("test runtime queue has capacity");
+    thread::spawn(move || {
+        claim_receiver.recv().ok()?;
+        let response = response_receiver.recv().ok()?;
+        drop(wire_delivery_sender);
+        Some(response)
+    })
+}
+
 impl AgentControlRuntimeReceiver {
     /// Wait until one request is available or all producers are gone.
     pub fn recv(&self) -> Result<AgentControlDispatch, AgentControlRuntimeReceiveError> {
-        self.inner
-            .recv()
-            .map_err(|_: RecvError| AgentControlRuntimeReceiveError::Disconnected)
+        loop {
+            match self.try_recv() {
+                Ok(dispatch) => return Ok(dispatch),
+                Err(AgentControlRuntimeReceiveError::Empty) => {
+                    thread::park_timeout(AGENT_CONTROL_RUNTIME_PRIORITY_POLL);
+                }
+                Err(source) => return Err(source),
+            }
+        }
     }
 
     /// Wait for one bounded duration.
@@ -455,20 +839,40 @@ impl AgentControlRuntimeReceiver {
         &self,
         timeout: Duration,
     ) -> Result<AgentControlDispatch, AgentControlRuntimeReceiveError> {
-        self.inner
-            .recv_timeout(timeout)
-            .map_err(|error| match error {
-                RecvTimeoutError::Timeout => AgentControlRuntimeReceiveError::Timeout,
-                RecvTimeoutError::Disconnected => AgentControlRuntimeReceiveError::Disconnected,
-            })
+        let started = Instant::now();
+        loop {
+            match self.try_recv() {
+                Ok(dispatch) => return Ok(dispatch),
+                Err(AgentControlRuntimeReceiveError::Empty) => {}
+                Err(source) => return Err(source),
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(AgentControlRuntimeReceiveError::Timeout);
+            }
+            thread::park_timeout(remaining.min(AGENT_CONTROL_RUNTIME_PRIORITY_POLL));
+        }
     }
 
     /// Poll without blocking.
     pub fn try_recv(&self) -> Result<AgentControlDispatch, AgentControlRuntimeReceiveError> {
-        self.inner.try_recv().map_err(|error| match error {
-            TryRecvError::Empty => AgentControlRuntimeReceiveError::Empty,
-            TryRecvError::Disconnected => AgentControlRuntimeReceiveError::Disconnected,
-        })
+        let priority_state = match self.priority.as_ref().map(Receiver::try_recv) {
+            Some(Ok(dispatch)) => return Ok(dispatch),
+            Some(Err(TryRecvError::Empty)) => Some(false),
+            Some(Err(TryRecvError::Disconnected)) => Some(true),
+            None => None,
+        };
+        match self.inner.try_recv() {
+            Ok(dispatch) => Ok(dispatch),
+            Err(TryRecvError::Empty) => Err(AgentControlRuntimeReceiveError::Empty),
+            Err(TryRecvError::Disconnected) => {
+                if matches!(priority_state, Some(false)) {
+                    Err(AgentControlRuntimeReceiveError::Empty)
+                } else {
+                    Err(AgentControlRuntimeReceiveError::Disconnected)
+                }
+            }
+        }
     }
 }
 
@@ -498,8 +902,12 @@ impl std::error::Error for AgentControlRuntimeReceiveError {}
 pub struct AgentControlDispatch {
     request: AgentControlRequestV1,
     received_at: HostMonotonicTimestamp,
+    #[cfg(feature = "operator-console")]
+    typed_request_key: Option<AgentControlTypedRequestKey>,
+    terminal_response_deadline: Option<Instant>,
     claim: SyncSender<()>,
     response: SyncSender<AgentControlResponseV1>,
+    wire_delivery: Receiver<()>,
 }
 
 impl AgentControlDispatch {
@@ -509,6 +917,11 @@ impl AgentControlDispatch {
 
     pub const fn received_at(&self) -> HostMonotonicTimestamp {
         self.received_at
+    }
+
+    #[cfg(feature = "operator-console")]
+    pub(crate) const fn typed_request_key(&self) -> Option<AgentControlTypedRequestKey> {
+        self.typed_request_key
     }
 
     /// Rendezvous with the server and obtain the only token from which command
@@ -521,7 +934,9 @@ impl AgentControlDispatch {
         Ok(AgentControlClaimedRequest {
             request: self.request,
             received_at: self.received_at,
+            terminal_response_deadline: self.terminal_response_deadline,
             response: self.response,
+            wire_delivery: self.wire_delivery,
         })
     }
 }
@@ -532,7 +947,9 @@ impl AgentControlDispatch {
 pub struct AgentControlClaimedRequest {
     request: AgentControlRequestV1,
     received_at: HostMonotonicTimestamp,
+    terminal_response_deadline: Option<Instant>,
     response: SyncSender<AgentControlResponseV1>,
+    wire_delivery: Receiver<()>,
 }
 
 impl AgentControlClaimedRequest {
@@ -542,6 +959,14 @@ impl AgentControlClaimedRequest {
 
     pub const fn received_at(&self) -> HostMonotonicTimestamp {
         self.received_at
+    }
+
+    /// Exact absolute response deadline supplied by the direct socket owner.
+    /// Trusted in-process submissions have no socket rendezvous and therefore
+    /// return `None`; their terminal owner must derive a deadline from the
+    /// same parsed terminal policy.
+    pub const fn terminal_response_deadline(&self) -> Option<Instant> {
+        self.terminal_response_deadline
     }
 
     /// Report that a long-running command has passed runtime admission, then
@@ -582,6 +1007,30 @@ impl AgentControlClaimedRequest {
             .map_err(|_| AgentControlDispatchResponseError::ClientUnavailable)
     }
 
+    /// Report exact completion and wait until the server confirms that the
+    /// complete response frame reached the connected socket.
+    ///
+    /// Shutdown uses this stronger boundary before clearing the shared run
+    /// flag. A write failure, cancellation, or socket-thread exit drops the
+    /// acknowledgement sender and is reported as delivery uncertainty.
+    pub fn respond_completed_after_wire_delivery(
+        self,
+    ) -> Result<(), AgentControlDispatchResponseError> {
+        if matches!(self.request.command(), AgentControlCommandV1::QueryStatus) {
+            return Err(AgentControlDispatchResponseError::StatusQueryRequiresStatus);
+        }
+        self.response
+            .send(AgentControlResponseV1::accepted(
+                self.request.request_id(),
+                self.request.command().kind(),
+                AgentControlCompletionV1::Completed,
+            ))
+            .map_err(|_| AgentControlDispatchResponseError::ClientUnavailable)?;
+        self.wire_delivery
+            .recv()
+            .map_err(|_| AgentControlDispatchResponseError::WireDeliveryUncertain)
+    }
+
     /// Return the exact status snapshot for a claimed query.
     pub fn respond_status(
         self,
@@ -612,6 +1061,26 @@ impl AgentControlClaimedRequest {
             ))
             .map_err(|_| AgentControlDispatchResponseError::ClientUnavailable)
     }
+
+    /// Send a final rejection and retain the socket owner until the complete
+    /// frame reaches the connected client. Terminal operations use this
+    /// before clearing their shared run flag.
+    pub fn reject_after_wire_delivery(
+        self,
+        code: AgentControlRejectionCodeV1,
+        retryable: bool,
+    ) -> Result<(), AgentControlDispatchResponseError> {
+        self.response
+            .send(AgentControlResponseV1::rejected(
+                Some(self.request.request_id()),
+                code,
+                retryable,
+            ))
+            .map_err(|_| AgentControlDispatchResponseError::ClientUnavailable)?;
+        self.wire_delivery
+            .recv()
+            .map_err(|_| AgentControlDispatchResponseError::WireDeliveryUncertain)
+    }
 }
 
 /// Long-running request released only after its truthful
@@ -638,6 +1107,7 @@ pub enum AgentControlDispatchResponseError {
     StatusQueryRequiresStatus,
     StatusForNonQuery,
     ClientUnavailable,
+    WireDeliveryUncertain,
 }
 
 impl fmt::Display for AgentControlDispatchResponseError {
@@ -660,6 +1130,12 @@ pub struct AgentControlSocketServer {
     runtime: AgentControlRuntimeSender,
     parser: AgentControlRequestParser,
 }
+
+type AgentControlPayloadOutcome = (
+    AgentControlResponseV1,
+    Option<AgentControlConnectionIssue>,
+    Option<SyncSender<()>>,
+);
 
 impl AgentControlSocketServer {
     /// Verify the private directory, reject any existing destination, bind the
@@ -785,7 +1261,7 @@ impl AgentControlSocketServer {
             .set_nonblocking(false)
             .map_err(|source| AgentControlServeError::ConfigureClient { source })?;
         let mut request_payload = [0_u8; MAX_AGENT_CONTROL_REQUEST_JSON_BYTES];
-        let (response, connection_issue) = match read_request_frame_into(
+        let (response, connection_issue, wire_delivery) = match read_request_frame_into(
             &mut stream,
             self.timeouts.read,
             &mut request_payload,
@@ -799,6 +1275,7 @@ impl AgentControlSocketServer {
                     false,
                 ),
                 Some(AgentControlConnectionIssue::InvalidFrameLength { declared_bytes }),
+                None,
             ),
             Err(ReadRequestFrameError::Io { source, timeout }) => (
                 AgentControlResponseV1::rejected(
@@ -807,12 +1284,18 @@ impl AgentControlSocketServer {
                     timeout,
                 ),
                 Some(AgentControlConnectionIssue::Read { source, timeout }),
+                None,
             ),
             Err(ReadRequestFrameError::ShutdownRequested) => {
                 return Err(AgentControlServeError::ShutdownRequested);
             }
         };
         write_response_frame(&mut stream, response, self.timeouts.write, cancellation)?;
+        if let Some(wire_delivery) = wire_delivery {
+            // The runtime may use the ordinary response API and deliberately
+            // drop its receiver. Wire success remains successful either way.
+            let _ = wire_delivery.send(());
+        }
         Ok(AgentControlServeOutcome::Responded {
             response,
             connection_issue,
@@ -823,8 +1306,7 @@ impl AgentControlSocketServer {
         &mut self,
         payload: &[u8],
         cancellation: Option<&AtomicBool>,
-    ) -> Result<(AgentControlResponseV1, Option<AgentControlConnectionIssue>), AgentControlServeError>
-    {
+    ) -> Result<AgentControlPayloadOutcome, AgentControlServeError> {
         require_not_cancelled(cancellation)?;
         let request = match self.parser.parse_next(payload) {
             Ok(request) => request,
@@ -832,6 +1314,7 @@ impl AgentControlSocketServer {
                 return Ok((
                     parse_rejection(&source),
                     Some(AgentControlConnectionIssue::RequestParse { source }),
+                    None,
                 ));
             }
         };
@@ -845,24 +1328,32 @@ impl AgentControlSocketServer {
                         false,
                     ),
                     Some(AgentControlConnectionIssue::Clock { source }),
+                    None,
                 ));
             }
         };
+        let runtime_timeout = self.timeouts.response_timeout_for(request.command());
         let runtime_deadline = Instant::now()
-            .checked_add(self.timeouts.runtime_response)
+            .checked_add(runtime_timeout)
             .ok_or(AgentControlServeError::DeadlineOverflow)?;
         let (claim_sender, claim_receiver) = mpsc::sync_channel(0);
         let (response_sender, response_receiver) = mpsc::sync_channel(0);
+        let (wire_delivery_sender, wire_delivery_receiver) = mpsc::sync_channel(1);
         let dispatch = AgentControlDispatch {
             request,
             received_at,
+            #[cfg(feature = "operator-console")]
+            typed_request_key: None,
+            terminal_response_deadline: matches!(request.command(), AgentControlCommandV1::SaveMap)
+                .then_some(runtime_deadline),
             claim: claim_sender,
             response: response_sender,
+            wire_delivery: wire_delivery_receiver,
         };
         require_not_cancelled(cancellation)?;
-        match self.runtime.inner.try_send(dispatch) {
+        match self.runtime.try_send(dispatch) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
+            Err(AgentControlRuntimeTrySendError::Full) => {
                 return Ok((
                     AgentControlResponseV1::rejected(
                         Some(request.request_id()),
@@ -870,9 +1361,10 @@ impl AgentControlSocketServer {
                         true,
                     ),
                     Some(AgentControlConnectionIssue::RuntimeQueueFull),
+                    None,
                 ));
             }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(AgentControlRuntimeTrySendError::Disconnected) => {
                 return Ok((
                     AgentControlResponseV1::rejected(
                         Some(request.request_id()),
@@ -880,6 +1372,7 @@ impl AgentControlSocketServer {
                         false,
                     ),
                     Some(AgentControlConnectionIssue::RuntimeQueueDisconnected),
+                    None,
                 ));
             }
         }
@@ -894,6 +1387,7 @@ impl AgentControlSocketServer {
                         true,
                     ),
                     Some(AgentControlConnectionIssue::RuntimeClaimTimeout),
+                    None,
                 ));
             }
             Err(CancellableReceiveError::Disconnected) => {
@@ -904,6 +1398,7 @@ impl AgentControlSocketServer {
                         false,
                     ),
                     Some(AgentControlConnectionIssue::RuntimeClaimChannelClosed),
+                    None,
                 ));
             }
             Err(CancellableReceiveError::ShutdownRequested) => {
@@ -912,7 +1407,7 @@ impl AgentControlSocketServer {
         }
 
         match recv_until(&response_receiver, runtime_deadline, cancellation) {
-            Ok(response) => Ok((response, None)),
+            Ok(response) => Ok((response, None, Some(wire_delivery_sender))),
             Err(CancellableReceiveError::Deadline) => {
                 Err(AgentControlServeError::RuntimeResponseDeadlineAfterClaim {
                     request_id: request.request_id(),
@@ -952,6 +1447,17 @@ pub struct AgentControlSocketTask {
     handle: Option<JoinHandle<AgentControlSocketTaskExit>>,
 }
 
+struct AgentControlSocketTaskParts {
+    task: AgentControlSocketTask,
+    receiver: AgentControlRuntimeReceiver,
+    #[cfg(all(
+        feature = "agent-runtime",
+        feature = "actuation",
+        feature = "operator-console"
+    ))]
+    typed_ingress: AgentControlTypedIngress,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentControlSocketChildStart {
     Ready,
@@ -978,6 +1484,34 @@ impl AgentControlSocketTask {
         })
     }
 
+    /// Start the socket owner and release exactly one additional, typed
+    /// in-process ingress for the authenticated unified console.
+    ///
+    /// Socket and console requests still converge on the same receiver and
+    /// therefore the same supervisor/motion owner. The extra ingress is not
+    /// cloneable and accepts only an existing [`AgentControlRequestV1`].
+    #[cfg(all(
+        feature = "agent-runtime",
+        feature = "actuation",
+        feature = "operator-console"
+    ))]
+    pub fn bind_and_spawn_with_typed_ingress(
+        config: AgentControlSocketConfig,
+        clock: AgentControlMonotonicOrigin,
+        capacity: AgentControlRuntimeQueueCapacity,
+        running: Arc<AtomicBool>,
+    ) -> Result<
+        (Self, AgentControlRuntimeReceiver, AgentControlTypedIngress),
+        AgentControlSocketTaskStartError,
+    > {
+        Self::bind_and_spawn_components(config, clock, capacity, running, |task_main| {
+            thread::Builder::new()
+                .name(AGENT_CONTROL_SOCKET_THREAD_NAME.to_owned())
+                .spawn(task_main)
+        })
+        .map(|parts| (parts.task, parts.receiver, parts.typed_ingress))
+    }
+
     fn bind_and_spawn_with<Spawn>(
         config: AgentControlSocketConfig,
         clock: AgentControlMonotonicOrigin,
@@ -990,10 +1524,39 @@ impl AgentControlSocketTask {
             Box<dyn FnOnce() -> AgentControlSocketTaskExit + Send + 'static>,
         ) -> io::Result<JoinHandle<AgentControlSocketTaskExit>>,
     {
+        Self::bind_and_spawn_components(config, clock, capacity, running, spawn)
+            .map(|parts| (parts.task, parts.receiver))
+    }
+
+    fn bind_and_spawn_components<Spawn>(
+        config: AgentControlSocketConfig,
+        clock: AgentControlMonotonicOrigin,
+        capacity: AgentControlRuntimeQueueCapacity,
+        running: Arc<AtomicBool>,
+        spawn: Spawn,
+    ) -> Result<AgentControlSocketTaskParts, AgentControlSocketTaskStartError>
+    where
+        Spawn: FnOnce(
+            Box<dyn FnOnce() -> AgentControlSocketTaskExit + Send + 'static>,
+        ) -> io::Result<JoinHandle<AgentControlSocketTaskExit>>,
+    {
         if !running.load(Ordering::Acquire) {
             return Err(AgentControlSocketTaskStartError::ShutdownAlreadyRequested);
         }
-        let (sender, receiver) = agent_control_runtime_queue(capacity);
+        let (mut sender, mut receiver) = agent_control_runtime_queue(capacity);
+        let (priority, priority_receiver) = mpsc::sync_channel(capacity.get());
+        receiver.priority = Some(priority_receiver);
+        sender.priority = Some(priority.clone());
+        #[cfg(all(
+            feature = "agent-runtime",
+            feature = "actuation",
+            feature = "operator-console"
+        ))]
+        let typed_ingress = AgentControlTypedIngress {
+            normal: sender.inner.clone(),
+            priority,
+            next_key: NonZeroU64::new(1),
+        };
         let server = match AgentControlSocketServer::bind(config, clock, sender) {
             Ok(server) => server,
             Err(source) => {
@@ -1084,7 +1647,16 @@ impl AgentControlSocketTask {
             handle: Some(handle),
         };
         match start_receiver.recv_timeout(AGENT_CONTROL_SOCKET_STARTUP_TIMEOUT) {
-            Ok(AgentControlSocketChildStart::Ready) => Ok((task, receiver)),
+            Ok(AgentControlSocketChildStart::Ready) => Ok(AgentControlSocketTaskParts {
+                task,
+                receiver,
+                #[cfg(all(
+                    feature = "agent-runtime",
+                    feature = "actuation",
+                    feature = "operator-console"
+                ))]
+                typed_ingress,
+            }),
             Ok(AgentControlSocketChildStart::ShutdownRequested) => {
                 task.request_shutdown();
                 let task_exit = task.join_handle();
@@ -2010,7 +2582,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::navigation::{AgentBaseCommandStateV1, AgentMapStateV1, AgentRuntimeStateV1};
+    use crate::navigation::{
+        AgentBaseCommandStateV1, AgentControlCommandKindV1, AgentControlResponseKindV1,
+        AgentMapStateV1, AgentRuntimeStateV1,
+    };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -2053,6 +2628,7 @@ mod tests {
             Duration::from_millis(150),
             Duration::from_secs(2),
             runtime,
+            Duration::from_secs(5),
         )
         .expect("test timeouts")
     }
@@ -2062,6 +2638,7 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(30),
             Duration::from_secs(30),
+            Duration::from_secs(10 * 60),
         )
         .expect("maximum bounded cancellation test timeouts")
     }
@@ -2090,6 +2667,128 @@ mod tests {
             "command": command,
         }))
         .expect("serialize request")
+    }
+
+    #[cfg(all(
+        feature = "agent-runtime",
+        feature = "actuation",
+        feature = "operator-console"
+    ))]
+    #[test]
+    fn typed_ingress_converges_on_the_same_claimed_dispatch_without_reparsing() {
+        let capacity = AgentControlRuntimeQueueCapacity::try_new(1).expect("queue capacity");
+        let (sender, mut receiver) = agent_control_runtime_queue(capacity);
+        let (priority, priority_receiver) = mpsc::sync_channel(capacity.get());
+        receiver.priority = Some(priority_receiver);
+        let mut ingress = AgentControlTypedIngress {
+            normal: sender.inner.clone(),
+            priority,
+            next_key: NonZeroU64::new(1),
+        };
+        drop(sender);
+        let parsed = AgentControlRequestParser::new()
+            .parse_next(&request(41, json!({"kind":"stop"})))
+            .expect("parse once at the test boundary");
+        let submission = ingress
+            .try_submit(parsed, HostMonotonicTimestamp::from_nanos(77))
+            .expect("typed submission");
+        assert_eq!(submission.request_id().get(), 41);
+        assert_eq!(
+            submission.try_take_claim(),
+            Err(AgentControlTypedSubmissionPollError::Pending)
+        );
+
+        let dispatch = receiver.try_recv().expect("shared runtime dispatch");
+        assert_eq!(dispatch.request(), parsed);
+        assert_eq!(
+            dispatch.received_at(),
+            HostMonotonicTimestamp::from_nanos(77)
+        );
+        let claimed = dispatch.claim().expect("buffered local claim");
+        submission.try_take_claim().expect("exact claim observed");
+        claimed
+            .respond_completed()
+            .expect("buffered local response");
+        let response = submission
+            .try_take_response()
+            .expect("exact runtime response");
+        assert_eq!(response.request_id(), Some(parsed.request_id()));
+        assert!(matches!(
+            response.response(),
+            AgentControlResponseKindV1::Accepted {
+                command: AgentControlCommandKindV1::Stop,
+                completion: AgentControlCompletionV1::Completed,
+            }
+        ));
+    }
+
+    #[cfg(all(
+        feature = "agent-runtime",
+        feature = "actuation",
+        feature = "operator-console"
+    ))]
+    #[test]
+    fn typed_stop_has_a_reserved_priority_lane_and_distinct_correlation_namespace() {
+        let capacity = AgentControlRuntimeQueueCapacity::try_new(1).expect("queue capacity");
+        let (sender, mut receiver) = agent_control_runtime_queue(capacity);
+        let (priority, priority_receiver) = mpsc::sync_channel(capacity.get());
+        receiver.priority = Some(priority_receiver);
+        let mut ingress = AgentControlTypedIngress {
+            normal: sender.inner.clone(),
+            priority,
+            next_key: NonZeroU64::new(1),
+        };
+
+        let socket_request = AgentControlRequestParser::new()
+            .parse_next(&request(1, json!({"kind":"arm"})))
+            .expect("socket request");
+        let (claim, _claim_rx) = mpsc::sync_channel(0);
+        let (response, _response_rx) = mpsc::sync_channel(0);
+        let (_delivery, delivery_rx) = mpsc::sync_channel(0);
+        sender
+            .inner
+            .try_send(AgentControlDispatch {
+                request: socket_request,
+                received_at: HostMonotonicTimestamp::from_nanos(10),
+                #[cfg(feature = "operator-console")]
+                typed_request_key: None,
+                terminal_response_deadline: None,
+                claim,
+                response,
+                wire_delivery: delivery_rx,
+            })
+            .expect("normal lane filled");
+
+        // A separate boundary may legitimately reuse the same wire request ID.
+        // The process-local typed key—not that caller number—correlates its
+        // eventual physical evidence.
+        let console_request = AgentControlRequestParser::new()
+            .parse_next(&request(1, json!({"kind":"stop"})))
+            .expect("typed request");
+        let submission = ingress
+            .try_submit(console_request, HostMonotonicTimestamp::from_nanos(20))
+            .expect("reserved priority lane accepts stop");
+
+        let priority_dispatch = receiver.try_recv().expect("priority dispatch first");
+        assert!(matches!(
+            priority_dispatch.request().command(),
+            AgentControlCommandV1::Stop
+        ));
+        assert_eq!(
+            priority_dispatch.typed_request_key(),
+            Some(submission.typed_request_key())
+        );
+        assert_eq!(
+            priority_dispatch.request().request_id(),
+            socket_request.request_id()
+        );
+
+        let normal_dispatch = receiver.try_recv().expect("normal dispatch retained");
+        assert!(matches!(
+            normal_dispatch.request().command(),
+            AgentControlCommandV1::Arm
+        ));
+        assert_eq!(normal_dispatch.typed_request_key(), None);
     }
 
     fn write_request(stream: &mut UnixStream, payload: &[u8]) {
@@ -2170,7 +2869,8 @@ mod tests {
             AgentControlSocketTimeouts::try_new(
                 Duration::ZERO,
                 Duration::from_secs(1),
-                Duration::from_secs(1)
+                Duration::from_secs(1),
+                Duration::from_secs(1),
             )
             .is_err()
         );
@@ -2178,9 +2878,29 @@ mod tests {
             AgentControlSocketTimeouts::try_new(
                 Duration::from_secs(1),
                 Duration::from_secs(31),
-                Duration::from_secs(1)
+                Duration::from_secs(1),
+                Duration::from_secs(1),
             )
             .is_err()
+        );
+        assert!(
+            AgentControlSocketTimeouts::try_new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(3),
+            )
+            .is_err()
+        );
+        let parsed_timeouts = timeouts(Duration::from_millis(40));
+        assert_eq!(
+            parsed_timeouts.response_timeout_for(AgentControlCommandV1::Arm),
+            Duration::from_millis(40)
+        );
+        assert_eq!(
+            parsed_timeouts.response_timeout_for(AgentControlCommandV1::SaveMap),
+            Duration::from_secs(5),
+            "terminal SaveMap must not inherit the ordinary runtime deadline"
         );
         assert!(matches!(
             AgentControlRuntimeQueueCapacity::try_new(0),
@@ -2260,7 +2980,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_response_is_framed_bounded_and_stamped_from_shared_origin() {
+    fn shutdown_completion_waits_for_a_complete_framed_wire_write() {
         let directory = TestDirectory::new(0o700);
         let socket_path = directory.socket_path();
         let (server, receiver) = bind_server(&directory, 2, Duration::from_secs(1));
@@ -2277,9 +2997,11 @@ mod tests {
             let claimed = dispatch.claim().expect("claim rendezvous");
             assert!(matches!(
                 claimed.request().command(),
-                AgentControlCommandV1::Stop
+                AgentControlCommandV1::Shutdown
             ));
-            claimed.respond_completed().expect("completion rendezvous");
+            claimed
+                .respond_completed_after_wire_delivery()
+                .expect("wire-delivered completion");
         });
         let server_thread = thread::spawn(move || {
             let mut server = server;
@@ -2287,11 +3009,11 @@ mod tests {
             (server, outcome)
         });
         let (response, encoded_bytes) =
-            round_trip(&socket_path, &request(1, json!({"kind":"stop"})));
+            round_trip(&socket_path, &request(1, json!({"kind":"shutdown"})));
         assert!(encoded_bytes <= MAX_AGENT_CONTROL_RESPONSE_JSON_BYTES);
         assert_eq!(response["request_id"], 1);
         assert_eq!(response["response"]["kind"], "accepted");
-        assert_eq!(response["response"]["command"], "stop");
+        assert_eq!(response["response"]["command"], "shutdown");
         assert_eq!(response["response"]["completion"], "completed");
         runtime.join().expect("runtime thread");
         let (server, outcome) = server_thread.join().expect("server thread");
@@ -2311,6 +3033,97 @@ mod tests {
             AgentControlSocketCleanupOutcome::RemovedCreatedSocket
         ));
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn shutdown_completion_reports_wire_delivery_uncertainty_after_response_rendezvous() {
+        let (claim_sender, claim_receiver) = mpsc::sync_channel(0);
+        let (response_sender, response_receiver) = mpsc::sync_channel(0);
+        let (wire_delivery_sender, wire_delivery_receiver) = mpsc::sync_channel(1);
+        let request = AgentControlRequestParser::new()
+            .parse_next(&request(1, json!({"kind":"shutdown"})))
+            .expect("parsed shutdown");
+        let dispatch = AgentControlDispatch {
+            request,
+            received_at: HostMonotonicTimestamp::from_nanos(10_000),
+            #[cfg(feature = "operator-console")]
+            typed_request_key: None,
+            terminal_response_deadline: None,
+            claim: claim_sender,
+            response: response_sender,
+            wire_delivery: wire_delivery_receiver,
+        };
+        let peer = thread::spawn(move || {
+            claim_receiver.recv().expect("claim");
+            let response = response_receiver.recv().expect("runtime response");
+            drop(wire_delivery_sender);
+            response
+        });
+
+        let error = dispatch
+            .claim()
+            .expect("claimed shutdown")
+            .respond_completed_after_wire_delivery()
+            .expect_err("a dropped write acknowledgement is not completion");
+        assert_eq!(
+            error,
+            AgentControlDispatchResponseError::WireDeliveryUncertain
+        );
+        let response = peer.join().expect("delivery peer");
+        assert_eq!(
+            response.response(),
+            AgentControlResponseKindV1::Accepted {
+                command: AgentControlCommandKindV1::Shutdown,
+                completion: AgentControlCompletionV1::Completed,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_rejection_requires_wire_delivery_acknowledgement() {
+        let (claim_sender, claim_receiver) = mpsc::sync_channel(0);
+        let (response_sender, response_receiver) = mpsc::sync_channel(0);
+        let (wire_delivery_sender, wire_delivery_receiver) = mpsc::sync_channel(1);
+        let request = AgentControlRequestParser::new()
+            .parse_next(&request(1, json!({"kind":"save_map"})))
+            .expect("parsed save-map request");
+        let terminal_response_deadline = Instant::now() + Duration::from_secs(5);
+        let dispatch = AgentControlDispatch {
+            request,
+            received_at: HostMonotonicTimestamp::from_nanos(10_000),
+            #[cfg(feature = "operator-console")]
+            typed_request_key: None,
+            terminal_response_deadline: Some(terminal_response_deadline),
+            claim: claim_sender,
+            response: response_sender,
+            wire_delivery: wire_delivery_receiver,
+        };
+        let runtime = thread::spawn(move || {
+            let claimed = dispatch.claim().expect("claimed save-map request");
+            assert_eq!(
+                claimed.terminal_response_deadline(),
+                Some(terminal_response_deadline)
+            );
+            claimed
+                .reject_after_wire_delivery(AgentControlRejectionCodeV1::PersistenceFailed, false)
+        });
+        claim_receiver.recv().expect("claim");
+        let response = response_receiver.recv().expect("runtime response");
+        assert!(matches!(
+            response.response(),
+            AgentControlResponseKindV1::Rejected {
+                code: AgentControlRejectionCodeV1::PersistenceFailed,
+                retryable: false,
+            }
+        ));
+        assert!(!runtime.is_finished());
+        wire_delivery_sender
+            .send(())
+            .expect("wire-delivery evidence");
+        runtime
+            .join()
+            .expect("runtime thread")
+            .expect("wire-delivered rejection");
     }
 
     #[test]

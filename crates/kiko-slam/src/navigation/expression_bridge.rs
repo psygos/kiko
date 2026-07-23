@@ -8,10 +8,10 @@
 //!
 //! OAK device timestamps and host timestamps have unrelated epochs. The bridge
 //! therefore never guesses an offset between them: the device timestamp is
-//! checked only for capture-clock continuity, while one injected
-//! [`MonotonicClock`] supplies the host observation, reaction, and intent time
-//! at this call boundary. The eye actor must receive a clone or shared adapter
-//! with that exact same clock origin.
+//! checked only for capture-clock continuity, while clones of one injected
+//! [`MonotonicClock`] supply ingress observation, processing, reaction, and
+//! intent time. The RGB ingress and eye actor must receive clones or shared
+//! adapters with that exact same clock origin.
 
 use std::fmt;
 
@@ -22,9 +22,10 @@ use kiko_expression_core::{
 };
 use kiko_expression_runtime::{
     AdaptError, CameraForwardDepthMeters, CameraToHeadGazeExtrinsics, EyeRenderStyle,
-    HeadGazeProjectionError, HeadRelativeGaze, OakCameraTargetPoint, OakCameraTargetRay,
-    PreparedEyeIntent, RayHeadGazeProjectionError, SceneAnalysis, SceneMotionConfig,
-    SceneMotionError, SceneMotionExtractor, adapt_reaction_output,
+    HeadGazeProjectionError, HeadRelativeGaze, MonotonicLatestAdmission, MonotonicLatestGap,
+    OakCameraTargetPoint, OakCameraTargetRay, PreparedEyeIntent, RayHeadGazeProjectionError,
+    SceneAnalysis, SceneMotionConfig, SceneMotionError, SceneMotionExtractor,
+    adapt_reaction_output,
 };
 use kiko_eye_runtime::{ClockError, MonotonicClock};
 use oak_sys::{ImageFrame, StreamId};
@@ -67,15 +68,14 @@ impl std::error::Error for RgbHeadGazeProjectionError {
 /// A successful expression decision and its continuity semantics.
 ///
 /// Each variant contains exactly one small, transport-independent eye intent.
-/// A gap is not reported as an ordinary first frame: diagnostics retain the
-/// capture sequences which forced the comparison history to be discarded.
+/// A forward gap remains a real comparison against the last accepted frame,
+/// while its exact skipped-sequence count remains available to diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RgbExpressionBridgeOutcome {
     ColdStart(PreparedEyeIntent),
     Consecutive(PreparedEyeIntent),
-    ColdStartAfterGap {
-        previous_capture_sequence: u64,
-        actual_capture_sequence: u64,
+    ForwardGap {
+        gap: MonotonicLatestGap,
         prepared: PreparedEyeIntent,
     },
 }
@@ -87,7 +87,7 @@ impl RgbExpressionBridgeOutcome {
         match self {
             Self::ColdStart(prepared)
             | Self::Consecutive(prepared)
-            | Self::ColdStartAfterGap { prepared, .. } => prepared,
+            | Self::ForwardGap { prepared, .. } => prepared,
         }
     }
 }
@@ -117,9 +117,6 @@ pub enum RgbExpressionBridgeError {
         previous_ns: i64,
         actual_ns: i64,
     },
-    ExtractorStateMismatch {
-        actual_capture_sequence: u64,
-    },
     SceneMotion(SceneMotionError),
     Adapt(AdaptError),
 }
@@ -143,18 +140,9 @@ impl std::error::Error for RgbExpressionBridgeError {
             Self::Adapt(source) => Some(source),
             Self::NotRgbStream { .. }
             | Self::NonTightBgrLayout { .. }
-            | Self::DeviceCaptureClockNotIncreasing { .. }
-            | Self::ExtractorStateMismatch { .. } => None,
+            | Self::DeviceCaptureClockNotIncreasing { .. } => None,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct AcceptedFrame {
-    capture_sequence: u64,
-    device_timestamp_ns: i64,
-    host_timestamp: MonotonicTimestamp,
-    layout: ImageLayout,
 }
 
 #[derive(Clone, Copy)]
@@ -182,6 +170,33 @@ impl<'a> From<&'a ImageFrame> for BorrowedOakFrame<'a> {
     }
 }
 
+/// One owned RGB frame paired with its host-clock observation at queue ingress.
+///
+/// `F` is moved into this wrapper. In production it remains the original
+/// [`ImageFrame`] allocation; no frame or pixel buffer is cloned.
+pub(super) struct IngressObservedRgbFrame<F> {
+    frame: F,
+    observed_at: MonotonicTimestamp,
+}
+
+impl<F> IngressObservedRgbFrame<F> {
+    pub(super) const fn new(frame: F, observed_at: MonotonicTimestamp) -> Self {
+        Self { frame, observed_at }
+    }
+
+    pub(super) const fn frame(&self) -> &F {
+        &self.frame
+    }
+
+    pub(super) const fn observed_at(&self) -> MonotonicTimestamp {
+        self.observed_at
+    }
+
+    fn into_parts(self) -> (F, MonotonicTimestamp) {
+        (self.frame, self.observed_at)
+    }
+}
+
 /// Stateful, allocation-free RGB reaction boundary for one OAK stream epoch.
 pub struct RgbExpressionBridge<C> {
     clock: C,
@@ -191,7 +206,7 @@ pub struct RgbExpressionBridge<C> {
     gaze_geometry: Option<CameraToHeadGazeExtrinsics>,
     extractor: SceneMotionExtractor,
     mixer: ReactionMixer,
-    last_accepted: Option<AcceptedFrame>,
+    last_device_timestamp_ns: Option<i64>,
 }
 
 impl<C: MonotonicClock> RgbExpressionBridge<C> {
@@ -228,7 +243,7 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
             gaze_geometry,
             extractor: SceneMotionExtractor::new(scene_motion),
             mixer: ReactionMixer::new(RGB_EXPRESSION_HEAD_POLICY),
-            last_accepted: None,
+            last_device_timestamp_ns: None,
         }
     }
 
@@ -270,12 +285,13 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
             .map_err(RgbHeadGazeProjectionError::Ray)
     }
 
-    /// Borrow one checked OAK RGB frame and prepare one bounded eye intent.
+    /// Borrow one synchronously delivered OAK RGB frame and prepare one
+    /// bounded eye intent.
     ///
-    /// The caller must invoke this at frame ingress: the single clock sample
-    /// taken here becomes the host observation time. OAK device time is used
-    /// only for continuity, so this adapter deliberately cannot certify the
-    /// age of a frame retained in an upstream caller-owned queue.
+    /// This direct-capture entrypoint uses its single clock sample as both
+    /// ingress observation and processing time. Queued production delivery
+    /// must use [`Self::process_queued_oak_frame`] so queue residence contributes
+    /// to freshness.
     pub fn process_oak_frame(
         &mut self,
         frame: &ImageFrame,
@@ -283,13 +299,41 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         self.process_borrowed(frame.into())
     }
 
+    /// Process a moved frame whose host observation was captured before queue
+    /// admission by a clone of this bridge's exact clock origin.
+    pub(super) fn process_queued_oak_frame(
+        &mut self,
+        frame: &IngressObservedRgbFrame<ImageFrame>,
+    ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
+        let borrowed = IngressObservedRgbFrame::new(frame.frame().into(), frame.observed_at());
+        self.process_ingress_observed_borrowed(borrowed)
+    }
+
+    fn process_ingress_observed_borrowed(
+        &mut self,
+        frame: IngressObservedRgbFrame<BorrowedOakFrame<'_>>,
+    ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
+        let (frame, observed_at) = frame.into_parts();
+        let now = self.clock.now().map_err(RgbExpressionBridgeError::Clock)?;
+        self.process_borrowed_at(frame, observed_at, now)
+    }
+
     fn process_borrowed(
         &mut self,
         frame: BorrowedOakFrame<'_>,
     ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
-        let layout = parse_tight_bgr_layout(frame)?;
         let now = self.clock.now().map_err(RgbExpressionBridgeError::Clock)?;
-        let freshness = FreshnessWindow::from_ttl(now, self.freshness)
+        self.process_borrowed_at(frame, now, now)
+    }
+
+    fn process_borrowed_at(
+        &mut self,
+        frame: BorrowedOakFrame<'_>,
+        observed_at: MonotonicTimestamp,
+        now: MonotonicTimestamp,
+    ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
+        let layout = parse_tight_bgr_layout(frame)?;
+        let freshness = FreshnessWindow::from_ttl(observed_at, self.freshness)
             .map_err(RgbExpressionBridgeError::Freshness)?;
         let observation = RgbObservation::new(
             FrameId::new(self.stream_epoch, frame.capture_sequence),
@@ -299,33 +343,14 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         let view = RgbFrameView::try_new(observation, frame.pixels)
             .map_err(RgbExpressionBridgeError::Layout)?;
 
-        self.validate_continuity_before_gap_reset(frame, layout, now)?;
+        self.validate_device_capture_clock(frame.device_timestamp_ns)?;
 
-        let (analysis, gap) = match self.extractor.analyze(view, now) {
-            Ok(analysis) => (analysis, None),
-            Err(SceneMotionError::FrameGap { actual, .. }) => {
-                let previous = self
-                    .last_accepted
-                    .map(|accepted| accepted.capture_sequence)
-                    .ok_or(RgbExpressionBridgeError::ExtractorStateMismatch {
-                        actual_capture_sequence: actual,
-                    })?;
-                self.extractor.reset();
-                let analysis = self
-                    .extractor
-                    .analyze(view, now)
-                    .map_err(RgbExpressionBridgeError::SceneMotion)?;
-                (analysis, Some((previous, actual)))
-            }
-            Err(source) => return Err(RgbExpressionBridgeError::SceneMotion(source)),
-        };
-
-        self.last_accepted = Some(AcceptedFrame {
-            capture_sequence: frame.capture_sequence,
-            device_timestamp_ns: frame.device_timestamp_ns,
-            host_timestamp: now,
-            layout,
-        });
+        let admitted = self
+            .extractor
+            .analyze_monotonic_latest(view, now)
+            .map_err(RgbExpressionBridgeError::SceneMotion)?;
+        let analysis = admitted.analysis();
+        self.last_device_timestamp_ns = Some(frame.device_timestamp_ns);
 
         let scene = analysis.observation();
         let reaction = self.mixer.mix(
@@ -340,86 +365,37 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         let prepared = adapt_reaction_output(reaction, ExpressionKind::Curious, self.style, now)
             .map_err(RgbExpressionBridgeError::Adapt)?;
 
-        Ok(match gap {
-            Some((previous_capture_sequence, actual_capture_sequence)) => {
+        Ok(match admitted.admission() {
+            MonotonicLatestAdmission::ColdStart => {
                 debug_assert!(matches!(analysis, SceneAnalysis::ColdStart(_)));
-                RgbExpressionBridgeOutcome::ColdStartAfterGap {
-                    previous_capture_sequence,
-                    actual_capture_sequence,
-                    prepared,
-                }
-            }
-            None if matches!(analysis, SceneAnalysis::ColdStart(_)) => {
                 RgbExpressionBridgeOutcome::ColdStart(prepared)
             }
-            None => RgbExpressionBridgeOutcome::Consecutive(prepared),
+            MonotonicLatestAdmission::Consecutive { .. } => {
+                debug_assert!(!matches!(analysis, SceneAnalysis::ColdStart(_)));
+                RgbExpressionBridgeOutcome::Consecutive(prepared)
+            }
+            MonotonicLatestAdmission::ForwardGap(gap) => {
+                debug_assert!(!matches!(analysis, SceneAnalysis::ColdStart(_)));
+                RgbExpressionBridgeOutcome::ForwardGap { gap, prepared }
+            }
         })
     }
 
-    /// These checks intentionally precede `SceneMotionExtractor::analyze`.
-    /// The extractor reports a sequence gap before its layout and observation
-    /// clock checks; admitting a reset without this preflight would therefore
-    /// hide a simultaneous layout or clock fault as a benign cold start.
-    fn validate_continuity_before_gap_reset(
+    /// OAK capture time has a device-local epoch and is therefore checked only
+    /// for strict monotonicity. Sequence, layout, freshness, stream epoch, and
+    /// host-clock admission each remain owned exactly once by the extractor.
+    fn validate_device_capture_clock(
         &self,
-        frame: BorrowedOakFrame<'_>,
-        layout: ImageLayout,
-        now: MonotonicTimestamp,
+        device_timestamp_ns: i64,
     ) -> Result<(), RgbExpressionBridgeError> {
-        let Some(previous) = self.last_accepted else {
+        let Some(previous_ns) = self.last_device_timestamp_ns else {
             return Ok(());
         };
-        if previous.capture_sequence == u64::MAX {
-            return Err(RgbExpressionBridgeError::SceneMotion(
-                SceneMotionError::FrameSequenceExhausted {
-                    previous: previous.capture_sequence,
-                },
-            ));
-        }
-        if frame.capture_sequence == previous.capture_sequence {
-            return Err(RgbExpressionBridgeError::SceneMotion(
-                SceneMotionError::DuplicateFrame {
-                    sequence: frame.capture_sequence,
-                },
-            ));
-        }
-        if frame.capture_sequence < previous.capture_sequence {
-            return Err(RgbExpressionBridgeError::SceneMotion(
-                SceneMotionError::OutOfOrderFrame {
-                    previous: previous.capture_sequence,
-                    actual: frame.capture_sequence,
-                },
-            ));
-        }
-        if layout != previous.layout {
-            return Err(RgbExpressionBridgeError::SceneMotion(
-                SceneMotionError::LayoutChanged {
-                    expected: previous.layout,
-                    actual: layout,
-                },
-            ));
-        }
-        if frame.device_timestamp_ns <= previous.device_timestamp_ns {
+        if device_timestamp_ns <= previous_ns {
             return Err(RgbExpressionBridgeError::DeviceCaptureClockNotIncreasing {
-                previous_ns: previous.device_timestamp_ns,
-                actual_ns: frame.device_timestamp_ns,
+                previous_ns,
+                actual_ns: device_timestamp_ns,
             });
-        }
-        if now < previous.host_timestamp {
-            return Err(RgbExpressionBridgeError::SceneMotion(
-                SceneMotionError::HostClockRegressed {
-                    previous_ns: previous.host_timestamp.nanos_since_epoch(),
-                    actual_ns: now.nanos_since_epoch(),
-                },
-            ));
-        }
-        if now == previous.host_timestamp {
-            return Err(RgbExpressionBridgeError::SceneMotion(
-                SceneMotionError::ObservationClockNotIncreasing {
-                    previous_ns: previous.host_timestamp.nanos_since_epoch(),
-                    actual_ns: now.nanos_since_epoch(),
-                },
-            ));
         }
         Ok(())
     }
@@ -461,32 +437,49 @@ fn parse_tight_bgr_layout(
 mod tests {
     use std::sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
-    use kiko_expression_core::{PositiveUnitAmount, UnitAmount};
+    use kiko_expression_core::{MonotonicTimestamp, PositiveUnitAmount, UnitAmount};
     use kiko_expression_runtime::{MotionThresholds, SamplingGeometry};
     use kiko_eye_protocol::Expression;
 
     use super::*;
 
+    struct TestClockState {
+        now_ns: AtomicU64,
+        failing: AtomicBool,
+    }
+
     #[derive(Clone)]
-    struct TestClock(Arc<AtomicU64>);
+    struct TestClock(Arc<TestClockState>);
 
     impl TestClock {
         fn new(now_ns: u64) -> Self {
-            Self(Arc::new(AtomicU64::new(now_ns)))
+            Self(Arc::new(TestClockState {
+                now_ns: AtomicU64::new(now_ns),
+                failing: AtomicBool::new(false),
+            }))
         }
 
         fn set(&self, now_ns: u64) {
-            self.0.store(now_ns, Ordering::Relaxed);
+            self.0.now_ns.store(now_ns, Ordering::Relaxed);
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.0.failing.store(failing, Ordering::Relaxed);
         }
     }
 
     impl MonotonicClock for TestClock {
         fn now(&self) -> Result<MonotonicTimestamp, ClockError> {
+            if self.0.failing.load(Ordering::Relaxed) {
+                return Err(ClockError::ElapsedNanosecondsOutOfRange {
+                    elapsed_nanoseconds: u128::MAX,
+                });
+            }
             Ok(MonotonicTimestamp::from_nanos_since_epoch(
-                self.0.load(Ordering::Relaxed),
+                self.0.now_ns.load(Ordering::Relaxed),
             ))
         }
     }
@@ -567,6 +560,18 @@ mod tests {
         pixels
     }
 
+    fn queued_rgb<'a>(
+        capture_sequence: u64,
+        device_timestamp_ns: i64,
+        observed_at_ns: u64,
+        pixels: &'a [u8; 12],
+    ) -> IngressObservedRgbFrame<BorrowedOakFrame<'a>> {
+        IngressObservedRgbFrame::new(
+            rgb(capture_sequence, device_timestamp_ns, pixels),
+            MonotonicTimestamp::from_nanos_since_epoch(observed_at_ns),
+        )
+    }
+
     #[test]
     fn cold_start_returns_only_styled_neutral_prepared_intent() {
         let clock = TestClock::new(10);
@@ -615,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn genuine_capture_gap_resets_and_reports_a_distinct_cold_start() {
+    fn replace_latest_gaps_compare_motion_and_report_exact_skip_evidence() {
         let clock = TestClock::new(10);
         let mut bridge = bridge(clock.clone());
         bridge
@@ -626,24 +631,37 @@ mod tests {
         let changed = localized_change();
         let outcome = bridge
             .process_borrowed(rgb(42, 2_000, &changed))
-            .expect("gap cold start");
-        assert!(matches!(
-            outcome,
-            RgbExpressionBridgeOutcome::ColdStartAfterGap {
-                previous_capture_sequence: 40,
-                actual_capture_sequence: 42,
-                ..
-            }
-        ));
-        assert_eq!(
-            outcome.into_prepared().intent().expression(),
-            Expression::Neutral
-        );
+            .expect("forward gap remains comparable");
+        let RgbExpressionBridgeOutcome::ForwardGap { gap, prepared } = outcome else {
+            panic!("forward gap must retain gap evidence");
+        };
+        assert_eq!(gap.previous_sequence(), 40);
+        assert_eq!(gap.actual_sequence(), 42);
+        assert_eq!(gap.skipped_sequence_count().get(), 1);
+        assert_eq!(prepared.intent().expression(), Expression::Curious);
 
         clock.set(30);
+        let second_gap = bridge
+            .process_borrowed(rgb(45, 3_000, &[0; 12]))
+            .expect("another replace-latest gap");
+        let RgbExpressionBridgeOutcome::ForwardGap { gap, prepared } = second_gap else {
+            panic!("second forward gap must retain gap evidence");
+        };
+        assert_eq!(gap.previous_sequence(), 42);
+        assert_eq!(gap.actual_sequence(), 45);
+        assert_eq!(gap.skipped_sequence_count().get(), 2);
+        assert_eq!(
+            prepared.intent().expression(),
+            Expression::Curious,
+            "repeated replace-latest gaps must not repeatedly cold-reset the eyes"
+        );
+
+        clock.set(40);
+        let changed_again = localized_change();
         let next = bridge
-            .process_borrowed(rgb(43, 3_000, &[0; 12]))
-            .expect("extractor was re-primed");
+            .process_borrowed(rgb(46, 4_000, &changed_again))
+            .expect("consecutive frame after gaps");
+        assert!(matches!(next, RgbExpressionBridgeOutcome::Consecutive(_)));
         assert_eq!(
             next.into_prepared().intent().expression(),
             Expression::Curious
@@ -715,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_and_device_clock_faults_are_not_hidden_by_a_gap_reset() {
+    fn layout_and_device_clock_faults_are_not_hidden_by_forward_gap_admission() {
         let clock = TestClock::new(10);
         let mut bridge = bridge(clock.clone());
         bridge
@@ -737,6 +755,19 @@ mod tests {
                 actual_ns: 1_000,
             })
         );
+
+        clock.set(40);
+        let changed = localized_change();
+        let recovered = bridge
+            .process_borrowed(rgb(7, 3_000, &changed))
+            .expect("layout and device-clock rejections did not advance either state owner");
+        let RgbExpressionBridgeOutcome::ForwardGap { gap, prepared } = recovered else {
+            panic!("recovery must retain the original sequence baseline");
+        };
+        assert_eq!(gap.previous_sequence(), 5);
+        assert_eq!(gap.actual_sequence(), 7);
+        assert_eq!(gap.skipped_sequence_count().get(), 1);
+        assert_eq!(prepared.intent().expression(), Expression::Curious);
     }
 
     #[test]
@@ -759,6 +790,99 @@ mod tests {
         );
         clock.set(30);
         assert!(bridge.process_borrowed(rgb(6, 2_000, &[0; 12])).is_ok());
+    }
+
+    #[test]
+    fn queued_frame_is_stale_at_the_exclusive_deadline_without_advancing_state() {
+        let clock = TestClock::new(10);
+        let mut bridge = bridge(clock.clone());
+        bridge
+            .process_ingress_observed_borrowed(queued_rgb(5, 1_000, 10, &[0; 12]))
+            .expect("prime extractor from ingress observation");
+
+        clock.set(120);
+        let changed = localized_change();
+        assert_eq!(
+            bridge.process_ingress_observed_borrowed(queued_rgb(6, 2_000, 20, &changed)),
+            Err(RgbExpressionBridgeError::SceneMotion(
+                SceneMotionError::StaleFrame {
+                    deadline_ns: 120,
+                    now_ns: 120,
+                }
+            ))
+        );
+
+        clock.set(130);
+        let recovered = bridge
+            .process_ingress_observed_borrowed(queued_rgb(6, 2_000, 130, &changed))
+            .expect("stale rejection retained sequence, pixels, and device-clock baselines");
+        assert!(matches!(
+            recovered,
+            RgbExpressionBridgeOutcome::Consecutive(_)
+        ));
+        assert_eq!(
+            recovered.into_prepared().intent().expression(),
+            Expression::Curious
+        );
+    }
+
+    #[test]
+    fn queued_host_time_failures_do_not_advance_state() {
+        let clock = TestClock::new(10);
+        let mut bridge = bridge(clock.clone());
+        bridge
+            .process_ingress_observed_borrowed(queued_rgb(5, 1_000, 10, &[0; 12]))
+            .expect("prime extractor from ingress observation");
+
+        clock.set(9);
+        assert_eq!(
+            bridge.process_ingress_observed_borrowed(queued_rgb(6, 2_000, 9, &[0; 12])),
+            Err(RgbExpressionBridgeError::SceneMotion(
+                SceneMotionError::HostClockRegressed {
+                    previous_ns: 10,
+                    actual_ns: 9,
+                }
+            ))
+        );
+
+        clock.set(20);
+        assert_eq!(
+            bridge.process_ingress_observed_borrowed(queued_rgb(6, 2_000, 10, &[0; 12])),
+            Err(RgbExpressionBridgeError::SceneMotion(
+                SceneMotionError::ObservationClockNotIncreasing {
+                    previous_ns: 10,
+                    actual_ns: 10,
+                }
+            ))
+        );
+        assert_eq!(
+            bridge.process_ingress_observed_borrowed(queued_rgb(6, 2_000, 21, &[0; 12])),
+            Err(RgbExpressionBridgeError::SceneMotion(
+                SceneMotionError::FrameFromFuture {
+                    observed_at_ns: 21,
+                    now_ns: 20,
+                }
+            ))
+        );
+
+        clock.set_failing(true);
+        assert_eq!(
+            bridge.process_ingress_observed_borrowed(queued_rgb(6, 2_000, 20, &[0; 12])),
+            Err(RgbExpressionBridgeError::Clock(
+                ClockError::ElapsedNanosecondsOutOfRange {
+                    elapsed_nanoseconds: u128::MAX,
+                }
+            ))
+        );
+
+        clock.set_failing(false);
+        let recovered = bridge
+            .process_ingress_observed_borrowed(queued_rgb(6, 2_000, 20, &[0; 12]))
+            .expect("all queued host-time rejections retained every admission baseline");
+        assert!(matches!(
+            recovered,
+            RgbExpressionBridgeOutcome::Consecutive(_)
+        ));
     }
 
     #[test]

@@ -543,6 +543,45 @@ impl RectifiedStereo {
     pub fn dimensions(&self) -> FrameDimensions {
         self.dimensions
     }
+
+    /// Exact calibration equality used when one tracker must replay historical
+    /// frames and then continue with a live camera. Approximate rectification
+    /// compatibility is insufficient here: accepting different projection
+    /// coefficients or baseline would silently change the reconstructed map.
+    #[cfg(any(feature = "nano-agent", test))]
+    pub(crate) fn exactly_matches_calibration(&self, calibration: &StereoCalibration) -> bool {
+        fn intrinsics_match(left: PinholeIntrinsics, right: PinholeIntrinsics) -> bool {
+            left.fx().to_bits() == right.fx().to_bits()
+                && left.fy().to_bits() == right.fy().to_bits()
+                && left.cx().to_bits() == right.cx().to_bits()
+                && left.cy().to_bits() == right.cy().to_bits()
+        }
+
+        calibration.is_rectified()
+            && self.dimensions == calibration.dimensions()
+            && self.baseline_m.to_bits() == calibration.baseline_m().to_bits()
+            && intrinsics_match(self.left, calibration.left())
+            && intrinsics_match(self.right, calibration.right())
+    }
+
+    /// Bit-exact equality for immutable live-calibration admission.
+    ///
+    /// Both values already represent structurally valid rectified stereo
+    /// models. Exact matching prevents a reconnect or launch artifact from
+    /// silently changing the projection used by an existing map.
+    pub fn exactly_matches(&self, other: &Self) -> bool {
+        fn intrinsics(left: PinholeIntrinsics, right: PinholeIntrinsics) -> bool {
+            left.fx().to_bits() == right.fx().to_bits()
+                && left.fy().to_bits() == right.fy().to_bits()
+                && left.cx().to_bits() == right.cx().to_bits()
+                && left.cy().to_bits() == right.cy().to_bits()
+        }
+
+        self.dimensions == other.dimensions
+            && self.baseline_m.to_bits() == other.baseline_m.to_bits()
+            && intrinsics(self.left, other.left)
+            && intrinsics(self.right, other.right)
+    }
 }
 
 impl RectifiedStereoArithmetic {
@@ -1003,6 +1042,11 @@ impl Triangulator {
         Self { stereo, config }
     }
 
+    #[cfg(feature = "nano-agent")]
+    pub(crate) fn exactly_matches_calibration(&self, calibration: &StereoCalibration) -> bool {
+        self.stereo.exactly_matches_calibration(calibration)
+    }
+
     pub fn triangulate(
         &self,
         matches: &Matches<Raw>,
@@ -1199,6 +1243,35 @@ mod tests {
             stereo.arithmetic.baseline_m.to_bits(),
             f64::from(baseline_m).to_bits()
         );
+    }
+
+    #[test]
+    fn replay_calibration_match_is_bit_exact_and_requires_rectification() {
+        let dimensions = FrameDimensions::try_new(640, 480).expect("test dimensions");
+        let left = PinholeIntrinsics::try_new(400.0, 401.0, 320.0, 240.0).expect("left intrinsics");
+        let right =
+            PinholeIntrinsics::try_new(400.0, 401.0, 320.0, 240.0).expect("right intrinsics");
+        let baseline_m = 0.075_f32;
+        let calibration = StereoCalibration::try_new(left, right, dimensions, baseline_m, true)
+            .expect("test calibration");
+        let stereo =
+            RectifiedStereo::from_stereo_calibration(&calibration).expect("rectified stereo");
+        assert!(stereo.exactly_matches_calibration(&calibration));
+
+        let adjacent_baseline = f32::from_bits(
+            baseline_m
+                .to_bits()
+                .checked_add(1)
+                .expect("finite adjacent bit"),
+        );
+        let changed_baseline =
+            StereoCalibration::try_new(left, right, dimensions, adjacent_baseline, true)
+                .expect("adjacent baseline");
+        assert!(!stereo.exactly_matches_calibration(&changed_baseline));
+
+        let unrectified = StereoCalibration::try_new(left, right, dimensions, baseline_m, false)
+            .expect("structurally valid unrectified calibration");
+        assert!(!stereo.exactly_matches_calibration(&unrectified));
     }
 
     #[test]

@@ -18,14 +18,39 @@ agent-runtime = [
     "dep:kiko-supervisor-core",
     "dep:tokio",
 ]
-nano-agent = ["agent-runtime", "actuation", "record", "dep:robot-server"]
-nano-bench = ["agent-runtime", "actuation", "record", "dep:robot-server", "dep:tokio"]
+operator-console = ["dep:bytes", "dep:getrandom", "dep:rustix", "dep:tokio", "dep:warp"]
+nano-agent = [
+    "agent-runtime",
+    "actuation",
+    "operator-console",
+    "record",
+    "dep:kiko-nano-deployment-gate",
+    "dep:robot-server",
+    "dep:rustix",
+]
+# Manually invoked, wheels-off-only qualification surface. The production
+# deployment is built with `nano-agent` alone, so its exact binary contains no
+# candidate entry point.
+nano-wheels-off-qualification = ["nano-agent"]
+# Manually invoked, attended, wheel-on commissioning lane. Production
+# `nano-agent` does not enable this feature and therefore contains no
+# commissioning actuation entry point.
+nano-base-commissioning = [
+    "agent-runtime",
+    "actuation",
+    "operator-console",
+    "record",
+    "dep:kiko-base-commissioning",
+    "dep:robot-server",
+    "dep:rustix",
+]
 ort-coreml = ["ort/coreml"]
 ort-cuda = ["ort/cuda"]
 ort-tensorrt = ["ort/tensorrt"]
 
 [dependencies]
 bytemuck = { version = "1.24.0", features = ["derive"] }
+bytes = { version = "1.5", optional = true }
 clap = { version = "4.5.28", features = ["derive", "env"] }
 crossbeam-channel = "0.5.13"
 libc = "0.2.153"
@@ -42,24 +67,34 @@ kiko-eye-protocol = { path = "../kiko-eye-protocol", optional = true }
 kiko-eye-runtime = { path = "../kiko-eye-runtime", optional = true }
 kiko-head-protocol = { path = "../kiko-head-protocol", optional = true }
 kiko-head-runtime = { path = "../kiko-head-runtime", optional = true }
+kiko-base-commissioning = { path = "../kiko-base-commissioning", optional = true, features = ["serde"] }
+kiko-nano-deployment-gate = { path = "../kiko-nano-deployment-gate", optional = true }
 kiko-supervisor-core = { path = "../kiko-supervisor-core", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = { version = "0.10", optional = true }
 slotmap = "1.0"
 oak-sys = { path = "../oak-sys", optional = true }
-ctrlc = { version = "3.4", optional = true }
+ctrlc = { version = "3.4", features = ["termination"], optional = true }
 chrono = { version = "0.4", optional = true }
-tokio = { version = "1.35", optional = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+getrandom = { version = "0.3", features = ["std"], optional = true }
+rustix = { version = "1.1", features = ["fs", "process", "termios"], optional = true }
+tokio = { version = "1.35", optional = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+warp = { version = "0.3", optional = true }
 
 [[bin]]
 name = "kiko-slam"
 path = "src/bin/kiko_slam.rs"
 
 [[bin]]
-name = "kiko-nano-wheels-off-bench"
-path = "src/bin/kiko_nano_wheels_off_bench.rs"
-required-features = ["nano-bench"]
+name = "kiko-nano-deployment-qualify"
+path = "src/bin/kiko_nano_deployment_qualify.rs"
+required-features = ["nano-agent"]
+
+[[bin]]
+name = "kiko-nano-base-commission"
+path = "src/bin/kiko_nano_base_commission.rs"
+required-features = ["nano-base-commissioning"]
 
 [[bench]]
 name = "pose_graph_jacobians"

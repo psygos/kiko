@@ -6,9 +6,16 @@
 
 use std::fmt;
 
-use kiko_supervisor_core::{AuthorityLeaseId, SupervisorAction};
+use kiko_supervisor_core::{AuthorityDuration, AuthorityLeaseId, SupervisorAction};
 use robot_protocol::v2::HostCommandResult;
 
+use super::agent_manual::{
+    AgentAutonomousAuthority, AgentAutonomousControlError, AgentAutonomousMode,
+    AgentAutonomousRequest, AgentAutonomousTick, PendingAgentAutonomousGrant,
+    PendingAgentAutonomousStop,
+};
+#[cfg(feature = "operator-console")]
+use super::control_socket::AgentControlTypedRequestKey;
 use super::{
     AgentControlClaimedRequest, AgentControlClockError, AgentControlCommandV1,
     AgentControlDispatchResponseError, AgentControlMonotonicOrigin, AgentControlRejectionCodeV1,
@@ -22,6 +29,23 @@ pub struct AgentControlDispatcher {
     receiver: AgentControlRuntimeReceiver,
     clock: AgentControlMonotonicOrigin,
     manual: AgentManualControlCore,
+    #[cfg(feature = "operator-console")]
+    ingress_policy: AgentControlIngressPolicy,
+    #[cfg(feature = "operator-console")]
+    last_claimed_typed_request_key: Option<AgentControlTypedRequestKey>,
+}
+
+/// Which authority-bearing commands the legacy local socket may originate.
+///
+/// The authenticated operator/agent console uses the typed in-process lane.
+/// In unified production mode, the legacy socket remains available for
+/// observation and safety reduction but cannot bypass console arbitration to
+/// acquire or renew motion authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "operator-console")]
+enum AgentControlIngressPolicy {
+    Unrestricted,
+    UnifiedConsoleAuthority,
 }
 
 impl AgentControlDispatcher {
@@ -34,6 +58,28 @@ impl AgentControlDispatcher {
             receiver,
             clock,
             manual,
+            #[cfg(feature = "operator-console")]
+            ingress_policy: AgentControlIngressPolicy::Unrestricted,
+            #[cfg(feature = "operator-console")]
+            last_claimed_typed_request_key: None,
+        }
+    }
+
+    /// Build the production dispatcher in which the legacy socket can observe
+    /// and reduce safety state but only the authenticated typed console lane
+    /// may acquire or renew motion authority.
+    #[cfg(feature = "operator-console")]
+    pub const fn new_with_unified_console_authority(
+        receiver: AgentControlRuntimeReceiver,
+        clock: AgentControlMonotonicOrigin,
+        manual: AgentManualControlCore,
+    ) -> Self {
+        Self {
+            receiver,
+            clock,
+            manual,
+            ingress_policy: AgentControlIngressPolicy::UnifiedConsoleAuthority,
+            last_claimed_typed_request_key: None,
         }
     }
 
@@ -43,6 +89,77 @@ impl AgentControlDispatcher {
 
     pub const fn manual_mut(&mut self) -> &mut AgentManualControlCore {
         &mut self.manual
+    }
+
+    #[cfg(feature = "operator-console")]
+    pub(crate) fn take_last_claimed_typed_request_key(
+        &mut self,
+    ) -> Option<AgentControlTypedRequestKey> {
+        self.last_claimed_typed_request_key.take()
+    }
+
+    pub(crate) fn request_autonomous(
+        &mut self,
+        mode: AgentAutonomousMode,
+        duration: AuthorityDuration,
+        now: crate::HostMonotonicTimestamp,
+    ) -> Result<AgentAutonomousRequest, AgentAutonomousControlError> {
+        self.manual.request_autonomous(mode, duration, now)
+    }
+
+    pub(crate) fn complete_autonomous_grant_with_applied_zero(
+        &mut self,
+        pending: &PendingAgentAutonomousGrant,
+        result: HostCommandResult,
+        observed_at: crate::HostMonotonicTimestamp,
+        now: crate::HostMonotonicTimestamp,
+    ) -> Result<AgentAutonomousAuthority, AgentAutonomousControlError> {
+        self.manual
+            .complete_autonomous_grant_with_applied_zero(pending, result, observed_at, now)
+    }
+
+    pub(crate) fn renew_autonomous(
+        &mut self,
+        active: &mut AgentAutonomousAuthority,
+        duration: AuthorityDuration,
+        now: crate::HostMonotonicTimestamp,
+    ) -> Result<(), AgentAutonomousControlError> {
+        self.manual.renew_autonomous(active, duration, now)
+    }
+
+    pub(crate) fn tick_autonomous(
+        &mut self,
+        active: &AgentAutonomousAuthority,
+        now: crate::HostMonotonicTimestamp,
+    ) -> Result<AgentAutonomousTick, AgentAutonomousControlError> {
+        self.manual.tick_autonomous(active, now)
+    }
+
+    pub(crate) fn begin_autonomous_release(
+        &mut self,
+        active: &AgentAutonomousAuthority,
+        now: crate::HostMonotonicTimestamp,
+    ) -> Result<PendingAgentAutonomousStop, AgentAutonomousControlError> {
+        self.manual.begin_autonomous_release(active, now)
+    }
+
+    pub(crate) fn cancel_pending_autonomous_grant(
+        &mut self,
+        pending: &PendingAgentAutonomousGrant,
+        now: crate::HostMonotonicTimestamp,
+    ) -> Result<PendingAgentAutonomousStop, AgentAutonomousControlError> {
+        self.manual.cancel_pending_autonomous_grant(pending, now)
+    }
+
+    pub(crate) fn complete_autonomous_stop_with_applied_zero(
+        &mut self,
+        pending: &PendingAgentAutonomousStop,
+        result: HostCommandResult,
+        observed_at: crate::HostMonotonicTimestamp,
+        now: crate::HostMonotonicTimestamp,
+    ) -> Result<(), AgentAutonomousControlError> {
+        self.manual
+            .complete_autonomous_stop_with_applied_zero(pending, result, observed_at, now)
     }
 
     /// Return the sole owner's conservative lifecycle/status projection.
@@ -134,7 +251,11 @@ impl AgentControlDispatcher {
         self.dispatch_claimed(map, claimed, observed_at)
     }
 
-    fn try_claim_one(&self) -> Result<ClaimedDispatch, AgentControlDispatcherError> {
+    fn try_claim_one(&mut self) -> Result<ClaimedDispatch, AgentControlDispatcherError> {
+        #[cfg(feature = "operator-console")]
+        {
+            self.last_claimed_typed_request_key = None;
+        }
         let dispatch = match self.receiver.try_recv() {
             Ok(dispatch) => dispatch,
             Err(AgentControlRuntimeReceiveError::Empty) => {
@@ -142,11 +263,43 @@ impl AgentControlDispatcher {
             }
             Err(source) => return Err(AgentControlDispatcherError::Receive(source)),
         };
+        #[cfg(feature = "operator-console")]
+        let socket_command_rejected = self.ingress_policy
+            == AgentControlIngressPolicy::UnifiedConsoleAuthority
+            && dispatch.typed_request_key().is_none()
+            && !socket_command_is_observational_or_safety_reducing(dispatch.request().command());
+        #[cfg(feature = "operator-console")]
+        let typed_request_key = dispatch.typed_request_key();
         match dispatch.claim() {
-            Ok(claimed) => Ok(ClaimedDispatch::Claimed(claimed)),
-            Err(AgentControlDispatchResponseError::ClientUnavailable) => Ok(ClaimedDispatch::None(
-                AgentDispatchOutcome::ClientUnavailableBeforeClaim,
-            )),
+            #[cfg(feature = "operator-console")]
+            Ok(claimed) if socket_command_rejected => {
+                self.last_claimed_typed_request_key = typed_request_key;
+                match claimed.reject(AgentControlRejectionCodeV1::AuthorityDenied, false) {
+                    Ok(()) => Ok(ClaimedDispatch::None(
+                        AgentDispatchOutcome::RejectedManual {
+                            code: AgentControlRejectionCodeV1::AuthorityDenied,
+                            retryable: false,
+                        },
+                    )),
+                    Err(source) => Err(AgentControlDispatcherError::Response(source)),
+                }
+            }
+            Ok(claimed) => {
+                #[cfg(feature = "operator-console")]
+                {
+                    self.last_claimed_typed_request_key = typed_request_key;
+                }
+                Ok(ClaimedDispatch::Claimed(claimed))
+            }
+            Err(AgentControlDispatchResponseError::ClientUnavailable) => {
+                #[cfg(feature = "operator-console")]
+                {
+                    self.last_claimed_typed_request_key = None;
+                }
+                Ok(ClaimedDispatch::None(
+                    AgentDispatchOutcome::ClientUnavailableBeforeClaim,
+                ))
+            }
             Err(source) => Err(AgentControlDispatcherError::Response(source)),
         }
     }
@@ -241,6 +394,21 @@ impl AgentControlDispatcher {
         }
         Ok(AgentDispatchOutcome::RejectedManual { code, retryable })
     }
+}
+
+#[cfg(feature = "operator-console")]
+const fn socket_command_is_observational_or_safety_reducing(
+    command: AgentControlCommandV1,
+) -> bool {
+    matches!(
+        command,
+        AgentControlCommandV1::QueryStatus
+            | AgentControlCommandV1::Disarm
+            | AgentControlCommandV1::Stop
+            | AgentControlCommandV1::MapOnly
+            | AgentControlCommandV1::ManualStop(_)
+            | AgentControlCommandV1::Shutdown
+    )
 }
 
 enum ClaimedDispatch {
@@ -501,6 +669,80 @@ mod tests {
             AgentManualControlCore::new(disarmed(), Some(policy())),
         );
         (sender, dispatcher, clock)
+    }
+
+    #[cfg(feature = "operator-console")]
+    #[test]
+    fn unified_console_policy_denies_socket_authority_acquisition_but_keeps_stop() {
+        let (sender, receiver) = agent_control_runtime_queue(
+            AgentControlRuntimeQueueCapacity::try_new(8).expect("queue capacity"),
+        );
+        let clock = AgentControlMonotonicOrigin::new(Instant::now(), at(BASE_NS + 5));
+        let mut dispatcher = AgentControlDispatcher::new_with_unified_console_authority(
+            receiver,
+            clock,
+            AgentManualControlCore::new(ready(), Some(policy())),
+        );
+        let mut safety_parser = AgentControlRequestParser::new();
+        assert!(socket_command_is_observational_or_safety_reducing(
+            request(
+                &mut safety_parser,
+                99,
+                json!({"kind": "manual_stop", "sequence": 1})
+            )
+            .command()
+        ));
+        let mut parser = AgentControlRequestParser::new();
+
+        let arm_peer = enqueue_agent_control_test_request(
+            &sender,
+            request(&mut parser, 1, json!({"kind": "arm"})),
+            clock.try_now().expect("arm receipt stamp"),
+        );
+        assert!(matches!(
+            dispatcher
+                .try_dispatch_one(AgentMapStateV1::UNAVAILABLE)
+                .expect("policy rejection"),
+            AgentDispatchOutcome::RejectedManual {
+                code: AgentControlRejectionCodeV1::AuthorityDenied,
+                retryable: false,
+            }
+        ));
+        assert!(matches!(
+            arm_peer.join().expect("arm peer"),
+            Some(response)
+                if matches!(
+                    response.response(),
+                    AgentControlResponseKindV1::Rejected {
+                        code: AgentControlRejectionCodeV1::AuthorityDenied,
+                        retryable: false,
+                    }
+                )
+        ));
+
+        let stop_peer = enqueue_agent_control_test_request(
+            &sender,
+            request(&mut parser, 2, json!({"kind": "stop"})),
+            clock.try_now().expect("stop receipt stamp"),
+        );
+        let AgentDispatchOutcome::GlobalStopRequested { claimed, .. } = dispatcher
+            .try_dispatch_one(AgentMapStateV1::UNAVAILABLE)
+            .expect("safety-reducing socket command")
+        else {
+            panic!("stop remains admitted")
+        };
+        claimed.respond_completed().expect("stop response");
+        assert!(matches!(
+            stop_peer.join().expect("stop peer"),
+            Some(response)
+                if matches!(
+                    response.response(),
+                    AgentControlResponseKindV1::Accepted {
+                        command: super::super::AgentControlCommandKindV1::Stop,
+                        completion: AgentControlCompletionV1::Completed,
+                    }
+                )
+        ));
     }
 
     #[test]

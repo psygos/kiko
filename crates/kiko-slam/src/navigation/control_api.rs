@@ -56,6 +56,14 @@ impl AgentControlRequestId {
             .map(Self)
             .ok_or(AgentControlRequestParseError::ZeroRequestId)
     }
+
+    /// Construct an ID already proven nonzero by the sole in-process console
+    /// sequencer. Kept navigation-private so transports and clients cannot
+    /// bypass that sequencer.
+    #[cfg(feature = "operator-console")]
+    pub(super) const fn from_console_sequence(raw: NonZeroU64) -> Self {
+        Self(raw)
+    }
 }
 
 /// One fully parsed request. Its command has passed only boundary-level
@@ -75,6 +83,21 @@ impl AgentControlRequestV1 {
     /// Parsed command intent.
     pub const fn command(self) -> AgentControlCommandV1 {
         self.command
+    }
+
+    /// Build one request from parts owned by the in-process console mux.
+    ///
+    /// This is deliberately navigation-private: only the mux may allocate the
+    /// process-lifetime downstream sequence.
+    #[cfg(feature = "operator-console")]
+    pub(super) const fn from_console_parts(
+        request_id: AgentControlRequestId,
+        command: AgentControlCommandV1,
+    ) -> Self {
+        Self {
+            request_id,
+            command,
+        }
     }
 }
 
@@ -204,6 +227,14 @@ impl AgentManualVelocityV1 {
             sequence: ManualDriveSequence::from_raw(sequence),
             velocity,
         })
+    }
+
+    #[cfg(feature = "operator-console")]
+    pub(super) const fn from_console_parts(
+        sequence: ManualDriveSequence,
+        velocity: FiniteManualVelocityV1,
+    ) -> Self {
+        Self { sequence, velocity }
     }
 }
 

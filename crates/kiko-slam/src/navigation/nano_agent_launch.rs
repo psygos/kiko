@@ -24,8 +24,9 @@ use oak_sys::{
 use serde::Deserialize;
 
 use super::{
-    MAX_NANO_AGENT_POLICY_CONFIG_JSON_BYTES, MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES,
-    MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
+    MAX_NANO_AGENT_POLICY_CONFIG_JSON_BYTES, MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES,
+    MAX_NANO_OCCUPANCY_CELLS, MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES,
+    MAX_NAVIGATION_INGRESS_RECORDS, MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
 };
 use crate::InferenceBackend;
 use crate::dense::occupancy::OccupancyGridGeometry;
@@ -33,7 +34,7 @@ use crate::dense::occupancy_runtime::OccupancySnapshotCadence;
 use crate::live_runtime::{LiveOccupancyHostPolicy, LiveOccupancyHostPolicyError};
 
 /// The only supported production Nano launch-document schema.
-pub const NANO_AGENT_LAUNCH_V1: u32 = 1;
+pub const NANO_AGENT_LAUNCH_V2: u32 = 2;
 
 /// Hard bound applied before JSON decoding can allocate caller-sized values.
 pub const MAX_NANO_AGENT_LAUNCH_JSON_BYTES: usize = 64 * 1_024;
@@ -57,17 +58,20 @@ pub const MAX_RERUN_DECIMATION: u32 = 10_000;
 pub const MAX_RERUN_MEMORY_BYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
 pub const MAX_RERUN_FLUSH_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_NANO_STATE_BYTES: u64 = 1_099_511_627_776;
+pub const MAX_NANO_NAVIGATION_DATASET_FILES: u64 = 65_536;
 pub const MIN_NANO_OCCUPANCY_RESOLUTION_M: f64 = 0.001;
 pub const MAX_NANO_OCCUPANCY_RESOLUTION_M: f64 = 10.0;
 pub const MAX_NANO_OCCUPANCY_ABS_LOWER_BOUND_M: f64 = 100_000.0;
 pub const MAX_NANO_OCCUPANCY_AXIS_CELLS: u32 = 100_000;
-pub const MAX_NANO_OCCUPANCY_CELLS: usize = 16_000_000;
 pub const MAX_NANO_OCCUPANCY_KEYFRAMES: usize = 1_000_000;
 pub const MAX_NANO_OCCUPANCY_SNAPSHOT_CADENCE: usize = 1_000_000;
 
 const SHA256_HEX_BYTES: usize = 64;
-const MAX_PLANT_ARTIFACT_ID_BYTES: usize = 64;
+const MAX_LAUNCH_ARTIFACT_ID_BYTES: usize = 64;
 const MIN_RERUN_MEMORY_BYTES: u64 = 1_048_576;
+const NAVIGATION_DATASET_ADMISSION_FRAGMENT_BYTES: u64 = 4_096;
+const MAX_NAVIGATION_DATASET_MANIFEST_BYTES: u64 = 64 * 1_024 * 1_024;
+const MAX_WARM_START_SELECTION_BYTES: u64 = 4 * 1_024;
 
 /// Roles are retained in errors so a rejected weak field is unambiguous.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +80,7 @@ pub enum NanoLaunchAssetRole {
     NavigationShadowConfig,
     PhysicalActuationConfig,
     ControllerServerContract,
+    CalibrationArtifact,
     PlantArtifact,
     OnnxRuntimeLibrary,
     SuperpointModel,
@@ -83,11 +88,12 @@ pub enum NanoLaunchAssetRole {
 }
 
 impl NanoLaunchAssetRole {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::AgentPolicy,
         Self::NavigationShadowConfig,
         Self::PhysicalActuationConfig,
         Self::ControllerServerContract,
+        Self::CalibrationArtifact,
         Self::PlantArtifact,
         Self::OnnxRuntimeLibrary,
         Self::SuperpointModel,
@@ -100,6 +106,7 @@ impl NanoLaunchAssetRole {
             Self::NavigationShadowConfig => MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES as u64,
             Self::PhysicalActuationConfig => MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES as u64,
             Self::ControllerServerContract => MAX_CONTROLLER_SERVER_CONTRACT_JSON_BYTES,
+            Self::CalibrationArtifact => MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES as u64,
             Self::PlantArtifact
             | Self::OnnxRuntimeLibrary
             | Self::SuperpointModel
@@ -117,6 +124,19 @@ pub struct NanoLaunchAssetBinding {
 }
 
 impl NanoLaunchAssetBinding {
+    #[cfg(feature = "nano-wheels-off-qualification")]
+    pub(crate) const fn from_parsed_parts(
+        relative_path: ArtifactRelativePath,
+        byte_limit: DeploymentAssetByteLimit,
+        expected_sha256: [u8; 32],
+    ) -> Self {
+        Self {
+            relative_path,
+            byte_limit,
+            expected_sha256,
+        }
+    }
+
     pub const fn relative_path(&self) -> &ArtifactRelativePath {
         &self.relative_path
     }
@@ -194,6 +214,33 @@ pub struct NanoLaunchPlantArtifactId(String);
 impl NanoLaunchPlantArtifactId {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Bounded calibration artifact identifier retained for exact manifest,
+/// policy, launch-path, and content-digest binding during bootstrap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NanoLaunchCalibrationArtifactId(String);
+
+impl NanoLaunchCalibrationArtifactId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NanoLaunchCalibrationArtifact {
+    artifact_id: NanoLaunchCalibrationArtifactId,
+    asset: NanoLaunchAssetBinding,
+}
+
+impl NanoLaunchCalibrationArtifact {
+    pub const fn artifact_id(&self) -> &NanoLaunchCalibrationArtifactId {
+        &self.artifact_id
+    }
+
+    pub const fn asset(&self) -> &NanoLaunchAssetBinding {
+        &self.asset
     }
 }
 
@@ -454,18 +501,57 @@ impl NanoLaunchRerun {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NanoNavigationDatasetStorageLimits {
+    maximum_bytes: NonZeroU64,
+    maximum_files: NonZeroU64,
+    maximum_ingress_records: NonZeroUsize,
+    minimum_free_bytes_after_write: NonZeroU64,
+    terminal_reserve_bytes: NonZeroU64,
+}
+
+impl NanoNavigationDatasetStorageLimits {
+    /// Maximum cumulative logical bytes admitted for dataset-owned payloads,
+    /// sidecars, IMU samples, journal records, and the final manifest.
+    pub const fn maximum_bytes(self) -> u64 {
+        self.maximum_bytes.get()
+    }
+
+    /// Maximum cumulative regular-file count admitted beneath the dataset.
+    pub const fn maximum_files(self) -> u64 {
+        self.maximum_files.get()
+    }
+
+    /// Independent upper bound for journal records admitted in this dataset.
+    pub const fn maximum_ingress_records(self) -> usize {
+        self.maximum_ingress_records.get()
+    }
+
+    /// Descriptor-relative filesystem free-space floor required after every
+    /// dataset-owned write.
+    pub const fn minimum_free_bytes_after_write(self) -> u64 {
+        self.minimum_free_bytes_after_write.get()
+    }
+
+    /// Admission bytes withheld from open-ended capture so terminal manifest,
+    /// map, and selection publication can still allocate their bounded
+    /// transient files. Map and selection bytes remain owned and counted by
+    /// their existing persistence quota, not by the dataset logical-byte
+    /// counter.
+    pub const fn terminal_reserve_bytes(self) -> u64 {
+        self.terminal_reserve_bytes.get()
+    }
+}
+
 /// Output paths are canonical and relative to the state root supplied by the
 /// service, never to the deployment root or current working directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NanoLaunchStorage {
     map_snapshot: ArtifactRelativePath,
-    navigation_records: ArtifactRelativePath,
-    startup_evidence: ArtifactRelativePath,
-    maximum_map_bytes: NonZeroU64,
-    maximum_navigation_record_bytes: NonZeroU64,
-    maximum_startup_evidence_bytes: NonZeroU64,
-    maximum_total_state_bytes: NonZeroU64,
-    minimum_free_bytes: NonZeroU64,
+    navigation_dataset_directory: ArtifactRelativePath,
+    maximum_map_snapshot_bytes: NonZeroU64,
+    minimum_free_bytes_after_map_save: NonZeroU64,
+    navigation_dataset_limits: NanoNavigationDatasetStorageLimits,
 }
 
 impl NanoLaunchStorage {
@@ -473,42 +559,36 @@ impl NanoLaunchStorage {
         &self.map_snapshot
     }
 
-    pub const fn navigation_records(&self) -> &ArtifactRelativePath {
-        &self.navigation_records
+    /// Quota-controlled recording destination for the current navigation
+    /// session.
+    pub const fn navigation_dataset_directory(&self) -> &ArtifactRelativePath {
+        &self.navigation_dataset_directory
     }
 
-    pub const fn startup_evidence(&self) -> &ArtifactRelativePath {
-        &self.startup_evidence
+    pub const fn navigation_dataset_limits(&self) -> NanoNavigationDatasetStorageLimits {
+        self.navigation_dataset_limits
     }
 
-    pub const fn maximum_map_bytes(&self) -> u64 {
-        self.maximum_map_bytes.get()
+    /// Exact encoded-byte ceiling enforced for the configured map snapshot.
+    pub const fn maximum_map_snapshot_bytes(&self) -> u64 {
+        self.maximum_map_snapshot_bytes.get()
     }
 
-    pub const fn maximum_navigation_record_bytes(&self) -> u64 {
-        self.maximum_navigation_record_bytes.get()
-    }
-
-    pub const fn maximum_startup_evidence_bytes(&self) -> u64 {
-        self.maximum_startup_evidence_bytes.get()
-    }
-
-    pub const fn maximum_total_state_bytes(&self) -> u64 {
-        self.maximum_total_state_bytes.get()
-    }
-
-    pub const fn minimum_free_bytes(&self) -> u64 {
-        self.minimum_free_bytes.get()
+    /// Free-space floor enforced after map publication and reserved, in
+    /// addition to fragment-rounded transient map bytes, before publication.
+    pub const fn minimum_free_bytes_after_map_save(&self) -> u64 {
+        self.minimum_free_bytes_after_map_save.get()
     }
 }
 
 /// Fully parsed production launch document.
 #[derive(Clone, Debug, PartialEq)]
-pub struct NanoAgentLaunchV1 {
+pub struct NanoAgentLaunchV2 {
     agent_policy: NanoLaunchAssetBinding,
     navigation_shadow_config: NanoLaunchAssetBinding,
     physical_actuation_config: NanoLaunchAssetBinding,
     controller_server: NanoLaunchControllerServer,
+    calibration_artifact: NanoLaunchCalibrationArtifact,
     plant_artifact: NanoLaunchPlantArtifact,
     oak: NanoOakStreamGraph,
     occupancy: NanoLaunchOccupancy,
@@ -517,7 +597,7 @@ pub struct NanoAgentLaunchV1 {
     storage: NanoLaunchStorage,
 }
 
-impl NanoAgentLaunchV1 {
+impl NanoAgentLaunchV2 {
     /// Parse one exact bounded JSON byte sequence exactly once.
     pub fn parse_json(json: &[u8]) -> Result<Self, NanoAgentLaunchParseError> {
         if json.len() > MAX_NANO_AGENT_LAUNCH_JSON_BYTES {
@@ -527,15 +607,15 @@ impl NanoAgentLaunchV1 {
             });
         }
         let mut deserializer = serde_json::Deserializer::from_slice(json);
-        let dto = NanoAgentLaunchV1Dto::deserialize(&mut deserializer)
+        let dto = NanoAgentLaunchV2Dto::deserialize(&mut deserializer)
             .map_err(NanoAgentLaunchParseError::JsonDecode)?;
         deserializer
             .end()
             .map_err(NanoAgentLaunchParseError::JsonTrailingData)?;
-        if dto.schema_version != NANO_AGENT_LAUNCH_V1 {
+        if dto.schema_version != NANO_AGENT_LAUNCH_V2 {
             return Err(NanoAgentLaunchParseError::UnsupportedSchema {
                 actual: dto.schema_version,
-                supported: NANO_AGENT_LAUNCH_V1,
+                supported: NANO_AGENT_LAUNCH_V2,
             });
         }
 
@@ -549,6 +629,7 @@ impl NanoAgentLaunchV1 {
             dto.physical_actuation_config_asset,
         )?;
         let controller_server = parse_controller_server(dto.controller_server)?;
+        let calibration_artifact = parse_calibration_artifact(dto.calibration_artifact)?;
         let plant_artifact = parse_plant_artifact(dto.plant_artifact)?;
         let oak = parse_oak(dto.oak)?;
         let occupancy = parse_occupancy(dto.occupancy)?;
@@ -561,6 +642,7 @@ impl NanoAgentLaunchV1 {
             navigation_shadow_config,
             physical_actuation_config,
             controller_server,
+            calibration_artifact,
             plant_artifact,
             oak,
             occupancy,
@@ -592,6 +674,10 @@ impl NanoAgentLaunchV1 {
         &self.plant_artifact
     }
 
+    pub const fn calibration_artifact(&self) -> &NanoLaunchCalibrationArtifact {
+        &self.calibration_artifact
+    }
+
     pub const fn oak(&self) -> &NanoOakStreamGraph {
         &self.oak
     }
@@ -618,6 +704,7 @@ impl NanoAgentLaunchV1 {
             NanoLaunchAssetRole::NavigationShadowConfig => &self.navigation_shadow_config,
             NanoLaunchAssetRole::PhysicalActuationConfig => &self.physical_actuation_config,
             NanoLaunchAssetRole::ControllerServerContract => &self.controller_server.contract_asset,
+            NanoLaunchAssetRole::CalibrationArtifact => &self.calibration_artifact.asset,
             NanoLaunchAssetRole::PlantArtifact => &self.plant_artifact.asset,
             NanoLaunchAssetRole::OnnxRuntimeLibrary => &self.inference.onnx_runtime_library,
             NanoLaunchAssetRole::SuperpointModel => &self.inference.superpoint_model,
@@ -629,13 +716,13 @@ impl NanoAgentLaunchV1 {
 /// Loaded launch document retaining the exact no-follow source bytes and
 /// digest used by the parser.
 #[derive(Debug)]
-pub struct LoadedNanoAgentLaunchV1 {
-    launch: NanoAgentLaunchV1,
+pub struct LoadedNanoAgentLaunchV2 {
+    launch: NanoAgentLaunchV2,
     source: LoadedDeploymentAsset,
 }
 
-impl LoadedNanoAgentLaunchV1 {
-    pub const fn launch(&self) -> &NanoAgentLaunchV1 {
+impl LoadedNanoAgentLaunchV2 {
+    pub const fn launch(&self) -> &NanoAgentLaunchV2 {
         &self.launch
     }
 
@@ -647,7 +734,7 @@ impl LoadedNanoAgentLaunchV1 {
         self.source.content_sha256()
     }
 
-    pub fn into_parts(self) -> (NanoAgentLaunchV1, LoadedDeploymentAsset) {
+    pub fn into_parts(self) -> (NanoAgentLaunchV2, LoadedDeploymentAsset) {
         (self.launch, self.source)
     }
 }
@@ -657,10 +744,10 @@ impl LoadedNanoAgentLaunchV1 {
 /// Every path component is opened without following symlinks. The retained
 /// content digest identifies the exact bytes parsed, but does not authenticate
 /// the root or its publisher.
-pub fn load_nano_agent_launch_v1(
+pub fn load_nano_agent_launch_v2(
     deployment_root: &Path,
     launch_relative_path: ArtifactRelativePath,
-) -> Result<LoadedNanoAgentLaunchV1, NanoAgentLaunchLoadError> {
+) -> Result<LoadedNanoAgentLaunchV2, NanoAgentLaunchLoadError> {
     let byte_limit = DeploymentAssetByteLimit::try_new(
         u64::try_from(MAX_NANO_AGENT_LAUNCH_JSON_BYTES)
             .expect("launch JSON bound fits every supported host"),
@@ -669,7 +756,7 @@ pub fn load_nano_agent_launch_v1(
     let source = load_deployment_asset(deployment_root, launch_relative_path, byte_limit)
         .map_err(NanoAgentLaunchLoadError::Load)?;
     let launch =
-        NanoAgentLaunchV1::parse_json(source.bytes()).map_err(NanoAgentLaunchLoadError::Parse)?;
+        NanoAgentLaunchV2::parse_json(source.bytes()).map_err(NanoAgentLaunchLoadError::Parse)?;
     for role in NanoLaunchAssetRole::ALL {
         if launch.asset(role).relative_path() == source.relative_path() {
             return Err(NanoAgentLaunchLoadError::InputAliasesLaunchDocument {
@@ -678,7 +765,7 @@ pub fn load_nano_agent_launch_v1(
             });
         }
     }
-    Ok(LoadedNanoAgentLaunchV1 { launch, source })
+    Ok(LoadedNanoAgentLaunchV2 { launch, source })
 }
 
 #[derive(Debug)]
@@ -753,6 +840,7 @@ pub enum NanoAgentLaunchParseError {
         relative_path: ArtifactRelativePath,
     },
     InvalidPlantArtifactId,
+    InvalidCalibrationArtifactId,
     InvalidSocket {
         field: &'static str,
         source: std::net::AddrParseError,
@@ -789,6 +877,10 @@ pub enum NanoAgentLaunchParseError {
         field: &'static str,
         value: u64,
     },
+    NavigationDatasetCountNotRepresentable {
+        field: &'static str,
+        value: u64,
+    },
     OccupancyHostPolicy(LiveOccupancyHostPolicyError),
     OakStereoDepthContractMismatch,
     OakDeviceConfig(DeviceConfigError),
@@ -800,15 +892,25 @@ pub enum NanoAgentLaunchParseError {
         field: &'static str,
         source: ArtifactRelativePathError,
     },
+    MissingStorageField {
+        field: &'static str,
+    },
+    LegacyStorageField {
+        field: &'static str,
+    },
     OverlappingStoragePaths {
         first: &'static str,
         second: &'static str,
     },
-    StateQuotaArithmeticOverflow,
-    ReservedStateExceedsTotal {
-        reserved_bytes: u64,
-        maximum_total_state_bytes: u64,
+    NavigationDatasetTerminalReserveNotBelowMaximum {
+        reserve_bytes: u64,
+        maximum_dataset_bytes: u64,
     },
+    NavigationDatasetTerminalReserveTooSmall {
+        reserve_bytes: u64,
+        minimum_bytes: u64,
+    },
+    NavigationDatasetTerminalReserveArithmeticOverflow,
 }
 
 impl fmt::Display for NanoAgentLaunchParseError {
@@ -859,12 +961,13 @@ impl std::error::Error for NanoLaunchSha256Error {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoAgentLaunchV1Dto {
+struct NanoAgentLaunchV2Dto {
     schema_version: u32,
     agent_policy_asset: NanoLaunchAssetBindingDto,
     navigation_shadow_config_asset: NanoLaunchAssetBindingDto,
     physical_actuation_config_asset: NanoLaunchAssetBindingDto,
     controller_server: NanoLaunchControllerServerDto,
+    calibration_artifact: NanoLaunchCalibrationArtifactDto,
     plant_artifact: NanoLaunchPlantArtifactDto,
     oak: NanoOakStreamGraphDto,
     occupancy: NanoLaunchOccupancyDto,
@@ -875,7 +978,7 @@ struct NanoAgentLaunchV1Dto {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoLaunchAssetBindingDto {
+pub(crate) struct NanoLaunchAssetBindingDto {
     relative_path: String,
     maximum_bytes: u64,
     sha256_hex: String,
@@ -883,21 +986,28 @@ struct NanoLaunchAssetBindingDto {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoLaunchControllerServerDto {
+pub(crate) struct NanoLaunchControllerServerDto {
     contract_asset: NanoLaunchAssetBindingDto,
     command_udp_endpoint: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoLaunchPlantArtifactDto {
+pub(crate) struct NanoLaunchPlantArtifactDto {
     artifact_id: String,
     asset: NanoLaunchAssetBindingDto,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoOakStreamGraphDto {
+pub(crate) struct NanoLaunchCalibrationArtifactDto {
+    artifact_id: String,
+    asset: NanoLaunchAssetBindingDto,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NanoOakStreamGraphDto {
     selector_source: String,
     maximum_usb_speed: String,
     minimum_usb_speed: String,
@@ -910,7 +1020,7 @@ struct NanoOakStreamGraphDto {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoOakImageStreamDto {
+pub(crate) struct NanoOakImageStreamDto {
     width_px: u32,
     height_px: u32,
     fps: u32,
@@ -918,7 +1028,7 @@ struct NanoOakImageStreamDto {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoOakRectifiedStereoStreamDto {
+pub(crate) struct NanoOakRectifiedStereoStreamDto {
     width_px: u32,
     height_px: u32,
     fps: u32,
@@ -927,7 +1037,7 @@ struct NanoOakRectifiedStereoStreamDto {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoOakDepthStreamDto {
+pub(crate) struct NanoOakDepthStreamDto {
     width_px: u32,
     height_px: u32,
     fps: u32,
@@ -936,20 +1046,20 @@ struct NanoOakDepthStreamDto {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoOakImuStreamDto {
+pub(crate) struct NanoOakImuStreamDto {
     rate_hz: u32,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoOakQueueDto {
+pub(crate) struct NanoOakQueueDto {
     size: u32,
     blocking: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoLaunchOccupancyDto {
+pub(crate) struct NanoLaunchOccupancyDto {
     resolution_m: f64,
     lower_x_m: f64,
     lower_y_m: f64,
@@ -962,7 +1072,7 @@ struct NanoLaunchOccupancyDto {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoLaunchInferenceDto {
+pub(crate) struct NanoLaunchInferenceDto {
     onnx_runtime_library_asset: NanoLaunchAssetBindingDto,
     superpoint_model_asset: NanoLaunchAssetBindingDto,
     lightglue_model_asset: NanoLaunchAssetBindingDto,
@@ -974,7 +1084,7 @@ struct NanoLaunchInferenceDto {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoLaunchRerunDto {
+pub(crate) struct NanoLaunchRerunDto {
     kind: String,
     bind: String,
     decimation: u32,
@@ -984,18 +1094,26 @@ struct NanoLaunchRerunDto {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoLaunchStorageDto {
+pub(crate) struct NanoLaunchStorageDto {
     map_snapshot_relative_path: String,
-    navigation_records_relative_path: String,
-    startup_evidence_relative_path: String,
-    maximum_map_bytes: u64,
-    maximum_navigation_record_bytes: u64,
-    maximum_startup_evidence_bytes: u64,
-    maximum_total_state_bytes: u64,
-    minimum_free_bytes: u64,
+    navigation_dataset_directory_relative_path: Option<String>,
+    maximum_map_snapshot_bytes: Option<u64>,
+    minimum_free_bytes_after_map_save: Option<u64>,
+    maximum_navigation_dataset_bytes: Option<u64>,
+    maximum_navigation_dataset_files: Option<u64>,
+    maximum_navigation_ingress_records: Option<u64>,
+    minimum_free_bytes_after_navigation_dataset_write: Option<u64>,
+    navigation_dataset_terminal_reserve_bytes: Option<u64>,
+    navigation_records_relative_path: Option<String>,
+    startup_evidence_relative_path: Option<String>,
+    maximum_map_bytes: Option<u64>,
+    maximum_navigation_record_bytes: Option<u64>,
+    maximum_startup_evidence_bytes: Option<u64>,
+    maximum_total_state_bytes: Option<u64>,
+    minimum_free_bytes: Option<u64>,
 }
 
-fn parse_asset(
+pub(crate) fn parse_asset(
     role: NanoLaunchAssetRole,
     dto: NanoLaunchAssetBindingDto,
 ) -> Result<NanoLaunchAssetBinding, NanoAgentLaunchParseError> {
@@ -1020,7 +1138,7 @@ fn parse_asset(
     })
 }
 
-fn parse_controller_server(
+pub(crate) fn parse_controller_server(
     dto: NanoLaunchControllerServerDto,
 ) -> Result<NanoLaunchControllerServer, NanoAgentLaunchParseError> {
     Ok(NanoLaunchControllerServer {
@@ -1035,17 +1153,10 @@ fn parse_controller_server(
     })
 }
 
-fn parse_plant_artifact(
+pub(crate) fn parse_plant_artifact(
     dto: NanoLaunchPlantArtifactDto,
 ) -> Result<NanoLaunchPlantArtifact, NanoAgentLaunchParseError> {
-    if dto.artifact_id.is_empty()
-        || dto.artifact_id.len() > MAX_PLANT_ARTIFACT_ID_BYTES
-        || dto.artifact_id.bytes().all(|byte| byte == b'0')
-        || !dto
-            .artifact_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-    {
+    if !valid_launch_artifact_id(&dto.artifact_id) {
         return Err(NanoAgentLaunchParseError::InvalidPlantArtifactId);
     }
     Ok(NanoLaunchPlantArtifact {
@@ -1054,7 +1165,30 @@ fn parse_plant_artifact(
     })
 }
 
-fn parse_oak(dto: NanoOakStreamGraphDto) -> Result<NanoOakStreamGraph, NanoAgentLaunchParseError> {
+pub(crate) fn parse_calibration_artifact(
+    dto: NanoLaunchCalibrationArtifactDto,
+) -> Result<NanoLaunchCalibrationArtifact, NanoAgentLaunchParseError> {
+    if !valid_launch_artifact_id(&dto.artifact_id) {
+        return Err(NanoAgentLaunchParseError::InvalidCalibrationArtifactId);
+    }
+    Ok(NanoLaunchCalibrationArtifact {
+        artifact_id: NanoLaunchCalibrationArtifactId(dto.artifact_id),
+        asset: parse_asset(NanoLaunchAssetRole::CalibrationArtifact, dto.asset)?,
+    })
+}
+
+fn valid_launch_artifact_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_LAUNCH_ARTIFACT_ID_BYTES
+        && !value.bytes().all(|byte| byte == b'0')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+pub(crate) fn parse_oak(
+    dto: NanoOakStreamGraphDto,
+) -> Result<NanoOakStreamGraph, NanoAgentLaunchParseError> {
     if dto.selector_source != "exact_inventory_oak_mxid" {
         return Err(NanoAgentLaunchParseError::UnsupportedOakSelectorSource);
     }
@@ -1105,7 +1239,7 @@ fn parse_oak(dto: NanoOakStreamGraphDto) -> Result<NanoOakStreamGraph, NanoAgent
     Ok(graph)
 }
 
-fn parse_occupancy(
+pub(crate) fn parse_occupancy(
     dto: NanoLaunchOccupancyDto,
 ) -> Result<NanoLaunchOccupancy, NanoAgentLaunchParseError> {
     if !dto.resolution_m.is_finite()
@@ -1197,7 +1331,26 @@ fn bounded_nonzero_usize(
     Ok(NonZeroUsize::new(converted).expect("nonzero checked above"))
 }
 
-fn parse_inference(
+fn bounded_navigation_dataset_record_count(
+    field: &'static str,
+    value: u64,
+    maximum: usize,
+) -> Result<NonZeroUsize, NanoAgentLaunchParseError> {
+    let converted = usize::try_from(value).map_err(|_| {
+        NanoAgentLaunchParseError::NavigationDatasetCountNotRepresentable { field, value }
+    })?;
+    if converted == 0 || converted > maximum {
+        return Err(NanoAgentLaunchParseError::NumericOutOfRange {
+            field,
+            value,
+            minimum: 1,
+            maximum: u64::try_from(maximum).expect("dataset record bound fits u64"),
+        });
+    }
+    Ok(NonZeroUsize::new(converted).expect("nonzero checked above"))
+}
+
+pub(crate) fn parse_inference(
     dto: NanoLaunchInferenceDto,
 ) -> Result<NanoLaunchInference, NanoAgentLaunchParseError> {
     Ok(NanoLaunchInference {
@@ -1247,7 +1400,9 @@ fn parse_inference_backend(
     }
 }
 
-fn parse_rerun(dto: NanoLaunchRerunDto) -> Result<NanoLaunchRerun, NanoAgentLaunchParseError> {
+pub(crate) fn parse_rerun(
+    dto: NanoLaunchRerunDto,
+) -> Result<NanoLaunchRerun, NanoAgentLaunchParseError> {
     if dto.kind != "serve_loopback" {
         return Err(NanoAgentLaunchParseError::UnsupportedRerunKind);
     }
@@ -1269,78 +1424,175 @@ fn parse_rerun(dto: NanoLaunchRerunDto) -> Result<NanoLaunchRerun, NanoAgentLaun
     })
 }
 
-fn parse_storage(
+pub(crate) fn parse_storage(
     dto: NanoLaunchStorageDto,
 ) -> Result<NanoLaunchStorage, NanoAgentLaunchParseError> {
+    for (field, present) in [
+        (
+            "storage.navigation_records_relative_path",
+            dto.navigation_records_relative_path.is_some(),
+        ),
+        (
+            "storage.startup_evidence_relative_path",
+            dto.startup_evidence_relative_path.is_some(),
+        ),
+        ("storage.maximum_map_bytes", dto.maximum_map_bytes.is_some()),
+        (
+            "storage.maximum_navigation_record_bytes",
+            dto.maximum_navigation_record_bytes.is_some(),
+        ),
+        (
+            "storage.maximum_startup_evidence_bytes",
+            dto.maximum_startup_evidence_bytes.is_some(),
+        ),
+        (
+            "storage.maximum_total_state_bytes",
+            dto.maximum_total_state_bytes.is_some(),
+        ),
+        (
+            "storage.minimum_free_bytes",
+            dto.minimum_free_bytes.is_some(),
+        ),
+    ] {
+        if present {
+            return Err(NanoAgentLaunchParseError::LegacyStorageField { field });
+        }
+    }
     let map_snapshot = parse_storage_path(
         "storage.map_snapshot_relative_path",
         dto.map_snapshot_relative_path,
     )?;
-    let navigation_records = parse_storage_path(
-        "storage.navigation_records_relative_path",
-        dto.navigation_records_relative_path,
+    let navigation_dataset_directory = parse_storage_path(
+        "storage.navigation_dataset_directory_relative_path",
+        dto.navigation_dataset_directory_relative_path.ok_or(
+            NanoAgentLaunchParseError::MissingStorageField {
+                field: "storage.navigation_dataset_directory_relative_path",
+            },
+        )?,
     )?;
-    let startup_evidence = parse_storage_path(
-        "storage.startup_evidence_relative_path",
-        dto.startup_evidence_relative_path,
-    )?;
-    ensure_nonoverlapping_storage_paths([
+    ensure_nonoverlapping_storage_paths(&[
         ("map_snapshot", &map_snapshot),
-        ("navigation_records", &navigation_records),
-        ("startup_evidence", &startup_evidence),
+        (
+            "navigation_dataset_directory",
+            &navigation_dataset_directory,
+        ),
     ])?;
 
-    let maximum_map_bytes = bounded_nonzero_u64(
-        "storage.maximum_map_bytes",
-        dto.maximum_map_bytes,
+    let maximum_map_snapshot_bytes = bounded_nonzero_u64(
+        "storage.maximum_map_snapshot_bytes",
+        dto.maximum_map_snapshot_bytes
+            .ok_or(NanoAgentLaunchParseError::MissingStorageField {
+                field: "storage.maximum_map_snapshot_bytes",
+            })?,
         1,
         MAX_NANO_STATE_BYTES,
     )?;
-    let maximum_navigation_record_bytes = bounded_nonzero_u64(
-        "storage.maximum_navigation_record_bytes",
-        dto.maximum_navigation_record_bytes,
+    let minimum_free_bytes_after_map_save = bounded_nonzero_u64(
+        "storage.minimum_free_bytes_after_map_save",
+        dto.minimum_free_bytes_after_map_save.ok_or(
+            NanoAgentLaunchParseError::MissingStorageField {
+                field: "storage.minimum_free_bytes_after_map_save",
+            },
+        )?,
         1,
         MAX_NANO_STATE_BYTES,
     )?;
-    let maximum_startup_evidence_bytes = bounded_nonzero_u64(
-        "storage.maximum_startup_evidence_bytes",
-        dto.maximum_startup_evidence_bytes,
+    let maximum_navigation_dataset_bytes = bounded_nonzero_u64(
+        "storage.maximum_navigation_dataset_bytes",
+        dto.maximum_navigation_dataset_bytes.ok_or(
+            NanoAgentLaunchParseError::MissingStorageField {
+                field: "storage.maximum_navigation_dataset_bytes",
+            },
+        )?,
         1,
         MAX_NANO_STATE_BYTES,
     )?;
-    let maximum_total_state_bytes = bounded_nonzero_u64(
-        "storage.maximum_total_state_bytes",
-        dto.maximum_total_state_bytes,
+    let maximum_navigation_dataset_files = bounded_nonzero_u64(
+        "storage.maximum_navigation_dataset_files",
+        dto.maximum_navigation_dataset_files.ok_or(
+            NanoAgentLaunchParseError::MissingStorageField {
+                field: "storage.maximum_navigation_dataset_files",
+            },
+        )?,
+        1,
+        MAX_NANO_NAVIGATION_DATASET_FILES,
+    )?;
+    let maximum_navigation_ingress_records_u64 = dto.maximum_navigation_ingress_records.ok_or(
+        NanoAgentLaunchParseError::MissingStorageField {
+            field: "storage.maximum_navigation_ingress_records",
+        },
+    )?;
+    let maximum_navigation_ingress_records = bounded_navigation_dataset_record_count(
+        "storage.maximum_navigation_ingress_records",
+        maximum_navigation_ingress_records_u64,
+        MAX_NAVIGATION_INGRESS_RECORDS,
+    )?;
+    let minimum_free_bytes_after_navigation_dataset_write = bounded_nonzero_u64(
+        "storage.minimum_free_bytes_after_navigation_dataset_write",
+        dto.minimum_free_bytes_after_navigation_dataset_write
+            .ok_or(NanoAgentLaunchParseError::MissingStorageField {
+                field: "storage.minimum_free_bytes_after_navigation_dataset_write",
+            })?,
         1,
         MAX_NANO_STATE_BYTES,
     )?;
-    let minimum_free_bytes = bounded_nonzero_u64(
-        "storage.minimum_free_bytes",
-        dto.minimum_free_bytes,
+    let navigation_dataset_terminal_reserve_bytes = bounded_nonzero_u64(
+        "storage.navigation_dataset_terminal_reserve_bytes",
+        dto.navigation_dataset_terminal_reserve_bytes.ok_or(
+            NanoAgentLaunchParseError::MissingStorageField {
+                field: "storage.navigation_dataset_terminal_reserve_bytes",
+            },
+        )?,
         1,
         MAX_NANO_STATE_BYTES,
     )?;
-    let reserved_bytes = maximum_map_bytes
-        .get()
-        .checked_add(maximum_navigation_record_bytes.get())
-        .and_then(|value| value.checked_add(maximum_startup_evidence_bytes.get()))
-        .ok_or(NanoAgentLaunchParseError::StateQuotaArithmeticOverflow)?;
-    if reserved_bytes > maximum_total_state_bytes.get() {
-        return Err(NanoAgentLaunchParseError::ReservedStateExceedsTotal {
-            reserved_bytes,
-            maximum_total_state_bytes: maximum_total_state_bytes.get(),
-        });
+    if navigation_dataset_terminal_reserve_bytes.get() >= maximum_navigation_dataset_bytes.get() {
+        return Err(
+            NanoAgentLaunchParseError::NavigationDatasetTerminalReserveNotBelowMaximum {
+                reserve_bytes: navigation_dataset_terminal_reserve_bytes.get(),
+                maximum_dataset_bytes: maximum_navigation_dataset_bytes.get(),
+            },
+        );
+    }
+    let minimum_terminal_reserve =
+        minimum_navigation_dataset_terminal_reserve(maximum_map_snapshot_bytes.get())?;
+    if navigation_dataset_terminal_reserve_bytes.get() < minimum_terminal_reserve {
+        return Err(
+            NanoAgentLaunchParseError::NavigationDatasetTerminalReserveTooSmall {
+                reserve_bytes: navigation_dataset_terminal_reserve_bytes.get(),
+                minimum_bytes: minimum_terminal_reserve,
+            },
+        );
     }
     Ok(NanoLaunchStorage {
         map_snapshot,
-        navigation_records,
-        startup_evidence,
-        maximum_map_bytes,
-        maximum_navigation_record_bytes,
-        maximum_startup_evidence_bytes,
-        maximum_total_state_bytes,
-        minimum_free_bytes,
+        navigation_dataset_directory,
+        maximum_map_snapshot_bytes,
+        minimum_free_bytes_after_map_save,
+        navigation_dataset_limits: NanoNavigationDatasetStorageLimits {
+            maximum_bytes: maximum_navigation_dataset_bytes,
+            maximum_files: maximum_navigation_dataset_files,
+            maximum_ingress_records: maximum_navigation_ingress_records,
+            minimum_free_bytes_after_write: minimum_free_bytes_after_navigation_dataset_write,
+            terminal_reserve_bytes: navigation_dataset_terminal_reserve_bytes,
+        },
     })
+}
+
+fn minimum_navigation_dataset_terminal_reserve(
+    maximum_map_snapshot_bytes: u64,
+) -> Result<u64, NanoAgentLaunchParseError> {
+    let unrounded = maximum_map_snapshot_bytes
+        .checked_add(MAX_NAVIGATION_DATASET_MANIFEST_BYTES)
+        .and_then(|bytes| bytes.checked_add(MAX_WARM_START_SELECTION_BYTES))
+        .ok_or(NanoAgentLaunchParseError::NavigationDatasetTerminalReserveArithmeticOverflow)?;
+    let remainder = unrounded % NAVIGATION_DATASET_ADMISSION_FRAGMENT_BYTES;
+    if remainder == 0 {
+        return Ok(unrounded);
+    }
+    unrounded
+        .checked_add(NAVIGATION_DATASET_ADMISSION_FRAGMENT_BYTES - remainder)
+        .ok_or(NanoAgentLaunchParseError::NavigationDatasetTerminalReserveArithmeticOverflow)
 }
 
 fn parse_storage_path(
@@ -1352,7 +1604,7 @@ fn parse_storage_path(
 }
 
 fn ensure_nonoverlapping_storage_paths(
-    paths: [(&'static str, &ArtifactRelativePath); 3],
+    paths: &[(&'static str, &ArtifactRelativePath)],
 ) -> Result<(), NanoAgentLaunchParseError> {
     for first_index in 0..paths.len() {
         for second_index in (first_index + 1)..paths.len() {
@@ -1372,7 +1624,7 @@ fn ensure_nonoverlapping_storage_paths(
 }
 
 fn ensure_distinct_input_assets(
-    launch: &NanoAgentLaunchV1,
+    launch: &NanoAgentLaunchV2,
 ) -> Result<(), NanoAgentLaunchParseError> {
     for (first_index, first_role) in NanoLaunchAssetRole::ALL.iter().copied().enumerate() {
         for second_role in NanoLaunchAssetRole::ALL[(first_index + 1)..]
@@ -1442,7 +1694,7 @@ fn bounded_nonzero_u64(
     Ok(NonZeroU64::new(value).expect("positive minimum checked above"))
 }
 
-fn parse_sha256(value: &str) -> Result<[u8; 32], NanoLaunchSha256Error> {
+pub(crate) fn parse_sha256(value: &str) -> Result<[u8; 32], NanoLaunchSha256Error> {
     if value.len() != SHA256_HEX_BYTES {
         return Err(NanoLaunchSha256Error::WrongLength {
             actual_bytes: value.len(),
@@ -1476,7 +1728,7 @@ const fn lowercase_hex_nibble(byte: u8) -> Option<u8> {
 mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::{Value, json};
@@ -1498,21 +1750,29 @@ mod tests {
 
     fn valid_value() -> Value {
         json!({
-            "schema_version": 1,
-            "agent_policy_asset": asset("config/agent-policy-v1.json", 65_536, 1),
+            "schema_version": 2,
+            "agent_policy_asset": asset("config/agent-policy-v3.json", 65_536, 1),
             "navigation_shadow_config_asset": asset(
                 "config/navigation-shadow-v1.json",
                 262_144,
                 2
             ),
             "physical_actuation_config_asset": asset(
-                "config/navigation-actuation-v1.json",
+                "config/navigation-actuation-v2.json",
                 16_384,
                 3
             ),
             "controller_server": {
                 "contract_asset": asset("config/controller-server-v1.json", 8_192, 4),
                 "command_udp_endpoint": "127.0.0.1:8080"
+            },
+            "calibration_artifact": {
+                "artifact_id": "kiko-calibration-v1",
+                "asset": asset(
+                    "artifacts/calibration/kiko-calibration-v1.json",
+                    65_536,
+                    9
+                )
             },
             "plant_artifact": {
                 "artifact_id": "qualified-drive-v1",
@@ -1570,19 +1830,20 @@ mod tests {
             },
             "storage": {
                 "map_snapshot_relative_path": "maps/current.kiko-map",
-                "navigation_records_relative_path": "records/navigation",
-                "startup_evidence_relative_path": "evidence/startup",
-                "maximum_map_bytes": 67_108_864,
-                "maximum_navigation_record_bytes": 536_870_912,
-                "maximum_startup_evidence_bytes": 16_777_216,
-                "maximum_total_state_bytes": 1_073_741_824,
-                "minimum_free_bytes": 134_217_728
+                "navigation_dataset_directory_relative_path": "records/navigation",
+                "maximum_map_snapshot_bytes": 67_108_864,
+                "minimum_free_bytes_after_map_save": 134_217_728,
+                "maximum_navigation_dataset_bytes": 8_589_934_592_u64,
+                "maximum_navigation_dataset_files": 65_536,
+                "maximum_navigation_ingress_records": 100_000,
+                "minimum_free_bytes_after_navigation_dataset_write": 1_073_741_824,
+                "navigation_dataset_terminal_reserve_bytes": 268_435_456
             }
         })
     }
 
-    fn parse(value: &Value) -> Result<NanoAgentLaunchV1, NanoAgentLaunchParseError> {
-        NanoAgentLaunchV1::parse_json(&serde_json::to_vec(value).expect("fixture serializes"))
+    fn parse(value: &Value) -> Result<NanoAgentLaunchV2, NanoAgentLaunchParseError> {
+        NanoAgentLaunchV2::parse_json(&serde_json::to_vec(value).expect("fixture serializes"))
     }
 
     #[test]
@@ -1616,6 +1877,24 @@ mod tests {
             launch.occupancy().host_policy().geometry(),
             launch.occupancy().geometry()
         );
+        assert_eq!(
+            launch.storage().navigation_dataset_directory().as_path(),
+            Path::new("records/navigation")
+        );
+        assert_eq!(launch.storage().maximum_map_snapshot_bytes(), 67_108_864);
+        assert_eq!(
+            launch.storage().minimum_free_bytes_after_map_save(),
+            134_217_728
+        );
+        let dataset_limits = launch.storage().navigation_dataset_limits();
+        assert_eq!(dataset_limits.maximum_bytes(), 8_589_934_592);
+        assert_eq!(dataset_limits.maximum_files(), 65_536);
+        assert_eq!(dataset_limits.maximum_ingress_records(), 100_000);
+        assert_eq!(
+            dataset_limits.minimum_free_bytes_after_write(),
+            1_073_741_824
+        );
+        assert_eq!(dataset_limits.terminal_reserve_bytes(), 268_435_456);
     }
 
     #[test]
@@ -1637,7 +1916,7 @@ mod tests {
         let mut bytes = serde_json::to_vec(&valid_value()).expect("fixture serializes");
         bytes.extend_from_slice(b"{}");
         assert!(matches!(
-            NanoAgentLaunchV1::parse_json(&bytes),
+            NanoAgentLaunchV2::parse_json(&bytes),
             Err(NanoAgentLaunchParseError::JsonTrailingData(_))
         ));
     }
@@ -1822,19 +2101,188 @@ mod tests {
     }
 
     #[test]
-    fn state_paths_and_quotas_do_not_overlap_or_overcommit() {
+    fn state_paths_do_not_overlap_and_legacy_quota_fields_are_rejected() {
         let mut overlap = valid_value();
-        overlap["storage"]["startup_evidence_relative_path"] = json!("records/navigation/evidence");
+        overlap["storage"]["navigation_dataset_directory_relative_path"] = json!("maps");
         assert!(matches!(
             parse(&overlap),
             Err(NanoAgentLaunchParseError::OverlappingStoragePaths { .. })
         ));
 
-        let mut overcommit = valid_value();
-        overcommit["storage"]["maximum_total_state_bytes"] = json!(100);
+        let mut stale_contract = valid_value();
+        stale_contract["storage"]["maximum_navigation_record_bytes"] = json!(100);
         assert!(matches!(
-            parse(&overcommit),
-            Err(NanoAgentLaunchParseError::ReservedStateExceedsTotal { .. })
+            parse(&stale_contract),
+            Err(NanoAgentLaunchParseError::LegacyStorageField {
+                field: "storage.maximum_navigation_record_bytes"
+            })
+        ));
+
+        for (field, qualified_field) in [
+            (
+                "maximum_map_snapshot_bytes",
+                "storage.maximum_map_snapshot_bytes",
+            ),
+            (
+                "minimum_free_bytes_after_map_save",
+                "storage.minimum_free_bytes_after_map_save",
+            ),
+            (
+                "maximum_navigation_dataset_bytes",
+                "storage.maximum_navigation_dataset_bytes",
+            ),
+            (
+                "maximum_navigation_dataset_files",
+                "storage.maximum_navigation_dataset_files",
+            ),
+            (
+                "maximum_navigation_ingress_records",
+                "storage.maximum_navigation_ingress_records",
+            ),
+            (
+                "minimum_free_bytes_after_navigation_dataset_write",
+                "storage.minimum_free_bytes_after_navigation_dataset_write",
+            ),
+            (
+                "navigation_dataset_terminal_reserve_bytes",
+                "storage.navigation_dataset_terminal_reserve_bytes",
+            ),
+        ] {
+            let mut missing = valid_value();
+            missing["storage"]
+                .as_object_mut()
+                .expect("storage object")
+                .remove(field);
+            assert!(matches!(
+                parse(&missing),
+                Err(NanoAgentLaunchParseError::MissingStorageField {
+                    field: actual
+                }) if actual == qualified_field
+            ));
+
+            let mut zero = valid_value();
+            zero["storage"][field] = json!(0);
+            assert!(matches!(
+                parse(&zero),
+                Err(NanoAgentLaunchParseError::NumericOutOfRange { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn navigation_dataset_limits_are_bounded_and_terminal_reserve_is_checked() {
+        assert!(matches!(
+            minimum_navigation_dataset_terminal_reserve(u64::MAX),
+            Err(NanoAgentLaunchParseError::NavigationDatasetTerminalReserveArithmeticOverflow)
+        ));
+
+        let mut too_many_files = valid_value();
+        too_many_files["storage"]["maximum_navigation_dataset_files"] =
+            json!(MAX_NANO_NAVIGATION_DATASET_FILES + 1);
+        assert!(matches!(
+            parse(&too_many_files),
+            Err(NanoAgentLaunchParseError::NumericOutOfRange {
+                field: "storage.maximum_navigation_dataset_files",
+                ..
+            })
+        ));
+
+        let mut too_many_records = valid_value();
+        too_many_records["storage"]["maximum_navigation_ingress_records"] =
+            json!(u64::try_from(MAX_NAVIGATION_INGRESS_RECORDS).expect("bound fits u64") + 1);
+        assert!(matches!(
+            parse(&too_many_records),
+            Err(NanoAgentLaunchParseError::NumericOutOfRange {
+                field: "storage.maximum_navigation_ingress_records",
+                ..
+            })
+        ));
+
+        let mut reserve_reaches_maximum = valid_value();
+        reserve_reaches_maximum["storage"]["navigation_dataset_terminal_reserve_bytes"] =
+            reserve_reaches_maximum["storage"]["maximum_navigation_dataset_bytes"].clone();
+        assert!(matches!(
+            parse(&reserve_reaches_maximum),
+            Err(NanoAgentLaunchParseError::NavigationDatasetTerminalReserveNotBelowMaximum { .. })
+        ));
+
+        let expected_minimum = 134_221_824;
+        let mut one_byte_short = valid_value();
+        one_byte_short["storage"]["navigation_dataset_terminal_reserve_bytes"] =
+            json!(expected_minimum - 1);
+        assert!(matches!(
+            parse(&one_byte_short),
+            Err(NanoAgentLaunchParseError::NavigationDatasetTerminalReserveTooSmall {
+                reserve_bytes,
+                minimum_bytes
+            }) if reserve_bytes == expected_minimum - 1 && minimum_bytes == expected_minimum
+        ));
+
+        let mut exact_minimum = valid_value();
+        exact_minimum["storage"]["navigation_dataset_terminal_reserve_bytes"] =
+            json!(expected_minimum);
+        let parsed = parse(&exact_minimum).expect("fragment-rounded minimum is admitted");
+        assert_eq!(
+            parsed
+                .storage()
+                .navigation_dataset_limits()
+                .terminal_reserve_bytes(),
+            expected_minimum
+        );
+
+        let mut unaligned_map = valid_value();
+        unaligned_map["storage"]["maximum_map_snapshot_bytes"] = json!(67_108_865);
+        unaligned_map["storage"]["navigation_dataset_terminal_reserve_bytes"] = json!(134_225_919);
+        assert!(matches!(
+            parse(&unaligned_map),
+            Err(
+                NanoAgentLaunchParseError::NavigationDatasetTerminalReserveTooSmall {
+                    minimum_bytes: 134_225_920,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn actual_v1_storage_shape_is_a_typed_unsupported_schema() {
+        let mut legacy = valid_value();
+        legacy["schema_version"] = json!(1);
+        let storage = legacy["storage"].as_object_mut().expect("storage object");
+        storage.remove("navigation_dataset_directory_relative_path");
+        storage.remove("maximum_map_snapshot_bytes");
+        storage.remove("minimum_free_bytes_after_map_save");
+        storage.remove("maximum_navigation_dataset_bytes");
+        storage.remove("maximum_navigation_dataset_files");
+        storage.remove("maximum_navigation_ingress_records");
+        storage.remove("minimum_free_bytes_after_navigation_dataset_write");
+        storage.remove("navigation_dataset_terminal_reserve_bytes");
+        storage.insert(
+            "navigation_records_relative_path".to_owned(),
+            json!("records/navigation"),
+        );
+        storage.insert(
+            "startup_evidence_relative_path".to_owned(),
+            json!("evidence/startup"),
+        );
+        storage.insert("maximum_map_bytes".to_owned(), json!(67_108_864));
+        storage.insert(
+            "maximum_navigation_record_bytes".to_owned(),
+            json!(536_870_912),
+        );
+        storage.insert(
+            "maximum_startup_evidence_bytes".to_owned(),
+            json!(16_777_216),
+        );
+        storage.insert("maximum_total_state_bytes".to_owned(), json!(1_073_741_824));
+        storage.insert("minimum_free_bytes".to_owned(), json!(134_217_728));
+
+        assert!(matches!(
+            parse(&legacy),
+            Err(NanoAgentLaunchParseError::UnsupportedSchema {
+                actual: 1,
+                supported: 2
+            })
         ));
     }
 
@@ -1867,7 +2315,7 @@ mod tests {
         let bytes = serde_json::to_vec(&valid_value()).expect("fixture serializes");
         fs::write(directory.join("launch.json"), &bytes).expect("write launch");
         symlink("launch.json", directory.join("launch-link.json")).expect("create symlink");
-        let linked = load_nano_agent_launch_v1(
+        let linked = load_nano_agent_launch_v2(
             &directory,
             ArtifactRelativePath::parse("launch-link.json".to_owned()).expect("relative path"),
         );
@@ -1880,7 +2328,7 @@ mod tests {
             serde_json::to_vec(&aliases).expect("fixture serializes"),
         )
         .expect("rewrite launch");
-        let aliased = load_nano_agent_launch_v1(
+        let aliased = load_nano_agent_launch_v2(
             &directory,
             ArtifactRelativePath::parse("launch.json".to_owned()).expect("relative path"),
         );

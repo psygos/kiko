@@ -250,6 +250,42 @@ impl RawImuCalibration {
         &self.provenance
     }
 
+    /// Bit-exact equality for immutable calibration admission.
+    ///
+    /// All floating-point components were proven finite at construction, so
+    /// comparing their IEEE-754 encodings has one unambiguous meaning and
+    /// deliberately distinguishes signed zero. This is stricter than the
+    /// numerical comparisons used while validating a rotation.
+    pub fn exactly_matches(&self, other: &Self) -> bool {
+        fn matrix(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> bool {
+            left.iter()
+                .flatten()
+                .zip(right.iter().flatten())
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+        }
+        fn vector(left: [f64; 3], right: [f64; 3]) -> bool {
+            left.into_iter()
+                .zip(right)
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+        }
+
+        self.provenance == other.provenance
+            && matrix(self.gyro_affine, other.gyro_affine)
+            && vector(
+                self.gyro_bias_native_rad_per_sec,
+                other.gyro_bias_native_rad_per_sec,
+            )
+            && matrix(self.accel_affine, other.accel_affine)
+            && vector(
+                self.accel_bias_native_m_per_sec2,
+                other.accel_bias_native_m_per_sec2,
+            )
+            && matrix(
+                self.native_imu_to_base_rotation,
+                other.native_imu_to_base_rotation,
+            )
+    }
+
     pub fn calibrate_angular_velocity(
         &self,
         raw: OakImuAngularVelocity,

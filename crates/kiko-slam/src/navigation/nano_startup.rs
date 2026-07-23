@@ -18,15 +18,15 @@ use kiko_supervisor_core::{
 use robot_command_client::VerifiedControllerAcquisition;
 
 use super::{
-    AgentAuthorityError, AgentAuthoritySupervisor, ManifestBoundNanoAgentPolicyConfigV1,
-    NanoAccessoryManifestBindingError, NanoAgentPolicyConfigV1, NavigationClockEpoch,
+    AgentAuthorityError, AgentAuthoritySupervisor, ManifestBoundNanoAgentPolicyConfigV3,
+    NanoAccessoryManifestBindingError, NanoAgentPolicyConfigV3, NavigationClockEpoch,
 };
 use crate::HostMonotonicTimestamp;
 
 /// Startup evidence whose file locations, contents, parsed policy, exact
 /// inventory, and live controller acquisition all describe the same robot.
 pub struct AdmittedNanoStartup {
-    policy: ManifestBoundNanoAgentPolicyConfigV1,
+    policy: ManifestBoundNanoAgentPolicyConfigV3,
     exact_inventory: ExactInventoryAdmission,
     artifact_hashes: ManifestArtifactHashes,
     controller_acquisition: VerifiedControllerAcquisition,
@@ -36,7 +36,7 @@ pub struct AdmittedNanoStartup {
 impl AdmittedNanoStartup {
     #[allow(clippy::too_many_arguments)]
     pub fn admit(
-        policy: NanoAgentPolicyConfigV1,
+        policy: NanoAgentPolicyConfigV3,
         loaded_manifest: LoadedExpectedManifestV1,
         artifact_hashes: ManifestArtifactHashes,
         exact_inventory: ExactInventoryAdmission,
@@ -214,7 +214,7 @@ impl AdmittedNanoStartup {
         })
     }
 
-    pub const fn policy(&self) -> &ManifestBoundNanoAgentPolicyConfigV1 {
+    pub const fn policy(&self) -> &ManifestBoundNanoAgentPolicyConfigV3 {
         &self.policy
     }
 
@@ -277,7 +277,7 @@ impl AdmittedNanoStartup {
 /// contained authority is provably `Disarmed`; arming still requires an
 /// explicit command and a newly applied zero receipt.
 pub struct DisarmedNanoStartup {
-    policy: ManifestBoundNanoAgentPolicyConfigV1,
+    policy: ManifestBoundNanoAgentPolicyConfigV3,
     exact_inventory: ExactInventoryAdmission,
     artifact_hashes: ManifestArtifactHashes,
     controller_acquisition: VerifiedControllerAcquisition,
@@ -286,7 +286,7 @@ pub struct DisarmedNanoStartup {
 }
 
 impl DisarmedNanoStartup {
-    pub const fn policy(&self) -> &ManifestBoundNanoAgentPolicyConfigV1 {
+    pub const fn policy(&self) -> &ManifestBoundNanoAgentPolicyConfigV3 {
         &self.policy
     }
 
@@ -324,7 +324,7 @@ impl DisarmedNanoStartup {
 
 /// Owned parts for construction of the sole Nano runtime owner.
 pub struct DisarmedNanoStartupParts {
-    pub policy: ManifestBoundNanoAgentPolicyConfigV1,
+    pub policy: ManifestBoundNanoAgentPolicyConfigV3,
     pub exact_inventory: ExactInventoryAdmission,
     pub artifact_hashes: ManifestArtifactHashes,
     pub controller_acquisition: VerifiedControllerAcquisition,
@@ -506,7 +506,7 @@ mod tests {
 
     use super::*;
     use crate::navigation::{
-        AgentMapStateV1, AgentRuntimeStateV1, NanoAgentPolicyConfigV1, NavigationClockEpoch,
+        AgentMapStateV1, AgentRuntimeStateV1, NanoAgentPolicyConfigV3, NavigationClockEpoch,
     };
 
     const UID_BYTES: [u8; 12] = [0x11; 12];
@@ -557,17 +557,25 @@ mod tests {
             }
         }
 
-        fn policy(&self) -> NanoAgentPolicyConfigV1 {
+        fn policy(&self) -> NanoAgentPolicyConfigV3 {
             let socket_path = self.root.join("agent-control.sock");
             let map_path = self.root.join("current.kmap");
             let value = json!({
-                "schema_version": 1,
+                "schema_version": 3,
                 "control": {
                     "socket_path": socket_path,
                     "read_timeout_ms": 100,
                     "write_timeout_ms": 100,
                     "runtime_response_timeout_ms": 500,
-                    "runtime_queue_capacity": 8
+                    "terminal_response_timeout_ms": 300000,
+                    "runtime_queue_capacity": 8,
+                    "operator_console": {
+                        "bind_address": "127.0.0.1:9877",
+                        "capability_path": socket_path.with_extension("capability"),
+                        "deadman_tick_ms": 20,
+                        "manual_command_forward_mm_per_s": 100,
+                        "manual_command_yaw_millirad_per_s": 500
+                    }
                 },
                 "inventory": {
                     "manifest_path": self.manifest_path,
@@ -603,7 +611,7 @@ mod tests {
                     "frontier_explore": {"permission": "disabled"}
                 }
             });
-            NanoAgentPolicyConfigV1::parse_json(&serde_json::to_vec(&value).expect("policy JSON"))
+            NanoAgentPolicyConfigV3::parse_json(&serde_json::to_vec(&value).expect("policy JSON"))
                 .expect("parsed policy")
         }
 
@@ -618,7 +626,7 @@ mod tests {
 
         fn hashes(
             &self,
-            policy: &NanoAgentPolicyConfigV1,
+            policy: &NanoAgentPolicyConfigV3,
             loaded: &LoadedExpectedManifestV1,
         ) -> ManifestArtifactHashes {
             hash_manifest_artifacts(

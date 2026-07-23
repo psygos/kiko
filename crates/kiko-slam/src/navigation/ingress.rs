@@ -2,7 +2,9 @@
 //!
 //! This module records the exact admission order of already parsed navigation
 //! inputs and the identities needed to find stereo and depth payloads in the
-//! owning dataset. It does not serialize tracker-derived
+//! owning dataset. Qualification builds may additionally append an exact,
+//! event-correlated controller-application receipt after the controller has
+//! acknowledged a raw wheels-off step. It does not serialize tracker-derived
 //! [`crate::VisualIncrement`] or [`crate::MapLocalization`] values and therefore
 //! does not promise deterministic SLAM or MPC replay. Host process clock values
 //! and process-local map IDs never enter the wire format: live boundaries turn
@@ -11,7 +13,17 @@
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use std::sync::Arc;
 
+use robot_protocol::v2::{
+    ControlEpoch, ControllerBootId, ControllerUid, DomainError, TimerPwm, V2CommandSequence,
+};
+
+#[cfg(unix)]
+use crate::dataset::{DatasetStorageQuota, DatasetStorageQuotaError};
 use crate::dense::occupancy::OccupancyGridSnapshot;
 use crate::dense::occupancy_runtime::TimedOccupancySnapshot;
 use crate::{
@@ -41,6 +53,7 @@ const KIND_POINT_GOAL: u8 = 4;
 const KIND_MAP_EPOCH_STARTED: u8 = 5;
 const KIND_CONTROL_TICK: u8 = 6;
 const KIND_ACCEPTED_GLOBAL_MAP: u8 = 7;
+const KIND_QUALIFICATION_APPLIED_STEP: u8 = 8;
 
 /// Opaque identity shared with the dataset manifest that owns this sidecar.
 ///
@@ -1121,6 +1134,95 @@ impl ControlTickIngress {
     }
 }
 
+/// Exact controller evidence for one applied wheels-off qualification ramp step.
+///
+/// The qualification event identity and requested target remain distinct from
+/// the controller command requested for this particular ramp step. The latter
+/// may differ while the candidate session advances toward the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QualificationAppliedStepIngress {
+    observed_offset: NavigationClockOffset,
+    qualification_event_id: NonZeroU64,
+    controller_uid: ControllerUid,
+    controller_boot_id: ControllerBootId,
+    control_epoch: ControlEpoch,
+    controller_sequence: V2CommandSequence,
+    requested_target: TimerPwm,
+    controller_requested_step: TimerPwm,
+    actual_applied: TimerPwm,
+    target_reached: bool,
+}
+
+impl QualificationAppliedStepIngress {
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse(
+        clock_epoch: NavigationClockEpoch,
+        observed_at: HostMonotonicTimestamp,
+        qualification_event_id: NonZeroU64,
+        controller_uid: ControllerUid,
+        controller_boot_id: ControllerBootId,
+        control_epoch: ControlEpoch,
+        controller_sequence: V2CommandSequence,
+        requested_target: TimerPwm,
+        controller_requested_step: TimerPwm,
+        actual_applied: TimerPwm,
+        target_reached: bool,
+    ) -> Result<Self, NavigationIngressBoundaryError> {
+        Ok(Self {
+            observed_offset: clock_epoch.offset_at(observed_at)?,
+            qualification_event_id,
+            controller_uid,
+            controller_boot_id,
+            control_epoch,
+            controller_sequence,
+            requested_target,
+            controller_requested_step,
+            actual_applied,
+            target_reached,
+        })
+    }
+
+    pub const fn observed_offset(self) -> NavigationClockOffset {
+        self.observed_offset
+    }
+
+    pub const fn qualification_event_id(self) -> NonZeroU64 {
+        self.qualification_event_id
+    }
+
+    pub const fn controller_uid(self) -> ControllerUid {
+        self.controller_uid
+    }
+
+    pub const fn controller_boot_id(self) -> ControllerBootId {
+        self.controller_boot_id
+    }
+
+    pub const fn control_epoch(self) -> ControlEpoch {
+        self.control_epoch
+    }
+
+    pub const fn controller_sequence(self) -> V2CommandSequence {
+        self.controller_sequence
+    }
+
+    pub const fn requested_target(self) -> TimerPwm {
+        self.requested_target
+    }
+
+    pub const fn controller_requested_step(self) -> TimerPwm {
+        self.controller_requested_step
+    }
+
+    pub const fn actual_applied(self) -> TimerPwm {
+        self.actual_applied
+    }
+
+    pub const fn target_reached(self) -> bool {
+        self.target_reached
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NavigationIngressEvent {
     VisualAttempt(VisualAttemptIngress),
@@ -1130,6 +1232,7 @@ pub enum NavigationIngressEvent {
     AcceptedGlobalMap(AcceptedGlobalMapIngress),
     PointGoal(MapPointGoalIngress),
     ControlTick(ControlTickIngress),
+    QualificationAppliedStep(QualificationAppliedStepIngress),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1225,7 +1328,8 @@ impl NavigationIngressOrderState {
             NavigationIngressEvent::VisualAttempt(_)
             | NavigationIngressEvent::ImuReport(_)
             | NavigationIngressEvent::AcceptedDepth(_)
-            | NavigationIngressEvent::ControlTick(_) => {}
+            | NavigationIngressEvent::ControlTick(_)
+            | NavigationIngressEvent::QualificationAppliedStep(_) => {}
         }
         Ok(())
     }
@@ -1247,7 +1351,8 @@ impl NavigationIngressOrderState {
             | NavigationIngressEvent::ImuReport(_)
             | NavigationIngressEvent::AcceptedDepth(_)
             | NavigationIngressEvent::PointGoal(_)
-            | NavigationIngressEvent::ControlTick(_) => {}
+            | NavigationIngressEvent::ControlTick(_)
+            | NavigationIngressEvent::QualificationAppliedStep(_) => {}
         }
     }
 }
@@ -1460,6 +1565,8 @@ pub struct NavigationIngressWriter<W> {
     record_count: usize,
     order_state: NavigationIngressOrderState,
     poisoned: bool,
+    #[cfg(unix)]
+    dataset_storage_quota: Option<Arc<DatasetStorageQuota>>,
 }
 
 /// Successful stream finalization paired with the only descriptor that can bind it.
@@ -1485,9 +1592,24 @@ impl<W> FinalizedNavigationIngress<W> {
 
 impl<W: Write + Seek> NavigationIngressWriter<W> {
     pub fn new(
+        inner: W,
+        recording_id: NavigationRecordingId,
+        capacity: NavigationIngressCapacity,
+    ) -> Result<Self, NavigationIngressStreamWriteError> {
+        Self::new_internal(
+            inner,
+            recording_id,
+            capacity,
+            #[cfg(unix)]
+            None,
+        )
+    }
+
+    fn new_internal(
         mut inner: W,
         recording_id: NavigationRecordingId,
         capacity: NavigationIngressCapacity,
+        #[cfg(unix)] dataset_storage_quota: Option<Arc<DatasetStorageQuota>>,
     ) -> Result<Self, NavigationIngressStreamWriteError> {
         let current_position =
             inner
@@ -1524,6 +1646,26 @@ impl<W: Write + Seek> NavigationIngressWriter<W> {
         let mut header = [0; HEADER_BYTES];
         encode_header(&mut header, 0, recording_id)
             .map_err(NavigationIngressStreamWriteError::Write)?;
+        #[cfg(unix)]
+        match dataset_storage_quota.as_ref() {
+            Some(quota) => quota
+                .write_live_with(
+                    Path::new(NAVIGATION_INGRESS_STREAM_FILE),
+                    u64::try_from(header.len()).expect("bounded header length fits u64"),
+                    || {
+                        inner.write_all(&header)?;
+                        inner.seek(SeekFrom::End(0))
+                    },
+                )
+                .map_err(NavigationIngressStreamWriteError::StorageQuota)?,
+            None => inner.write_all(&header).map_err(|source| {
+                NavigationIngressStreamWriteError::Io {
+                    stage: NavigationIngressWriteStage::WriteHeader,
+                    source,
+                }
+            })?,
+        }
+        #[cfg(not(unix))]
         inner
             .write_all(&header)
             .map_err(|source| NavigationIngressStreamWriteError::Io {
@@ -1537,6 +1679,8 @@ impl<W: Write + Seek> NavigationIngressWriter<W> {
             record_count: 0,
             order_state: NavigationIngressOrderState::default(),
             poisoned: false,
+            #[cfg(unix)]
+            dataset_storage_quota,
         })
     }
 
@@ -1585,12 +1729,36 @@ impl<W: Write + Seek> NavigationIngressWriter<W> {
         };
         let mut bytes = [0; RECORD_BYTES];
         encode_record(&mut bytes, record);
-        if let Err(source) = self.inner.write_all(&bytes) {
+        #[cfg(unix)]
+        let write_result = match self.dataset_storage_quota.as_ref() {
+            Some(quota) => quota
+                .write_live_with(
+                    Path::new(NAVIGATION_INGRESS_STREAM_FILE),
+                    u64::try_from(bytes.len()).expect("bounded record length fits u64"),
+                    || {
+                        self.inner.write_all(&bytes)?;
+                        self.inner.seek(SeekFrom::End(0))
+                    },
+                )
+                .map_err(NavigationIngressStreamWriteError::StorageQuota),
+            None => self.inner.write_all(&bytes).map_err(|source| {
+                NavigationIngressStreamWriteError::Io {
+                    stage: NavigationIngressWriteStage::WriteRecord,
+                    source,
+                }
+            }),
+        };
+        #[cfg(not(unix))]
+        let write_result =
+            self.inner
+                .write_all(&bytes)
+                .map_err(|source| NavigationIngressStreamWriteError::Io {
+                    stage: NavigationIngressWriteStage::WriteRecord,
+                    source,
+                });
+        if let Err(error) = write_result {
             self.poisoned = true;
-            return Err(NavigationIngressStreamWriteError::Io {
-                stage: NavigationIngressWriteStage::WriteRecord,
-                source,
-            });
+            return Err(error);
         }
         self.record_count += 1;
         self.order_state.commit(event);
@@ -1700,6 +1868,18 @@ impl<W: Write + Seek> NavigationIngressWriter<W> {
     }
 }
 
+#[cfg(unix)]
+impl NavigationIngressWriter<std::fs::File> {
+    pub fn new_with_dataset_storage_quota(
+        inner: std::fs::File,
+        recording_id: NavigationRecordingId,
+        capacity: NavigationIngressCapacity,
+        dataset_storage_quota: Arc<DatasetStorageQuota>,
+    ) -> Result<Self, NavigationIngressStreamWriteError> {
+        Self::new_internal(inner, recording_id, capacity, Some(dataset_storage_quota))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavigationIngressWriteStage {
     InspectInitialPosition,
@@ -1719,6 +1899,8 @@ pub enum NavigationIngressStreamWriteError {
         stage: NavigationIngressWriteStage,
         source: io::Error,
     },
+    #[cfg(unix)]
+    StorageQuota(DatasetStorageQuotaError),
     FinalizeAndRestore {
         finalize: io::Error,
         restore: io::Error,
@@ -1759,6 +1941,8 @@ impl std::fmt::Display for NavigationIngressStreamWriteError {
                     "navigation ingress stream I/O failed at {stage:?}: {source}"
                 )
             }
+            #[cfg(unix)]
+            Self::StorageQuota(source) => source.fmt(f),
             Self::FinalizeAndRestore { finalize, restore } => write!(
                 f,
                 "navigation ingress count finalization failed ({finalize}); restoring the end position also failed ({restore})"
@@ -1810,6 +1994,8 @@ impl std::error::Error for NavigationIngressStreamWriteError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Write(source) => Some(source),
+            #[cfg(unix)]
+            Self::StorageQuota(source) => Some(source),
             Self::Io { source, .. }
             | Self::FinalizeAndRestore {
                 finalize: source, ..
@@ -2227,6 +2413,18 @@ pub enum NavigationIngressParseError {
         record_index: usize,
         value: u8,
     },
+    ZeroQualificationEventId {
+        record_index: usize,
+    },
+    InvalidQualificationProtocolField {
+        record_index: usize,
+        field: &'static str,
+        source: DomainError,
+    },
+    InvalidQualificationTargetReached {
+        record_index: usize,
+        value: u8,
+    },
     ZeroDeviceSessionId {
         record_index: usize,
     },
@@ -2366,6 +2564,7 @@ impl std::error::Error for NavigationIngressParseError {
         match self {
             Self::InvalidInertialValue { source, .. } => Some(source),
             Self::InvalidGoalPoint { source, .. } => Some(source),
+            Self::InvalidQualificationProtocolField { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -2503,6 +2702,22 @@ fn encode_record(bytes: &mut [u8], record: NavigationIngressRecord) {
             record_header[8] = KIND_CONTROL_TICK;
             put_u64(payload, 0, event.offset.as_nanos());
         }
+        NavigationIngressEvent::QualificationAppliedStep(event) => {
+            record_header[8] = KIND_QUALIFICATION_APPLIED_STEP;
+            put_u64(payload, 0, event.observed_offset.as_nanos());
+            put_u64(payload, 8, event.qualification_event_id.get());
+            payload[16..28].copy_from_slice(event.controller_uid.as_bytes());
+            put_u64(payload, 28, event.controller_boot_id.get());
+            put_u32(payload, 36, event.control_epoch.get());
+            put_u32(payload, 40, event.controller_sequence.get());
+            payload[44] = event.requested_target.left().get().to_le_bytes()[0];
+            payload[45] = event.requested_target.right().get().to_le_bytes()[0];
+            payload[46] = event.controller_requested_step.left().get().to_le_bytes()[0];
+            payload[47] = event.controller_requested_step.right().get().to_le_bytes()[0];
+            payload[48] = event.actual_applied.left().get().to_le_bytes()[0];
+            payload[49] = event.actual_applied.right().get().to_le_bytes()[0];
+            payload[50] = u8::from(event.target_reached);
+        }
     }
 }
 
@@ -2540,6 +2755,7 @@ fn parse_record(
         KIND_MAP_EPOCH_STARTED => parse_map_epoch_started(record_index, payload)?,
         KIND_CONTROL_TICK => parse_control_tick(record_index, payload)?,
         KIND_ACCEPTED_GLOBAL_MAP => parse_accepted_global_map(record_index, payload)?,
+        KIND_QUALIFICATION_APPLIED_STEP => parse_qualification_applied_step(record_index, payload)?,
         value => {
             return Err(NavigationIngressParseError::UnknownEventKind {
                 record_index,
@@ -2698,6 +2914,100 @@ fn parse_control_tick(
     Ok(NavigationIngressEvent::ControlTick(ControlTickIngress {
         offset: NavigationClockOffset(get_u64(payload, 0)),
     }))
+}
+
+fn parse_qualification_applied_step(
+    record_index: usize,
+    payload: &[u8],
+) -> Result<NavigationIngressEvent, NavigationIngressParseError> {
+    require_zero(record_index, &payload[51..])?;
+    let qualification_event_id = NonZeroU64::new(get_u64(payload, 8))
+        .ok_or(NavigationIngressParseError::ZeroQualificationEventId { record_index })?;
+    let controller_uid = ControllerUid::try_new(
+        payload[16..28]
+            .try_into()
+            .expect("fixed qualification controller UID"),
+    )
+    .map_err(
+        |source| NavigationIngressParseError::InvalidQualificationProtocolField {
+            record_index,
+            field: "qualification.controller_uid",
+            source,
+        },
+    )?;
+    let controller_boot_id = ControllerBootId::try_new(get_u64(payload, 28)).map_err(|source| {
+        NavigationIngressParseError::InvalidQualificationProtocolField {
+            record_index,
+            field: "qualification.controller_boot_id",
+            source,
+        }
+    })?;
+    let control_epoch = ControlEpoch::try_new(get_u32(payload, 36)).map_err(|source| {
+        NavigationIngressParseError::InvalidQualificationProtocolField {
+            record_index,
+            field: "qualification.control_epoch",
+            source,
+        }
+    })?;
+    let requested_target = TimerPwm::try_new(
+        i8::from_le_bytes([payload[44]]),
+        i8::from_le_bytes([payload[45]]),
+    )
+    .map_err(
+        |source| NavigationIngressParseError::InvalidQualificationProtocolField {
+            record_index,
+            field: "qualification.requested_target_timer_pwm_percent",
+            source,
+        },
+    )?;
+    let controller_requested_step = TimerPwm::try_new(
+        i8::from_le_bytes([payload[46]]),
+        i8::from_le_bytes([payload[47]]),
+    )
+    .map_err(
+        |source| NavigationIngressParseError::InvalidQualificationProtocolField {
+            record_index,
+            field: "qualification.controller_requested_step_timer_pwm_percent",
+            source,
+        },
+    )?;
+    let actual_applied = TimerPwm::try_new(
+        i8::from_le_bytes([payload[48]]),
+        i8::from_le_bytes([payload[49]]),
+    )
+    .map_err(
+        |source| NavigationIngressParseError::InvalidQualificationProtocolField {
+            record_index,
+            field: "qualification.actual_applied_timer_pwm_percent",
+            source,
+        },
+    )?;
+    let target_reached = match payload[50] {
+        0 => false,
+        1 => true,
+        value => {
+            return Err(
+                NavigationIngressParseError::InvalidQualificationTargetReached {
+                    record_index,
+                    value,
+                },
+            );
+        }
+    };
+    Ok(NavigationIngressEvent::QualificationAppliedStep(
+        QualificationAppliedStepIngress {
+            observed_offset: NavigationClockOffset(get_u64(payload, 0)),
+            qualification_event_id,
+            controller_uid,
+            controller_boot_id,
+            control_epoch,
+            controller_sequence: V2CommandSequence::new(get_u32(payload, 40)),
+            requested_target,
+            controller_requested_step,
+            actual_applied,
+            target_reached,
+        },
+    ))
 }
 
 fn parse_session(
@@ -3009,6 +3319,23 @@ mod tests {
         .expect("accepted global map")
     }
 
+    fn qualification_applied_step() -> QualificationAppliedStepIngress {
+        QualificationAppliedStepIngress::parse(
+            clock(),
+            host_time(1_020),
+            NonZeroU64::new(17).expect("event ID"),
+            ControllerUid::try_new([0x5a; 12]).expect("controller UID"),
+            ControllerBootId::try_new(23).expect("boot ID"),
+            ControlEpoch::try_new(29).expect("control epoch"),
+            V2CommandSequence::new(31),
+            TimerPwm::try_new(10, -10).expect("requested target"),
+            TimerPwm::try_new(5, -5).expect("requested step"),
+            TimerPwm::try_new(5, -5).expect("applied step"),
+            false,
+        )
+        .expect("qualification applied step")
+    }
+
     fn mixed_events() -> [NavigationIngressEvent; 8] {
         let snapshot = snapshot(4);
         let mut coordinator = NavigationMapEpochCoordinator::new();
@@ -3090,6 +3417,65 @@ mod tests {
                 .map(|record| record.sequence().as_u64())
                 .collect::<Vec<_>>(),
             (1..=events.len() as u64).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn qualification_applied_step_round_trips_with_exact_correlation() {
+        let event = qualification_applied_step();
+        let mut log = NavigationIngressLog::new(recording_id(1), capacity(1));
+        let record = log
+            .push(NavigationIngressEvent::QualificationAppliedStep(event))
+            .expect("append qualification evidence");
+        assert_eq!(record.sequence().as_u64(), 1);
+
+        let encoded = log.encode().expect("encode");
+        let decoded = NavigationIngressLog::parse(Some(&encoded), recording_id(1), capacity(1))
+            .expect("parse");
+        assert_eq!(
+            decoded.records()[0].event(),
+            NavigationIngressEvent::QualificationAppliedStep(event)
+        );
+    }
+
+    #[test]
+    fn qualification_applied_step_decoder_rejects_weak_wire_states() {
+        let mut log = NavigationIngressLog::new(recording_id(1), capacity(1));
+        log.push(NavigationIngressEvent::QualificationAppliedStep(
+            qualification_applied_step(),
+        ))
+        .expect("append");
+        let encoded = log.encode().expect("encode");
+        let payload = HEADER_BYTES + RECORD_PAYLOAD_OFFSET;
+
+        let mut zero_event = encoded.clone();
+        put_u64(&mut zero_event[payload..], 8, 0);
+        assert_eq!(
+            NavigationIngressLog::parse(Some(&zero_event), recording_id(1), capacity(1)),
+            Err(NavigationIngressParseError::ZeroQualificationEventId { record_index: 0 })
+        );
+
+        let mut invalid_target_reached = encoded.clone();
+        invalid_target_reached[payload + 50] = 2;
+        assert_eq!(
+            NavigationIngressLog::parse(
+                Some(&invalid_target_reached),
+                recording_id(1),
+                capacity(1),
+            ),
+            Err(
+                NavigationIngressParseError::InvalidQualificationTargetReached {
+                    record_index: 0,
+                    value: 2,
+                }
+            )
+        );
+
+        let mut nonzero_reserved = encoded;
+        nonzero_reserved[payload + 51] = 1;
+        assert_eq!(
+            NavigationIngressLog::parse(Some(&nonzero_reserved), recording_id(1), capacity(1)),
+            Err(NavigationIngressParseError::NonZeroReservedRecord { record_index: 0 })
         );
     }
 
