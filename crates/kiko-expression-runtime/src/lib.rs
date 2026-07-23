@@ -33,8 +33,9 @@ pub use gaze_geometry::{
     OakCameraTargetPoint, OakCameraTargetRay, QuaternionComponent, RayHeadGazeProjectionError,
 };
 pub use scene_motion::{
-    MAX_SCENE_SAMPLES, MotionThresholds, SamplingGeometry, SamplingGeometryError, SceneAnalysis,
-    SceneMotionConfig, SceneMotionConfigError, SceneMotionError, SceneMotionExtractor,
+    MAX_SCENE_SAMPLES, MonotonicLatestAdmission, MonotonicLatestGap, MonotonicLatestSceneAnalysis,
+    MotionThresholds, SamplingGeometry, SamplingGeometryError, SceneAnalysis, SceneMotionConfig,
+    SceneMotionConfigError, SceneMotionError, SceneMotionExtractor,
 };
 pub use session::{
     ControlBinding, ExpectedEyeIdentity, EyeSession, EyeSessionFault, EyeSessionFaultKind,

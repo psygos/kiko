@@ -1,6 +1,9 @@
 //! Deterministic, allocation-free scene motion from sampled RGB luminance.
 
-use core::{fmt, mem, num::NonZeroU16};
+use core::{
+    fmt, mem,
+    num::{NonZeroU16, NonZeroU64},
+};
 
 use kiko_expression_core::{
     ChannelOrder, FrameId, ImageLayout, ImagePoint, MonotonicTimestamp, PositiveUnitAmount,
@@ -174,6 +177,63 @@ impl SceneAnalysis {
     }
 }
 
+/// Exact evidence for a forward jump in one monotonic capture sequence.
+///
+/// `skipped_sequence_count` is nonzero by construction and equals
+/// `actual_sequence - previous_sequence - 1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MonotonicLatestGap {
+    previous_sequence: u64,
+    actual_sequence: u64,
+    skipped_sequence_count: NonZeroU64,
+}
+
+impl MonotonicLatestGap {
+    pub const fn previous_sequence(self) -> u64 {
+        self.previous_sequence
+    }
+
+    pub const fn actual_sequence(self) -> u64 {
+        self.actual_sequence
+    }
+
+    pub const fn skipped_sequence_count(self) -> NonZeroU64 {
+        self.skipped_sequence_count
+    }
+}
+
+/// How one accepted frame relates to the extractor's previous accepted frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MonotonicLatestAdmission {
+    ColdStart,
+    Consecutive {
+        previous_sequence: u64,
+        actual_sequence: u64,
+    },
+    ForwardGap(MonotonicLatestGap),
+}
+
+/// Scene analysis plus the monotonic-latest admission evidence which produced it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MonotonicLatestSceneAnalysis {
+    analysis: SceneAnalysis,
+    admission: MonotonicLatestAdmission,
+}
+
+impl MonotonicLatestSceneAnalysis {
+    pub const fn analysis(self) -> SceneAnalysis {
+        self.analysis
+    }
+
+    pub const fn admission(self) -> MonotonicLatestAdmission {
+        self.admission
+    }
+
+    pub const fn observation(self) -> SceneObservation {
+        self.analysis.observation()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ExtractorState {
     Cold,
@@ -185,7 +245,13 @@ enum ExtractorState {
     },
 }
 
-/// Stateful adjacent-frame extractor with fixed sampled-luminance storage.
+#[derive(Clone, Copy)]
+enum SequencePolicy {
+    StrictConsecutive,
+    MonotonicLatest,
+}
+
+/// Stateful accepted-frame extractor with fixed sampled-luminance storage.
 ///
 /// Pixel data remains borrowed. Only two fixed arrays of sampled `u8`
 /// luminances are retained; no frame is cloned and no heap allocation occurs.
@@ -223,9 +289,44 @@ impl SceneMotionExtractor {
         frame: RgbFrameView<'_>,
         now: MonotonicTimestamp,
     ) -> Result<SceneAnalysis, SceneMotionError> {
+        self.analyze_with_policy(frame, now, SequencePolicy::StrictConsecutive)
+            .map(|(analysis, _)| analysis)
+    }
+
+    /// Analyze the newest available frame from a replace-latest queue.
+    ///
+    /// Forward sequence gaps are accepted and compared with the previous
+    /// accepted frame. The returned admission reports the exact nonzero number
+    /// of skipped sequence values. Duplicate, reordered, stale, cross-epoch,
+    /// layout-changing, and non-monotonic-clock frames remain rejecting.
+    /// Every rejection leaves comparison state unchanged.
+    pub fn analyze_monotonic_latest(
+        &mut self,
+        frame: RgbFrameView<'_>,
+        now: MonotonicTimestamp,
+    ) -> Result<MonotonicLatestSceneAnalysis, SceneMotionError> {
+        self.analyze_with_policy(frame, now, SequencePolicy::MonotonicLatest)
+            .map(|(analysis, admission)| MonotonicLatestSceneAnalysis {
+                analysis,
+                admission,
+            })
+    }
+
+    fn analyze_with_policy(
+        &mut self,
+        frame: RgbFrameView<'_>,
+        now: MonotonicTimestamp,
+        sequence_policy: SequencePolicy,
+    ) -> Result<(SceneAnalysis, MonotonicLatestAdmission), SceneMotionError> {
         let observation = frame.observation();
         let layout = observation.layout();
-        self.validate_frame(observation.frame_id(), observation.freshness(), layout, now)?;
+        let admission = self.validate_frame(
+            observation.frame_id(),
+            observation.freshness(),
+            layout,
+            now,
+            sequence_policy,
+        )?;
 
         let sample_count = usize::from(self.config.geometry.sample_count());
         let mean_luminance = sample_luminances(
@@ -268,7 +369,7 @@ impl SceneMotionExtractor {
             processed_at: now,
             layout,
         };
-        Ok(scene)
+        Ok((scene, admission))
     }
 
     fn validate_frame(
@@ -277,7 +378,8 @@ impl SceneMotionExtractor {
         freshness: kiko_expression_core::FreshnessWindow,
         layout: ImageLayout,
         now: MonotonicTimestamp,
-    ) -> Result<(), SceneMotionError> {
+        sequence_policy: SequencePolicy,
+    ) -> Result<MonotonicLatestAdmission, SceneMotionError> {
         let geometry = self.config.geometry;
         if layout.width_px() < u32::from(geometry.columns())
             || layout.height_px() < u32::from(geometry.rows())
@@ -314,7 +416,7 @@ impl SceneMotionExtractor {
             layout: previous_layout,
         } = self.state
         else {
-            return Ok(());
+            return Ok(MonotonicLatestAdmission::ColdStart);
         };
 
         if now < previous_processed_at {
@@ -329,29 +431,14 @@ impl SceneMotionExtractor {
                 actual: frame_id.stream_epoch(),
             });
         }
-        let Some(expected_sequence) = previous_frame.sequence().checked_add(1) else {
-            return Err(SceneMotionError::FrameSequenceExhausted {
-                previous: previous_frame.sequence(),
-            });
+        let admission = match sequence_policy {
+            SequencePolicy::StrictConsecutive => {
+                strict_consecutive_admission(previous_frame.sequence(), frame_id.sequence())?
+            }
+            SequencePolicy::MonotonicLatest => {
+                monotonic_latest_admission(previous_frame.sequence(), frame_id.sequence())?
+            }
         };
-        let actual_sequence = frame_id.sequence();
-        if actual_sequence == previous_frame.sequence() {
-            return Err(SceneMotionError::DuplicateFrame {
-                sequence: actual_sequence,
-            });
-        }
-        if actual_sequence < previous_frame.sequence() {
-            return Err(SceneMotionError::OutOfOrderFrame {
-                previous: previous_frame.sequence(),
-                actual: actual_sequence,
-            });
-        }
-        if actual_sequence != expected_sequence {
-            return Err(SceneMotionError::FrameGap {
-                expected: expected_sequence,
-                actual: actual_sequence,
-            });
-        }
         if layout != previous_layout {
             return Err(SceneMotionError::LayoutChanged {
                 expected: previous_layout,
@@ -364,8 +451,68 @@ impl SceneMotionExtractor {
                 actual_ns: observed_at.nanos_since_epoch(),
             });
         }
-        Ok(())
+        Ok(admission)
     }
+}
+
+fn strict_consecutive_admission(
+    previous_sequence: u64,
+    actual_sequence: u64,
+) -> Result<MonotonicLatestAdmission, SceneMotionError> {
+    let Some(expected_sequence) = previous_sequence.checked_add(1) else {
+        return Err(SceneMotionError::FrameSequenceExhausted {
+            previous: previous_sequence,
+        });
+    };
+    if actual_sequence == previous_sequence {
+        return Err(SceneMotionError::DuplicateFrame {
+            sequence: actual_sequence,
+        });
+    }
+    if actual_sequence < previous_sequence {
+        return Err(SceneMotionError::OutOfOrderFrame {
+            previous: previous_sequence,
+            actual: actual_sequence,
+        });
+    }
+    if actual_sequence != expected_sequence {
+        return Err(SceneMotionError::FrameGap {
+            expected: expected_sequence,
+            actual: actual_sequence,
+        });
+    }
+    Ok(MonotonicLatestAdmission::Consecutive {
+        previous_sequence,
+        actual_sequence,
+    })
+}
+
+fn monotonic_latest_admission(
+    previous_sequence: u64,
+    actual_sequence: u64,
+) -> Result<MonotonicLatestAdmission, SceneMotionError> {
+    if actual_sequence == previous_sequence {
+        return Err(SceneMotionError::DuplicateFrame {
+            sequence: actual_sequence,
+        });
+    }
+    let Some(advance) = actual_sequence.checked_sub(previous_sequence) else {
+        return Err(SceneMotionError::OutOfOrderFrame {
+            previous: previous_sequence,
+            actual: actual_sequence,
+        });
+    };
+    let Some(skipped_sequence_count) = advance.checked_sub(1).and_then(NonZeroU64::new) else {
+        return Ok(MonotonicLatestAdmission::Consecutive {
+            previous_sequence,
+            actual_sequence,
+        });
+    };
+    Ok(MonotonicLatestAdmission::ForwardGap(MonotonicLatestGap {
+        previous_sequence,
+        actual_sequence,
+        skipped_sequence_count,
+    }))
 }
 
 fn sample_luminances(
@@ -904,6 +1051,216 @@ mod tests {
                 .expect("state did not advance"),
             SceneAnalysis::NoMotion(_)
         ));
+    }
+
+    #[test]
+    fn monotonic_latest_gap_is_compared_and_reports_exact_skip_evidence() {
+        let mut extractor = SceneMotionExtractor::new(config(3, 3, 10, 1_000));
+        let first = solid(0, 12);
+        let mut changed = solid(0, 12);
+        changed[2 * 3..2 * 3 + 3].fill(255);
+
+        let first = extractor
+            .analyze_monotonic_latest(
+                view(&first, ChannelOrder::Rgb, 12, 4, 10),
+                MonotonicTimestamp::from_nanos_since_epoch(10),
+            )
+            .expect("prime monotonic-latest extractor");
+        assert!(matches!(first.analysis(), SceneAnalysis::ColdStart(_)));
+        assert_eq!(first.admission(), MonotonicLatestAdmission::ColdStart);
+
+        let gapped = extractor
+            .analyze_monotonic_latest(
+                view(&changed, ChannelOrder::Rgb, 12, 9, 20),
+                MonotonicTimestamp::from_nanos_since_epoch(20),
+            )
+            .expect("forward gap is an admitted comparison");
+        assert!(matches!(gapped.analysis(), SceneAnalysis::Motion(_)));
+        let MonotonicLatestAdmission::ForwardGap(gap) = gapped.admission() else {
+            panic!("gap admission must retain evidence");
+        };
+        assert_eq!(gap.previous_sequence(), 4);
+        assert_eq!(gap.actual_sequence(), 9);
+        assert_eq!(gap.skipped_sequence_count().get(), 4);
+        assert_eq!(
+            gapped.observation().frame_id().sequence(),
+            gap.actual_sequence()
+        );
+
+        let consecutive = extractor
+            .analyze_monotonic_latest(
+                view(&changed, ChannelOrder::Rgb, 12, 10, 30),
+                MonotonicTimestamp::from_nanos_since_epoch(30),
+            )
+            .expect("comparison history advances to the admitted latest frame");
+        assert!(matches!(consecutive.analysis(), SceneAnalysis::NoMotion(_)));
+        assert_eq!(
+            consecutive.admission(),
+            MonotonicLatestAdmission::Consecutive {
+                previous_sequence: 9,
+                actual_sequence: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn monotonic_latest_gap_count_is_checked_across_u64_boundaries() {
+        for previous_sequence in [0, 1, 42, u64::MAX - 100] {
+            for advance in 1_u64..=100 {
+                let Some(actual_sequence) = previous_sequence.checked_add(advance) else {
+                    continue;
+                };
+                let admission = monotonic_latest_admission(previous_sequence, actual_sequence)
+                    .expect("strictly forward sequence");
+                if advance == 1 {
+                    assert_eq!(
+                        admission,
+                        MonotonicLatestAdmission::Consecutive {
+                            previous_sequence,
+                            actual_sequence,
+                        }
+                    );
+                } else {
+                    let MonotonicLatestAdmission::ForwardGap(gap) = admission else {
+                        panic!("advance greater than one must report a gap");
+                    };
+                    assert_eq!(gap.previous_sequence(), previous_sequence);
+                    assert_eq!(gap.actual_sequence(), actual_sequence);
+                    assert_eq!(gap.skipped_sequence_count().get(), advance - 1);
+                }
+            }
+        }
+
+        let MonotonicLatestAdmission::ForwardGap(maximum_gap) =
+            monotonic_latest_admission(0, u64::MAX).expect("maximum forward gap")
+        else {
+            panic!("maximum forward gap must retain evidence");
+        };
+        assert_eq!(maximum_gap.skipped_sequence_count().get(), u64::MAX - 1);
+        assert_eq!(
+            monotonic_latest_admission(u64::MAX, u64::MAX),
+            Err(SceneMotionError::DuplicateFrame { sequence: u64::MAX })
+        );
+        assert_eq!(
+            monotonic_latest_admission(u64::MAX, u64::MAX - 1),
+            Err(SceneMotionError::OutOfOrderFrame {
+                previous: u64::MAX,
+                actual: u64::MAX - 1,
+            })
+        );
+        assert_eq!(
+            strict_consecutive_admission(u64::MAX, u64::MAX),
+            Err(SceneMotionError::FrameSequenceExhausted { previous: u64::MAX })
+        );
+    }
+
+    #[test]
+    fn monotonic_latest_rejections_leave_the_previous_frame_unchanged() {
+        let mut extractor = SceneMotionExtractor::new(config(3, 3, 1, 1));
+        let pixels = solid(0, 12);
+        extractor
+            .analyze_monotonic_latest(
+                view(&pixels, ChannelOrder::Rgb, 12, 10, 10),
+                MonotonicTimestamp::from_nanos_since_epoch(10),
+            )
+            .expect("prime");
+
+        let small_layout = ImageLayout::try_new(2, 2, 6, ChannelOrder::Rgb).expect("small layout");
+        let small_observation = RgbObservation::new(
+            FrameId::new(StreamEpochId::try_new(7).expect("epoch"), 11),
+            small_layout,
+            freshness(20),
+        );
+        let small_pixels = [0_u8; 12];
+        let small = RgbFrameView::try_new(small_observation, &small_pixels).expect("small view");
+        assert!(matches!(
+            extractor
+                .analyze_monotonic_latest(small, MonotonicTimestamp::from_nanos_since_epoch(20)),
+            Err(SceneMotionError::FrameSmallerThanSamplingGrid { .. })
+        ));
+        assert!(matches!(
+            extractor.analyze_monotonic_latest(
+                view(&pixels, ChannelOrder::Rgb, 12, 11, 20),
+                MonotonicTimestamp::from_nanos_since_epoch(19)
+            ),
+            Err(SceneMotionError::FrameFromFuture { .. })
+        ));
+        assert!(matches!(
+            extractor.analyze_monotonic_latest(
+                view(&pixels, ChannelOrder::Rgb, 12, 11, 20),
+                MonotonicTimestamp::from_nanos_since_epoch(120)
+            ),
+            Err(SceneMotionError::StaleFrame { .. })
+        ));
+        assert!(matches!(
+            extractor.analyze_monotonic_latest(
+                view(&pixels, ChannelOrder::Rgb, 12, 11, 9),
+                MonotonicTimestamp::from_nanos_since_epoch(9)
+            ),
+            Err(SceneMotionError::HostClockRegressed { .. })
+        ));
+
+        let layout = ImageLayout::try_new(3, 3, 12, ChannelOrder::Rgb).expect("layout");
+        let other_epoch = RgbObservation::new(
+            FrameId::new(StreamEpochId::try_new(8).expect("other epoch"), 11),
+            layout,
+            freshness(20),
+        );
+        let other_epoch = RgbFrameView::try_new(other_epoch, &pixels).expect("other epoch view");
+        assert!(matches!(
+            extractor.analyze_monotonic_latest(
+                other_epoch,
+                MonotonicTimestamp::from_nanos_since_epoch(20)
+            ),
+            Err(SceneMotionError::StreamEpochChanged { .. })
+        ));
+        assert_eq!(
+            extractor.analyze_monotonic_latest(
+                view(&pixels, ChannelOrder::Rgb, 12, 10, 20),
+                MonotonicTimestamp::from_nanos_since_epoch(20)
+            ),
+            Err(SceneMotionError::DuplicateFrame { sequence: 10 })
+        );
+        assert_eq!(
+            extractor.analyze_monotonic_latest(
+                view(&pixels, ChannelOrder::Rgb, 12, 9, 20),
+                MonotonicTimestamp::from_nanos_since_epoch(20)
+            ),
+            Err(SceneMotionError::OutOfOrderFrame {
+                previous: 10,
+                actual: 9,
+            })
+        );
+        assert!(matches!(
+            extractor.analyze_monotonic_latest(
+                view(&pixels, ChannelOrder::Bgr, 12, 11, 20),
+                MonotonicTimestamp::from_nanos_since_epoch(20)
+            ),
+            Err(SceneMotionError::LayoutChanged { .. })
+        ));
+        assert_eq!(
+            extractor.analyze_monotonic_latest(
+                view(&pixels, ChannelOrder::Rgb, 12, 11, 10),
+                MonotonicTimestamp::from_nanos_since_epoch(20)
+            ),
+            Err(SceneMotionError::ObservationClockNotIncreasing {
+                previous_ns: 10,
+                actual_ns: 10,
+            })
+        );
+
+        let accepted = extractor
+            .analyze_monotonic_latest(
+                view(&pixels, ChannelOrder::Rgb, 12, 20, 30),
+                MonotonicTimestamp::from_nanos_since_epoch(30),
+            )
+            .expect("all rejections retained sequence ten as the baseline");
+        let MonotonicLatestAdmission::ForwardGap(gap) = accepted.admission() else {
+            panic!("valid recovery must report the original baseline");
+        };
+        assert_eq!(gap.previous_sequence(), 10);
+        assert_eq!(gap.actual_sequence(), 20);
+        assert_eq!(gap.skipped_sequence_count().get(), 9);
     }
 
     #[test]
