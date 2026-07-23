@@ -11,7 +11,9 @@ use kiko_eye_protocol::{
     EncodeError, HandshakeNonce, IdentityReport, MAX_ENCODED_FRAME_BYTES, Message, encode,
 };
 
-use crate::config::{BaudRate, ConfigParseError, DeviceIdentity, OperationTimeout};
+use crate::config::{
+    BaudRate, ConfigParseError, DeviceIdentity, OperationTimeout, StaticEyeRuntimeConfig,
+};
 use crate::framing::{FrameReadError, FrameReader};
 use crate::transport::{
     AsyncByteTransport, ClockError, MonotonicClock, SerialConfigurationEvidence, SerialOpenError,
@@ -66,6 +68,21 @@ impl IdentityProbeConfig {
             operation_timeout,
             empty_delimiter_budget: EMPTY_DELIMITER_BUDGET,
         })
+    }
+
+    /// Derive an identity-only probe from an already parsed deployment
+    /// policy, without reconstructing weak paths, baud rates, or time units.
+    ///
+    /// The one shared probe timeout is the larger of the actor's separately
+    /// bounded read and write timeouts. The probe retains its stricter fixed
+    /// empty-delimiter budget and never acquires renderer control.
+    pub fn from_static_runtime(runtime: &StaticEyeRuntimeConfig) -> Self {
+        Self {
+            device: runtime.device().clone(),
+            baud_rate: runtime.baud_rate(),
+            operation_timeout: runtime.response_timeout().max(runtime.write_timeout()),
+            empty_delimiter_budget: EMPTY_DELIMITER_BUDGET,
+        }
     }
 
     pub const fn device(&self) -> &DeviceIdentity {
@@ -446,6 +463,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::config::StaticEyeRuntimeConfigInput;
 
     #[derive(Clone, Default)]
     struct FakeClock(Arc<AtomicU64>);
@@ -621,6 +639,29 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn identity_probe_is_derived_from_typed_runtime_without_reparsing() {
+        let runtime = StaticEyeRuntimeConfig::parse(StaticEyeRuntimeConfigInput {
+            device_path: "/dev/serial/by-id/usb-kiko_kiko-eyes-kep2_a1-if00".to_owned(),
+            baud_rate_bps: 115_200,
+            response_timeout_ms: 80,
+            write_timeout_ms: 120,
+            write_attempts: 1,
+            empty_delimiter_budget: 7,
+            expected_device_uid: [1; 16],
+            expected_firmware_build_id: [2; 32],
+            expected_capabilities_bits: Capabilities::KNOWN_BITS,
+            intent_lease_ms: 500,
+        })
+        .expect("valid static runtime");
+
+        let probe = IdentityProbeConfig::from_static_runtime(&runtime);
+        assert_eq!(probe.device(), runtime.device());
+        assert_eq!(probe.baud_rate(), runtime.baud_rate());
+        assert_eq!(probe.operation_timeout(), runtime.write_timeout());
+        assert_eq!(probe.empty_delimiter_budget(), EMPTY_DELIMITER_BUDGET);
     }
 
     #[tokio::test]

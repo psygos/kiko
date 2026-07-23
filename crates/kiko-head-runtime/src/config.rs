@@ -198,6 +198,22 @@ impl HeadProbeConfig {
     pub const fn noise_budget_bytes(&self) -> u16 {
         self.noise_budget_bytes
     }
+
+    /// Derive the read-only probe boundary from an already parsed runtime
+    /// policy without reconstructing weak strings or numeric units.
+    ///
+    /// The fixed READ request uses the runtime's bounded write timeout; the
+    /// device identity, response timeout, and framing-noise budget retain the
+    /// exact parsed values. This conversion does not open the serial device or
+    /// grant torque consent.
+    pub fn from_runtime(runtime: &HeadRuntimeConfig) -> Self {
+        Self {
+            device: runtime.device.clone(),
+            response_timeout: runtime.response_timeout,
+            request_timeout: runtime.write_timeout,
+            noise_budget_bytes: runtime.noise_budget_bytes,
+        }
+    }
 }
 
 /// Number of permitted write attempts. Only a retryable zero-progress failure
@@ -1160,6 +1176,17 @@ mod tests {
             probe.noise_budget_bytes()
         );
         assert_eq!(hold.maximum_duration(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn read_only_probe_is_derived_from_typed_runtime_without_reparsing() {
+        let runtime = HeadRuntimeConfig::parse(valid_input()).expect("valid runtime");
+        let probe = HeadProbeConfig::from_runtime(&runtime);
+
+        assert_eq!(probe.device(), runtime.device());
+        assert_eq!(probe.response_timeout(), runtime.response_timeout());
+        assert_eq!(probe.request_timeout(), runtime.write_timeout());
+        assert_eq!(probe.noise_budget_bytes(), runtime.noise_budget_bytes());
     }
 
     #[test]
