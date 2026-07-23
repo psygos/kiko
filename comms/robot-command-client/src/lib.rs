@@ -19,7 +19,7 @@ pub use config::{
 };
 pub use domain::{
     AppliedCommandReceipt, ControllerSession, DisarmReceipt, MonotonicInstant,
-    PendingPhysicalCommand,
+    PendingPhysicalCommand, VerifiedControllerAcquisition,
 };
 pub use robot_protocol::v2::{
     ActuatorConfigFingerprint, ControlEpoch, ControllerBootId, ControllerUid, TimerPwm,

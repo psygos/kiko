@@ -1,7 +1,7 @@
 use crate::config::ClientConfig;
 use crate::domain::{
     AppliedCommandReceipt, ControllerSession, DisarmReceipt, MonotonicInstant,
-    PendingPhysicalCommand, ReceiptTiming,
+    PendingPhysicalCommand, ReceiptTiming, VerifiedControllerAcquisition,
 };
 use crate::transport::{MonotonicClock, V2CommandTransport};
 use robot_protocol::v2::{
@@ -127,7 +127,7 @@ where
     fn acquire_control_epoch(
         &mut self,
         boot_id: ControllerBootId,
-    ) -> Result<ControllerSession, FailureCause<Transport::Error>> {
+    ) -> Result<VerifiedControllerAcquisition, FailureCause<Transport::Error>> {
         let request_id = self.allocate_request_id()?;
         let request = AcquireControl {
             expected_controller_uid: self.config.controller_uid(),
@@ -149,13 +149,8 @@ where
                 actual: message.kind(),
             }));
         };
-        let epoch = verify_acquire_result(&self.config, boot_id, request_id, result)
-            .map_err(FailureCause::Evidence)?;
-        Ok(ControllerSession::from_verified_acquisition(
-            self.config.controller_uid(),
-            boot_id,
-            epoch,
-        ))
+        verify_acquire_result(&self.config, boot_id, request_id, result)
+            .map_err(FailureCause::Evidence)
     }
 
     fn command_once(
@@ -358,10 +353,11 @@ where
             Ok(boot_id) => boot_id,
             Err(cause) => return Err(AcquireFailure::latch(core, cause)),
         };
-        let session = match core.acquire_control_epoch(boot_id) {
-            Ok(session) => session,
+        let acquisition = match core.acquire_control_epoch(boot_id) {
+            Ok(acquisition) => acquisition,
             Err(cause) => return Err(AcquireFailure::latch(core, cause)),
         };
+        let session = acquisition.controller_session();
         core.reset_command_sequence();
         let receipt = match core.command_once(
             session,
@@ -382,7 +378,7 @@ where
         Ok((
             ArmedCommandClient {
                 core: Some(core),
-                session,
+                acquisition,
                 confirmed,
             },
             receipt,
@@ -415,7 +411,7 @@ where
     Clock: MonotonicClock,
 {
     core: Option<ClientCore<Transport, Clock>>,
-    session: ControllerSession,
+    acquisition: VerifiedControllerAcquisition,
     confirmed: ConfirmedAppliedState,
 }
 
@@ -469,7 +465,7 @@ where
             ));
         }
         let receipt = match core.command_once(
-            self.session,
+            self.acquisition.controller_session(),
             pending.requested_timer_pwm(),
             pending.lease(),
             Some(pending.acknowledgement_deadline_exclusive()),
@@ -525,7 +521,13 @@ where
     }
 
     pub const fn controller_session(&self) -> ControllerSession {
-        self.session
+        self.acquisition.controller_session()
+    }
+
+    /// Return the immutable acquisition-time identity report which created
+    /// this armed session.
+    pub const fn verified_acquisition(&self) -> VerifiedControllerAcquisition {
+        self.acquisition
     }
 }
 
@@ -785,7 +787,7 @@ fn verify_acquire_result(
     expected_boot_id: ControllerBootId,
     expected_request_id: RequestId,
     result: AcquireResult,
-) -> Result<ControlEpoch, EvidenceError> {
+) -> Result<VerifiedControllerAcquisition, EvidenceError> {
     verify_common_identity(config.controller_uid(), result.controller_uid)?;
     if result.boot_id != expected_boot_id {
         return Err(EvidenceError::ControllerBootIdMismatch {
@@ -822,7 +824,19 @@ fn verify_acquire_result(
     {
         return Err(EvidenceError::ActuatorConfigFingerprintMismatch);
     }
-    Ok(epoch)
+    let firmware_abi = core::num::NonZeroU16::new(result.observed_firmware_abi)
+        .expect("verified firmware ABI equals nonzero configured ABI");
+    let firmware_build_id = core::num::NonZeroU32::new(result.observed_firmware_build_id)
+        .expect("verified firmware build equals nonzero configured build");
+    let session =
+        ControllerSession::from_verified_acquisition(result.controller_uid, result.boot_id, epoch);
+    Ok(VerifiedControllerAcquisition::new(
+        session,
+        firmware_abi,
+        firmware_build_id,
+        result.observed_actuator_config_fingerprint,
+        result.capabilities,
+    ))
 }
 
 fn verify_command_result(

@@ -1,9 +1,11 @@
 use robot_protocol::ControllerUptimeMsWrapping;
 use robot_protocol::v2::{
-    ControlEpoch, ControllerBootId, ControllerDeadlineMsWrapping, ControllerFaults, ControllerUid,
-    HostCommandResult, HostCommandResultCode, OutputState, RemainingLeaseMs, RequestId, TimerPwm,
-    V2CommandLeaseMs, V2CommandSequence,
+    ActuatorConfigFingerprint, ControlEpoch, ControllerBootId, ControllerCapabilities,
+    ControllerDeadlineMsWrapping, ControllerFaults, ControllerUid, HostCommandResult,
+    HostCommandResultCode, OutputState, RemainingLeaseMs, RequestId, TimerPwm, V2CommandLeaseMs,
+    V2CommandSequence,
 };
+use std::num::{NonZeroU16, NonZeroU32};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -62,6 +64,73 @@ impl ControllerSession {
 
     pub const fn control_epoch(self) -> ControlEpoch {
         self.control_epoch
+    }
+}
+
+/// Exact controller identity and capabilities retained from one verified
+/// `AcquireResult`.
+///
+/// Callers cannot construct this value. It is minted only after the command
+/// client has matched the response to the request and verified UID, boot ID,
+/// control epoch, firmware ABI/build, actuator fingerprint, required safety
+/// capabilities, and clear controller faults. This is acquisition-time
+/// evidence; it does not claim continuing liveness after the response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedControllerAcquisition {
+    session: ControllerSession,
+    firmware_abi: NonZeroU16,
+    firmware_build_id: NonZeroU32,
+    actuator_config_fingerprint: ActuatorConfigFingerprint,
+    capabilities: ControllerCapabilities,
+}
+
+impl VerifiedControllerAcquisition {
+    pub(crate) const fn new(
+        session: ControllerSession,
+        firmware_abi: NonZeroU16,
+        firmware_build_id: NonZeroU32,
+        actuator_config_fingerprint: ActuatorConfigFingerprint,
+        capabilities: ControllerCapabilities,
+    ) -> Self {
+        Self {
+            session,
+            firmware_abi,
+            firmware_build_id,
+            actuator_config_fingerprint,
+            capabilities,
+        }
+    }
+
+    pub const fn controller_session(self) -> ControllerSession {
+        self.session
+    }
+
+    pub const fn controller_uid(self) -> ControllerUid {
+        self.session.controller_uid()
+    }
+
+    pub const fn boot_id(self) -> ControllerBootId {
+        self.session.boot_id()
+    }
+
+    pub const fn control_epoch(self) -> ControlEpoch {
+        self.session.control_epoch()
+    }
+
+    pub const fn firmware_abi(self) -> u16 {
+        self.firmware_abi.get()
+    }
+
+    pub const fn firmware_build_id(self) -> u32 {
+        self.firmware_build_id.get()
+    }
+
+    pub const fn actuator_config_fingerprint(self) -> ActuatorConfigFingerprint {
+        self.actuator_config_fingerprint
+    }
+
+    pub const fn capabilities(self) -> ControllerCapabilities {
+        self.capabilities
     }
 }
 

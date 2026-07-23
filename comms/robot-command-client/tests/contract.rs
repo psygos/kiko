@@ -203,6 +203,14 @@ fn exact_status_acquire_zero_motion_and_disarm_path() {
         .acquire_zero()
         .ok()
         .expect("zero acquisition succeeds");
+    let acquisition = armed.verified_acquisition();
+    assert_eq!(acquisition.controller_uid(), uid());
+    assert_eq!(acquisition.boot_id(), boot());
+    assert_eq!(acquisition.control_epoch(), epoch());
+    assert_eq!(acquisition.firmware_abi(), FIRMWARE_ABI);
+    assert_eq!(acquisition.firmware_build_id(), FIRMWARE_BUILD_ID);
+    assert_eq!(acquisition.actuator_config_fingerprint(), fingerprint());
+    assert_eq!(acquisition.capabilities(), capabilities());
     assert!(initial_receipt.is_confirmed_zero());
     assert_eq!(initial_receipt.sequence(), V2CommandSequence::FIRST);
     assert_eq!(initial_receipt.result(), HostCommandResultCode::AppliedNew);
