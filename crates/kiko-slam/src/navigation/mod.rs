@@ -32,6 +32,22 @@ mod local_costmap;
 mod manual_drive;
 mod manual_reference;
 pub mod mpc;
+#[cfg(all(feature = "agent-runtime", feature = "record", unix))]
+mod nano_accessory_worker;
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "record",
+    unix
+))]
+mod nano_agent_launch;
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "record",
+    unix
+))]
+mod nano_observed_inventory;
 mod odometry;
 mod reference;
 mod safety;
@@ -170,6 +186,35 @@ pub use manual_reference::{
     FrontierYawReferenceBuildError, FrontierYawScanBudgetError, FrontierYawScanBudgetV1,
     FrontierYawScanCommandError, FrontierYawScanCommandV1, FrontierYawTurnDirectionV1,
     ManualMpcCommandError, ManualMpcCommandV1, ManualReferenceBuildError, NumericAuthorityLeaseId,
+};
+#[cfg(all(feature = "agent-runtime", feature = "record", unix))]
+pub use nano_accessory_worker::{
+    MAX_NANO_ACCESSORY_HEALTH_PERIOD, NanoAccessoryFaultWaitError, NanoAccessoryFrameStats,
+    NanoAccessoryFrameSubmitOutcome, NanoAccessoryHealthPeriod, NanoAccessoryHealthPeriodError,
+    NanoAccessoryHealthStatusError, NanoAccessoryReadyEvidence, NanoAccessoryRgbIngress,
+    NanoAccessoryShutdownEvidence, NanoAccessoryTerminalFault, NanoAccessoryWorker,
+    NanoAccessoryWorkerConfig, NanoAccessoryWorkerConfigError, NanoAccessoryWorkerExit,
+    NanoAccessoryWorkerJoinError, NanoAccessoryWorkerStartError, NanoEyeActorStartupError,
+    NanoEyeReadyEvidence, NanoEyeShutdownEvidence, NanoHeadActorStartupError,
+    NanoHeadReadyEvidence, NanoHeadShutdownEvidence,
+};
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "record",
+    unix
+))]
+pub use nano_agent_launch::*;
+#[cfg(all(
+    feature = "agent-runtime",
+    feature = "actuation",
+    feature = "record",
+    unix
+))]
+pub use nano_observed_inventory::{
+    AdmittedOakSuperSpeedEvidence, NanoObservedInventoryBuildError, NanoObservedInventoryBuilder,
+    NanoObservedInventoryEvidenceError, NanoObservedInventoryEvidenceKind,
+    ProductionObservedDeviceInventoryV1,
 };
 pub use odometry::{
     BaseAcceleration, BaseAngularVelocity, CalibratedQuantity, CalibrationMatrix,

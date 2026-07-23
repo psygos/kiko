@@ -16,6 +16,7 @@ agent-runtime = [
     "dep:kiko-head-protocol",
     "dep:kiko-head-runtime",
     "dep:kiko-supervisor-core",
+    "dep:tokio",
 ]
 nano-bench = ["agent-runtime", "actuation", "record", "dep:robot-server", "dep:tokio"]
 ort-coreml = ["ort/coreml"]
