@@ -28,7 +28,10 @@ use robot_server::{
 };
 
 use super::actuation::LiveActuationError;
-use super::nano_bootstrap::{bootstrap_stereo, derive_required_probe_configs, require_running};
+use super::nano_bootstrap::{
+    NanoExactDevicePresenceTargets, bootstrap_stereo, derive_required_probe_configs,
+    require_running, wait_for_exact_device_presence,
+};
 use super::{
     AdmittedOakSuperSpeedEvidence, CandidateActuationSessionStartError, CandidateMpcBindingError,
     CandidateRuntimeServiceIntervalError, LoadedNanoWheelsOffQualificationLaunchV1,
@@ -353,6 +356,22 @@ pub async fn bootstrap_nano_wheels_off_qualification(
         .map_err(QualificationBootstrapPrimaryError::CandidateBinding)
         .map_err(QualificationBootstrapError::before_hardware)?;
     let candidate_limits = candidate_admission.limits();
+
+    // Match production cold-boot behavior exactly: retry only read-only
+    // enumeration of the already parsed identities. The head/eye probes, OAK
+    // connect, and controller exclusive open below each remain one attempt.
+    wait_for_exact_device_presence(
+        NanoExactDevicePresenceTargets::new(
+            &head_probe_config,
+            &eye_probe_config,
+            manifest.manifest().as_inventory().stm32(),
+            manifest.manifest().as_inventory().oak(),
+        ),
+        running,
+    )
+    .map_err(NanoBootstrapPrimaryError::DevicePresenceWait)
+    .map_err(QualificationBootstrapPrimaryError::common)
+    .map_err(QualificationBootstrapError::before_hardware)?;
 
     require_running(running)
         .map_err(QualificationBootstrapPrimaryError::common)

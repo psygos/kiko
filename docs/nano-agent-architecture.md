@@ -42,33 +42,50 @@ Every cold boot starts with no base owner and follows this order:
    and digest-bound before hardware access. Bind the expected head/eye policy
    to exact persistent identities; never choose the first matching serial port
    or camera.
-2. Complete finite read-only eye, adapter, and four-servo probes. The probe
+2. Within the compiled fixed 30-second device-presence window, poll only until
+   one sequential composite polling pass reports the exact head, eye, and
+   STM32 serial-by-id character devices and exact OAK MXID in `Available` or
+   `InUse` state. It observes immediately, then pauses for at most 100 ms after
+   each unsuccessful observation; shutdown is checked before every observation
+   and sleep and between serial metadata calls before native OAK discovery.
+   `Bootloader` and `Unknown` OAK states keep the wait active. An OAK reported
+   `InUse` counts as present for timing only: every serial probe, OAK connect,
+   and controller open below is still attempted exactly once, so a competing
+   owner or any other exclusive-open failure returns immediately instead of
+   restarting this poll. Timeout retains each serial-presence bit and the exact
+   OAK's last observed `Available`, `InUse`, `Bootloader`, `Unknown`, or missing
+   state when a complete prior pass exists; a timeout during the first partial
+   pass has no composite snapshot. Presence proves no identity, ownership, USB
+   speed, or continued availability. The fixed duration cannot preempt a
+   filesystem or native DepthAI call already in progress, but it prevents the
+   next component call from starting once the preceding boundary returns.
+3. Complete finite read-only eye, adapter, and four-servo probes. The probe
    sessions close before the single production accessory owner opens either
    serial device.
-3. Start the production accessory owner before opening OAK or starting the
+4. Start the production accessory owner before opening OAK or starting the
    STM32 owner. The head owner first
    observes each joint twice, admits the complete pose inside the exact policy
    window and freshness budget, writes that same pose with bounded speed and
    torque limits, enables or refreshes torque, and verifies two stopped
    readbacks before any natural-pose transition. It performs no pre-observation
    torque-disable.
-4. Open only the exact OAK MXID, require SuperSpeed, and bit-exactly bind its
+5. Open only the exact OAK MXID, require SuperSpeed, and bit-exactly bind its
    observed rectified stereo geometry to the retained calibration artifact.
    Require the artifact's raw IMU and tracking-camera-to-base values to equal
    the parsed navigation configuration and its three calibration IDs to equal
    the production actuation approval. Continuously reject a terminal accessory
    fault while waiting for the first stereo pair.
-5. Start the exact STM32 owner in a stopped state, acquire an acknowledged
+6. Start the exact STM32 owner in a stopped state, acquire an acknowledged
    applied zero, and compare the complete observed OAK/STM32/accessory/artifact
    inventory with the manifest. No base motion authority exists during the
    earlier head return.
-6. Establish device-clock epochs and measure freshness. A restart or timestamp
+7. Establish device-clock epochs and measure freshness. A restart or timestamp
    regression creates a new epoch and invalidates prior authority.
-7. Start RGB, stereo, metric rectified-left depth, IMU, online SLAM, occupancy,
+8. Start RGB, stereo, metric rectified-left depth, IMU, online SLAM, occupancy,
    expression, and Rerun streams. Occupancy readiness requires a localized pose
    and a fresh aligned depth integration; a file that merely parses is not a
    live-map readiness claim.
-8. Enter `Disarmed`. An explicit arm request can select exactly one authority
+9. Enter `Disarmed`. An explicit arm request can select exactly one authority
    only after the supervisor receives a fresh identity-bound applied zero.
 
 After the accessory owner is ready, a later bootstrap failure first stops and

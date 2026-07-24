@@ -4,17 +4,19 @@
 //! individual parsers alone:
 //!
 //! 1. load every launch-bound input without following symlinks;
-//! 2. parse policy, manifest, controller, navigation, and actuation contracts
-//!    exactly once;
-//! 3. issue finite read-only head and eye identity probes;
-//! 4. start and retain the sole manifest-bound natural-head/eye owner;
-//! 5. open one exact OAK at SuperSpeed, retain its first stereo frames, and
-//!    derive the runtime projection contract from observed intrinsics;
-//! 6. exclusively start the in-process serial/UDP owner and await an exact
+//! 2. parse and bind policy, manifest, controller, calibration, and plant
+//!    contracts exactly once;
+//! 3. wait boundedly for read-only presence of every exact parsed device;
+//! 4. issue finite read-only head and eye identity probes;
+//! 5. start and retain the sole manifest-bound natural-head/eye owner;
+//! 6. open one exact OAK at SuperSpeed, retain its first stereo frames, and
+//!    derive the runtime projection contract from observed intrinsics, then
+//!    parse and bind navigation and actuation exactly once;
+//! 7. exclusively start the in-process serial/UDP owner and await an exact
 //!    ready-stopped controller heartbeat;
-//! 7. acquire the sole controller session at an acknowledged exact zero;
-//! 8. build observed inventory only from retained runtime evidence; and
-//! 9. perform production admission, leaving the supervisor disarmed.
+//! 8. acquire the sole controller session at an acknowledged exact zero;
+//! 9. build observed inventory only from retained runtime evidence; and
+//! 10. perform production admission, leaving the supervisor disarmed.
 //!
 //! No motion-bearing base API is exposed before exact admission. Once the
 //! accessory owner is ready, every later failure keeps it alive through base
@@ -23,7 +25,9 @@
 //! resulting physical torque state.
 
 use std::fmt;
+use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -31,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use kiko_device_inventory::{
     ArtifactHashError, ArtifactId, ArtifactKind, ArtifactRelativePath, ArtifactRelativePathError,
-    LoadedDeploymentAsset, ManifestArtifactHashes, ManifestLoadError, hash_manifest_artifacts,
-    load_expected_manifest_v1_file,
+    LoadedDeploymentAsset, ManifestArtifactHashes, ManifestLoadError, OakIdentity,
+    Stm32StaticIdentity, hash_manifest_artifacts, load_expected_manifest_v1_file,
 };
 use kiko_expression_core::StreamEpochId;
 use kiko_eye_runtime::{
@@ -46,7 +50,8 @@ use kiko_supervisor_core::{ReadinessEpoch, SupervisorState};
 use oak_sys::{
     CalibrationError as OakCalibrationError, CloseError as OakCloseError, ConnectedDeviceIdentity,
     ConnectedDeviceIdentityError, DepthAiBuildMetadata, DepthAiBuildMetadataError, Device,
-    ImageError, ImageFrame as OakImageFrame, StreamId as OakStreamId, UsbTransportEvidenceError,
+    DeviceDiscoveryError, DeviceInfo, DeviceState, ImageError, ImageFrame as OakImageFrame,
+    StreamId as OakStreamId, UsbTransportEvidenceError,
 };
 use robot_command_client::DisarmReceipt;
 use robot_server::config::{ControllerServerConfigV1, ServerConfigError};
@@ -81,6 +86,13 @@ const STEREO_POLL_TIMEOUT_MS: u32 = 50;
 const STEREO_IDLE_SLEEP: Duration = Duration::from_micros(500);
 const MAX_STEREO_BOOTSTRAP_WAIT: Duration = Duration::from_secs(15);
 const NANO_BOOTSTRAP_ACCESSORY_HEALTH_PERIOD: Duration = Duration::from_secs(1);
+const NANO_DEVICE_PRESENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Fixed poll/sleep budget shared by production and wheels-off bootstrap.
+///
+/// A synchronous filesystem or DepthAI enumeration already in progress cannot
+/// be preempted. Shutdown and deadline are checked after each serial metadata
+/// call, before native discovery, and after the composite observation returns.
+const NANO_DEVICE_PRESENCE_POLLING_BUDGET: Duration = Duration::from_secs(30);
 
 /// Canonical service-owned input and output roots.
 ///
@@ -262,6 +274,395 @@ impl std::error::Error for NanoBootstrapRequestError {
             Self::Roots(source) => Some(source),
             Self::LaunchRelativePath(source) => Some(source),
         }
+    }
+}
+
+/// Exact device identities whose enumeration may lag filesystem availability
+/// during a cold boot.
+///
+/// This borrowed value contains only identities which have already crossed
+/// their launch, policy, manifest, and controller parsers. Presence is a timing
+/// observation, not admission evidence: every downstream probe, connect, and
+/// owner-open retains its existing one-shot ownership and admission semantics.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NanoExactDevicePresenceTargets<'target> {
+    head: &'target HeadProbeConfig,
+    eye: &'target IdentityProbeConfig,
+    controller: &'target Stm32StaticIdentity,
+    oak: &'target OakIdentity,
+}
+
+impl<'target> NanoExactDevicePresenceTargets<'target> {
+    pub(super) const fn new(
+        head: &'target HeadProbeConfig,
+        eye: &'target IdentityProbeConfig,
+        controller: &'target Stm32StaticIdentity,
+        oak: &'target OakIdentity,
+    ) -> Self {
+        Self {
+            head,
+            eye,
+            controller,
+            oak,
+        }
+    }
+}
+
+/// Device role retained by a serial-presence boundary failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NanoSerialPresenceRole {
+    Head,
+    Eye,
+    Controller,
+}
+
+/// One composite, read-only enumeration pass.
+///
+/// Serial booleans prove only that a character-device target was reported, and
+/// the OAK value retains the discovery state for the exact MXID. The snapshot
+/// does not prove atomic coexistence, ownership, identity readback, USB speed,
+/// firmware, or continued presence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NanoDevicePresenceSnapshot {
+    head_serial: bool,
+    eye_serial: bool,
+    controller_serial: bool,
+    oak: NanoOakPresence,
+}
+
+impl NanoDevicePresenceSnapshot {
+    const fn all_ready_for_acquisition_attempt(self) -> bool {
+        self.head_serial
+            && self.eye_serial
+            && self.controller_serial
+            && self.oak.ready_for_connect_attempt()
+    }
+
+    pub const fn head_serial_present(self) -> bool {
+        self.head_serial
+    }
+
+    pub const fn eye_serial_present(self) -> bool {
+        self.eye_serial
+    }
+
+    pub const fn controller_serial_present(self) -> bool {
+        self.controller_serial
+    }
+
+    pub const fn oak_presence(self) -> NanoOakPresence {
+        self.oak
+    }
+}
+
+/// Exact OAK MXID observation retained without collapsing transitional states
+/// into absence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NanoOakPresence {
+    Missing,
+    Available,
+    InUse,
+    Bootloader,
+    Unknown,
+}
+
+impl NanoOakPresence {
+    const fn ready_for_connect_attempt(self) -> bool {
+        matches!(self, Self::Available | Self::InUse)
+    }
+}
+
+impl From<DeviceState> for NanoOakPresence {
+    fn from(state: DeviceState) -> Self {
+        match state {
+            DeviceState::Available => Self::Available,
+            DeviceState::InUse => Self::InUse,
+            DeviceState::Bootloader => Self::Bootloader,
+            DeviceState::Unknown => Self::Unknown,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Failure of one read-only presence observation.
+#[derive(Debug)]
+pub enum NanoDevicePresenceProbeError {
+    SerialMetadata {
+        role: NanoSerialPresenceRole,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    SerialTargetIsNotCharacterDevice {
+        role: NanoSerialPresenceRole,
+        path: PathBuf,
+    },
+    OakDiscovery(DeviceDiscoveryError),
+}
+
+impl fmt::Display for NanoDevicePresenceProbeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "exact-device presence probe failed: {self:?}")
+    }
+}
+
+impl std::error::Error for NanoDevicePresenceProbeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SerialMetadata { source, .. } => Some(source),
+            Self::OakDiscovery(source) => Some(source),
+            Self::SerialTargetIsNotCharacterDevice { .. } => None,
+        }
+    }
+}
+
+/// Why the bounded pre-probe enumeration phase did not complete.
+///
+/// The fixed budget bounds scheduled boundary calls, polling, and sleeps. A
+/// synchronous filesystem or native discovery call already in progress cannot
+/// be preempted, but no later component call starts after shutdown or deadline
+/// is observed at the preceding boundary. Shutdown takes precedence when a
+/// composite observation returns; a successful snapshot is then checked
+/// against the deadline, while a probe error remains terminal.
+#[derive(Debug)]
+pub enum NanoDevicePresenceWaitError {
+    Interrupted,
+    Probe(NanoDevicePresenceProbeError),
+    DeadlineOverflow {
+        polling_budget: Duration,
+    },
+    TimedOut {
+        polling_budget: Duration,
+        attempts: u32,
+        last_observation: Option<NanoDevicePresenceSnapshot>,
+    },
+}
+
+impl fmt::Display for NanoDevicePresenceWaitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "bounded exact-device presence wait failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for NanoDevicePresenceWaitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Probe(source) => Some(source),
+            Self::Interrupted | Self::DeadlineOverflow { .. } | Self::TimedOut { .. } => None,
+        }
+    }
+}
+
+trait NanoDevicePresenceProbe {
+    fn observe(
+        &mut self,
+        checkpoint: &mut dyn FnMut() -> Result<(), NanoDevicePresenceWaitError>,
+    ) -> Result<NanoDevicePresenceSnapshot, NanoDevicePresenceWaitError>;
+}
+
+trait NanoDevicePresenceWaitRuntime {
+    fn now(&self) -> Instant;
+    fn sleep(&mut self, duration: Duration);
+}
+
+struct SystemNanoDevicePresenceProbe<'target> {
+    targets: NanoExactDevicePresenceTargets<'target>,
+}
+
+impl NanoDevicePresenceProbe for SystemNanoDevicePresenceProbe<'_> {
+    fn observe(
+        &mut self,
+        checkpoint: &mut dyn FnMut() -> Result<(), NanoDevicePresenceWaitError>,
+    ) -> Result<NanoDevicePresenceSnapshot, NanoDevicePresenceWaitError> {
+        observe_device_presence_components(
+            checkpoint,
+            || {
+                serial_character_device_is_present(
+                    NanoSerialPresenceRole::Head,
+                    Path::new(self.targets.head.device().path()),
+                )
+            },
+            || {
+                serial_character_device_is_present(
+                    NanoSerialPresenceRole::Eye,
+                    Path::new(self.targets.eye.device().path()),
+                )
+            },
+            || {
+                serial_character_device_is_present(
+                    NanoSerialPresenceRole::Controller,
+                    Path::new(self.targets.controller.serial_path().as_str()),
+                )
+            },
+            || {
+                // Device::list deliberately includes devices already in use.
+                // InUse is retained as presence so the one-shot exclusive
+                // connect reports the ownership conflict without another poll.
+                let devices = Device::list().map_err(NanoDevicePresenceProbeError::OakDiscovery)?;
+                Ok(exact_oak_mxid_presence(
+                    &devices,
+                    self.targets.oak.mxid().as_str(),
+                ))
+            },
+        )
+    }
+}
+
+fn observe_device_presence_components(
+    checkpoint: &mut dyn FnMut() -> Result<(), NanoDevicePresenceWaitError>,
+    head: impl FnOnce() -> Result<bool, NanoDevicePresenceProbeError>,
+    eye: impl FnOnce() -> Result<bool, NanoDevicePresenceProbeError>,
+    controller: impl FnOnce() -> Result<bool, NanoDevicePresenceProbeError>,
+    oak: impl FnOnce() -> Result<NanoOakPresence, NanoDevicePresenceProbeError>,
+) -> Result<NanoDevicePresenceSnapshot, NanoDevicePresenceWaitError> {
+    checkpoint()?;
+    let head_serial = head().map_err(NanoDevicePresenceWaitError::Probe)?;
+    checkpoint()?;
+    let eye_serial = eye().map_err(NanoDevicePresenceWaitError::Probe)?;
+    checkpoint()?;
+    let controller_serial = controller().map_err(NanoDevicePresenceWaitError::Probe)?;
+    checkpoint()?;
+    let oak = oak().map_err(NanoDevicePresenceWaitError::Probe)?;
+    Ok(NanoDevicePresenceSnapshot {
+        head_serial,
+        eye_serial,
+        controller_serial,
+        oak,
+    })
+}
+
+fn serial_character_device_is_present(
+    role: NanoSerialPresenceRole,
+    path: &Path,
+) -> Result<bool, NanoDevicePresenceProbeError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.file_type().is_char_device() => Ok(true),
+        Ok(_) => Err(
+            NanoDevicePresenceProbeError::SerialTargetIsNotCharacterDevice {
+                role,
+                path: path.to_path_buf(),
+            },
+        ),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(NanoDevicePresenceProbeError::SerialMetadata {
+            role,
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn exact_oak_mxid_presence(devices: &[DeviceInfo], expected_mxid: &str) -> NanoOakPresence {
+    devices
+        .iter()
+        .find(|device| device.device_id == expected_mxid)
+        .map_or(NanoOakPresence::Missing, |device| device.state.into())
+}
+
+struct SystemNanoDevicePresenceWaitRuntime;
+
+impl NanoDevicePresenceWaitRuntime for SystemNanoDevicePresenceWaitRuntime {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+pub(super) fn wait_for_exact_device_presence(
+    targets: NanoExactDevicePresenceTargets<'_>,
+    running: &AtomicBool,
+) -> Result<(), NanoDevicePresenceWaitError> {
+    let mut probe = SystemNanoDevicePresenceProbe { targets };
+    wait_for_exact_device_presence_with(
+        NANO_DEVICE_PRESENCE_POLLING_BUDGET,
+        running,
+        &mut probe,
+        &mut SystemNanoDevicePresenceWaitRuntime,
+    )
+}
+
+fn wait_for_exact_device_presence_with<Probe, Runtime>(
+    polling_budget: Duration,
+    running: &AtomicBool,
+    probe: &mut Probe,
+    runtime: &mut Runtime,
+) -> Result<(), NanoDevicePresenceWaitError>
+where
+    Probe: NanoDevicePresenceProbe,
+    Runtime: NanoDevicePresenceWaitRuntime,
+{
+    debug_assert!(!polling_budget.is_zero());
+    let started_at = runtime.now();
+    let deadline = started_at
+        .checked_add(polling_budget)
+        .ok_or(NanoDevicePresenceWaitError::DeadlineOverflow { polling_budget })?;
+    let mut attempts = 0_u32;
+    let mut last_observation = None;
+
+    loop {
+        if !running.load(Ordering::Acquire) {
+            return Err(NanoDevicePresenceWaitError::Interrupted);
+        }
+        if let Some(previous_observation) = last_observation {
+            let next_observation_at = runtime.now();
+            if !running.load(Ordering::Acquire) {
+                return Err(NanoDevicePresenceWaitError::Interrupted);
+            }
+            if next_observation_at >= deadline {
+                return Err(NanoDevicePresenceWaitError::TimedOut {
+                    polling_budget,
+                    attempts,
+                    last_observation: Some(previous_observation),
+                });
+            }
+        }
+
+        attempts = attempts.saturating_add(1);
+        let mut checkpoint = || {
+            if !running.load(Ordering::Acquire) {
+                return Err(NanoDevicePresenceWaitError::Interrupted);
+            }
+            if runtime.now() >= deadline {
+                return Err(NanoDevicePresenceWaitError::TimedOut {
+                    polling_budget,
+                    attempts,
+                    last_observation,
+                });
+            }
+            Ok(())
+        };
+        let observed = probe.observe(&mut checkpoint);
+        if !running.load(Ordering::Acquire) {
+            return Err(NanoDevicePresenceWaitError::Interrupted);
+        }
+        let observation = observed?;
+        let observed_at = runtime.now();
+        if !running.load(Ordering::Acquire) {
+            return Err(NanoDevicePresenceWaitError::Interrupted);
+        }
+        if observation.all_ready_for_acquisition_attempt() && observed_at <= deadline {
+            return Ok(());
+        }
+        if observed_at >= deadline {
+            return Err(NanoDevicePresenceWaitError::TimedOut {
+                polling_budget,
+                attempts,
+                last_observation: Some(observation),
+            });
+        }
+        last_observation = Some(observation);
+        if !running.load(Ordering::Acquire) {
+            return Err(NanoDevicePresenceWaitError::Interrupted);
+        }
+        let remaining = deadline
+            .checked_duration_since(observed_at)
+            .expect("the strict deadline comparison proved positive duration");
+        runtime.sleep(remaining.min(NANO_DEVICE_PRESENCE_POLL_INTERVAL));
     }
 }
 
@@ -477,6 +878,23 @@ pub async fn bootstrap_nano_production(
         &controller_server,
         loaded_manifest.manifest(),
     )
+    .map_err(NanoBootstrapError::before_hardware)?;
+
+    // Cold-boot enumeration may lag local-fs without implying a wrong device.
+    // Wait only for read-only presence of the exact parsed identities. Once
+    // all are reported present in one pass, every probe/connect below remains a
+    // single exclusive attempt: busy/in-use and all other open failures return
+    // immediately and are never converted into another presence poll.
+    wait_for_exact_device_presence(
+        NanoExactDevicePresenceTargets::new(
+            &head_probe_config,
+            &eye_probe_config,
+            loaded_manifest.manifest().stm32(),
+            loaded_manifest.manifest().oak(),
+        ),
+        running,
+    )
+    .map_err(NanoBootstrapPrimaryError::DevicePresenceWait)
     .map_err(NanoBootstrapError::before_hardware)?;
 
     let inventory_started_at =
@@ -2021,6 +2439,7 @@ pub enum NanoBootstrapPrimaryError {
         launch: String,
         manifest: String,
     },
+    DevicePresenceWait(NanoDevicePresenceWaitError),
     HeadProbe(Box<SerialHeadProbeError>),
     EyeProbe(IdentityProbeError),
     AccessoryHealthPeriod(NanoAccessoryHealthPeriodError),
@@ -2120,6 +2539,7 @@ impl std::error::Error for NanoBootstrapPrimaryError {
             Self::PlantDeploymentRelativePath(source) => Some(source),
             Self::PlantArtifactModel(source) => Some(source),
             Self::ControllerServerContract(source) => Some(source),
+            Self::DevicePresenceWait(source) => Some(source),
             Self::HeadProbe(source) => Some(source.as_ref()),
             Self::EyeProbe(source) => Some(source),
             Self::AccessoryHealthPeriod(source) => Some(source),
@@ -2181,8 +2601,11 @@ impl std::error::Error for NanoBootstrapPrimaryError {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::os::unix::fs::symlink;
     use std::rc::Rc;
+    use std::sync::atomic::AtomicU64;
 
     use super::*;
 
@@ -2233,6 +2656,515 @@ mod tests {
         .expect("valid bootstrap request");
 
         assert_eq!(request.accessory_stream_epoch, stream_epoch);
+    }
+
+    const fn presence(
+        head_serial: bool,
+        eye_serial: bool,
+        controller_serial: bool,
+        oak: bool,
+    ) -> NanoDevicePresenceSnapshot {
+        presence_with_oak(
+            head_serial,
+            eye_serial,
+            controller_serial,
+            if oak {
+                NanoOakPresence::Available
+            } else {
+                NanoOakPresence::Missing
+            },
+        )
+    }
+
+    const fn presence_with_oak(
+        head_serial: bool,
+        eye_serial: bool,
+        controller_serial: bool,
+        oak: NanoOakPresence,
+    ) -> NanoDevicePresenceSnapshot {
+        NanoDevicePresenceSnapshot {
+            head_serial,
+            eye_serial,
+            controller_serial,
+            oak,
+        }
+    }
+
+    static NEXT_PRESENCE_PATH_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    struct PresencePathFixture {
+        root: PathBuf,
+    }
+
+    impl PresencePathFixture {
+        fn new() -> Self {
+            let sequence = NEXT_PRESENCE_PATH_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "kiko-device-presence-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).expect("create exact-device presence fixture");
+            Self { root }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.root.join(name)
+        }
+    }
+
+    impl Drop for PresencePathFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn serial_presence_distinguishes_character_missing_and_wrong_type() {
+        let fixture = PresencePathFixture::new();
+        let head = fixture.path("head-by-id");
+        symlink("/dev/null", &head).expect("link exact path to character device");
+        assert!(
+            serial_character_device_is_present(NanoSerialPresenceRole::Head, &head)
+                .expect("character-device metadata")
+        );
+
+        let missing_path = fixture.path("missing-by-id");
+        assert!(
+            !serial_character_device_is_present(NanoSerialPresenceRole::Eye, &missing_path)
+                .expect("missing serial target is ordinary absence")
+        );
+        let dangling = fixture.path("eye-by-id");
+        symlink(fixture.path("not-enumerated"), &dangling).expect("create dangling serial link");
+        assert!(
+            !serial_character_device_is_present(NanoSerialPresenceRole::Eye, &dangling)
+                .expect("dangling serial target is ordinary absence")
+        );
+
+        let wrong_type = fixture.path("controller-by-id");
+        fs::write(&wrong_type, b"not a tty").expect("write non-device target");
+        assert!(matches!(
+            serial_character_device_is_present(
+                NanoSerialPresenceRole::Controller,
+                &wrong_type,
+            ),
+            Err(
+                NanoDevicePresenceProbeError::SerialTargetIsNotCharacterDevice {
+                    role: NanoSerialPresenceRole::Controller,
+                    path,
+                }
+            ) if path == wrong_type
+        ));
+    }
+
+    fn stop_presence_components_at_checkpoint(
+        stop: NanoDevicePresenceWaitError,
+        stop_at_checkpoint: u32,
+    ) -> (NanoDevicePresenceWaitError, Vec<&'static str>) {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let head_calls = Rc::clone(&calls);
+        let eye_calls = Rc::clone(&calls);
+        let controller_calls = Rc::clone(&calls);
+        let oak_calls = Rc::clone(&calls);
+        let mut stop = Some(stop);
+        let mut checkpoints = 0_u32;
+        let error = observe_device_presence_components(
+            &mut || {
+                checkpoints = checkpoints.saturating_add(1);
+                if checkpoints == stop_at_checkpoint {
+                    Err(stop
+                        .take()
+                        .expect("the selected checkpoint is reached once"))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                head_calls.borrow_mut().push("head");
+                Ok(true)
+            },
+            || {
+                eye_calls.borrow_mut().push("eye");
+                Ok(true)
+            },
+            || {
+                controller_calls.borrow_mut().push("controller");
+                Ok(true)
+            },
+            || {
+                oak_calls.borrow_mut().push("oak");
+                Ok(NanoOakPresence::Available)
+            },
+        )
+        .expect_err("the first component checkpoint stops the observation");
+        let calls = calls.borrow().clone();
+        (error, calls)
+    }
+
+    #[test]
+    fn component_checkpoints_prevent_later_boundaries_after_signal_or_deadline() {
+        let (error, calls) =
+            stop_presence_components_at_checkpoint(NanoDevicePresenceWaitError::Interrupted, 1);
+        assert!(matches!(error, NanoDevicePresenceWaitError::Interrupted));
+        assert!(calls.is_empty());
+
+        let polling_budget = Duration::from_secs(1);
+        let (error, calls) = stop_presence_components_at_checkpoint(
+            NanoDevicePresenceWaitError::TimedOut {
+                polling_budget,
+                attempts: 1,
+                last_observation: None,
+            },
+            2,
+        );
+        assert!(matches!(
+            error,
+            NanoDevicePresenceWaitError::TimedOut {
+                polling_budget: actual,
+                attempts: 1,
+                last_observation: None,
+            } if actual == polling_budget
+        ));
+        assert_eq!(calls, ["head"]);
+    }
+
+    struct ScriptedPresenceProbe<'running> {
+        observations: VecDeque<Result<NanoDevicePresenceSnapshot, NanoDevicePresenceProbeError>>,
+        calls: u32,
+        interrupt: Option<&'running AtomicBool>,
+    }
+
+    impl ScriptedPresenceProbe<'_> {
+        fn new(
+            observations: impl IntoIterator<
+                Item = Result<NanoDevicePresenceSnapshot, NanoDevicePresenceProbeError>,
+            >,
+        ) -> Self {
+            Self {
+                observations: observations.into_iter().collect(),
+                calls: 0,
+                interrupt: None,
+            }
+        }
+    }
+
+    impl<'running> ScriptedPresenceProbe<'running> {
+        fn interrupt(mut self, running: &'running AtomicBool) -> Self {
+            self.interrupt = Some(running);
+            self
+        }
+    }
+
+    impl NanoDevicePresenceProbe for ScriptedPresenceProbe<'_> {
+        fn observe(
+            &mut self,
+            _checkpoint: &mut dyn FnMut() -> Result<(), NanoDevicePresenceWaitError>,
+        ) -> Result<NanoDevicePresenceSnapshot, NanoDevicePresenceWaitError> {
+            self.calls = self.calls.saturating_add(1);
+            if let Some(running) = self.interrupt {
+                running.store(false, Ordering::Release);
+            }
+            self.observations
+                .pop_front()
+                .expect("test supplied one observation per expected attempt")
+                .map_err(NanoDevicePresenceWaitError::Probe)
+        }
+    }
+
+    struct FakePresenceWaitRuntime {
+        now: Rc<Cell<Instant>>,
+        sleeps: Vec<Duration>,
+    }
+
+    impl FakePresenceWaitRuntime {
+        fn new(now: Instant) -> Self {
+            Self {
+                now: Rc::new(Cell::new(now)),
+                sleeps: Vec::new(),
+            }
+        }
+
+        fn clock(&self) -> Rc<Cell<Instant>> {
+            Rc::clone(&self.now)
+        }
+    }
+
+    impl NanoDevicePresenceWaitRuntime for FakePresenceWaitRuntime {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.sleeps.push(duration);
+            self.now.set(self.now.get() + duration);
+        }
+    }
+
+    fn run_presence_wait(
+        polling_budget: Duration,
+        running: &AtomicBool,
+        probe: &mut impl NanoDevicePresenceProbe,
+        runtime: &mut FakePresenceWaitRuntime,
+    ) -> Result<(), NanoDevicePresenceWaitError> {
+        wait_for_exact_device_presence_with(polling_budget, running, probe, runtime)
+    }
+
+    #[test]
+    fn presence_wait_returns_without_sleep_after_one_complete_polling_pass() {
+        let running = AtomicBool::new(true);
+        let mut probe = ScriptedPresenceProbe::new([Ok(presence(true, true, true, true))]);
+        let mut runtime = FakePresenceWaitRuntime::new(Instant::now());
+
+        run_presence_wait(Duration::from_secs(1), &running, &mut probe, &mut runtime)
+            .expect("all exact targets were present");
+
+        assert_eq!(probe.calls, 1);
+        assert!(runtime.sleeps.is_empty());
+    }
+
+    #[test]
+    fn presence_wait_retries_until_one_pass_reports_all_exact_targets() {
+        let running = AtomicBool::new(true);
+        let mut probe = ScriptedPresenceProbe::new([
+            Ok(presence(true, true, true, false)),
+            Ok(presence(true, true, true, true)),
+        ]);
+        let mut runtime = FakePresenceWaitRuntime::new(Instant::now());
+
+        run_presence_wait(Duration::from_secs(1), &running, &mut probe, &mut runtime)
+            .expect("the exact OAK appeared inside the polling window");
+
+        assert_eq!(probe.calls, 2);
+        assert_eq!(runtime.sleeps, [NANO_DEVICE_PRESENCE_POLL_INTERVAL]);
+    }
+
+    #[test]
+    fn presence_wait_stops_exactly_at_deadline_and_retains_missing_roles() {
+        let running = AtomicBool::new(true);
+        let missing = presence(true, false, true, false);
+        let mut probe = ScriptedPresenceProbe::new([Ok(missing), Ok(missing), Ok(missing)]);
+        let mut runtime = FakePresenceWaitRuntime::new(Instant::now());
+        let polling_budget = Duration::from_millis(250);
+
+        let error = run_presence_wait(polling_budget, &running, &mut probe, &mut runtime)
+            .expect_err("eye and OAK never appeared");
+
+        assert!(matches!(
+            error,
+            NanoDevicePresenceWaitError::TimedOut {
+                polling_budget: actual,
+                attempts: 3,
+                last_observation,
+            } if actual == polling_budget && last_observation == Some(missing)
+        ));
+        assert_eq!(probe.calls, 3);
+        assert_eq!(
+            runtime.sleeps,
+            [
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+            ]
+        );
+    }
+
+    #[test]
+    fn presence_timeout_retains_transitional_oak_state() {
+        let running = AtomicBool::new(true);
+        let observation = presence_with_oak(true, true, true, NanoOakPresence::Bootloader);
+        let mut probe = ScriptedPresenceProbe::new([Ok(observation)]);
+        let mut runtime = FakePresenceWaitRuntime::new(Instant::now());
+        let polling_budget = Duration::from_millis(1);
+
+        let error = run_presence_wait(polling_budget, &running, &mut probe, &mut runtime)
+            .expect_err("bootloader state is not ready for a connect attempt");
+
+        assert!(matches!(
+            error,
+            NanoDevicePresenceWaitError::TimedOut {
+                attempts: 1,
+                last_observation,
+                ..
+            } if last_observation
+                .is_some_and(|snapshot| {
+                    snapshot.oak_presence() == NanoOakPresence::Bootloader
+                })
+        ));
+        assert_eq!(probe.calls, 1);
+        assert_eq!(runtime.sleeps, [polling_budget]);
+    }
+
+    struct ClockAdvancingPresenceProbe {
+        clock: Rc<Cell<Instant>>,
+        advance: Duration,
+        calls: u32,
+    }
+
+    impl NanoDevicePresenceProbe for ClockAdvancingPresenceProbe {
+        fn observe(
+            &mut self,
+            _checkpoint: &mut dyn FnMut() -> Result<(), NanoDevicePresenceWaitError>,
+        ) -> Result<NanoDevicePresenceSnapshot, NanoDevicePresenceWaitError> {
+            self.calls = self.calls.saturating_add(1);
+            self.clock.set(self.clock.get() + self.advance);
+            Ok(presence(true, true, true, true))
+        }
+    }
+
+    #[test]
+    fn all_present_observation_that_completes_after_deadline_times_out() {
+        let running = AtomicBool::new(true);
+        let polling_budget = Duration::from_millis(250);
+        let mut runtime = FakePresenceWaitRuntime::new(Instant::now());
+        let mut probe = ClockAdvancingPresenceProbe {
+            clock: runtime.clock(),
+            advance: Duration::from_millis(300),
+            calls: 0,
+        };
+
+        let error = run_presence_wait(polling_budget, &running, &mut probe, &mut runtime)
+            .expect_err("a late successful observation cannot cross the deadline");
+
+        assert!(matches!(
+            error,
+            NanoDevicePresenceWaitError::TimedOut {
+                polling_budget: actual,
+                attempts: 1,
+                last_observation,
+            } if actual == polling_budget
+                && last_observation
+                    .is_some_and(NanoDevicePresenceSnapshot::all_ready_for_acquisition_attempt)
+        ));
+        assert_eq!(probe.calls, 1);
+        assert!(runtime.sleeps.is_empty());
+    }
+
+    #[test]
+    fn presence_wait_is_signal_aware_before_any_enumeration() {
+        let running = AtomicBool::new(false);
+        let mut probe = ScriptedPresenceProbe::new([]);
+        let mut runtime = FakePresenceWaitRuntime::new(Instant::now());
+
+        assert!(matches!(
+            run_presence_wait(Duration::from_secs(1), &running, &mut probe, &mut runtime,),
+            Err(NanoDevicePresenceWaitError::Interrupted)
+        ));
+        assert_eq!(probe.calls, 0);
+        assert!(runtime.sleeps.is_empty());
+    }
+
+    #[test]
+    fn presence_wait_shutdown_during_complete_observation_cannot_report_success() {
+        let running = AtomicBool::new(true);
+        let mut probe =
+            ScriptedPresenceProbe::new([Ok(presence(true, true, true, true))]).interrupt(&running);
+        let mut runtime = FakePresenceWaitRuntime::new(Instant::now());
+
+        assert!(matches!(
+            run_presence_wait(Duration::from_secs(1), &running, &mut probe, &mut runtime,),
+            Err(NanoDevicePresenceWaitError::Interrupted)
+        ));
+        assert_eq!(probe.calls, 1);
+        assert!(runtime.sleeps.is_empty());
+    }
+
+    #[test]
+    fn presence_wait_shutdown_during_failed_observation_wins_over_probe_error() {
+        let running = AtomicBool::new(true);
+        let mut probe = ScriptedPresenceProbe::new([Err(
+            NanoDevicePresenceProbeError::SerialTargetIsNotCharacterDevice {
+                role: NanoSerialPresenceRole::Head,
+                path: PathBuf::from("/dev/serial/by-id/head"),
+            },
+        )])
+        .interrupt(&running);
+        let mut runtime = FakePresenceWaitRuntime::new(Instant::now());
+
+        assert!(matches!(
+            run_presence_wait(Duration::from_secs(1), &running, &mut probe, &mut runtime,),
+            Err(NanoDevicePresenceWaitError::Interrupted)
+        ));
+        assert_eq!(probe.calls, 1);
+        assert!(runtime.sleeps.is_empty());
+    }
+
+    #[test]
+    fn presence_probe_failure_is_not_retried() {
+        let running = AtomicBool::new(true);
+        let expected_path = PathBuf::from("/dev/serial/by-id/head");
+        let mut probe = ScriptedPresenceProbe::new([Err(
+            NanoDevicePresenceProbeError::SerialTargetIsNotCharacterDevice {
+                role: NanoSerialPresenceRole::Head,
+                path: expected_path.clone(),
+            },
+        )]);
+        let mut runtime = FakePresenceWaitRuntime::new(Instant::now());
+
+        let error = run_presence_wait(Duration::from_secs(1), &running, &mut probe, &mut runtime)
+            .expect_err("a malformed exact serial target is terminal");
+
+        assert!(matches!(
+            error,
+            NanoDevicePresenceWaitError::Probe(
+                NanoDevicePresenceProbeError::SerialTargetIsNotCharacterDevice {
+                    role: NanoSerialPresenceRole::Head,
+                    path,
+                }
+            ) if path == expected_path
+        ));
+        assert_eq!(probe.calls, 1);
+        assert!(runtime.sleeps.is_empty());
+    }
+
+    #[test]
+    fn oak_presence_accepts_available_and_in_use_but_not_transitional_states() {
+        let devices = [
+            DeviceInfo {
+                device_id: "different".to_owned(),
+                name: "unrelated".to_owned(),
+                state: oak_sys::DeviceState::Available,
+            },
+            DeviceInfo {
+                device_id: "available".to_owned(),
+                name: "exact-and-ready".to_owned(),
+                state: oak_sys::DeviceState::Available,
+            },
+            DeviceInfo {
+                device_id: "in-use".to_owned(),
+                name: "exact-but-owned".to_owned(),
+                state: oak_sys::DeviceState::InUse,
+            },
+            DeviceInfo {
+                device_id: "bootloader".to_owned(),
+                name: "exact-but-transitional".to_owned(),
+                state: oak_sys::DeviceState::Bootloader,
+            },
+            DeviceInfo {
+                device_id: "unknown".to_owned(),
+                name: "exact-but-unclassified".to_owned(),
+                state: oak_sys::DeviceState::Unknown,
+            },
+        ];
+
+        assert_eq!(
+            exact_oak_mxid_presence(&devices, "available"),
+            NanoOakPresence::Available
+        );
+        assert_eq!(
+            exact_oak_mxid_presence(&devices, "in-use"),
+            NanoOakPresence::InUse
+        );
+        assert_eq!(
+            exact_oak_mxid_presence(&devices, "bootloader"),
+            NanoOakPresence::Bootloader
+        );
+        assert_eq!(
+            exact_oak_mxid_presence(&devices, "unknown"),
+            NanoOakPresence::Unknown
+        );
+        assert_eq!(
+            exact_oak_mxid_presence(&devices, "missing"),
+            NanoOakPresence::Missing
+        );
     }
 
     #[derive(Clone)]

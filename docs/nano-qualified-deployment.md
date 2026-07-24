@@ -70,6 +70,24 @@ The service process still runs as `makerspace`. `Restart=no` remains
 unchanged, so a failed gate or runtime does not create a restart loop. Do not
 call `systemctl enable` until the wheels-off gate has passed.
 
+The compiled fixed 30-second device-presence window covers only late cold-boot
+enumeration. Before any serial probe or torque operation, the process observes
+the exact three serial-by-id character devices and exact OAK MXID in
+`Available` or `InUse` state immediately, then pauses for at most 100 ms after
+each unsuccessful observation until the fixed poll/sleep budget expires.
+`Bootloader` and `Unknown` OAK states keep the wait active. This does not weaken
+`Restart=no`: once one sequential composite polling pass reports all targets
+present, each downstream serial probe or owner open and the OAK connect remains
+a one-shot acquisition. In-use, permission, identity, USB-speed, protocol, and
+all other acquisition failures end the start without another presence wait or
+process restart. A signal stops the polling between observations and bounded
+sleeps and between serial metadata calls before native OAK discovery. Native
+discovery and filesystem calls already in progress remain operating-system
+boundaries rather than cancellable tasks; no later component call starts after
+the preceding boundary observes shutdown or deadline. Timeout evidence retains
+the last complete composite snapshot, or explicitly has none when the first
+pass stops partway through.
+
 ## Native runtime closure
 
 The 2026-07-23 read-only Nano audit found these source bytes:
