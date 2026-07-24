@@ -26,7 +26,9 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, StopBits};
+use tokio_serial::{
+    ClearBuffer, DataBits, FlowControl, Parity, SerialPort, SerialPortBuilderExt, StopBits,
+};
 
 const SERIAL_BAUD_BPS: u32 = 115_200;
 const UART_BITS_PER_BYTE_8N1: u32 = 10;
@@ -483,6 +485,7 @@ enum QualificationError {
     },
     Open(tokio_serial::Error),
     Exclusive(tokio_serial::Error),
+    ClearPendingInput(tokio_serial::Error),
     Read(std::io::Error),
     SerialWrite {
         phase: WriterPhase,
@@ -497,6 +500,7 @@ enum QualificationError {
     Encode(UartEncodeError),
     AdmissionTimeout {
         timeout_ms: u64,
+        initial_record_boundary_observed: bool,
         saw_hello: bool,
         saw_idle_heartbeat: bool,
     },
@@ -610,6 +614,10 @@ impl fmt::Display for QualificationError {
             Self::Exclusive(source) => {
                 write!(formatter, "exclusive serial ownership failed: {source}")
             }
+            Self::ClearPendingInput(source) => write!(
+                formatter,
+                "could not clear bytes pending in the host serial input queue: {source}"
+            ),
             Self::Read(source) => write!(formatter, "serial read failed: {source}"),
             Self::SerialWrite { phase, source } => {
                 write!(formatter, "serial {phase} failed: {source}")
@@ -625,11 +633,12 @@ impl fmt::Display for QualificationError {
             Self::Encode(source) => write!(formatter, "bounded KRP2 encode failed: {source}"),
             Self::AdmissionTimeout {
                 timeout_ms,
+                initial_record_boundary_observed,
                 saw_hello,
                 saw_idle_heartbeat,
             } => write!(
                 formatter,
-                "admission timed out after {timeout_ms} ms (hello={saw_hello}, idle_safe_heartbeat={saw_idle_heartbeat})"
+                "admission timed out after {timeout_ms} ms (initial_record_boundary={initial_record_boundary_observed}, hello={saw_hello}, idle_safe_heartbeat={saw_idle_heartbeat})"
             ),
             Self::ByteBudgetExceeded { maximum } => {
                 write!(formatter, "serial byte budget {maximum} exceeded")
@@ -762,7 +771,9 @@ impl std::error::Error for QualificationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Entropy(source) => Some(source),
-            Self::Open(source) | Self::Exclusive(source) => Some(source),
+            Self::Open(source) | Self::Exclusive(source) | Self::ClearPendingInput(source) => {
+                Some(source)
+            }
             Self::Read(source) => Some(source),
             Self::SerialWrite { source, .. } => Some(source),
             Self::Decode(source) => Some(source),
@@ -791,12 +802,16 @@ struct FramedSerialReader {
 impl FramedSerialReader {
     fn new() -> Self {
         Self {
-            decoder: UartStreamDecoder::new(),
+            decoder: UartStreamDecoder::new_at_unknown_record_offset(),
             pending: VecDeque::new(),
             buffer: [0; 512],
             observed_bytes: 0,
             observed_records: 0,
         }
+    }
+
+    const fn initial_record_boundary_observed(&self) -> bool {
+        !self.decoder.is_waiting_for_initial_boundary()
     }
 
     async fn next<R>(&mut self, reader: &mut R) -> Result<TimedMessage, QualificationError>
@@ -954,6 +969,7 @@ where
             .await
             .map_err(|_| QualificationError::AdmissionTimeout {
                 timeout_ms,
+                initial_record_boundary_observed: framed.initial_record_boundary_observed(),
                 saw_hello: hello.is_some(),
                 saw_idle_heartbeat,
             })??;
@@ -2278,6 +2294,13 @@ struct IdentityEvidence {
 }
 
 #[derive(Serialize)]
+struct ReceiveStartupEvidence {
+    host_input_queue_cleared_before_observation: bool,
+    initial_unknown_record_prefix_excluded: bool,
+    post_boundary_decode_policy: &'static str,
+}
+
+#[derive(Serialize)]
 struct PlanEvidence {
     rate_hz: u16,
     nominal_period_ns: u64,
@@ -2375,6 +2398,7 @@ struct QualificationEvidence {
     passed: bool,
     serial_by_id_path: String,
     run_id: u64,
+    receive_startup: ReceiveStartupEvidence,
     identity: IdentityEvidence,
     plan: PlanEvidence,
     wire_load: WireLoadEvidence,
@@ -2474,11 +2498,16 @@ fn build_evidence(
         && tracker.late_by_at_least_one_period == 0;
 
     Ok(QualificationEvidence {
-        schema_version: 1,
+        schema_version: 2,
         evidence_kind: "motor_inert_krp2_uart_transport_qualification",
         passed,
         serial_by_id_path: cli.serial_device.as_str().to_owned(),
         run_id: run_id.get(),
+        receive_startup: ReceiveStartupEvidence {
+            host_input_queue_cleared_before_observation: true,
+            initial_unknown_record_prefix_excluded: true,
+            post_boundary_decode_policy: "every complete record after the one initial synchronization delimiter is decoded strictly; a framing error fails the run",
+        },
         identity: IdentityEvidence {
             controller_uid_hex: encode_hex(admission.hello.controller_uid.as_bytes()),
             boot_id: admission.hello.boot_id.get(),
@@ -2626,7 +2655,7 @@ fn build_evidence(
             .is_some(),
         integrity_pattern_boundary: "the deterministic 20-byte pattern discriminates intended load and construction only; it is public and is not authentication",
         controller_clock_boundary: "wrapping-forward order is checked independently for Heartbeat uptime, odometry measurement uptime, diagnostic request receipt, and diagnostic response preparation; cross-stream timestamp order is not assumed because measurement and queueing times differ",
-        evidence_boundary: "software-observed host UART timing, decoded controller claims, and queue-depth samples for this run; no wheel motion, motor current, physical safety, or performance improvement is claimed",
+        evidence_boundary: "pre-open queued input and one initial unknown record prefix are excluded; measurements begin only after strict post-boundary identity admission and cover software-observed host UART timing, decoded controller claims, and queue-depth samples for this run; no wheel motion, motor current, physical safety, or performance improvement is claimed",
     })
 }
 
@@ -2681,6 +2710,8 @@ async fn main() -> Result<(), QualificationError> {
         .map_err(QualificationError::Open)?;
     port.set_exclusive(true)
         .map_err(QualificationError::Exclusive)?;
+    port.clear(ClearBuffer::Input)
+        .map_err(QualificationError::ClearPendingInput)?;
 
     let mut framed = FramedSerialReader::new();
     let mut clocks = ControllerClockTrackers::new();
@@ -2821,6 +2852,45 @@ mod tests {
                 .expect("known readiness bit"),
             faults: ControllerFaults::NONE,
         }
+    }
+
+    #[tokio::test]
+    async fn framed_reader_excludes_one_unknown_prefix_then_reports_corruption() {
+        let (mut writer, mut reader) = tokio::io::duplex(2_048);
+        writer
+            .write_all(&[0x55; MAX_UART_RECORD_BYTES * 2])
+            .await
+            .expect("unknown startup prefix");
+        writer
+            .write_all(&[0])
+            .await
+            .expect("startup alignment delimiter");
+        let hello_message = Message::ControllerHello(hello());
+        let hello_record = UartRecord::encode(hello_message).expect("Hello record");
+        writer
+            .write_all(hello_record.as_bytes())
+            .await
+            .expect("post-boundary Hello");
+
+        let mut framed = FramedSerialReader::new();
+        let timed = framed.next(&mut reader).await.expect("aligned Hello");
+        assert_eq!(timed.message, hello_message);
+        assert!(framed.initial_record_boundary_observed());
+
+        writer
+            .write_all(&[1; MAX_UART_RECORD_BYTES])
+            .await
+            .expect("post-boundary oversized body");
+        writer
+            .write_all(&[0])
+            .await
+            .expect("oversized record delimiter");
+        assert!(matches!(
+            framed.next(&mut reader).await,
+            Err(QualificationError::Decode(
+                UartStreamError::OversizedRecord { .. }
+            ))
+        ));
     }
 
     fn report(

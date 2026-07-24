@@ -16,7 +16,9 @@ use robot_protocol::v2::{
 };
 use serde_json::json;
 use tokio::io::AsyncReadExt;
-use tokio_serial::SerialPortBuilderExt;
+use tokio_serial::{
+    ClearBuffer, DataBits, FlowControl, Parity, SerialPort, SerialPortBuilderExt, StopBits,
+};
 
 const SERIAL_BAUD_BPS: u32 = 115_200;
 const MAX_SERIAL_PATH_BYTES: usize = 512;
@@ -140,12 +142,14 @@ impl std::error::Error for ProbeTimeoutError {}
 enum ProbeError {
     Open(tokio_serial::Error),
     Exclusive(tokio_serial::Error),
+    ClearPendingInput(tokio_serial::Error),
     Read(std::io::Error),
     SerialEof,
     Timeout {
         timeout_ms: u64,
         observed_bytes: usize,
         observed_records: usize,
+        initial_record_boundary_observed: bool,
     },
     ByteBudgetExceeded {
         maximum_bytes: usize,
@@ -166,15 +170,20 @@ impl fmt::Display for ProbeError {
             Self::Exclusive(source) => {
                 write!(formatter, "could not acquire exclusive serial ownership: {source}")
             }
+            Self::ClearPendingInput(source) => write!(
+                formatter,
+                "could not clear bytes pending in the host serial input queue: {source}"
+            ),
             Self::Read(source) => write!(formatter, "serial read failed: {source}"),
             Self::SerialEof => formatter.write_str("serial stream reached EOF"),
             Self::Timeout {
                 timeout_ms,
                 observed_bytes,
                 observed_records,
+                initial_record_boundary_observed,
             } => write!(
                 formatter,
-                "no ControllerHello arrived within {timeout_ms} ms after {observed_bytes} bytes and {observed_records} complete records"
+                "no ControllerHello arrived within {timeout_ms} ms after {observed_bytes} bytes and {observed_records} post-boundary complete records (initial_record_boundary_observed={initial_record_boundary_observed})"
             ),
             Self::ByteBudgetExceeded { maximum_bytes } => write!(
                 formatter,
@@ -198,7 +207,9 @@ impl fmt::Display for ProbeError {
 impl std::error::Error for ProbeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Open(source) | Self::Exclusive(source) => Some(source),
+            Self::Open(source) | Self::Exclusive(source) | Self::ClearPendingInput(source) => {
+                Some(source)
+            }
             Self::Read(source) => Some(source),
             Self::Decode(source) => Some(source),
             Self::EncodeObservation(source) => Some(source),
@@ -220,12 +231,18 @@ async fn main() -> Result<(), ProbeError> {
 
 async fn observe_hello(cli: &Cli) -> Result<ControllerHello, ProbeError> {
     let mut port = tokio_serial::new(cli.serial_device.as_str(), SERIAL_BAUD_BPS)
+        .data_bits(DataBits::Eight)
+        .parity(Parity::None)
+        .stop_bits(StopBits::One)
+        .flow_control(FlowControl::None)
         .open_native_async()
         .map_err(ProbeError::Open)?;
     port.set_exclusive(true).map_err(ProbeError::Exclusive)?;
+    port.clear(ClearBuffer::Input)
+        .map_err(ProbeError::ClearPendingInput)?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(cli.timeout_ms);
-    let mut decoder = UartStreamDecoder::new();
+    let mut decoder = UartStreamDecoder::new_at_unknown_record_offset();
     let mut buffer = [0_u8; 256];
     let mut observed_bytes = 0_usize;
     let mut observed_records = 0_usize;
@@ -240,6 +257,7 @@ async fn observe_hello(cli: &Cli) -> Result<ControllerHello, ProbeError> {
                     timeout_ms: cli.timeout_ms,
                     observed_bytes,
                     observed_records,
+                    initial_record_boundary_observed: !decoder.is_waiting_for_initial_boundary(),
                 });
             }
         };
@@ -302,9 +320,11 @@ fn write_observation(
     hello: ControllerHello,
 ) -> Result<(), ProbeError> {
     let observation = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "observation_kind": "read_only_krp2_controller_hello",
         "serial_by_id_path": serial_device.as_str(),
+        "host_input_queue_cleared_before_observation": true,
+        "initial_unknown_record_prefix_excluded": true,
         "controller_uid_hex": encode_hex(hello.controller_uid.as_bytes()),
         "observed_boot_id": hello.boot_id.get(),
         "firmware_abi": hello.firmware_abi,
@@ -321,7 +341,7 @@ fn write_observation(
         "watchdog_nominal_period_ms": hello.watchdog_nominal_period.get(),
         "neutral_output": neutral_output_name(hello.neutral_output),
         "physical_stop_semantics": stop_semantics_name(hello.physical_stop_semantics),
-        "evidence_boundary": "decoded software claim only; no serial bytes were transmitted and no physical behavior was observed"
+        "evidence_boundary": "decoded software claim after one host-input clear and one discarded initial record suffix; no serial bytes were transmitted and no physical behavior was observed"
     });
     let stdout = std::io::stdout();
     serde_json::to_writer_pretty(stdout.lock(), &observation)

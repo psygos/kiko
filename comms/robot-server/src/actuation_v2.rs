@@ -32,7 +32,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch, Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio_serial::SerialPortBuilderExt;
+use tokio_serial::{
+    ClearBuffer, DataBits, FlowControl, Parity, SerialPort, SerialPortBuilderExt, StopBits,
+};
 
 use crate::config::ControllerServerConfig;
 #[cfg(test)]
@@ -725,6 +727,7 @@ pub enum ActuationStartError {
     InvalidHeartbeatPeriod,
     OpenSerial(tokio_serial::Error),
     ExclusiveSerial(tokio_serial::Error),
+    ClearPendingSerialInput(tokio_serial::Error),
 }
 
 impl fmt::Display for ActuationStartError {
@@ -742,6 +745,10 @@ impl fmt::Display for ActuationStartError {
                 formatter,
                 "cannot acquire exclusive ownership of configured serial device: {source}"
             ),
+            Self::ClearPendingSerialInput(source) => write!(
+                formatter,
+                "cannot clear bytes pending in the host serial input queue: {source}"
+            ),
         }
     }
 }
@@ -749,7 +756,9 @@ impl fmt::Display for ActuationStartError {
 impl std::error::Error for ActuationStartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::OpenSerial(source) | Self::ExclusiveSerial(source) => Some(source),
+            Self::OpenSerial(source)
+            | Self::ExclusiveSerial(source)
+            | Self::ClearPendingSerialInput(source) => Some(source),
             Self::NonUtf8SerialDevice | Self::InvalidHeartbeatPeriod => None,
         }
     }
@@ -1001,17 +1010,29 @@ pub(crate) async fn start_serial_actor(
         .to_str()
         .ok_or(ActuationStartError::NonUtf8SerialDevice)?;
     let mut port = tokio_serial::new(device, CONTROLLER_SERIAL_BAUD_BPS)
+        .data_bits(DataBits::Eight)
+        .parity(Parity::None)
+        .stop_bits(StopBits::One)
+        .flow_control(FlowControl::None)
         .open_native_async()
         .map_err(ActuationStartError::OpenSerial)?;
     port.set_exclusive(true)
         .map_err(ActuationStartError::ExclusiveSerial)?;
-    Ok(spawn_actor(port, actor_config, telemetry))
+    port.clear(ClearBuffer::Input)
+        .map_err(ActuationStartError::ClearPendingSerialInput)?;
+    Ok(spawn_actor(
+        port,
+        actor_config,
+        telemetry,
+        UartStreamDecoder::new_at_unknown_record_offset(),
+    ))
 }
 
 fn spawn_actor<Transport>(
     transport: Transport,
     config: ActorConfig,
     telemetry: Arc<dyn ActuationTelemetry>,
+    decoder: UartStreamDecoder,
 ) -> StartedActuationActor
 where
     Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1026,7 +1047,7 @@ where
     };
     let (startup_ready, startup_ready_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        SerialActor::new(transport, config, telemetry, startup_ready)
+        SerialActor::new(transport, decoder, config, telemetry, startup_ready)
             .run(receiver, priority_stop, shutdown)
             .await
     });
@@ -1046,6 +1067,7 @@ where
         transport,
         ActorConfig::from_server_config(&ControllerServerConfig::from(config.clone()))?,
         telemetry,
+        UartStreamDecoder::new(),
     ))
 }
 
@@ -1230,13 +1252,14 @@ where
 {
     fn new(
         transport: Transport,
+        decoder: UartStreamDecoder,
         config: ActorConfig,
         telemetry: Arc<dyn ActuationTelemetry>,
         startup_ready: oneshot::Sender<()>,
     ) -> Self {
         Self {
             transport,
-            decoder: UartStreamDecoder::new(),
+            decoder,
             config,
             telemetry,
             startup_ready: Some(startup_ready),
@@ -4493,6 +4516,7 @@ mod tests {
                 actor_stream,
                 actor_config(),
                 Arc::new(NoopActuationTelemetry),
+                UartStreamDecoder::new(),
             );
             let mut controller = FakeController::new(controller_stream);
             controller
@@ -4624,6 +4648,59 @@ mod tests {
             HostCommandResultCode::Stopped
         );
         harness
+    }
+
+    #[tokio::test]
+    async fn fresh_open_excludes_one_unknown_prefix_then_keeps_framing_strict() {
+        let boot_id = boot(7);
+        let (actor_stream, controller_stream) = tokio::io::duplex(4_096);
+        let (_handle, startup_ready, actor) = spawn_actor(
+            actor_stream,
+            actor_config(),
+            Arc::new(NoopActuationTelemetry),
+            UartStreamDecoder::new_at_unknown_record_offset(),
+        );
+        let mut controller = FakeController::new(controller_stream);
+        controller
+            .stream
+            .write_all(&[0x55; MAX_RAW_FRAME_BYTES * 2])
+            .await
+            .expect("unknown startup prefix");
+        controller
+            .stream
+            .write_all(&[0])
+            .await
+            .expect("startup alignment delimiter");
+
+        controller
+            .send(Message::ControllerHello(hello_with(uid(), boot_id)))
+            .await;
+        let Message::ForceStop(stop) = controller.receive().await else {
+            panic!("aligned Hello must reach the startup stop")
+        };
+        assert!(matches!(
+            controller.receive().await,
+            Message::BeginSession(_)
+        ));
+        controller
+            .send(Message::HostStopResult(confirmed_stop(stop, boot_id)))
+            .await;
+        controller
+            .send(Message::ControllerReady(ready_at(boot_id, 1_000)))
+            .await;
+        controller
+            .send(Message::Heartbeat(zero_heartbeat(boot_id)))
+            .await;
+        timeout(IO_TIMEOUT, startup_ready)
+            .await
+            .expect("aligned startup timeout")
+            .expect("aligned startup reaches exact readiness");
+
+        controller
+            .send_corrupted(Message::Heartbeat(zero_heartbeat_at(boot_id, 1_002)))
+            .await;
+        assert!(matches!(controller.receive().await, Message::ForceStop(_)));
+        actor.abort();
     }
 
     #[test]
@@ -6385,6 +6462,7 @@ mod tests {
             actor_stream,
             actor_config(),
             Arc::new(NoopActuationTelemetry),
+            UartStreamDecoder::new(),
         );
         let mut controller = FakeController::new(controller_stream);
         controller
@@ -6418,6 +6496,7 @@ mod tests {
         let (startup_ready, _startup_ready_rx) = oneshot::channel();
         let actor = SerialActor::new(
             actor_stream,
+            UartStreamDecoder::new(),
             actor_config(),
             Arc::new(NoopActuationTelemetry),
             startup_ready,
@@ -6467,6 +6546,7 @@ mod tests {
         let (startup_ready, _startup_ready_rx) = oneshot::channel();
         let mut actor = SerialActor::new(
             actor_stream,
+            UartStreamDecoder::new(),
             actor_config(),
             Arc::new(NoopActuationTelemetry),
             startup_ready,
@@ -6502,6 +6582,7 @@ mod tests {
         let (candidate_ready, _candidate_ready_rx) = oneshot::channel();
         let candidate_actor = SerialActor::new(
             candidate_stream,
+            UartStreamDecoder::new(),
             candidate_actor_config(),
             Arc::new(NoopActuationTelemetry),
             candidate_ready,
@@ -6514,6 +6595,7 @@ mod tests {
         let (production_ready, _production_ready_rx) = oneshot::channel();
         let production_actor = SerialActor::new(
             production_stream,
+            UartStreamDecoder::new(),
             actor_config(),
             Arc::new(NoopActuationTelemetry),
             production_ready,
@@ -6614,6 +6696,7 @@ mod tests {
             actor_stream,
             actor_config(),
             Arc::new(NoopActuationTelemetry),
+            UartStreamDecoder::new(),
         );
         let mut controller = FakeController::new(controller_stream);
         let source = "127.0.0.1:41002".parse().expect("source address");
@@ -6660,6 +6743,7 @@ mod tests {
             actor_stream,
             actor_config(),
             Arc::new(NoopActuationTelemetry),
+            UartStreamDecoder::new(),
         );
         let mut controller = FakeController::new(controller_stream);
         let source = "127.0.0.1:41003".parse().expect("source address");

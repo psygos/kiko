@@ -3200,11 +3200,18 @@ impl core::error::Error for UartStreamError {
 /// An oversize record reports once, discards bytes through the next zero
 /// delimiter, and then accepts a fresh record. Every delimiter is therefore a
 /// bounded resynchronization point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UartDecoderState {
+    AcceptingRecord,
+    DiscardingInitialUnknownPrefix,
+    DiscardingOversizedRecord,
+}
+
 #[derive(Clone, Debug)]
 pub struct UartStreamDecoder {
     encoded: [u8; MAX_COBS_FRAME_BYTES],
     len: usize,
-    discarding_oversized: bool,
+    state: UartDecoderState,
 }
 
 impl Default for UartStreamDecoder {
@@ -3218,20 +3225,42 @@ impl UartStreamDecoder {
         Self {
             encoded: [0; MAX_COBS_FRAME_BYTES],
             len: 0,
-            discarding_oversized: false,
+            state: UartDecoderState::AcceptingRecord,
+        }
+    }
+
+    /// Starts at an explicitly unknown offset in a pre-existing byte stream.
+    ///
+    /// Bytes through the first zero delimiter are excluded exactly once. The
+    /// decoder then becomes identical to [`Self::new`]: empty, malformed, and
+    /// oversized subsequent records are reported rather than reclassified as
+    /// startup synchronization.
+    pub const fn new_at_unknown_record_offset() -> Self {
+        Self {
+            encoded: [0; MAX_COBS_FRAME_BYTES],
+            len: 0,
+            state: UartDecoderState::DiscardingInitialUnknownPrefix,
         }
     }
 
     pub const fn is_discarding_oversized_record(&self) -> bool {
-        self.discarding_oversized
+        matches!(self.state, UartDecoderState::DiscardingOversizedRecord)
+    }
+
+    pub const fn is_waiting_for_initial_boundary(&self) -> bool {
+        matches!(self.state, UartDecoderState::DiscardingInitialUnknownPrefix)
     }
 
     pub fn push(&mut self, byte: u8) -> Option<Result<Message, UartStreamError>> {
         if byte == 0 {
-            if self.discarding_oversized {
-                self.discarding_oversized = false;
-                self.len = 0;
-                return None;
+            match self.state {
+                UartDecoderState::DiscardingInitialUnknownPrefix
+                | UartDecoderState::DiscardingOversizedRecord => {
+                    self.state = UartDecoderState::AcceptingRecord;
+                    self.len = 0;
+                    return None;
+                }
+                UartDecoderState::AcceptingRecord => {}
             }
             if self.len == 0 {
                 return Some(Err(UartStreamError::EmptyRecord));
@@ -3247,12 +3276,12 @@ impl UartStreamDecoder {
             return Some(decode_raw_frame(&raw[..raw_len]).map_err(UartStreamError::Frame));
         }
 
-        if self.discarding_oversized {
+        if !matches!(self.state, UartDecoderState::AcceptingRecord) {
             return None;
         }
         if self.len == self.encoded.len() {
             self.len = 0;
-            self.discarding_oversized = true;
+            self.state = UartDecoderState::DiscardingOversizedRecord;
             return Some(Err(UartStreamError::OversizedRecord {
                 maximum: MAX_COBS_FRAME_BYTES,
             }));
@@ -3927,6 +3956,68 @@ mod tests {
             }
         }
         assert_eq!(second_event, Some(Ok(second)));
+    }
+
+    #[test]
+    fn unknown_offset_discards_exactly_one_initial_prefix_for_every_record_split() {
+        let stale = UartRecord::encode(messages()[8]).expect("stale record");
+        let expected = messages()[11];
+        let expected_record = UartRecord::encode(expected).expect("expected record");
+
+        for offset in 0..stale.len() {
+            let mut decoder = UartStreamDecoder::new_at_unknown_record_offset();
+            assert!(decoder.is_waiting_for_initial_boundary());
+            for &byte in &stale.as_bytes()[offset..] {
+                assert!(
+                    decoder.push(byte).is_none(),
+                    "initial suffix at offset {offset} must be excluded"
+                );
+            }
+            assert!(!decoder.is_waiting_for_initial_boundary());
+
+            let mut decoded = None;
+            for &byte in expected_record.as_bytes() {
+                if let Some(event) = decoder.push(byte) {
+                    assert!(decoded.is_none());
+                    decoded = Some(event);
+                }
+            }
+            assert_eq!(decoded, Some(Ok(expected)), "split offset {offset}");
+        }
+    }
+
+    #[test]
+    fn unknown_offset_has_one_unbounded_alignment_prefix_then_strict_framing() {
+        let mut decoder = UartStreamDecoder::new_at_unknown_record_offset();
+        for _ in 0..(MAX_COBS_FRAME_BYTES * 3) {
+            assert!(decoder.push(1).is_none());
+        }
+        assert!(decoder.is_waiting_for_initial_boundary());
+        assert!(decoder.push(0).is_none());
+        assert!(!decoder.is_waiting_for_initial_boundary());
+
+        assert_eq!(decoder.push(0), Some(Err(UartStreamError::EmptyRecord)));
+        for _ in 0..MAX_COBS_FRAME_BYTES {
+            assert!(decoder.push(1).is_none());
+        }
+        assert!(matches!(
+            decoder.push(1),
+            Some(Err(UartStreamError::OversizedRecord {
+                maximum: MAX_COBS_FRAME_BYTES
+            }))
+        ));
+        assert!(decoder.is_discarding_oversized_record());
+        assert!(decoder.push(0).is_none());
+
+        let expected = messages()[0];
+        let record = UartRecord::encode(expected).expect("record");
+        let mut decoded = None;
+        for &byte in record.as_bytes() {
+            if let Some(event) = decoder.push(byte) {
+                decoded = Some(event);
+            }
+        }
+        assert_eq!(decoded, Some(Ok(expected)));
     }
 
     #[test]
