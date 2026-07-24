@@ -5,6 +5,8 @@
 //! and prints the observed software claims as JSON. Those claims are inputs to
 //! commissioning; they are not proof of wiring, motor behavior, or safety.
 
+mod support;
+
 use std::fmt;
 use std::io::Write;
 use std::str::FromStr;
@@ -17,6 +19,7 @@ use robot_protocol::v2::{
 };
 use serde::Serialize;
 use serde_json::json;
+use support::wire_trace::WireTrace;
 use tokio::io::AsyncReadExt;
 use tokio_serial::{
     ClearBuffer, DataBits, FlowControl, Parity, SerialPort, SerialPortBuilderExt, StopBits,
@@ -32,8 +35,6 @@ const FAILURE_TRACE_DELIMITERS: usize = 64;
 const FAILURE_COMPLETION_MAX_BYTES: usize = 4 * 1_024;
 const FAILURE_COMPLETION_TIMEOUT_MS: u64 = 250;
 const SERIAL_BY_ID_PREFIX: &str = "/dev/serial/by-id/";
-const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -344,20 +345,6 @@ struct WireFailureEvidence {
     evidence_boundary: &'static str,
 }
 
-struct WireTrace<const BYTES: usize, const DELIMITERS: usize> {
-    bytes: [u8; BYTES],
-    next_byte: usize,
-    retained_bytes: usize,
-    delimiter_offsets: [usize; DELIMITERS],
-    next_delimiter: usize,
-    retained_delimiters: usize,
-    total_bytes: usize,
-    current_nonzero_run: usize,
-    maximum_completed_nonzero_run: usize,
-    initial_synchronization_delimiter_offset: Option<usize>,
-    fnv1a64: u64,
-}
-
 struct PendingDecodeFailure {
     source: UartStreamError,
     parser_events: usize,
@@ -494,7 +481,8 @@ impl PendingDecodeFailure {
             .map(WireIoErrorEvidence::from_error);
         ProbeError::Decode {
             source: self.source,
-            wire: Box::new(wire_trace.failure_evidence(
+            wire: Box::new(wire_failure_evidence(
+                wire_trace,
                 self.parser_events,
                 self.first_failure_after_observed_byte_count,
                 self.nonzero_run_bytes_at_first_failure,
@@ -549,119 +537,36 @@ fn enforce_exclusive_deadline<const BYTES: usize, const DELIMITERS: usize>(
     }
 }
 
-impl<const BYTES: usize, const DELIMITERS: usize> WireTrace<BYTES, DELIMITERS> {
-    const fn new() -> Self {
-        Self {
-            bytes: [0; BYTES],
-            next_byte: 0,
-            retained_bytes: 0,
-            delimiter_offsets: [0; DELIMITERS],
-            next_delimiter: 0,
-            retained_delimiters: 0,
-            total_bytes: 0,
-            current_nonzero_run: 0,
-            maximum_completed_nonzero_run: 0,
-            initial_synchronization_delimiter_offset: None,
-            fnv1a64: FNV1A64_OFFSET_BASIS,
-        }
-    }
-
-    fn observe(&mut self, byte: u8) -> Option<usize> {
-        let offset = self.total_bytes;
-        self.total_bytes += 1;
-        self.fnv1a64 ^= u64::from(byte);
-        self.fnv1a64 = self.fnv1a64.wrapping_mul(FNV1A64_PRIME);
-
-        if BYTES != 0 {
-            self.bytes[self.next_byte] = byte;
-            self.next_byte = (self.next_byte + 1) % BYTES;
-            if self.retained_bytes < BYTES {
-                self.retained_bytes += 1;
-            }
-        }
-
-        if byte == 0 {
-            let completed_nonzero_run = self.current_nonzero_run;
-            self.maximum_completed_nonzero_run = self
-                .maximum_completed_nonzero_run
-                .max(self.current_nonzero_run);
-            self.current_nonzero_run = 0;
-            if DELIMITERS != 0 {
-                self.delimiter_offsets[self.next_delimiter] = offset;
-                self.next_delimiter = (self.next_delimiter + 1) % DELIMITERS;
-                if self.retained_delimiters < DELIMITERS {
-                    self.retained_delimiters += 1;
-                }
-            }
-            Some(completed_nonzero_run)
-        } else {
-            self.current_nonzero_run += 1;
-            None
-        }
-    }
-
-    fn note_initial_synchronization_delimiter(&mut self) {
-        self.initial_synchronization_delimiter_offset = self.total_bytes.checked_sub(1);
-    }
-
-    fn failure_evidence(
-        &self,
-        parser_events: usize,
-        first_failure_after_observed_byte_count: usize,
-        nonzero_run_bytes_at_first_failure: usize,
-        offending_nonzero_run_bytes_if_terminated: Option<usize>,
-        stop_reason: FailureTraceStopReason,
-        completion_error: Option<WireIoErrorEvidence>,
-    ) -> WireFailureEvidence {
-        WireFailureEvidence {
-            schema_version: 1,
-            evidence_kind: "read_only_krp2_decode_failure_wire_trace",
-            total_traced_bytes_after_host_input_clear_through_stop: self.total_bytes,
-            all_traced_bytes_fnv1a64_hex: format!("{:016x}", self.fnv1a64),
-            initial_synchronization_delimiter_offset_zero_based: self
-                .initial_synchronization_delimiter_offset,
-            retained_delimiter_offsets_zero_based: self.retained_delimiter_offsets(),
-            first_decode_failure_after_observed_byte_count:
-                first_failure_after_observed_byte_count,
-            nonzero_run_bytes_at_first_decode_failure: nonzero_run_bytes_at_first_failure,
-            offending_nonzero_run_bytes_if_terminated,
-            failure_trace_stop_reason: stop_reason,
-            failure_trace_completion_error: completion_error,
-            current_unterminated_nonzero_run_bytes: self.current_nonzero_run,
-            maximum_completed_nonzero_run_bytes: self.maximum_completed_nonzero_run,
-            post_boundary_parser_events_including_failure: parser_events,
-            retained_start_offset_zero_based: self.total_bytes - self.retained_bytes,
-            retained_bytes_hex: encode_hex(&self.retained_bytes_in_order()),
-            evidence_boundary: "failure-only host observation after one input-queue clear; after the first strict decode failure, collection remains read-only and continues only to the earliest of the next zero delimiter, 4096 additional bytes, 250 ms completion deadline, original probe deadline, global 65536-byte observation budget, EOF, read error, or checked counter failure; retained hex is a bounded suffix, FNV-1a is a non-cryptographic fingerprint of bytes traced through that stop, and no serial bytes were transmitted",
-        }
-    }
-
-    fn retained_bytes_in_order(&self) -> Vec<u8> {
-        if BYTES == 0 || self.retained_bytes == 0 {
-            return Vec::new();
-        }
-        let start = if self.retained_bytes == BYTES {
-            self.next_byte
-        } else {
-            0
-        };
-        (0..self.retained_bytes)
-            .map(|index| self.bytes[(start + index) % BYTES])
-            .collect()
-    }
-
-    fn retained_delimiter_offsets(&self) -> Vec<usize> {
-        if DELIMITERS == 0 || self.retained_delimiters == 0 {
-            return Vec::new();
-        }
-        let start = if self.retained_delimiters == DELIMITERS {
-            self.next_delimiter
-        } else {
-            0
-        };
-        (0..self.retained_delimiters)
-            .map(|index| self.delimiter_offsets[(start + index) % DELIMITERS])
-            .collect()
+fn wire_failure_evidence<const BYTES: usize, const DELIMITERS: usize>(
+    wire_trace: &WireTrace<BYTES, DELIMITERS>,
+    parser_events: usize,
+    first_failure_after_observed_byte_count: usize,
+    nonzero_run_bytes_at_first_failure: usize,
+    offending_nonzero_run_bytes_if_terminated: Option<usize>,
+    stop_reason: FailureTraceStopReason,
+    completion_error: Option<WireIoErrorEvidence>,
+) -> WireFailureEvidence {
+    let snapshot = wire_trace.snapshot();
+    WireFailureEvidence {
+        schema_version: 1,
+        evidence_kind: "read_only_krp2_decode_failure_wire_trace",
+        total_traced_bytes_after_host_input_clear_through_stop: snapshot.total_bytes,
+        all_traced_bytes_fnv1a64_hex: format!("{:016x}", snapshot.fnv1a64),
+        initial_synchronization_delimiter_offset_zero_based: snapshot
+            .initial_synchronization_delimiter_offset,
+        retained_delimiter_offsets_zero_based: snapshot.retained_delimiter_offsets,
+        first_decode_failure_after_observed_byte_count:
+            first_failure_after_observed_byte_count,
+        nonzero_run_bytes_at_first_decode_failure: nonzero_run_bytes_at_first_failure,
+        offending_nonzero_run_bytes_if_terminated,
+        failure_trace_stop_reason: stop_reason,
+        failure_trace_completion_error: completion_error,
+        current_unterminated_nonzero_run_bytes: snapshot.current_nonzero_run,
+        maximum_completed_nonzero_run_bytes: snapshot.maximum_completed_nonzero_run,
+        post_boundary_parser_events_including_failure: parser_events,
+        retained_start_offset_zero_based: snapshot.retained_start_offset,
+        retained_bytes_hex: encode_hex(&snapshot.retained_bytes),
+        evidence_boundary: "failure-only host observation after one input-queue clear; after the first strict decode failure, collection remains read-only and continues only to the earliest of the next zero delimiter, 4096 additional bytes, 250 ms completion deadline, original probe deadline, global 65536-byte observation budget, EOF, read error, or checked counter failure; retained hex is a bounded suffix, FNV-1a is a non-cryptographic fingerprint of bytes traced through that stop, and no serial bytes were transmitted",
     }
 }
 
@@ -810,7 +715,7 @@ async fn observe_hello(cli: &Cli) -> Result<ControllerHello, ProbeError> {
                     offending_nonzero_run_bytes_if_terminated,
                 } = failure_trace_action_after_byte(
                     completed_nonzero_run,
-                    wire_trace.total_bytes,
+                    wire_trace.total_bytes(),
                     first_failure_after_observed_byte_count,
                 ) {
                     let commit_deadline =
@@ -876,9 +781,9 @@ async fn observe_hello(cli: &Cli) -> Result<ControllerHello, ProbeError> {
                     source,
                     event_index,
                 } => {
-                    let first_failure_after_observed_byte_count = wire_trace.total_bytes;
+                    let first_failure_after_observed_byte_count = wire_trace.total_bytes();
                     let nonzero_run_bytes_at_first_failure =
-                        completed_nonzero_run.unwrap_or(wire_trace.current_nonzero_run);
+                        completed_nonzero_run.unwrap_or(wire_trace.current_nonzero_run());
                     if matches!(source, UartStreamError::OversizedRecord { .. }) {
                         let (completion_deadline, completion_deadline_stop_reason) =
                             failure_completion_deadline(tokio::time::Instant::now(), deadline);
@@ -920,7 +825,8 @@ async fn observe_hello(cli: &Cli) -> Result<ControllerHello, ProbeError> {
                     )?;
                     return Err(ProbeError::Decode {
                         source,
-                        wire: Box::new(wire_trace.failure_evidence(
+                        wire: Box::new(wire_failure_evidence(
+                            &wire_trace,
                             event_index,
                             first_failure_after_observed_byte_count,
                             nonzero_run_bytes_at_first_failure,
@@ -1214,7 +1120,8 @@ mod tests {
             assert_eq!(trace.observe(byte), None);
         }
 
-        let evidence = trace.failure_evidence(
+        let evidence = wire_failure_evidence(
+            &trace,
             1,
             10,
             5,
@@ -1246,7 +1153,8 @@ mod tests {
         for byte in [0, 1, 0, 2, 0] {
             let _completed_run = trace.observe(byte);
         }
-        let evidence = trace.failure_evidence(
+        let evidence = wire_failure_evidence(
+            &trace,
             0,
             5,
             0,
@@ -1271,13 +1179,13 @@ mod tests {
         for _ in 0..(FAILURE_COMPLETION_MAX_BYTES - 1) {
             let completed_run = trace.observe(2);
             assert_eq!(
-                failure_trace_action_after_byte(completed_run, trace.total_bytes, 75),
+                failure_trace_action_after_byte(completed_run, trace.total_bytes(), 75),
                 FailureTraceAction::Continue
             );
         }
         let completed_run = trace.observe(0);
         assert_eq!(
-            failure_trace_action_after_byte(completed_run, trace.total_bytes, 75),
+            failure_trace_action_after_byte(completed_run, trace.total_bytes(), 75),
             FailureTraceAction::Finish {
                 stop_reason: FailureTraceStopReason::TerminatingDelimiterObserved,
                 offending_nonzero_run_bytes_if_terminated: Some(4_169),
@@ -1340,8 +1248,8 @@ mod tests {
         let pending = PendingDecodeFailure {
             source,
             parser_events: 1,
-            first_failure_after_observed_byte_count: trace.total_bytes,
-            nonzero_run_bytes_at_first_failure: trace.current_nonzero_run,
+            first_failure_after_observed_byte_count: trace.total_bytes(),
+            nonzero_run_bytes_at_first_failure: trace.current_nonzero_run(),
             completion_deadline: tokio::time::Instant::now(),
             completion_deadline_stop_reason:
                 FailureTraceStopReason::FailureCompletionDeadlineReached,
@@ -1350,7 +1258,7 @@ mod tests {
         let completed_run = trace.observe(0);
         let action = failure_trace_action_after_byte(
             completed_run,
-            trace.total_bytes,
+            trace.total_bytes(),
             pending.first_failure_after_observed_byte_count,
         );
         assert_eq!(
@@ -1431,7 +1339,7 @@ mod tests {
         let mut action = FailureTraceAction::Continue;
         for _ in 0..FAILURE_COMPLETION_MAX_BYTES {
             let completed_run = trace.observe(2);
-            action = failure_trace_action_after_byte(completed_run, trace.total_bytes, 75);
+            action = failure_trace_action_after_byte(completed_run, trace.total_bytes(), 75);
         }
         assert_eq!(
             action,
@@ -1440,7 +1348,8 @@ mod tests {
                 offending_nonzero_run_bytes_if_terminated: None,
             }
         );
-        let evidence = trace.failure_evidence(
+        let evidence = wire_failure_evidence(
+            &trace,
             1,
             75,
             74,
@@ -1629,7 +1538,8 @@ mod tests {
         }
         let error = ProbeError::Decode {
             source: UartStreamError::OversizedRecord { maximum: 73 },
-            wire: Box::new(trace.failure_evidence(
+            wire: Box::new(wire_failure_evidence(
+                &trace,
                 1,
                 4,
                 3,

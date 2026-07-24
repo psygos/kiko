@@ -6,8 +6,11 @@
 //! admission. Measurements describe this run; they are not performance
 //! improvement claims.
 
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::marker::PhantomData;
 use std::num::NonZeroU16;
 use std::str::FromStr;
 use std::time::Duration;
@@ -29,6 +32,8 @@ use tokio::time::Instant;
 use tokio_serial::{
     ClearBuffer, DataBits, FlowControl, Parity, SerialPort, SerialPortBuilderExt, StopBits,
 };
+
+use support::wire_trace::WireTrace;
 
 const SERIAL_BAUD_BPS: u32 = 115_200;
 const UART_BITS_PER_BYTE_8N1: u32 = 10;
@@ -53,6 +58,8 @@ const MAX_OBSERVED_RECORDS: usize = 20_000;
 const MAX_PENDING_DECODED_MESSAGES: usize = 128;
 const MAX_DEFERRED_DIAGNOSTIC_REPORTS: usize = MAX_IN_FLIGHT;
 const MAX_ENTROPY_ATTEMPTS: usize = 8;
+const FAILURE_TRACE_BYTES: usize = 8 * 1024;
+const FAILURE_TRACE_DELIMITERS: usize = 64;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -469,7 +476,47 @@ impl ProbePlan {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReceivePhaseEvidence {
+    ReadOnlyAdmission,
+    DiagnosticStream,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HostPayloadWriteBoundary {
+    NotInvokedBeforeAdmissionByProgramStructure,
+    PossibleBeforeFailureNotQuantified,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct QualifierWireFailureEvidence {
+    schema_version: u32,
+    evidence_kind: &'static str,
+    receive_phase: ReceivePhaseEvidence,
+    host_payload_write_boundary: HostPayloadWriteBoundary,
+    total_bytes_delivered_after_host_input_clear_through_failing_read: usize,
+    total_bytes_decoder_processed_through_failure: usize,
+    current_read_bytes_delivered: usize,
+    current_read_bytes_decoder_processed_through_failure: usize,
+    already_delivered_unprocessed_bytes_after_failure: usize,
+    all_delivered_bytes_through_failing_read_fnv1a64_hex: String,
+    initial_synchronization_delimiter_offset_zero_based: Option<usize>,
+    retained_delimiter_offsets_zero_based: Vec<usize>,
+    first_decode_failure_after_processed_byte_count: usize,
+    nonzero_run_bytes_at_first_decode_failure: usize,
+    failure_byte_completed_nonzero_run_bytes: Option<usize>,
+    first_delimiter_after_failure_offset_zero_based: Option<usize>,
+    offending_nonzero_run_bytes_if_terminated_in_delivered_suffix: Option<usize>,
+    current_unterminated_nonzero_run_bytes_after_delivered_suffix: usize,
+    maximum_completed_nonzero_run_bytes_after_delivered_suffix: usize,
+    post_boundary_parser_events_including_failure: usize,
+    retained_start_offset_zero_based: usize,
+    retained_bytes_hex: String,
+    evidence_boundary: &'static str,
+}
+
 enum QualificationError {
     DurationHasFractionalProbeCount {
         duration_ms: u64,
@@ -496,7 +543,10 @@ enum QualificationError {
         maximum_ms: u64,
     },
     SerialEof,
-    Decode(UartStreamError),
+    Decode {
+        source: UartStreamError,
+        wire: Box<QualifierWireFailureEvidence>,
+    },
     Encode(UartEncodeError),
     AdmissionTimeout {
         timeout_ms: u64,
@@ -591,6 +641,12 @@ enum QualificationError {
     Json(serde_json::Error),
 }
 
+impl fmt::Debug for QualificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
 impl fmt::Display for QualificationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("motor-inert KRP2 transport qualification failed: ")?;
@@ -629,7 +685,14 @@ impl fmt::Display for QualificationError {
                 )
             }
             Self::SerialEof => formatter.write_str("serial stream reached EOF"),
-            Self::Decode(source) => write!(formatter, "bounded KRP2 decode failed: {source}"),
+            Self::Decode { source, wire } => {
+                write!(
+                    formatter,
+                    "bounded KRP2 decode failed: {source}\nfailure_wire_evidence_json="
+                )?;
+                let encoded = serde_json::to_string(wire).map_err(|_| fmt::Error)?;
+                formatter.write_str(&encoded)
+            }
             Self::Encode(source) => write!(formatter, "bounded KRP2 encode failed: {source}"),
             Self::AdmissionTimeout {
                 timeout_ms,
@@ -776,7 +839,7 @@ impl std::error::Error for QualificationError {
             }
             Self::Read(source) => Some(source),
             Self::SerialWrite { source, .. } => Some(source),
-            Self::Decode(source) => Some(source),
+            Self::Decode { source, .. } => Some(source),
             Self::Encode(source) => Some(source),
             Self::WriterJoin(source) => Some(source),
             Self::Json(source) => Some(source),
@@ -791,15 +854,38 @@ struct TimedMessage {
     received_at: Instant,
 }
 
-struct FramedSerialReader {
+trait ReceivePhase {
+    const EVIDENCE: ReceivePhaseEvidence;
+    const HOST_PAYLOAD_WRITE_BOUNDARY: HostPayloadWriteBoundary;
+}
+
+struct AdmissionReceive;
+
+impl ReceivePhase for AdmissionReceive {
+    const EVIDENCE: ReceivePhaseEvidence = ReceivePhaseEvidence::ReadOnlyAdmission;
+    const HOST_PAYLOAD_WRITE_BOUNDARY: HostPayloadWriteBoundary =
+        HostPayloadWriteBoundary::NotInvokedBeforeAdmissionByProgramStructure;
+}
+
+struct DiagnosticStreamReceive;
+
+impl ReceivePhase for DiagnosticStreamReceive {
+    const EVIDENCE: ReceivePhaseEvidence = ReceivePhaseEvidence::DiagnosticStream;
+    const HOST_PAYLOAD_WRITE_BOUNDARY: HostPayloadWriteBoundary =
+        HostPayloadWriteBoundary::PossibleBeforeFailureNotQuantified;
+}
+
+struct FramedSerialReader<P> {
     decoder: UartStreamDecoder,
     pending: VecDeque<TimedMessage>,
     buffer: [u8; 512],
     observed_bytes: usize,
     observed_records: usize,
+    wire_trace: WireTrace<FAILURE_TRACE_BYTES, FAILURE_TRACE_DELIMITERS>,
+    phase: PhantomData<P>,
 }
 
-impl FramedSerialReader {
+impl FramedSerialReader<AdmissionReceive> {
     fn new() -> Self {
         Self {
             decoder: UartStreamDecoder::new_at_unknown_record_offset(),
@@ -807,9 +893,13 @@ impl FramedSerialReader {
             buffer: [0; 512],
             observed_bytes: 0,
             observed_records: 0,
+            wire_trace: WireTrace::new(),
+            phase: PhantomData,
         }
     }
+}
 
+impl<P: ReceivePhase> FramedSerialReader<P> {
     const fn initial_record_boundary_observed(&self) -> bool {
         !self.decoder.is_waiting_for_initial_boundary()
     }
@@ -839,21 +929,110 @@ impl FramedSerialReader {
                     maximum: MAX_OBSERVED_BYTES,
                 });
             }
-            for &byte in &self.buffer[..count] {
+            for (index, &byte) in self.buffer[..count].iter().enumerate() {
+                let completed_nonzero_run = self.wire_trace.observe(byte);
+                let was_waiting_for_initial_boundary =
+                    self.decoder.is_waiting_for_initial_boundary();
                 let Some(decoded) = self.decoder.push(byte) else {
+                    if was_waiting_for_initial_boundary
+                        && !self.decoder.is_waiting_for_initial_boundary()
+                    {
+                        self.wire_trace.note_initial_synchronization_delimiter();
+                    }
                     continue;
                 };
+                if was_waiting_for_initial_boundary
+                    && !self.decoder.is_waiting_for_initial_boundary()
+                {
+                    self.wire_trace.note_initial_synchronization_delimiter();
+                }
                 self.observed_records = self.observed_records.checked_add(1).ok_or(
                     QualificationError::RecordBudgetExceeded {
                         maximum: MAX_OBSERVED_RECORDS,
                     },
                 )?;
-                if self.observed_records > MAX_OBSERVED_RECORDS {
+                let record_budget_exceeded = self.observed_records > MAX_OBSERVED_RECORDS;
+                let message = match decoded {
+                    Ok(message) => message,
+                    Err(source) => {
+                        let first_failure_after_processed_byte_count =
+                            self.wire_trace.total_bytes();
+                        let nonzero_run_bytes_at_first_decode_failure = completed_nonzero_run
+                            .unwrap_or_else(|| self.wire_trace.current_nonzero_run());
+                        let current_read_bytes_decoder_processed_through_failure = index
+                            .checked_add(1)
+                            .ok_or(QualificationError::ByteBudgetExceeded {
+                                maximum: MAX_OBSERVED_BYTES,
+                            })?;
+                        let delivered_suffix = &self.buffer
+                            [current_read_bytes_decoder_processed_through_failure..count];
+                        let mut first_delimiter_after_failure_offset_zero_based = None;
+                        let mut offending_nonzero_run_bytes_if_terminated_in_delivered_suffix =
+                            None;
+                        for &delivered_byte in delivered_suffix {
+                            let offset = self.wire_trace.total_bytes();
+                            let terminated_run = self.wire_trace.observe(delivered_byte);
+                            if delivered_byte == 0
+                                && first_delimiter_after_failure_offset_zero_based.is_none()
+                            {
+                                first_delimiter_after_failure_offset_zero_based = Some(offset);
+                                if completed_nonzero_run.is_none() {
+                                    offending_nonzero_run_bytes_if_terminated_in_delivered_suffix =
+                                        terminated_run;
+                                }
+                            }
+                        }
+                        let snapshot = self.wire_trace.snapshot();
+                        debug_assert_eq!(snapshot.total_bytes, self.observed_bytes);
+                        return Err(QualificationError::Decode {
+                            source,
+                            wire: Box::new(QualifierWireFailureEvidence {
+                                schema_version: 1,
+                                evidence_kind:
+                                    "motor_inert_krp2_qualifier_decode_failure_wire_trace",
+                                receive_phase: P::EVIDENCE,
+                                host_payload_write_boundary: P::HOST_PAYLOAD_WRITE_BOUNDARY,
+                                total_bytes_delivered_after_host_input_clear_through_failing_read:
+                                    snapshot.total_bytes,
+                                total_bytes_decoder_processed_through_failure:
+                                    first_failure_after_processed_byte_count,
+                                current_read_bytes_delivered: count,
+                                current_read_bytes_decoder_processed_through_failure,
+                                already_delivered_unprocessed_bytes_after_failure:
+                                    delivered_suffix.len(),
+                                all_delivered_bytes_through_failing_read_fnv1a64_hex: format!(
+                                    "{:016x}",
+                                    snapshot.fnv1a64
+                                ),
+                                initial_synchronization_delimiter_offset_zero_based: snapshot
+                                    .initial_synchronization_delimiter_offset,
+                                retained_delimiter_offsets_zero_based: snapshot
+                                    .retained_delimiter_offsets,
+                                first_decode_failure_after_processed_byte_count:
+                                    first_failure_after_processed_byte_count,
+                                nonzero_run_bytes_at_first_decode_failure,
+                                failure_byte_completed_nonzero_run_bytes: completed_nonzero_run,
+                                first_delimiter_after_failure_offset_zero_based,
+                                offending_nonzero_run_bytes_if_terminated_in_delivered_suffix,
+                                current_unterminated_nonzero_run_bytes_after_delivered_suffix:
+                                    snapshot.current_nonzero_run,
+                                maximum_completed_nonzero_run_bytes_after_delivered_suffix: snapshot
+                                    .maximum_completed_nonzero_run,
+                                post_boundary_parser_events_including_failure: self
+                                    .observed_records,
+                                retained_start_offset_zero_based: snapshot.retained_start_offset,
+                                retained_bytes_hex: encode_hex(&snapshot.retained_bytes),
+                                evidence_boundary:
+                                    "failure-only host observation after one input-queue clear; the canonical decoder stopped at the first strict failure; any later bytes were already delivered by that same bounded read and were traced but not decoded; no additional serial read, retry, resynchronization, or decoder recovery was performed for this evidence; the program invokes no host-payload write before admission, and creates the split write half and writer task only afterward, while a diagnostic-stream failure may follow payload writes not quantified here; retained hex is a bounded suffix and FNV-1a is a non-cryptographic fingerprint",
+                            }),
+                        });
+                    }
+                };
+                if record_budget_exceeded {
                     return Err(QualificationError::RecordBudgetExceeded {
                         maximum: MAX_OBSERVED_RECORDS,
                     });
                 }
-                let message = decoded.map_err(QualificationError::Decode)?;
                 if self.pending.len() >= MAX_PENDING_DECODED_MESSAGES {
                     return Err(QualificationError::PendingDecodeBudgetExceeded {
                         maximum: MAX_PENDING_DECODED_MESSAGES,
@@ -928,13 +1107,18 @@ struct Admission {
     heartbeat_received_at: Instant,
 }
 
+struct AdmittedController {
+    admission: Admission,
+    framed: FramedSerialReader<DiagnosticStreamReceive>,
+}
+
 async fn admit_controller<R>(
     reader: &mut R,
-    framed: &mut FramedSerialReader,
+    mut framed: FramedSerialReader<AdmissionReceive>,
     exact: ExactController,
     timeout_ms: u64,
     clocks: &mut ControllerClockTrackers,
-) -> Result<Admission, QualificationError>
+) -> Result<AdmittedController, QualificationError>
 where
     R: AsyncRead + Unpin,
 {
@@ -955,11 +1139,22 @@ where
         ) = (hello, heartbeat, hello_received_at, heartbeat_received_at)
         {
             if admission_heartbeat_is_fresh(hello, admitted_heartbeat_received_at, Instant::now()) {
-                return Ok(Admission {
-                    hello,
-                    heartbeat: admitted_heartbeat,
-                    hello_received_at,
-                    heartbeat_received_at: admitted_heartbeat_received_at,
+                return Ok(AdmittedController {
+                    admission: Admission {
+                        hello,
+                        heartbeat: admitted_heartbeat,
+                        hello_received_at,
+                        heartbeat_received_at: admitted_heartbeat_received_at,
+                    },
+                    framed: FramedSerialReader {
+                        decoder: framed.decoder,
+                        pending: framed.pending,
+                        buffer: framed.buffer,
+                        observed_bytes: framed.observed_bytes,
+                        observed_records: framed.observed_records,
+                        wire_trace: framed.wire_trace,
+                        phase: PhantomData,
+                    },
                 });
             }
             heartbeat = None;
@@ -1936,7 +2131,7 @@ struct StreamParameters {
 async fn run_probe_stream<R, W>(
     read_half: &mut R,
     write_half: W,
-    framed: &mut FramedSerialReader,
+    framed: &mut FramedSerialReader<DiagnosticStreamReceive>,
     parameters: StreamParameters,
     clocks: &mut ControllerClockTrackers,
 ) -> Result<StreamOutcome, QualificationError>
@@ -2713,11 +2908,13 @@ async fn main() -> Result<(), QualificationError> {
     port.clear(ClearBuffer::Input)
         .map_err(QualificationError::ClearPendingInput)?;
 
-    let mut framed = FramedSerialReader::new();
     let mut clocks = ControllerClockTrackers::new();
-    let admission = admit_controller(
+    let AdmittedController {
+        admission,
+        mut framed,
+    } = admit_controller(
         &mut port,
-        &mut framed,
+        FramedSerialReader::new(),
         exact,
         cli.admission_timeout_ms,
         &mut clocks,
@@ -2753,6 +2950,7 @@ async fn main() -> Result<(), QualificationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -2760,6 +2958,46 @@ mod tests {
         ControllerDeadlineMsWrapping, MaxAbsPwmPercent, PwmFrequencyHz, V2CommandLeaseMs,
         WatchdogNominalPeriodMs, MAX_UART_RECORD_BYTES,
     };
+    use tokio::io::ReadBuf;
+
+    struct ChunkReader {
+        chunks: VecDeque<Vec<u8>>,
+        polls: usize,
+    }
+
+    impl ChunkReader {
+        fn one(bytes: Vec<u8>) -> Self {
+            Self::from_chunks([bytes])
+        }
+
+        fn from_chunks(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+                polls: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for ChunkReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.polls += 1;
+            let Some(bytes) = self.chunks.pop_front() else {
+                return Poll::Ready(Ok(()));
+            };
+            if bytes.len() > buffer.remaining() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "test read exceeds the qualifier read buffer",
+                )));
+            }
+            buffer.put_slice(&bytes);
+            Poll::Ready(Ok(()))
+        }
+    }
 
     struct FlushPendingWriter;
 
@@ -2887,10 +3125,320 @@ mod tests {
             .expect("oversized record delimiter");
         assert!(matches!(
             framed.next(&mut reader).await,
-            Err(QualificationError::Decode(
-                UartStreamError::OversizedRecord { .. }
-            ))
+            Err(QualificationError::Decode {
+                source: UartStreamError::OversizedRecord { .. },
+                ..
+            })
         ));
+    }
+
+    #[tokio::test]
+    async fn one_read_failure_is_phase_tagged_exact_and_never_hidden_by_queued_messages() {
+        let hello_record =
+            UartRecord::encode(Message::ControllerHello(hello())).expect("Hello record");
+        let heartbeat_record =
+            UartRecord::encode(Message::Heartbeat(heartbeat(1_000))).expect("Heartbeat record");
+        let prefix = [0x55, 0];
+        let delivered_suffix = [0, 9, 0];
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&prefix);
+        chunk.extend_from_slice(hello_record.as_bytes());
+        chunk.extend_from_slice(heartbeat_record.as_bytes());
+        chunk.extend_from_slice(&[1; MAX_UART_RECORD_BYTES]);
+        chunk.extend_from_slice(&delivered_suffix);
+        assert!(chunk.len() <= 512);
+
+        let failure_after_processed_bytes = prefix.len()
+            + hello_record.as_bytes().len()
+            + heartbeat_record.as_bytes().len()
+            + MAX_UART_RECORD_BYTES;
+        let expected_fnv1a64 =
+            chunk
+                .iter()
+                .fold(0xcbf2_9ce4_8422_2325_u64, |fingerprint, &byte| {
+                    (fingerprint ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                });
+        let mut reader = ChunkReader::one(chunk.clone());
+        let mut framed = FramedSerialReader::new();
+
+        let error = match framed.next(&mut reader).await {
+            Err(error @ QualificationError::Decode { .. }) => error,
+            Err(other) => panic!("unexpected strict failure: {other}"),
+            Ok(_) => panic!("queued valid messages must not hide later corruption in one read"),
+        };
+
+        assert_eq!(
+            reader.polls, 1,
+            "failure evidence must not trigger another read"
+        );
+        assert_eq!(
+            framed.pending.len(),
+            2,
+            "valid messages decoded earlier in the read remain private after strict failure"
+        );
+        assert_eq!(
+            std::error::Error::source(&error)
+                .expect("decode error source")
+                .to_string(),
+            UartStreamError::OversizedRecord {
+                maximum: MAX_UART_RECORD_BYTES - 1,
+            }
+            .to_string()
+        );
+        let QualificationError::Decode { source, wire } = &error else {
+            unreachable!("matched decode error above");
+        };
+        assert_eq!(
+            source,
+            &UartStreamError::OversizedRecord {
+                maximum: MAX_UART_RECORD_BYTES - 1,
+            }
+        );
+        assert_eq!(wire.receive_phase, ReceivePhaseEvidence::ReadOnlyAdmission);
+        assert_eq!(
+            wire.host_payload_write_boundary,
+            HostPayloadWriteBoundary::NotInvokedBeforeAdmissionByProgramStructure
+        );
+        assert_eq!(
+            wire.total_bytes_delivered_after_host_input_clear_through_failing_read,
+            chunk.len()
+        );
+        assert_eq!(
+            wire.total_bytes_decoder_processed_through_failure,
+            failure_after_processed_bytes
+        );
+        assert_eq!(wire.current_read_bytes_delivered, chunk.len());
+        assert_eq!(
+            wire.current_read_bytes_decoder_processed_through_failure,
+            failure_after_processed_bytes
+        );
+        assert_eq!(
+            wire.already_delivered_unprocessed_bytes_after_failure,
+            delivered_suffix.len()
+        );
+        assert_eq!(
+            wire.all_delivered_bytes_through_failing_read_fnv1a64_hex,
+            format!("{expected_fnv1a64:016x}")
+        );
+        assert_eq!(
+            wire.initial_synchronization_delimiter_offset_zero_based,
+            Some(1)
+        );
+        assert_eq!(
+            wire.first_decode_failure_after_processed_byte_count,
+            failure_after_processed_bytes
+        );
+        assert_eq!(
+            wire.nonzero_run_bytes_at_first_decode_failure,
+            MAX_UART_RECORD_BYTES
+        );
+        assert_eq!(wire.failure_byte_completed_nonzero_run_bytes, None);
+        assert_eq!(
+            wire.first_delimiter_after_failure_offset_zero_based,
+            Some(failure_after_processed_bytes)
+        );
+        assert_eq!(
+            wire.offending_nonzero_run_bytes_if_terminated_in_delivered_suffix,
+            Some(MAX_UART_RECORD_BYTES)
+        );
+        assert_eq!(
+            wire.current_unterminated_nonzero_run_bytes_after_delivered_suffix,
+            0
+        );
+        assert_eq!(
+            wire.maximum_completed_nonzero_run_bytes_after_delivered_suffix,
+            MAX_UART_RECORD_BYTES
+        );
+        assert_eq!(wire.post_boundary_parser_events_including_failure, 3);
+        assert_eq!(wire.retained_start_offset_zero_based, 0);
+        assert_eq!(wire.retained_bytes_hex, encode_hex(&chunk));
+
+        let rendered = format!("{error:?}");
+        let (_, evidence_json) = rendered
+            .split_once("failure_wire_evidence_json=")
+            .expect("machine-readable evidence marker");
+        let json: serde_json::Value =
+            serde_json::from_str(evidence_json).expect("valid failure evidence JSON");
+        assert_eq!(json["receive_phase"], "read_only_admission");
+        assert_eq!(
+            json["host_payload_write_boundary"],
+            "not_invoked_before_admission_by_program_structure"
+        );
+        assert_eq!(
+            json["nonzero_run_bytes_at_first_decode_failure"],
+            serde_json::json!(MAX_UART_RECORD_BYTES)
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_failure_distinguishes_global_and_current_read_accounting() {
+        let mut first_chunk = vec![0];
+        first_chunk.extend_from_slice(
+            UartRecord::encode(Message::ControllerHello(hello()))
+                .expect("Hello record")
+                .as_bytes(),
+        );
+        let mut failing_chunk = vec![1; MAX_UART_RECORD_BYTES];
+        let delivered_suffix = [0, 9, 0];
+        failing_chunk.extend_from_slice(&delivered_suffix);
+        let mut all_delivered = first_chunk.clone();
+        all_delivered.extend_from_slice(&failing_chunk);
+        let expected_fnv1a64 =
+            all_delivered
+                .iter()
+                .fold(0xcbf2_9ce4_8422_2325_u64, |fingerprint, &byte| {
+                    (fingerprint ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                });
+        let mut reader = ChunkReader::from_chunks([first_chunk.clone(), failing_chunk.clone()]);
+        let mut framed = FramedSerialReader::new();
+
+        let first = framed
+            .next(&mut reader)
+            .await
+            .expect("first read contains a valid Hello");
+        assert_eq!(first.message, Message::ControllerHello(hello()));
+        let error = framed
+            .next(&mut reader)
+            .await
+            .expect_err("second read has an oversized record");
+        let QualificationError::Decode { wire, .. } = error else {
+            panic!("expected a decode failure");
+        };
+        assert_eq!(wire.receive_phase, ReceivePhaseEvidence::ReadOnlyAdmission);
+        assert_eq!(
+            wire.total_bytes_delivered_after_host_input_clear_through_failing_read,
+            all_delivered.len()
+        );
+        assert_eq!(
+            wire.total_bytes_decoder_processed_through_failure,
+            first_chunk.len() + MAX_UART_RECORD_BYTES
+        );
+        assert_eq!(wire.current_read_bytes_delivered, failing_chunk.len());
+        assert_eq!(
+            wire.current_read_bytes_decoder_processed_through_failure,
+            MAX_UART_RECORD_BYTES
+        );
+        assert_eq!(
+            wire.already_delivered_unprocessed_bytes_after_failure,
+            delivered_suffix.len()
+        );
+        assert_eq!(
+            wire.all_delivered_bytes_through_failing_read_fnv1a64_hex,
+            format!("{expected_fnv1a64:016x}")
+        );
+        assert_eq!(
+            wire.first_delimiter_after_failure_offset_zero_based,
+            Some(first_chunk.len() + MAX_UART_RECORD_BYTES)
+        );
+        assert_eq!(wire.post_boundary_parser_events_including_failure, 2);
+        assert_eq!(reader.polls, 2);
+    }
+
+    #[tokio::test]
+    async fn delimiter_failure_does_not_label_a_later_run_as_the_offending_record() {
+        let chunk = vec![0, 0, 9, 0];
+        let mut reader = ChunkReader::one(chunk);
+        let mut framed = FramedSerialReader::new();
+
+        let error = framed
+            .next(&mut reader)
+            .await
+            .expect_err("second delimiter is an empty strict record");
+        let QualificationError::Decode { source, wire } = error else {
+            panic!("expected a decode failure");
+        };
+        assert_eq!(source, UartStreamError::EmptyRecord);
+        assert_eq!(wire.failure_byte_completed_nonzero_run_bytes, Some(0));
+        assert_eq!(
+            wire.first_delimiter_after_failure_offset_zero_based,
+            Some(3)
+        );
+        assert_eq!(
+            wire.offending_nonzero_run_bytes_if_terminated_in_delivered_suffix,
+            None
+        );
+        assert_eq!(
+            wire.maximum_completed_nonzero_run_bytes_after_delivered_suffix,
+            1
+        );
+        assert_eq!(reader.polls, 1);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_phase_failure_never_claims_that_prior_host_writes_were_impossible() {
+        let mut admission_chunk = vec![0];
+        admission_chunk.extend_from_slice(
+            UartRecord::encode(Message::ControllerHello(hello()))
+                .expect("Hello record")
+                .as_bytes(),
+        );
+        admission_chunk.extend_from_slice(
+            UartRecord::encode(Message::Heartbeat(heartbeat(1_000)))
+                .expect("Heartbeat record")
+                .as_bytes(),
+        );
+        let mut failing_chunk = vec![1; MAX_UART_RECORD_BYTES];
+        failing_chunk.push(0);
+        let mut reader = ChunkReader::from_chunks([admission_chunk, failing_chunk]);
+        let mut clocks = ControllerClockTrackers::new();
+        let mut admitted = admit_controller(
+            &mut reader,
+            FramedSerialReader::new(),
+            exact_controller(),
+            1_000,
+            &mut clocks,
+        )
+        .await
+        .expect("exact idle controller admission");
+        assert_eq!(reader.polls, 1);
+
+        let error = admitted
+            .framed
+            .next(&mut reader)
+            .await
+            .expect_err("oversized record must remain a strict failure");
+        let QualificationError::Decode { wire, .. } = error else {
+            panic!("expected a decode failure");
+        };
+        assert_eq!(wire.receive_phase, ReceivePhaseEvidence::DiagnosticStream);
+        assert_eq!(
+            wire.host_payload_write_boundary,
+            HostPayloadWriteBoundary::PossibleBeforeFailureNotQuantified
+        );
+        assert_eq!(reader.polls, 2);
+    }
+
+    #[tokio::test]
+    async fn successful_read_only_admission_is_the_only_transition_to_diagnostic_phase() {
+        let mut chunk = vec![0];
+        chunk.extend_from_slice(
+            UartRecord::encode(Message::ControllerHello(hello()))
+                .expect("Hello record")
+                .as_bytes(),
+        );
+        chunk.extend_from_slice(
+            UartRecord::encode(Message::Heartbeat(heartbeat(1_000)))
+                .expect("Heartbeat record")
+                .as_bytes(),
+        );
+        let mut reader = ChunkReader::one(chunk);
+        let mut clocks = ControllerClockTrackers::new();
+
+        let admitted = admit_controller(
+            &mut reader,
+            FramedSerialReader::new(),
+            exact_controller(),
+            1_000,
+            &mut clocks,
+        )
+        .await
+        .expect("exact idle controller admission");
+
+        fn require_diagnostic_phase(_: &FramedSerialReader<DiagnosticStreamReceive>) {}
+        require_diagnostic_phase(&admitted.framed);
+        assert_eq!(admitted.admission.hello, hello());
+        assert_eq!(admitted.admission.heartbeat, heartbeat(1_000));
+        assert_eq!(reader.polls, 1);
     }
 
     fn report(
