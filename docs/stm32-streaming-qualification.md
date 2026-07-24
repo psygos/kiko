@@ -154,12 +154,15 @@ distributions from that run only. A run with missing, duplicate, reordered,
 skipped, or period-late probes fails. Even a passing 75/100 Hz stress run does
 not promote that rate to a motion or MPC claim.
 
-Runtime liveness requires each idle-safe Heartbeat gap to remain within the
-controller's advertised watchdog period and each ControllerHello gap to remain
-within twice the protocol's canonical one-second Hello period. The Hello bound
-is deliberately based on its own protocol schedule, not the shorter watchdog
-period. Admission also rejects an otherwise valid heartbeat once its host
-receive age exceeds the advertised watchdog period.
+Runtime liveness compares host decode times, not controller emission times. Its
+Heartbeat bound is therefore the advertised nominal period plus a checked
+10 percent clock tolerance and 100 ms scheduling/transport margin; the
+motor-inert 250 ms profile yields a 375 ms host-observation bound. This admits
+bounded UART/USB/host jitter without relabelling the 250 ms on-wire claim.
+Each ControllerHello gap must remain within twice the protocol's canonical
+one-second Hello period. Admission separately rejects an otherwise valid
+post-match Heartbeat once its host receive age exceeds the advertised watchdog
+period.
 
 The parsed serial timeout is restricted to `7..=100 ms` and one deadline covers
 both the complete diagnostic-record write and its flush. After scheduling ends,

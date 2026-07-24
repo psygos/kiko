@@ -2298,8 +2298,9 @@ struct RuntimeLiveness {
 
 impl RuntimeLiveness {
     fn from_admission(admission: Admission) -> Result<Self, QualificationError> {
-        let advertised_watchdog =
-            Duration::from_millis(u64::from(admission.hello.watchdog_nominal_period.get()));
+        let advertised_watchdog_ms = u64::from(admission.hello.watchdog_nominal_period.get());
+        let heartbeat_host_observation_bound =
+            periodic_host_observation_bound(advertised_watchdog_ms)?;
         let canonical_hello_period =
             Duration::from_millis(u64::from(CANONICAL_CONTROLLER_HELLO_PERIOD_MS));
         let hello_maximum_gap = canonical_hello_period
@@ -2313,7 +2314,7 @@ impl RuntimeLiveness {
             ),
             heartbeat: PeriodicLiveness::admitted(
                 "Heartbeat",
-                advertised_watchdog,
+                heartbeat_host_observation_bound,
                 admission.heartbeat_received_at,
             ),
         })
@@ -2323,6 +2324,18 @@ impl RuntimeLiveness {
         self.hello.observe_trailing_gap(finished_at)?;
         self.heartbeat.observe_trailing_gap(finished_at)
     }
+}
+
+fn periodic_host_observation_bound(nominal_period_ms: u64) -> Result<Duration, QualificationError> {
+    let rate_margin_ms = nominal_period_ms
+        .checked_mul(CONTROLLER_CLOCK_RATE_TOLERANCE_PERCENT)
+        .map(|scaled| scaled.div_ceil(100))
+        .ok_or(QualificationError::HostDurationOutsideU64)?;
+    let maximum_gap_ms = nominal_period_ms
+        .checked_add(rate_margin_ms)
+        .and_then(|bound| bound.checked_add(CONTROLLER_CLOCK_FIXED_MARGIN_MS))
+        .ok_or(QualificationError::HostDurationOutsideU64)?;
+    Ok(Duration::from_millis(maximum_gap_ms))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3715,7 +3728,7 @@ fn build_evidence(
                 outcome.liveness.heartbeat.maximum_gap.as_millis(),
             )
             .map_err(|_| QualificationError::HostDurationOutsideU64)?,
-            bound_policy: "Heartbeat gap <= advertised watchdog_nominal_period; ControllerHello gap <= 2x the canonical protocol Hello period. These are host qualification bounds; only the watchdog period is an on-wire field.",
+            bound_policy: "Heartbeat host-receive gap <= advertised watchdog_nominal_period plus ceil(10 percent clock tolerance) plus 100 ms scheduling/transport margin; ControllerHello host-receive gap <= 2x the canonical protocol Hello period. These are host qualification bounds; only the watchdog period is an on-wire field.",
         },
         missing_sequences,
         final_idle_safe_heartbeat_received_after_last_write: outcome
@@ -5687,7 +5700,15 @@ mod tests {
             liveness.hello.maximum_gap,
             Duration::from_millis(u64::from(CANONICAL_CONTROLLER_HELLO_PERIOD_MS) * 2)
         );
-        assert_eq!(liveness.heartbeat.maximum_gap, Duration::from_millis(250));
+        assert_eq!(liveness.heartbeat.maximum_gap, Duration::from_millis(375));
+        assert_eq!(
+            periodic_host_observation_bound(250).expect("checked host observation bound"),
+            Duration::from_millis(375)
+        );
+        assert!(matches!(
+            periodic_host_observation_bound(u64::MAX),
+            Err(QualificationError::HostDurationOutsideU64)
+        ));
     }
 
     #[tokio::test]

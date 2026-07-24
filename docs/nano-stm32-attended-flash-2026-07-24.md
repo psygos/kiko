@@ -732,6 +732,42 @@ exact(("identity", "watchdog_nominal_period_ms"), 250)
 exact(("identity", "pwm_frequency_hz"), 20000)
 exact(("identity", "neutral_output"), "both_low")
 exact(("identity", "physical_stop_semantics"), "unverified")
+exact(("liveness", "controller_hello_maximum_allowed_gap_ms"), 2000)
+exact(("liveness", "idle_safe_heartbeat_maximum_allowed_gap_ms"), 375)
+exact(
+    ("liveness", "bound_policy"),
+    "Heartbeat host-receive gap <= advertised watchdog_nominal_period plus "
+    "ceil(10 percent clock tolerance) plus 100 ms scheduling/transport "
+    "margin; ControllerHello host-receive gap <= 2x the canonical protocol "
+    "Hello period. These are host qualification bounds; only the watchdog "
+    "period is an on-wire field.",
+)
+hello_gap_ns = bounded_int(
+    (
+        "liveness",
+        "controller_hello_maximum_observed_gap_ns_including_trailing_boundary",
+    ),
+    0,
+    2_000_000_000,
+)
+heartbeat_gap_ns = bounded_int(
+    (
+        "liveness",
+        "idle_safe_heartbeat_maximum_observed_gap_ns_including_trailing_boundary",
+    ),
+    0,
+    375_000_000,
+)
+bounded_int(
+    ("liveness", "controller_hello_messages_validated_including_admission"),
+    1,
+    (1 << 64) - 1,
+)
+bounded_int(
+    ("liveness", "idle_safe_heartbeat_messages_validated_including_admission"),
+    1,
+    (1 << 64) - 1,
+)
 exact(("plan", "rate_hz"), rate_hz)
 exact(("plan", "nominal_period_ns"), 1_000_000_000 // rate_hz)
 exact(("plan", "duration_ms"), 10000)
