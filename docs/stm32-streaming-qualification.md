@@ -93,19 +93,42 @@ discarding a reserved safety response.
 ## Reproducible motor-inert measurement
 
 `v2_transport_qualify` admits only the exact motor-inert diagnostic capability,
-an exact controller identity, and a fresh idle-safe heartbeat. It never creates
-a control session and never sends PWM. Run a separate process for each exact
-rate and retain each JSON output:
+an exact controller identity, and run-bound live freshness. It never creates a
+control session and never sends PWM. Run a separate process for each exact
+rate and retain each schema-3 JSON output.
 
-Each fresh host owner first claims the exact TTY exclusively, clears only the
-host input queue once, and excludes subsequently delivered bytes through the
-first zero delimiter. This establishes one explicit record boundary even when
-the previous owner closed mid-record. The clear does not prove that upstream
-ST-Link, USB, or in-flight bytes were absent. After that one delimiter, the
-canonical decoder is strict: any empty, malformed, or oversized record fails
-the probe or faults the runtime; no later error is relabelled as startup
-synchronization. Successful identity and qualification outputs use schema 2
-and state this boundary explicitly.
+The read-only `v2_identity_probe` retains its legacy receive boundary and
+schema-2 output: a fresh host owner clears only the host input queue once and
+excludes subsequently delivered bytes through the first zero delimiter. That
+establishes one explicit record boundary for the passive identity observation,
+but neither the clear nor that boundary proves that upstream ST-Link, USB, or
+in-flight buffers were empty.
+
+The transport qualifier uses a stronger schema-3 freshness protocol. After the
+same one-time host input clear, it raw-discards every byte delivered during a
+fixed 1,000 ms quarantine, then discards through one explicit following zero
+delimiter. Strict canonical decoding begins only at that boundary: an empty,
+malformed, or oversized subsequent record fails the run, and retries never
+resynchronize the decoder.
+
+An exact motor-inert `ControllerHello` and idle-safe `Heartbeat` decoded after
+the boundary are candidate evidence only. They authorize at most three
+pre-measurement, motor-inert diagnostic challenges under the qualifier's fresh
+nonzero run ID. The attempts use reserved descending sequences
+`u32::MAX`, `u32::MAX - 1`, and `u32::MAX - 2`, and each carries its recorded
+host-elapsed-nanosecond token. Only an exact run/sequence/token echo for the
+latest outstanding attempt can match. Final admission additionally requires a
+subsequently decoded exact `ControllerHello` and an idle-safe `Heartbeat`
+strictly forward from the matched report preparation time. Both the
+request-to-prepare service delta and the report-to-heartbeat delta must be
+wrapping-forward by less than half the `u32` clock range and no greater than
+their conservative host-elapsed bounds.
+
+This is evidence of a live, invocation-bound request/response path followed by
+new controller liveness. It is not proof that any upstream buffer was empty.
+The quarantine, alignment, candidate observations, one-to-three challenge
+writes, matched report, and post-match liveness are excluded from benchmark
+metrics.
 
 ```text
 cargo run --locked -p robot-server --bin v2_transport_qualify -- \

@@ -431,6 +431,151 @@ whether it had already made a diagnostic write. Fail-fast stopped the run, so
 no 50 Hz qualifier or later scripted phase followed. This directory is also
 failed evidence and must not be reused.
 
+The phase-tagged host diagnostic was then built natively from the clean,
+detached Nano checkout at
+`ba72b4404bd1bf7b0c123c61c128985b089460b0`. Its aarch64 identity and
+qualifier binaries hashed respectively to
+`80da2203560bf2942fae60731c06c0dea7e58c7995a03951c69205c8329f346f`
+and
+`a25e040b2045084028d0beebce4a71b9debed7116e594226f9ee5a5a56a84504`.
+All 24 identity and 25 qualifier tests passed natively. The source checkout
+remained clean.
+
+This was deliberately a non-qualifying diagnostic under existing Fable load,
+not another attended flash restart. It used the fresh evidence directory
+`/home/makerspace/kiko-hardware-evidence/20260724T190859IST-ba72b44-fable-load-phase-diagnostic`.
+No backup, flash, reset, quiet-load claim, physical instrumentation, control
+session, or PWM command was part of this run. Motor power remained
+operator-reported, not independently instrumented, as disconnected. The
+existing guardian and `kiko_face_follow.py` child had the same PIDs in the
+before and after process snapshots. Point-in-time `fuser` output, with the
+visibility of the unprivileged collection account, reported that child owning
+the head adapter at `/dev/ttyACM1` and reported no owner for the STM32 VCP at
+`/dev/ttyACM0` immediately before the qualifier. This is not proof that no
+other process held, or could subsequently acquire, a descriptor outside that
+snapshot and visibility boundary.
+
+Live USB topology showed that this separation is logical but not physical:
+the 12 Mbit/s ST-Link VCP at `1-2.1`, 12 Mbit/s head adapter at `1-2.2`,
+480 Mbit/s OAK at `1-2.3`, and 12 Mbit/s eyes at `1-2.4` all share USB-2 hub
+`1-2`. Fable did not appear to own the STM32 endpoint in the captured
+snapshots, but its OAK, head, USB, and CPU activity remains a load confound
+for later coexistence and performance qualification. The captured evidence
+does not show that Fable caused this transport failure.
+
+The 20 Hz qualifier returned status `1`, empty JSON, and phase-tagged stderr.
+Their hashes were respectively
+`4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865`,
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+and
+`a8372bbac7eb95b48533e3e5bedb22964da5448e0ccac181ed788d3975284047`.
+The strict primary error remained `OversizedRecord { maximum: 73 }`, but the
+new bounded evidence places it in `diagnostic_stream`, after the then-current
+`ba72b44` exact read-only admission logic accepted the stale candidate. It
+recorded 330 delivered bytes, failure after 328 decoder-processed bytes, an
+11-byte failing read with 9 bytes processed through failure, and 2
+already-delivered suffix bytes. It made no additional read, retry,
+resynchronization, decoder reset, or hidden recovery.
+
+The retained trace explains why the then-current read-only admission was not
+a freshness proof. Its initial synchronization delimiter was at zero-based
+offset `6`. The next records decoded, in order, as heartbeats with controller
+uptimes `80,500 ms` and `80,750 ms`, a `ControllerHello`, and a heartbeat at
+`81,000 ms`; their delimiters were at offsets `65`, `124`, `194`, and `253`.
+The candidate diagnostic body that follows reports both request receipt and
+response preparation at controller uptime `1,672,521 ms`. The gap from the
+last complete heartbeat is therefore exactly `1,591,521 ms`, or 26 minutes
+31.521 seconds. Those admitted heartbeat and hello bytes were old backlog
+relative to the later candidate, even though they arrived freshly at the
+host.
+
+After the delimiter at offset `253`, offsets `254` through `256` are
+`08 4b 52`; offsets `257` through `329` begin again with
+`08 4b 52 50 32` and contain a valid, current-like diagnostic body. The bytes
+alone do not select one of the four equivalent deletion windows described
+below. Their chronology is consistent with treating offsets `254..256` as
+the partial next stale-record prefix and offsets `257..329` as the
+current-like candidate. No trailing zero delimiter for that candidate was
+observed among the 330 delivered bytes, so it was not a complete record in
+the captured host stream and the strict decoder correctly did not accept it.
+The complete 76-byte nonzero tail was:
+
+```text
+084b52084b52503202413c022c02181917503142423533204b58ad1970ee65afca8d2e94baa066f801010104fc0409010101010101010101010101044985190449851901010101057b3be509
+```
+
+Because of the overlapping periodic prefix, deleting any one contiguous
+three-byte window beginning at tail offset `0`, `1`, `2`, or `3` produces the
+same unique 73-byte COBS candidate; the bytes do not identify which equivalent
+window is the omitted partial prefix. The candidate hash is
+`cda219604a77215699d4172d0362bd1d32b9ec27bf14a85f8084cd5460ae830f`.
+Canonical COBS and KRP2 decoding yields one 72-byte raw frame with hash
+`ebc540876d44c99f51a967b008a99c17fef2b0708364e2c2ab8f38d049278387`
+and a valid CRC-32C. It decodes as a sequence-0
+`TransportDiagnosticReport` with run ID `17899170492241055178`, host elapsed
+token `591100`, result `EchoedMotorInert`, zero left/right PWM, disabled
+output, clear faults, zero recorded RX/TX queue depth, and the admitted
+controller UID and boot ID. However, the collection did not persist the
+host-generated expected run ID independently before the write. Binding this
+current-like body to this qualifier invocation is therefore an inference, not
+proof that this invocation's probe was processed. The absent trailing
+delimiter is an additional reason not to treat it as an accepted report.
+
+The evidence is consistent with stale ST-Link/USB/TTY pipeline bytes remaining
+upstream or in flight when the host cleared its input queue: the 257 bytes
+before the current-like candidate are consistent with an initial stale tail,
+three stale heartbeats, one stale hello, and a three-byte partial prefix of
+another stale record. The exact layer that retained or discarded each byte
+was not directly observed. What is established is a host freshness-boundary
+defect: clearing the host input queue once, excluding only through the first
+delimiter, and measuring freshness from host receive time allowed a
+26-minute-old coherent identity sequence to satisfy admission. This trace is
+not evidence of payload insertion or replay. The checked-in firmware's atomic
+record queue and the qualifier's exact-once byte tracing remain relevant
+source facts, but they do not turn a non-atomic multi-layer clear into a
+freshness guarantee. There were no kernel-journal entries in the captured run
+window; absence of a log does not establish that all buffering layers behaved
+atomically.
+
+The bridge probe reported `V2J33S25`. ST's
+[current RN0093 release note](https://www.st.com/resource/en/release_note/rn0093-firmware-upgrade-for-stlink-stlinkv2-stlinkv21-and-stlinkv3-boards-stmicroelectronics.pdf)
+lists `V2J48M35` for ST-LINK/V2-1 and records intervening Virtual COM Port
+buffer and behavior changes at `V2J35M26`. The installed bridge is behind
+that target, but an update is not a proven fix for the host
+freshness-boundary defect demonstrated by that revision, and no ST-Link
+firmware update was attempted. The exact offline-analysis artifact hash is
+`1d401a71b552a19f750428ff756aa0e9bf32bbabd394aba5947740334a363331`.
+
+The current worktree now implements this host-side correction, but it has not
+yet been qualified on the Nano. After the one-time host input clear, the
+qualifier accounts for and raw-discards every byte delivered during a fixed
+1,000 ms quarantine, discards through one subsequent zero delimiter, and
+starts strict decoding at that known record boundary. The exact motor-inert
+Hello and idle-safe Heartbeat observed next are candidate-selection evidence
+only; they do not establish freshness or permit a control session or PWM.
+
+Before any measured diagnostic probe, the qualifier generates a fresh
+entropy-derived run ID and writes at most three motor-inert challenges,
+250 ms apart, using reserved descending sequences and per-attempt host-elapsed
+tokens. Only the latest successfully written exact challenge tuple may match;
+nonmatching reports and replies to superseded attempts are discarded and
+counted. After a match, admission requires a subsequently decoded exact Hello
+and an idle-safe Heartbeat whose controller uptime strictly follows the
+matched report's response-preparation time. The diagnostic service delta and
+report-to-Heartbeat delta are each capped by a conservative host-elapsed upper
+bound. This is a run-bound round trip and controller-clock liveness witness,
+not a multi-Heartbeat cadence measurement and not proof that every upstream
+buffer is empty.
+
+Strict post-boundary decode failures remain terminal. Successfully written
+challenge tuples are included in success evidence and in typed strict-decode
+failure evidence, but the process does not durably journal a tuple before its
+serial write. The next evidence step is therefore a fresh
+motor-power-disconnected Nano build and 20/50 Hz qualification under the
+explicitly recorded Fable coexistence load. A remaining post-boundary
+corruption would justify direct STM32 USART2 TX or equivalent halted-RAM
+accepted-byte evidence.
+
 ## Exact remaining gate
 
 Before the wheel-attach sentence is allowed:

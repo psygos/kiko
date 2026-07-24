@@ -574,17 +574,35 @@ observation budget, EOF, a typed read failure, or a checked counter failure.
 The capture helper hashes that standard error before stopping, so do not retry
 or continue in the same evidence directory.
 
-A successful fresh owner cleared only its host input queue once and excluded
-subsequently delivered bytes through the first zero delimiter. It did not
-prove that upstream or in-flight bytes were absent. Every record after that one
-boundary remains strict.
+The single-clear/first-delimiter boundary in the preceding paragraph applies
+only to the legacy read-only identity probe and its schema-2 output. A
+successful identity observation does not prove that upstream or in-flight
+bytes were absent. Every decoded identity record after that selected boundary
+remains strict.
 
-Run separate 10-second 20 Hz and 50 Hz processes. The motor-inert token is
-deliberately not session-unique. The qualifier admits a fresh idle-safe
-heartbeat, never begins a session, and never sends PWM. Each run repeats the
-privileged no-owner check, captures the real status, then parses and checks its
-schema, exact identity, requested rate/window, zero-loss counts, and final
-idle-safe heartbeat:
+Run separate 10-second 20 Hz and 50 Hz qualifier processes. Each schema-3 run
+clears the host input queue once, raw-discards every byte delivered during a
+fixed 1,000 ms quarantine, then discards through one explicit following zero
+delimiter. The canonical decoder is strict from that boundary and never
+resynchronizes.
+
+An exact motor-inert `ControllerHello` and idle-safe `Heartbeat` are only
+pre-challenge candidate evidence. Before measurement, the qualifier may write
+one to three motor-inert diagnostic challenges under its fresh nonzero run ID.
+Attempts use reserved descending sequences and a recorded
+host-elapsed-nanosecond token. Only an exact run/sequence/token echo for the
+latest outstanding attempt may match. A subsequently decoded exact
+`ControllerHello` and strictly forward, host-time-bounded idle-safe
+`Heartbeat` are then required. This establishes a live round trip bound to the
+current qualifier invocation; it does not prove that ST-Link, USB, TTY, or
+other upstream buffers were empty. Candidate traffic, challenge writes, the
+matched report, and post-match liveness are excluded from the measured probe
+stream.
+
+The qualifier never begins a control session and never sends PWM. Each run
+repeats the privileged no-owner check, captures the real status, then parses
+and checks its schema-3 freshness evidence, exact identity, requested
+rate/window, zero-loss counts, and final idle-safe heartbeat:
 
 ```bash
 run_and_check_motor_inert_transport() {
@@ -650,18 +668,42 @@ boot_id = int(sys.argv[5], 10)
 rate_hz = int(sys.argv[6], 10)
 planned_periods = rate_hz * 10
 
-def exact(path, expected):
+def value_at(path):
     value = evidence
     for key in path:
         if type(value) is not dict or key not in value:
             raise ValueError(f"missing qualifier field: {path!r}")
         value = value[key]
+    return value
+
+def exact(path, expected):
+    value = value_at(path)
     if type(value) is not type(expected) or value != expected:
         raise ValueError(
             f"qualifier field {path!r} differs: expected {expected!r}, got {value!r}"
         )
 
-exact(("schema_version",), 2)
+def bounded_int(path, minimum, maximum):
+    value = value_at(path)
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(
+            f"qualifier field {path!r} is outside "
+            f"{minimum}..={maximum}: {value!r}"
+        )
+    return value
+
+def exact_object_keys(value, label, expected_keys):
+    if type(value) is not dict:
+        raise ValueError(f"{label} is not a JSON object: {value!r}")
+    actual_keys = set(value)
+    if actual_keys != expected_keys:
+        raise ValueError(
+            f"{label} keys differ: "
+            f"missing={sorted(expected_keys - actual_keys)}, "
+            f"extra={sorted(actual_keys - expected_keys)}"
+        )
+
+exact(("schema_version",), 3)
 exact(("evidence_kind",), "motor_inert_krp2_uart_transport_qualification")
 exact(("passed",), True)
 exact(("serial_by_id_path",), serial_path)
@@ -669,8 +711,10 @@ exact(("receive_startup", "host_input_queue_cleared_before_observation"), True)
 exact(("receive_startup", "initial_unknown_record_prefix_excluded"), True)
 exact(
     ("receive_startup", "post_boundary_decode_policy"),
-    "every complete record after the one initial synchronization delimiter is "
-    "decoded strictly; a framing error fails the run",
+    "startup bytes are raw-discarded for the declared bounded quarantine and "
+    "through one selected delimiter; every subsequent complete record is "
+    "decoded strictly; bounded motor-inert challenge retries do not "
+    "resynchronize the decoder; a framing error fails the run",
 )
 exact(("identity", "controller_uid_hex"), controller_uid)
 exact(("identity", "boot_id"), boot_id)
@@ -712,6 +756,193 @@ exact(("final_idle_safe_heartbeat_received_after_last_write",), True)
 run_id = evidence.get("run_id")
 if type(run_id) is not int or not 0 < run_id < (1 << 64):
     raise ValueError(f"invalid nonzero u64 run ID: {run_id!r}")
+
+freshness_path = ("receive_startup", "freshness_admission")
+freshness = value_at(freshness_path)
+expected_freshness_keys = {
+    "boundary",
+    "challenge",
+    "pre_challenge_reports_discarded",
+    "nonmatching_reports_discarded_before_match",
+    "earlier_attempt_reports_discarded_after_later_challenge",
+    "nonforward_heartbeats_discarded_after_match",
+    "matched_report_request_received_uptime_ms_wrapping",
+    "matched_report_response_prepared_uptime_ms_wrapping",
+    "matched_report_controller_service_ms",
+    "matched_report_host_elapsed_controller_clock_upper_bound_ms",
+    "admitted_heartbeat_delta_after_report_ms",
+    "admitted_heartbeat_host_elapsed_controller_clock_upper_bound_ms",
+}
+exact_object_keys(freshness, "freshness admission", expected_freshness_keys)
+
+boundary_path = freshness_path + ("boundary",)
+boundary = value_at(boundary_path)
+expected_boundary_keys = {
+    "input_quarantine_target_ms",
+    "input_quarantine_elapsed_ns",
+    "input_quarantine_bytes_discarded",
+    "input_quarantine_delimiters_discarded",
+    "boundary_alignment_bytes_discarded_including_delimiter",
+    "strict_record_boundary_established",
+}
+exact_object_keys(boundary, "freshness boundary", expected_boundary_keys)
+exact(boundary_path + ("input_quarantine_target_ms",), 1000)
+bounded_int(
+    boundary_path + ("input_quarantine_elapsed_ns",),
+    1_000_000_000,
+    (1 << 64) - 1,
+)
+for field in (
+    "input_quarantine_bytes_discarded",
+    "input_quarantine_delimiters_discarded",
+):
+    bounded_int(boundary_path + (field,), 0, (1 << 64) - 1)
+bounded_int(
+    boundary_path + ("boundary_alignment_bytes_discarded_including_delimiter",),
+    1,
+    (1 << 64) - 1,
+)
+exact(boundary_path + ("strict_record_boundary_established",), True)
+
+challenge_path = freshness_path + ("challenge",)
+challenge = value_at(challenge_path)
+expected_challenge_keys = {
+    "attempts_written",
+    "attempts",
+    "matched_attempt_index_zero_based",
+}
+exact_object_keys(challenge, "freshness challenge", expected_challenge_keys)
+attempts_written = bounded_int(
+    challenge_path + ("attempts_written",),
+    1,
+    3,
+)
+exact(
+    challenge_path + ("matched_attempt_index_zero_based",),
+    attempts_written - 1,
+)
+attempts = challenge["attempts"]
+if type(attempts) is not list or len(attempts) != 3:
+    raise ValueError(f"expected exactly three freshness-attempt slots: {attempts!r}")
+diagnostic_probe_encoded_bytes = bounded_int(
+    ("wire_load", "diagnostic_probe_encoded_bytes"),
+    1,
+    (1 << 64) - 1,
+)
+expected_attempt_keys = {
+    "run_id",
+    "reserved_sequence",
+    "host_elapsed_ns_token",
+    "encoded_bytes_written",
+}
+for index, attempt in enumerate(attempts):
+    if index >= attempts_written:
+        if attempt is not None:
+            raise ValueError(
+                f"unwritten freshness-attempt slot {index} is not null: {attempt!r}"
+            )
+        continue
+    if type(attempt) is not dict or set(attempt) != expected_attempt_keys:
+        raise ValueError(
+            f"freshness-attempt slot {index} has unexpected shape: {attempt!r}"
+        )
+    attempt_run_id = attempt["run_id"]
+    if type(attempt_run_id) is not int or attempt_run_id != run_id:
+        raise ValueError(
+            f"freshness-attempt slot {index} run ID differs: {attempt_run_id!r}"
+        )
+    expected_sequence = ((1 << 32) - 1) - index
+    attempt_sequence = attempt["reserved_sequence"]
+    if (
+        type(attempt_sequence) is not int
+        or attempt_sequence != expected_sequence
+    ):
+        raise ValueError(
+            f"freshness-attempt slot {index} sequence differs: "
+            f"{attempt_sequence!r}"
+        )
+    token = attempt["host_elapsed_ns_token"]
+    if type(token) is not int or not 0 <= token < (1 << 64):
+        raise ValueError(
+            f"freshness-attempt slot {index} has invalid u64 token: {token!r}"
+        )
+    attempt_encoded_bytes = attempt["encoded_bytes_written"]
+    if (
+        type(attempt_encoded_bytes) is not int
+        or attempt_encoded_bytes != diagnostic_probe_encoded_bytes
+    ):
+        raise ValueError(
+            f"freshness-attempt slot {index} encoded length differs: "
+            f"{attempt_encoded_bytes!r}"
+        )
+
+for field in (
+    "pre_challenge_reports_discarded",
+    "nonmatching_reports_discarded_before_match",
+    "earlier_attempt_reports_discarded_after_later_challenge",
+    "nonforward_heartbeats_discarded_after_match",
+):
+    bounded_int(freshness_path + (field,), 0, (1 << 64) - 1)
+
+request_uptime = bounded_int(
+    freshness_path + ("matched_report_request_received_uptime_ms_wrapping",),
+    0,
+    (1 << 32) - 1,
+)
+response_uptime = bounded_int(
+    freshness_path + ("matched_report_response_prepared_uptime_ms_wrapping",),
+    0,
+    (1 << 32) - 1,
+)
+service_delta = (response_uptime - request_uptime) & ((1 << 32) - 1)
+exact(
+    freshness_path + ("matched_report_controller_service_ms",),
+    service_delta,
+)
+if service_delta >= (1 << 31):
+    raise ValueError(
+        f"freshness service delta is not wrapping-forward: {service_delta!r}"
+    )
+service_host_bound = bounded_int(
+    freshness_path
+    + ("matched_report_host_elapsed_controller_clock_upper_bound_ms",),
+    0,
+    (1 << 64) - 1,
+)
+if service_delta > service_host_bound:
+    raise ValueError(
+        f"freshness service delta exceeds host bound: "
+        f"{service_delta} > {service_host_bound}"
+    )
+
+admitted_heartbeat_uptime = bounded_int(
+    ("identity", "admitted_idle_heartbeat_uptime_ms_wrapping"),
+    0,
+    (1 << 32) - 1,
+)
+heartbeat_delta = (
+    admitted_heartbeat_uptime - response_uptime
+) & ((1 << 32) - 1)
+exact(
+    freshness_path + ("admitted_heartbeat_delta_after_report_ms",),
+    heartbeat_delta,
+)
+if not 0 < heartbeat_delta < (1 << 31):
+    raise ValueError(
+        f"post-report heartbeat delta is not strictly wrapping-forward: "
+        f"{heartbeat_delta!r}"
+    )
+heartbeat_host_bound = bounded_int(
+    freshness_path
+    + ("admitted_heartbeat_host_elapsed_controller_clock_upper_bound_ms",),
+    0,
+    (1 << 64) - 1,
+)
+if heartbeat_delta > heartbeat_host_bound:
+    raise ValueError(
+        f"post-report heartbeat delta exceeds host bound: "
+        f"{heartbeat_delta} > {heartbeat_host_bound}"
+    )
 print("qualified")
 ' \
     "$stem.json" \

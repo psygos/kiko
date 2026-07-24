@@ -2,9 +2,11 @@
 //!
 //! This tool refuses every controller profile that advertises nonzero PWM,
 //! never creates a control session, and writes only
-//! `TransportDiagnosticProbe` records after exact identity and idle-safe-state
-//! admission. Measurements describe this run; they are not performance
-//! improvement claims.
+//! `TransportDiagnosticProbe` records. It uses bounded reserved-sequence
+//! probes to establish a run-bound live round trip after an exact motor-inert
+//! candidate, then begins measured probes only after a nonce echo plus a
+//! post-match-decoded exact Hello and idle-safe Heartbeat. Measurements
+//! describe this run; they are not performance improvement claims.
 
 mod support;
 
@@ -46,7 +48,8 @@ const MAX_PROBES: usize = 3_000;
 const MAX_IN_FLIGHT: usize = 256;
 const WRITER_QUEUE_CAPACITY: usize = 8;
 const COMPLETION_QUEUE_CAPACITY: usize = 32;
-const MIN_ADMISSION_TIMEOUT_MS: u64 = 1;
+const INITIAL_INPUT_QUARANTINE_MS: u64 = 1_000;
+const MIN_ADMISSION_TIMEOUT_MS: u64 = 4_000;
 const MAX_ADMISSION_TIMEOUT_MS: u64 = 30_000;
 const MIN_FINAL_DRAIN_MS: u64 = 100;
 const MAX_FINAL_DRAIN_MS: u64 = 10_000;
@@ -60,6 +63,11 @@ const MAX_DEFERRED_DIAGNOSTIC_REPORTS: usize = MAX_IN_FLIGHT;
 const MAX_ENTROPY_ATTEMPTS: usize = 8;
 const FAILURE_TRACE_BYTES: usize = 8 * 1024;
 const FAILURE_TRACE_DELIMITERS: usize = 64;
+const FRESHNESS_CHALLENGE_SEQUENCE: u32 = u32::MAX;
+const MAX_FRESHNESS_CHALLENGE_ATTEMPTS: usize = 3;
+const FRESHNESS_CHALLENGE_RETRY_MS: u64 = 250;
+const CONTROLLER_CLOCK_RATE_TOLERANCE_PERCENT: u64 = 10;
+const CONTROLLER_CLOCK_FIXED_MARGIN_MS: u64 = 100;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -96,7 +104,9 @@ struct Cli {
     /// integral number of periods at the selected exact rational rate.
     #[arg(long, default_value_t = 10_000, value_parser = parse_duration_ms)]
     duration_ms: u64,
-    /// Deadline for exact Hello plus fresh idle-safe Heartbeat admission.
+    /// One deadline covering input quarantine, exact idle candidate
+    /// observation, a nonce-bound motor-inert freshness challenge, and
+    /// post-match-decoded Hello plus idle-safe Heartbeat admission.
     #[arg(long, default_value_t = 5_000, value_parser = parse_admission_timeout_ms)]
     admission_timeout_ms: u64,
     /// Bounded receive-only drain after the final diagnostic write completes.
@@ -479,15 +489,117 @@ impl ProbePlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ReceivePhaseEvidence {
-    ReadOnlyAdmission,
+    ReadOnlyCandidate,
+    FreshnessAdmission,
     DiagnosticStream,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum HostPayloadWriteBoundary {
-    NotInvokedBeforeAdmissionByProgramStructure,
+    NotInvokedBeforeFreshnessChallengeByProgramStructure,
+    OneToThreeMotorInertFreshnessChallengesWritten,
     PossibleBeforeFailureNotQuantified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct FreshnessBoundaryEvidence {
+    input_quarantine_target_ms: u64,
+    input_quarantine_elapsed_ns: u64,
+    input_quarantine_bytes_discarded: usize,
+    input_quarantine_delimiters_discarded: usize,
+    boundary_alignment_bytes_discarded_including_delimiter: usize,
+    strict_record_boundary_established: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct FreshnessChallengeAttemptEvidence {
+    run_id: u64,
+    reserved_sequence: u32,
+    host_elapsed_ns_token: u64,
+    encoded_bytes_written: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct FreshnessChallengeEvidence {
+    attempts_written: usize,
+    attempts: [Option<FreshnessChallengeAttemptEvidence>; MAX_FRESHNESS_CHALLENGE_ATTEMPTS],
+    matched_attempt_index_zero_based: Option<usize>,
+}
+
+impl FreshnessChallengeEvidence {
+    const fn new() -> Self {
+        Self {
+            attempts_written: 0,
+            attempts: [None; MAX_FRESHNESS_CHALLENGE_ATTEMPTS],
+            matched_attempt_index_zero_based: None,
+        }
+    }
+
+    fn record_written(
+        &mut self,
+        attempt: FreshnessChallengeAttemptEvidence,
+    ) -> Result<(), QualificationError> {
+        let Some(slot) = self.attempts.get_mut(self.attempts_written) else {
+            return Err(
+                QualificationError::FreshnessChallengeAttemptBudgetExceeded {
+                    maximum: MAX_FRESHNESS_CHALLENGE_ATTEMPTS,
+                },
+            );
+        };
+        *slot = Some(attempt);
+        self.attempts_written += 1;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct FreshnessAdmissionEvidence {
+    boundary: FreshnessBoundaryEvidence,
+    challenge: FreshnessChallengeEvidence,
+    pre_challenge_reports_discarded: usize,
+    nonmatching_reports_discarded_before_match: usize,
+    earlier_attempt_reports_discarded_after_later_challenge: usize,
+    nonforward_heartbeats_discarded_after_match: usize,
+    matched_report_request_received_uptime_ms_wrapping: u32,
+    matched_report_response_prepared_uptime_ms_wrapping: u32,
+    matched_report_controller_service_ms: u32,
+    matched_report_host_elapsed_controller_clock_upper_bound_ms: u64,
+    admitted_heartbeat_delta_after_report_ms: u32,
+    admitted_heartbeat_host_elapsed_controller_clock_upper_bound_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionStage {
+    InputQuarantine,
+    RecordBoundaryAlignment,
+    ReadOnlyCandidate,
+    FreshnessChallenge,
+    PostMatchLiveness,
+}
+
+impl fmt::Display for AdmissionStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InputQuarantine => "input_quarantine",
+            Self::RecordBoundaryAlignment => "record_boundary_alignment",
+            Self::ReadOnlyCandidate => "read_only_candidate",
+            Self::FreshnessChallenge => "freshness_challenge",
+            Self::PostMatchLiveness => "post_match_liveness",
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AdmissionTimeoutEvidence {
+    timeout_ms: u64,
+    stage: AdmissionStage,
+    initial_record_boundary_observed: bool,
+    stage_hello_observed: bool,
+    stage_idle_safe_heartbeat_observed: bool,
+    challenge_report_matched: bool,
+    freshness_boundary: Option<FreshnessBoundaryEvidence>,
+    freshness_challenge: Option<FreshnessChallengeEvidence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -496,6 +608,8 @@ struct QualifierWireFailureEvidence {
     evidence_kind: &'static str,
     receive_phase: ReceivePhaseEvidence,
     host_payload_write_boundary: HostPayloadWriteBoundary,
+    freshness_boundary: FreshnessBoundaryEvidence,
+    freshness_challenge: Option<FreshnessChallengeEvidence>,
     total_bytes_delivered_after_host_input_clear_through_failing_read: usize,
     total_bytes_decoder_processed_through_failure: usize,
     current_read_bytes_delivered: usize,
@@ -548,12 +662,7 @@ enum QualificationError {
         wire: Box<QualifierWireFailureEvidence>,
     },
     Encode(UartEncodeError),
-    AdmissionTimeout {
-        timeout_ms: u64,
-        initial_record_boundary_observed: bool,
-        saw_hello: bool,
-        saw_idle_heartbeat: bool,
-    },
+    AdmissionTimeout(Box<AdmissionTimeoutEvidence>),
     ByteBudgetExceeded {
         maximum: usize,
     },
@@ -578,12 +687,22 @@ enum QualificationError {
     HostDirectionMessageFromController {
         kind: robot_protocol::v2::MessageKind,
     },
-    StaleDiagnosticReportBeforeProbe,
+    RepeatedFreshnessTupleAfterMatch,
+    FreshnessChallengeAttemptBudgetExceeded {
+        maximum: usize,
+    },
+    FreshnessChallengeStateInconsistent,
     ControllerClockAnomaly {
         stream: &'static str,
         previous_ms: u32,
         current_ms: u32,
     },
+    ControllerClockHostBoundExceeded {
+        stream: &'static str,
+        controller_delta_ms: u32,
+        host_elapsed_upper_bound_ms: u64,
+    },
+    UnexpectedDiagnosticReportAfterFreshnessMatch,
     ScheduleInstantOverflow,
     HostDurationOutsideU64,
     SequenceOutsideU32 {
@@ -694,14 +813,21 @@ impl fmt::Display for QualificationError {
                 formatter.write_str(&encoded)
             }
             Self::Encode(source) => write!(formatter, "bounded KRP2 encode failed: {source}"),
-            Self::AdmissionTimeout {
-                timeout_ms,
-                initial_record_boundary_observed,
-                saw_hello,
-                saw_idle_heartbeat,
-            } => write!(
+            Self::AdmissionTimeout(evidence) => write!(
                 formatter,
-                "admission timed out after {timeout_ms} ms (initial_record_boundary={initial_record_boundary_observed}, hello={saw_hello}, idle_safe_heartbeat={saw_idle_heartbeat})"
+                "admission timed out after {} ms in {} \
+                 (initial_record_boundary={}, stage_hello_observed={}, \
+                 stage_idle_safe_heartbeat_observed={}, \
+                 challenge_report_matched={}, freshness_boundary={:?}, \
+                 freshness_challenge={:?})",
+                evidence.timeout_ms,
+                evidence.stage,
+                evidence.initial_record_boundary_observed,
+                evidence.stage_hello_observed,
+                evidence.stage_idle_safe_heartbeat_observed,
+                evidence.challenge_report_matched,
+                evidence.freshness_boundary,
+                evidence.freshness_challenge,
             ),
             Self::ByteBudgetExceeded { maximum } => {
                 write!(formatter, "serial byte budget {maximum} exceeded")
@@ -733,9 +859,17 @@ impl fmt::Display for QualificationError {
                     "controller emitted host-direction message {kind:?}"
                 )
             }
-            Self::StaleDiagnosticReportBeforeProbe => {
-                formatter.write_str("diagnostic report arrived before this run sent any probe")
-            }
+            Self::RepeatedFreshnessTupleAfterMatch => formatter.write_str(
+                "another diagnostic report carried the already-matched freshness \
+                 run/sequence/token tuple",
+            ),
+            Self::FreshnessChallengeAttemptBudgetExceeded { maximum } => write!(
+                formatter,
+                "freshness challenge attempt budget {maximum} exceeded"
+            ),
+            Self::FreshnessChallengeStateInconsistent => formatter.write_str(
+                "internal freshness challenge state is inconsistent with recorded writes",
+            ),
             Self::ControllerClockAnomaly {
                 stream,
                 previous_ms,
@@ -743,6 +877,18 @@ impl fmt::Display for QualificationError {
             } => write!(
                 formatter,
                 "{stream} controller clock is non-forward in wrapping half-range ({previous_ms} -> {current_ms})"
+            ),
+            Self::ControllerClockHostBoundExceeded {
+                stream,
+                controller_delta_ms,
+                host_elapsed_upper_bound_ms,
+            } => write!(
+                formatter,
+                "{stream} controller delta {controller_delta_ms} ms exceeds the conservative \
+                 host-elapsed upper bound {host_elapsed_upper_bound_ms} ms"
+            ),
+            Self::UnexpectedDiagnosticReportAfterFreshnessMatch => formatter.write_str(
+                "an additional diagnostic report arrived after the freshness match",
             ),
             Self::ScheduleInstantOverflow => formatter.write_str("host schedule instant overflow"),
             Self::HostDurationOutsideU64 => {
@@ -862,9 +1008,17 @@ trait ReceivePhase {
 struct AdmissionReceive;
 
 impl ReceivePhase for AdmissionReceive {
-    const EVIDENCE: ReceivePhaseEvidence = ReceivePhaseEvidence::ReadOnlyAdmission;
+    const EVIDENCE: ReceivePhaseEvidence = ReceivePhaseEvidence::ReadOnlyCandidate;
     const HOST_PAYLOAD_WRITE_BOUNDARY: HostPayloadWriteBoundary =
-        HostPayloadWriteBoundary::NotInvokedBeforeAdmissionByProgramStructure;
+        HostPayloadWriteBoundary::NotInvokedBeforeFreshnessChallengeByProgramStructure;
+}
+
+struct FreshnessAdmissionReceive;
+
+impl ReceivePhase for FreshnessAdmissionReceive {
+    const EVIDENCE: ReceivePhaseEvidence = ReceivePhaseEvidence::FreshnessAdmission;
+    const HOST_PAYLOAD_WRITE_BOUNDARY: HostPayloadWriteBoundary =
+        HostPayloadWriteBoundary::OneToThreeMotorInertFreshnessChallengesWritten;
 }
 
 struct DiagnosticStreamReceive;
@@ -880,20 +1034,49 @@ struct FramedSerialReader<P> {
     pending: VecDeque<TimedMessage>,
     buffer: [u8; 512],
     observed_bytes: usize,
+    decoder_processed_bytes: usize,
     observed_records: usize,
     wire_trace: WireTrace<FAILURE_TRACE_BYTES, FAILURE_TRACE_DELIMITERS>,
+    freshness_boundary: FreshnessBoundaryEvidence,
+    freshness_challenge: Option<FreshnessChallengeEvidence>,
     phase: PhantomData<P>,
 }
 
 impl FramedSerialReader<AdmissionReceive> {
+    #[cfg(test)]
     fn new() -> Self {
         Self {
             decoder: UartStreamDecoder::new_at_unknown_record_offset(),
             pending: VecDeque::new(),
             buffer: [0; 512],
             observed_bytes: 0,
+            decoder_processed_bytes: 0,
             observed_records: 0,
             wire_trace: WireTrace::new(),
+            freshness_boundary: FreshnessBoundaryEvidence {
+                input_quarantine_target_ms: 0,
+                input_quarantine_elapsed_ns: 0,
+                input_quarantine_bytes_discarded: 0,
+                input_quarantine_delimiters_discarded: 0,
+                boundary_alignment_bytes_discarded_including_delimiter: 1,
+                strict_record_boundary_established: false,
+            },
+            freshness_challenge: None,
+            phase: PhantomData,
+        }
+    }
+
+    fn from_established_boundary(boundary: EstablishedFreshnessBoundary) -> Self {
+        Self {
+            decoder: UartStreamDecoder::new(),
+            pending: VecDeque::new(),
+            buffer: [0; 512],
+            observed_bytes: boundary.wire_trace.total_bytes(),
+            decoder_processed_bytes: 0,
+            observed_records: 0,
+            wire_trace: boundary.wire_trace,
+            freshness_boundary: boundary.evidence,
+            freshness_challenge: None,
             phase: PhantomData,
         }
     }
@@ -902,6 +1085,24 @@ impl FramedSerialReader<AdmissionReceive> {
 impl<P: ReceivePhase> FramedSerialReader<P> {
     const fn initial_record_boundary_observed(&self) -> bool {
         !self.decoder.is_waiting_for_initial_boundary()
+    }
+
+    fn transition<Q: ReceivePhase>(
+        self,
+        freshness_challenge: Option<FreshnessChallengeEvidence>,
+    ) -> FramedSerialReader<Q> {
+        FramedSerialReader {
+            decoder: self.decoder,
+            pending: self.pending,
+            buffer: self.buffer,
+            observed_bytes: self.observed_bytes,
+            decoder_processed_bytes: self.decoder_processed_bytes,
+            observed_records: self.observed_records,
+            wire_trace: self.wire_trace,
+            freshness_boundary: self.freshness_boundary,
+            freshness_challenge,
+            phase: PhantomData,
+        }
     }
 
     async fn next<R>(&mut self, reader: &mut R) -> Result<TimedMessage, QualificationError>
@@ -930,6 +1131,11 @@ impl<P: ReceivePhase> FramedSerialReader<P> {
                 });
             }
             for (index, &byte) in self.buffer[..count].iter().enumerate() {
+                self.decoder_processed_bytes = self.decoder_processed_bytes.checked_add(1).ok_or(
+                    QualificationError::ByteBudgetExceeded {
+                        maximum: MAX_OBSERVED_BYTES,
+                    },
+                )?;
                 let completed_nonzero_run = self.wire_trace.observe(byte);
                 let was_waiting_for_initial_boundary =
                     self.decoder.is_waiting_for_initial_boundary();
@@ -955,8 +1161,7 @@ impl<P: ReceivePhase> FramedSerialReader<P> {
                 let message = match decoded {
                     Ok(message) => message,
                     Err(source) => {
-                        let first_failure_after_processed_byte_count =
-                            self.wire_trace.total_bytes();
+                        let first_failure_after_processed_byte_count = self.decoder_processed_bytes;
                         let nonzero_run_bytes_at_first_decode_failure = completed_nonzero_run
                             .unwrap_or_else(|| self.wire_trace.current_nonzero_run());
                         let current_read_bytes_decoder_processed_through_failure = index
@@ -992,6 +1197,8 @@ impl<P: ReceivePhase> FramedSerialReader<P> {
                                     "motor_inert_krp2_qualifier_decode_failure_wire_trace",
                                 receive_phase: P::EVIDENCE,
                                 host_payload_write_boundary: P::HOST_PAYLOAD_WRITE_BOUNDARY,
+                                freshness_boundary: self.freshness_boundary,
+                                freshness_challenge: self.freshness_challenge,
                                 total_bytes_delivered_after_host_input_clear_through_failing_read:
                                     snapshot.total_bytes,
                                 total_bytes_decoder_processed_through_failure:
@@ -1023,7 +1230,7 @@ impl<P: ReceivePhase> FramedSerialReader<P> {
                                 retained_start_offset_zero_based: snapshot.retained_start_offset,
                                 retained_bytes_hex: encode_hex(&snapshot.retained_bytes),
                                 evidence_boundary:
-                                    "failure-only host observation after one input-queue clear; the canonical decoder stopped at the first strict failure; any later bytes were already delivered by that same bounded read and were traced but not decoded; no additional serial read, retry, resynchronization, or decoder recovery was performed for this evidence; the program invokes no host-payload write before admission, and creates the split write half and writer task only afterward, while a diagnostic-stream failure may follow payload writes not quantified here; retained hex is a bounded suffix and FNV-1a is a non-cryptographic fingerprint",
+                                    "failure-only host observation after one input-queue clear, a bounded startup quarantine, and explicit delimiter alignment; startup-discarded bytes are included in the global byte trace but were never decoded; the strict canonical decoder stopped at its first post-boundary failure; any later bytes were already delivered by that same bounded read and were traced but not decoded; no additional serial read, resynchronization, or decoder recovery was performed after the strict boundary; before a match, only the explicitly recorded bounded motor-inert freshness attempts may be retried; the phase tag states whether no host payload, one to three recorded motor-inert freshness challenges, or an unquantified number of benchmark diagnostics may precede the failure; retained hex is a bounded suffix and FNV-1a is a non-cryptographic fingerprint",
                             }),
                         });
                     }
@@ -1043,6 +1250,159 @@ impl<P: ReceivePhase> FramedSerialReader<P> {
                     received_at: Instant::now(),
                 });
             }
+        }
+    }
+}
+
+struct EstablishedFreshnessBoundary {
+    wire_trace: WireTrace<FAILURE_TRACE_BYTES, FAILURE_TRACE_DELIMITERS>,
+    evidence: FreshnessBoundaryEvidence,
+}
+
+async fn establish_freshness_boundary<R>(
+    reader: &mut R,
+    admission_started_at: Instant,
+    admission_deadline: Instant,
+    timeout_ms: u64,
+    quarantine_duration: Duration,
+) -> Result<EstablishedFreshnessBoundary, QualificationError>
+where
+    R: AsyncRead + Unpin,
+{
+    let requested_quarantine_deadline = admission_started_at
+        .checked_add(quarantine_duration)
+        .ok_or(QualificationError::ScheduleInstantOverflow)?;
+    let quarantine_deadline = requested_quarantine_deadline.min(admission_deadline);
+    let mut wire_trace = WireTrace::new();
+    let mut buffer = [0_u8; 512];
+    let mut quarantine_bytes = 0_usize;
+    let mut quarantine_delimiters = 0_usize;
+    let input_quarantine_timeout = || {
+        QualificationError::AdmissionTimeout(Box::new(AdmissionTimeoutEvidence {
+            timeout_ms,
+            stage: AdmissionStage::InputQuarantine,
+            initial_record_boundary_observed: false,
+            stage_hello_observed: false,
+            stage_idle_safe_heartbeat_observed: false,
+            challenge_report_matched: false,
+            freshness_boundary: None,
+            freshness_challenge: None,
+        }))
+    };
+
+    loop {
+        tokio::task::yield_now().await;
+        if Instant::now() >= quarantine_deadline {
+            if quarantine_deadline == admission_deadline {
+                return Err(input_quarantine_timeout());
+            }
+            break;
+        }
+        let count =
+            match tokio::time::timeout_at(quarantine_deadline, reader.read(&mut buffer)).await {
+                Ok(Ok(0)) => return Err(QualificationError::SerialEof),
+                Ok(Ok(count)) => count,
+                Ok(Err(source)) => return Err(QualificationError::Read(source)),
+                Err(_) if quarantine_deadline == admission_deadline => {
+                    return Err(input_quarantine_timeout());
+                }
+                Err(_) => break,
+            };
+        quarantine_bytes =
+            quarantine_bytes
+                .checked_add(count)
+                .ok_or(QualificationError::ByteBudgetExceeded {
+                    maximum: MAX_OBSERVED_BYTES,
+                })?;
+        if quarantine_bytes > MAX_OBSERVED_BYTES {
+            return Err(QualificationError::ByteBudgetExceeded {
+                maximum: MAX_OBSERVED_BYTES,
+            });
+        }
+        for &byte in &buffer[..count] {
+            if wire_trace.observe(byte).is_some() {
+                quarantine_delimiters = quarantine_delimiters.checked_add(1).ok_or(
+                    QualificationError::RecordBudgetExceeded {
+                        maximum: MAX_OBSERVED_RECORDS,
+                    },
+                )?;
+            }
+        }
+    }
+
+    let quarantine_elapsed = Instant::now()
+        .checked_duration_since(admission_started_at)
+        .ok_or(QualificationError::HostDurationOutsideU64)?;
+    let quarantine_target_ms = u64::try_from(quarantine_duration.as_millis())
+        .map_err(|_| QualificationError::HostDurationOutsideU64)?;
+    let quarantine_elapsed_ns = duration_ns_u64(quarantine_elapsed)?;
+    let mut alignment_bytes = 0_usize;
+    let alignment_timeout = |alignment_bytes, boundary_observed| {
+        QualificationError::AdmissionTimeout(Box::new(AdmissionTimeoutEvidence {
+            timeout_ms,
+            stage: AdmissionStage::RecordBoundaryAlignment,
+            initial_record_boundary_observed: boundary_observed,
+            stage_hello_observed: false,
+            stage_idle_safe_heartbeat_observed: false,
+            challenge_report_matched: false,
+            freshness_boundary: Some(FreshnessBoundaryEvidence {
+                input_quarantine_target_ms: quarantine_target_ms,
+                input_quarantine_elapsed_ns: quarantine_elapsed_ns,
+                input_quarantine_bytes_discarded: quarantine_bytes,
+                input_quarantine_delimiters_discarded: quarantine_delimiters,
+                boundary_alignment_bytes_discarded_including_delimiter: alignment_bytes,
+                strict_record_boundary_established: boundary_observed,
+            }),
+            freshness_challenge: None,
+        }))
+    };
+    loop {
+        tokio::task::yield_now().await;
+        if Instant::now() >= admission_deadline {
+            return Err(alignment_timeout(alignment_bytes, false));
+        }
+        let mut byte = [0_u8; 1];
+        let count = tokio::time::timeout_at(admission_deadline, reader.read(&mut byte))
+            .await
+            .map_err(|_| alignment_timeout(alignment_bytes, false))?
+            .map_err(QualificationError::Read)?;
+        if count == 0 {
+            return Err(QualificationError::SerialEof);
+        }
+        alignment_bytes =
+            alignment_bytes
+                .checked_add(1)
+                .ok_or(QualificationError::ByteBudgetExceeded {
+                    maximum: MAX_OBSERVED_BYTES,
+                })?;
+        let total_bytes = quarantine_bytes.checked_add(alignment_bytes).ok_or(
+            QualificationError::ByteBudgetExceeded {
+                maximum: MAX_OBSERVED_BYTES,
+            },
+        )?;
+        if total_bytes > MAX_OBSERVED_BYTES {
+            return Err(QualificationError::ByteBudgetExceeded {
+                maximum: MAX_OBSERVED_BYTES,
+            });
+        }
+        let completed_run = wire_trace.observe(byte[0]);
+        if Instant::now() >= admission_deadline {
+            return Err(alignment_timeout(alignment_bytes, byte[0] == 0));
+        }
+        if byte[0] == 0 {
+            debug_assert!(completed_run.is_some());
+            wire_trace.note_initial_synchronization_delimiter();
+            return Ok(EstablishedFreshnessBoundary {
+                wire_trace,
+                evidence: FreshnessBoundaryEvidence {
+                    input_quarantine_target_ms: quarantine_target_ms,
+                    input_quarantine_elapsed_ns: quarantine_elapsed_ns,
+                    input_quarantine_bytes_discarded: quarantine_bytes,
+                    input_quarantine_delimiters_discarded: quarantine_delimiters,
+                    boundary_alignment_bytes_discarded_including_delimiter: alignment_bytes,
+                    strict_record_boundary_established: true,
+                },
+            });
         }
     }
 }
@@ -1105,6 +1465,7 @@ struct Admission {
     heartbeat: Heartbeat,
     hello_received_at: Instant,
     heartbeat_received_at: Instant,
+    freshness: FreshnessAdmissionEvidence,
 }
 
 struct AdmittedController {
@@ -1112,91 +1473,560 @@ struct AdmittedController {
     framed: FramedSerialReader<DiagnosticStreamReceive>,
 }
 
-async fn admit_controller<R>(
-    reader: &mut R,
-    mut framed: FramedSerialReader<AdmissionReceive>,
+#[derive(Clone, Copy)]
+struct AdmissionParameters {
     exact: ExactController,
     timeout_ms: u64,
+    run_id: TransportDiagnosticRunId,
+    serial_write_timeout: SerialWriteTimeout,
+    quarantine_duration: Duration,
+    challenge_retry_interval: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct FreshnessChallenge {
+    run_id: TransportDiagnosticRunId,
+    sequence: TransportDiagnosticSequence,
+    token: HostElapsedNsToken,
+    record: UartRecord,
+    created_at: Instant,
+}
+
+impl FreshnessChallenge {
+    fn new(
+        exact: ExactController,
+        run_id: TransportDiagnosticRunId,
+        attempt_index: usize,
+        token: HostElapsedNsToken,
+        created_at: Instant,
+    ) -> Result<Self, QualificationError> {
+        let attempt_offset =
+            u32::try_from(attempt_index).map_err(|_| QualificationError::SequenceOutsideU32 {
+                index: attempt_index,
+            })?;
+        let sequence_value = FRESHNESS_CHALLENGE_SEQUENCE
+            .checked_sub(attempt_offset)
+            .ok_or(
+                QualificationError::FreshnessChallengeAttemptBudgetExceeded {
+                    maximum: MAX_FRESHNESS_CHALLENGE_ATTEMPTS,
+                },
+            )?;
+        let sequence = TransportDiagnosticSequence::new(sequence_value);
+        let record = UartRecord::encode(Message::TransportDiagnosticProbe(
+            TransportDiagnosticProbe::new(exact.uid, exact.boot_id, run_id, sequence, token),
+        ))
+        .map_err(QualificationError::Encode)?;
+        Ok(Self {
+            run_id,
+            sequence,
+            token,
+            record,
+            created_at,
+        })
+    }
+
+    fn evidence(self) -> FreshnessChallengeAttemptEvidence {
+        FreshnessChallengeAttemptEvidence {
+            run_id: self.run_id.get(),
+            reserved_sequence: self.sequence.get(),
+            host_elapsed_ns_token: self.token.get(),
+            encoded_bytes_written: self.record.len(),
+        }
+    }
+
+    fn matches(self, report: TransportDiagnosticReport) -> bool {
+        report.run_id == self.run_id
+            && report.sequence == self.sequence
+            && report.host_elapsed_ns_token == self.token
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MatchedFreshnessReport {
+    report: TransportDiagnosticReport,
+    challenge: FreshnessChallenge,
+    controller_service_ms: u32,
+    host_elapsed_upper_bound_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PostMatchHeartbeat {
+    heartbeat: Heartbeat,
+    received_at: Instant,
+    controller_delta_after_report_ms: u32,
+    host_elapsed_upper_bound_ms: u64,
+}
+
+fn admission_timeout(
+    timeout_ms: u64,
+    stage: AdmissionStage,
+    framed: &FramedSerialReader<impl ReceivePhase>,
+    saw_hello: bool,
+    saw_idle_heartbeat: bool,
+    challenge_report_matched: bool,
+) -> QualificationError {
+    QualificationError::AdmissionTimeout(Box::new(AdmissionTimeoutEvidence {
+        timeout_ms,
+        stage,
+        initial_record_boundary_observed: framed.initial_record_boundary_observed(),
+        stage_hello_observed: saw_hello,
+        stage_idle_safe_heartbeat_observed: saw_idle_heartbeat,
+        challenge_report_matched,
+        freshness_boundary: Some(framed.freshness_boundary),
+        freshness_challenge: framed.freshness_challenge,
+    }))
+}
+
+async fn admit_controller<S>(
+    serial: &mut S,
+    parameters: AdmissionParameters,
     clocks: &mut ControllerClockTrackers,
 ) -> Result<AdmittedController, QualificationError>
 where
-    R: AsyncRead + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    let deadline = Instant::now()
+    let AdmissionParameters {
+        exact,
+        timeout_ms,
+        run_id,
+        serial_write_timeout,
+        quarantine_duration,
+        challenge_retry_interval,
+    } = parameters;
+    let admission_started_at = Instant::now();
+    let deadline = admission_started_at
         .checked_add(Duration::from_millis(timeout_ms))
         .ok_or(QualificationError::ScheduleInstantOverflow)?;
+    let boundary = establish_freshness_boundary(
+        serial,
+        admission_started_at,
+        deadline,
+        timeout_ms,
+        quarantine_duration,
+    )
+    .await?;
+    let mut framed = FramedSerialReader::from_established_boundary(boundary);
     let mut hello = None;
     let mut heartbeat = None;
-    let mut hello_received_at = None;
-    let mut heartbeat_received_at = None;
     let mut saw_idle_heartbeat = false;
-    loop {
-        if let (
-            Some(hello),
-            Some(admitted_heartbeat),
-            Some(hello_received_at),
-            Some(admitted_heartbeat_received_at),
-        ) = (hello, heartbeat, hello_received_at, heartbeat_received_at)
-        {
-            if admission_heartbeat_is_fresh(hello, admitted_heartbeat_received_at, Instant::now()) {
-                return Ok(AdmittedController {
-                    admission: Admission {
-                        hello,
-                        heartbeat: admitted_heartbeat,
-                        hello_received_at,
-                        heartbeat_received_at: admitted_heartbeat_received_at,
-                    },
-                    framed: FramedSerialReader {
-                        decoder: framed.decoder,
-                        pending: framed.pending,
-                        buffer: framed.buffer,
-                        observed_bytes: framed.observed_bytes,
-                        observed_records: framed.observed_records,
-                        wire_trace: framed.wire_trace,
-                        phase: PhantomData,
-                    },
-                });
-            }
-            heartbeat = None;
-            heartbeat_received_at = None;
-        }
-        let timed = tokio::time::timeout_at(deadline, framed.next(reader))
-            .await
-            .map_err(|_| QualificationError::AdmissionTimeout {
+    let mut pre_challenge_reports_discarded = 0_usize;
+
+    while hello.is_none() || heartbeat.is_none() {
+        tokio::task::yield_now().await;
+        if Instant::now() >= deadline {
+            return Err(admission_timeout(
                 timeout_ms,
-                initial_record_boundary_observed: framed.initial_record_boundary_observed(),
-                saw_hello: hello.is_some(),
+                AdmissionStage::ReadOnlyCandidate,
+                &framed,
+                hello.is_some(),
                 saw_idle_heartbeat,
+                false,
+            ));
+        }
+        let timed = tokio::time::timeout_at(deadline, framed.next(serial))
+            .await
+            .map_err(|_| {
+                admission_timeout(
+                    timeout_ms,
+                    AdmissionStage::ReadOnlyCandidate,
+                    &framed,
+                    hello.is_some(),
+                    saw_idle_heartbeat,
+                    false,
+                )
             })??;
+        if Instant::now() >= deadline {
+            return Err(admission_timeout(
+                timeout_ms,
+                AdmissionStage::ReadOnlyCandidate,
+                &framed,
+                hello.is_some(),
+                saw_idle_heartbeat,
+                false,
+            ));
+        }
         match timed.message {
             Message::ControllerHello(value) => {
-                validate_hello(exact, value)?;
-                hello = Some(value);
-                hello_received_at = Some(timed.received_at);
+                if validate_hello(exact, value).is_ok() {
+                    hello = Some(value);
+                }
             }
             Message::Heartbeat(value) => {
-                validate_idle_heartbeat(exact, value)?;
-                clocks.heartbeat.observe(value.controller_uptime.get())?;
-                saw_idle_heartbeat = true;
-                heartbeat = Some(value);
-                heartbeat_received_at = Some(timed.received_at);
-            }
-            Message::ObservationalOdometry(value) => {
-                validate_idle_odometry(exact, value)?;
-                clocks
-                    .odometry_measurement
-                    .observe(value.controller_uptime.get())?;
+                if validate_idle_heartbeat(exact, value).is_ok() {
+                    saw_idle_heartbeat = true;
+                    heartbeat = Some(value);
+                }
             }
             Message::TransportDiagnosticReport(_) => {
-                return Err(QualificationError::StaleDiagnosticReportBeforeProbe);
+                pre_challenge_reports_discarded = pre_challenge_reports_discarded
+                    .checked_add(1)
+                    .ok_or(QualificationError::RecordBudgetExceeded {
+                        maximum: MAX_OBSERVED_RECORDS,
+                    })?;
+            }
+            Message::ObservationalOdometry(_)
+            | Message::ControllerReady(_)
+            | Message::AppliedResult(_)
+            | Message::HostStopResult(_)
+            | Message::AcquireResult(_)
+            | Message::HostCommandResult(_)
+            | Message::StatusReport(_)
+            | Message::AcquireControl(_)
+            | Message::HostCommand(_)
+            | Message::HostStop(_)
+            | Message::StatusQuery(_)
+            | Message::BeginSession(_)
+            | Message::ApplyPwm(_)
+            | Message::ForceStop(_)
+            | Message::TransportDiagnosticProbe(_) => {}
+        }
+    }
+
+    if Instant::now() >= deadline {
+        return Err(admission_timeout(
+            timeout_ms,
+            AdmissionStage::FreshnessChallenge,
+            &framed,
+            false,
+            false,
+            false,
+        ));
+    }
+    let mut challenges = [None; MAX_FRESHNESS_CHALLENGE_ATTEMPTS];
+    let mut challenge_evidence = FreshnessChallengeEvidence::new();
+    let challenge_created_at = Instant::now();
+    let challenge_token = HostElapsedNsToken::new(duration_ns_u64(
+        challenge_created_at
+            .checked_duration_since(admission_started_at)
+            .ok_or(QualificationError::HostDurationOutsideU64)?,
+    )?);
+    let first_challenge =
+        FreshnessChallenge::new(exact, run_id, 0, challenge_token, challenge_created_at)?;
+    tokio::time::timeout_at(
+        deadline,
+        write_and_flush_within(
+            serial,
+            first_challenge.record.as_bytes(),
+            serial_write_timeout,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        admission_timeout(
+            timeout_ms,
+            AdmissionStage::FreshnessChallenge,
+            &framed,
+            false,
+            false,
+            false,
+        )
+    })?
+    .map_err(WriterFailure::into_qualification)?;
+    challenge_evidence.record_written(first_challenge.evidence())?;
+    challenges[0] = Some(first_challenge);
+    let mut framed = framed.transition::<FreshnessAdmissionReceive>(Some(challenge_evidence));
+    let mut next_retry_at = Instant::now()
+        .checked_add(challenge_retry_interval)
+        .ok_or(QualificationError::ScheduleInstantOverflow)?;
+    let mut matched_report: Option<MatchedFreshnessReport> = None;
+    let mut post_match_hello: Option<(ControllerHello, Instant)> = None;
+    let mut post_match_heartbeat: Option<PostMatchHeartbeat> = None;
+    let mut nonmatching_reports_discarded = 0_usize;
+    let mut earlier_attempt_reports_discarded = 0_usize;
+    let mut nonforward_heartbeats_discarded = 0_usize;
+
+    loop {
+        tokio::task::yield_now().await;
+        let stage = if matched_report.is_some() {
+            AdmissionStage::PostMatchLiveness
+        } else {
+            AdmissionStage::FreshnessChallenge
+        };
+        if Instant::now() >= deadline {
+            return Err(admission_timeout(
+                timeout_ms,
+                stage,
+                &framed,
+                post_match_hello.is_some(),
+                post_match_heartbeat.is_some(),
+                matched_report.is_some(),
+            ));
+        }
+        if let (Some(matched), Some((hello, hello_received_at)), Some(post_heartbeat), true) = (
+            matched_report,
+            post_match_hello,
+            post_match_heartbeat,
+            framed.pending.is_empty(),
+        ) {
+            if !heartbeat_within_watchdog_bound(hello, post_heartbeat.received_at, Instant::now()) {
+                post_match_heartbeat = None;
+                continue;
+            }
+            clocks
+                .diagnostic_request_received
+                .observe(matched.report.request_received_at.get())?;
+            clocks
+                .diagnostic_response_prepared
+                .observe(matched.report.response_prepared_at.get())?;
+            clocks
+                .heartbeat
+                .observe(post_heartbeat.heartbeat.controller_uptime.get())?;
+            let freshness = FreshnessAdmissionEvidence {
+                boundary: framed.freshness_boundary,
+                challenge: challenge_evidence,
+                pre_challenge_reports_discarded,
+                nonmatching_reports_discarded_before_match: nonmatching_reports_discarded,
+                earlier_attempt_reports_discarded_after_later_challenge:
+                    earlier_attempt_reports_discarded,
+                nonforward_heartbeats_discarded_after_match: nonforward_heartbeats_discarded,
+                matched_report_request_received_uptime_ms_wrapping: matched
+                    .report
+                    .request_received_at
+                    .get(),
+                matched_report_response_prepared_uptime_ms_wrapping: matched
+                    .report
+                    .response_prepared_at
+                    .get(),
+                matched_report_controller_service_ms: matched.controller_service_ms,
+                matched_report_host_elapsed_controller_clock_upper_bound_ms: matched
+                    .host_elapsed_upper_bound_ms,
+                admitted_heartbeat_delta_after_report_ms: post_heartbeat
+                    .controller_delta_after_report_ms,
+                admitted_heartbeat_host_elapsed_controller_clock_upper_bound_ms: post_heartbeat
+                    .host_elapsed_upper_bound_ms,
+            };
+            return Ok(AdmittedController {
+                admission: Admission {
+                    hello,
+                    heartbeat: post_heartbeat.heartbeat,
+                    hello_received_at,
+                    heartbeat_received_at: post_heartbeat.received_at,
+                    freshness,
+                },
+                framed: framed.transition::<DiagnosticStreamReceive>(Some(challenge_evidence)),
+            });
+        }
+
+        let retry_is_available = matched_report.is_none()
+            && challenge_evidence.attempts_written < MAX_FRESHNESS_CHALLENGE_ATTEMPTS
+            && next_retry_at < deadline;
+        let receive_deadline = if retry_is_available {
+            next_retry_at
+        } else {
+            deadline
+        };
+        let timed = if retry_is_available && Instant::now() >= next_retry_at {
+            None
+        } else {
+            match tokio::time::timeout_at(receive_deadline, framed.next(serial)).await {
+                Ok(result) => Some(result?),
+                Err(_) if retry_is_available => None,
+                Err(_) => {
+                    return Err(admission_timeout(
+                        timeout_ms,
+                        stage,
+                        &framed,
+                        post_match_hello.is_some(),
+                        post_match_heartbeat.is_some(),
+                        matched_report.is_some(),
+                    ));
+                }
+            }
+        };
+        let Some(timed) = timed else {
+            if Instant::now() >= deadline {
+                return Err(admission_timeout(
+                    timeout_ms,
+                    stage,
+                    &framed,
+                    post_match_hello.is_some(),
+                    post_match_heartbeat.is_some(),
+                    matched_report.is_some(),
+                ));
+            }
+            let attempt_index = challenge_evidence.attempts_written;
+            let challenge_created_at = Instant::now();
+            let token = HostElapsedNsToken::new(duration_ns_u64(
+                challenge_created_at
+                    .checked_duration_since(admission_started_at)
+                    .ok_or(QualificationError::HostDurationOutsideU64)?,
+            )?);
+            let challenge =
+                FreshnessChallenge::new(exact, run_id, attempt_index, token, challenge_created_at)?;
+            tokio::time::timeout_at(
+                deadline,
+                write_and_flush_within(serial, challenge.record.as_bytes(), serial_write_timeout),
+            )
+            .await
+            .map_err(|_| {
+                admission_timeout(
+                    timeout_ms,
+                    AdmissionStage::FreshnessChallenge,
+                    &framed,
+                    post_match_hello.is_some(),
+                    post_match_heartbeat.is_some(),
+                    false,
+                )
+            })?
+            .map_err(WriterFailure::into_qualification)?;
+            challenge_evidence.record_written(challenge.evidence())?;
+            challenges[attempt_index] = Some(challenge);
+            framed.freshness_challenge = Some(challenge_evidence);
+            next_retry_at = Instant::now()
+                .checked_add(challenge_retry_interval)
+                .ok_or(QualificationError::ScheduleInstantOverflow)?;
+            continue;
+        };
+        if Instant::now() >= deadline {
+            return Err(admission_timeout(
+                timeout_ms,
+                stage,
+                &framed,
+                post_match_hello.is_some(),
+                post_match_heartbeat.is_some(),
+                matched_report.is_some(),
+            ));
+        }
+        match timed.message {
+            Message::ControllerHello(value) => {
+                if matched_report.is_some() {
+                    validate_hello(exact, value)?;
+                    post_match_hello = Some((value, timed.received_at));
+                }
+            }
+            Message::Heartbeat(value) => {
+                if let Some(matched) = matched_report {
+                    validate_idle_heartbeat(exact, value)?;
+                    let controller_delta = value
+                        .controller_uptime
+                        .wrapping_elapsed_since(matched.report.response_prepared_at);
+                    if controller_uptime_strictly_follows(
+                        value.controller_uptime,
+                        matched.report.response_prepared_at,
+                    ) {
+                        let host_upper_bound = controller_clock_host_upper_bound_ms(
+                            matched.challenge.created_at,
+                            timed.received_at,
+                        )?;
+                        if u64::from(controller_delta) > host_upper_bound {
+                            return Err(QualificationError::ControllerClockHostBoundExceeded {
+                                stream: "post-diagnostic Heartbeat",
+                                controller_delta_ms: controller_delta,
+                                host_elapsed_upper_bound_ms: host_upper_bound,
+                            });
+                        }
+                        post_match_heartbeat = Some(PostMatchHeartbeat {
+                            heartbeat: value,
+                            received_at: timed.received_at,
+                            controller_delta_after_report_ms: controller_delta,
+                            host_elapsed_upper_bound_ms: host_upper_bound,
+                        });
+                    } else {
+                        nonforward_heartbeats_discarded = nonforward_heartbeats_discarded
+                            .checked_add(1)
+                            .ok_or(QualificationError::RecordBudgetExceeded {
+                                maximum: MAX_OBSERVED_RECORDS,
+                            })?;
+                    }
+                }
+            }
+            Message::ObservationalOdometry(value) => {
+                if matched_report.is_some() {
+                    validate_idle_odometry(exact, value)?;
+                }
+            }
+            Message::TransportDiagnosticReport(value) => {
+                if let Some(matched) = matched_report {
+                    return Err(if matched.challenge.matches(value) {
+                        QualificationError::RepeatedFreshnessTupleAfterMatch
+                    } else {
+                        QualificationError::UnexpectedDiagnosticReportAfterFreshnessMatch
+                    });
+                }
+                let matching_attempt = challenges
+                    .iter()
+                    .take(challenge_evidence.attempts_written)
+                    .position(|candidate| {
+                        candidate.is_some_and(|challenge| challenge.matches(value))
+                    });
+                let Some(matching_attempt) = matching_attempt else {
+                    nonmatching_reports_discarded = nonmatching_reports_discarded
+                        .checked_add(1)
+                        .ok_or(QualificationError::RecordBudgetExceeded {
+                            maximum: MAX_OBSERVED_RECORDS,
+                        })?;
+                    continue;
+                };
+                let latest_attempt = challenge_evidence
+                    .attempts_written
+                    .checked_sub(1)
+                    .ok_or(QualificationError::FreshnessChallengeStateInconsistent)?;
+                if matching_attempt != latest_attempt {
+                    earlier_attempt_reports_discarded = earlier_attempt_reports_discarded
+                        .checked_add(1)
+                        .ok_or(QualificationError::RecordBudgetExceeded {
+                            maximum: MAX_OBSERVED_RECORDS,
+                        })?;
+                    continue;
+                }
+                validate_controller_identity(exact, value.controller_uid, value.boot_id)?;
+                validate_idle_diagnostic_report(value)?;
+                if value.result != TransportDiagnosticResultCode::EchoedMotorInert {
+                    return Err(QualificationError::DiagnosticDenied {
+                        sequence: value.sequence.get(),
+                        result: value.result,
+                    });
+                }
+                let service_ms = value
+                    .response_prepared_at
+                    .wrapping_elapsed_since(value.request_received_at);
+                if service_ms >= 0x8000_0000 {
+                    return Err(QualificationError::ControllerClockAnomaly {
+                        stream: "freshness diagnostic request-to-response service",
+                        previous_ms: value.request_received_at.get(),
+                        current_ms: value.response_prepared_at.get(),
+                    });
+                }
+                let matched_challenge = challenges
+                    .get(matching_attempt)
+                    .copied()
+                    .flatten()
+                    .ok_or(QualificationError::FreshnessChallengeStateInconsistent)?;
+                let host_upper_bound = controller_clock_host_upper_bound_ms(
+                    matched_challenge.created_at,
+                    timed.received_at,
+                )?;
+                if u64::from(service_ms) > host_upper_bound {
+                    return Err(QualificationError::ControllerClockHostBoundExceeded {
+                        stream: "freshness diagnostic request-to-response service",
+                        controller_delta_ms: service_ms,
+                        host_elapsed_upper_bound_ms: host_upper_bound,
+                    });
+                }
+                matched_report = Some(MatchedFreshnessReport {
+                    report: value,
+                    challenge: matched_challenge,
+                    controller_service_ms: service_ms,
+                    host_elapsed_upper_bound_ms: host_upper_bound,
+                });
+                challenge_evidence.matched_attempt_index_zero_based = Some(matching_attempt);
+                framed.freshness_challenge = Some(challenge_evidence);
+                post_match_hello = None;
+                post_match_heartbeat = None;
             }
             Message::ControllerReady(value) => {
+                if matched_report.is_none() {
+                    continue;
+                }
                 validate_controller_identity(exact, value.controller_uid, value.boot_id)?;
                 return Err(QualificationError::UnexpectedControllerMessage {
                     kind: Message::ControllerReady(value).kind(),
                 });
             }
             Message::AppliedResult(value) => {
+                if matched_report.is_none() {
+                    continue;
+                }
                 validate_controller_identity(exact, value.controller_uid, value.boot_id)?;
                 return Err(QualificationError::UnexpectedControllerMessage {
                     kind: Message::AppliedResult(value).kind(),
@@ -1206,6 +2036,9 @@ where
             | Message::AcquireResult(_)
             | Message::HostCommandResult(_)
             | Message::StatusReport(_)) => {
+                if matched_report.is_none() {
+                    continue;
+                }
                 return Err(QualificationError::UnexpectedControllerMessage { kind: value.kind() });
             }
             value @ (Message::AcquireControl(_)
@@ -1216,6 +2049,9 @@ where
             | Message::ApplyPwm(_)
             | Message::ForceStop(_)
             | Message::TransportDiagnosticProbe(_)) => {
+                if matched_report.is_none() {
+                    continue;
+                }
                 return Err(QualificationError::HostDirectionMessageFromController {
                     kind: value.kind(),
                 });
@@ -1224,7 +2060,7 @@ where
     }
 }
 
-fn admission_heartbeat_is_fresh(
+fn heartbeat_within_watchdog_bound(
     hello: ControllerHello,
     received_at: Instant,
     now: Instant,
@@ -1232,6 +2068,36 @@ fn admission_heartbeat_is_fresh(
     let maximum_age = Duration::from_millis(u64::from(hello.watchdog_nominal_period.get()));
     now.checked_duration_since(received_at)
         .is_some_and(|age| age <= maximum_age)
+}
+
+fn controller_uptime_strictly_follows(
+    current: ControllerUptimeMsWrapping,
+    previous: ControllerUptimeMsWrapping,
+) -> bool {
+    let delta = current.wrapping_elapsed_since(previous);
+    delta != 0 && delta < 0x8000_0000
+}
+
+fn controller_clock_host_upper_bound_ms(
+    started_at: Instant,
+    observed_at: Instant,
+) -> Result<u64, QualificationError> {
+    let elapsed = observed_at
+        .checked_duration_since(started_at)
+        .ok_or(QualificationError::HostDurationOutsideU64)?;
+    let elapsed_ms_ceil = elapsed
+        .as_nanos()
+        .checked_add(999_999)
+        .and_then(|nanoseconds| u64::try_from(nanoseconds / 1_000_000).ok())
+        .ok_or(QualificationError::HostDurationOutsideU64)?;
+    let rate_margin_ms = elapsed_ms_ceil
+        .checked_mul(CONTROLLER_CLOCK_RATE_TOLERANCE_PERCENT)
+        .map(|scaled| scaled.div_ceil(100))
+        .ok_or(QualificationError::HostDurationOutsideU64)?;
+    elapsed_ms_ceil
+        .checked_add(rate_margin_ms)
+        .and_then(|bound| bound.checked_add(CONTROLLER_CLOCK_FIXED_MARGIN_MS))
+        .ok_or(QualificationError::HostDurationOutsideU64)
 }
 
 fn validate_controller_identity(
@@ -2492,6 +3358,7 @@ struct IdentityEvidence {
 struct ReceiveStartupEvidence {
     host_input_queue_cleared_before_observation: bool,
     initial_unknown_record_prefix_excluded: bool,
+    freshness_admission: FreshnessAdmissionEvidence,
     post_boundary_decode_policy: &'static str,
 }
 
@@ -2693,7 +3560,7 @@ fn build_evidence(
         && tracker.late_by_at_least_one_period == 0;
 
     Ok(QualificationEvidence {
-        schema_version: 2,
+        schema_version: 3,
         evidence_kind: "motor_inert_krp2_uart_transport_qualification",
         passed,
         serial_by_id_path: cli.serial_device.as_str().to_owned(),
@@ -2701,7 +3568,8 @@ fn build_evidence(
         receive_startup: ReceiveStartupEvidence {
             host_input_queue_cleared_before_observation: true,
             initial_unknown_record_prefix_excluded: true,
-            post_boundary_decode_policy: "every complete record after the one initial synchronization delimiter is decoded strictly; a framing error fails the run",
+            freshness_admission: admission.freshness,
+            post_boundary_decode_policy: "startup bytes are raw-discarded for the declared bounded quarantine and through one selected delimiter; every subsequent complete record is decoded strictly; bounded motor-inert challenge retries do not resynchronize the decoder; a framing error fails the run",
         },
         identity: IdentityEvidence {
             controller_uid_hex: encode_hex(admission.hello.controller_uid.as_bytes()),
@@ -2747,7 +3615,7 @@ fn build_evidence(
                 theoretical_host_to_controller_bits_per_second / f64::from(SERIAL_BAUD_BPS),
             theoretical_controller_to_host_fraction_of_baud:
                 theoretical_controller_to_host_bits_per_second / f64::from(SERIAL_BAUD_BPS),
-            theoretical_scope: "each full-duplex direction is reported separately for diagnostic records only; excludes Hello, Heartbeat, odometry, OS scheduling, and controller service",
+            theoretical_scope: "each full-duplex direction is reported separately for measured diagnostic records only; excludes startup quarantine, freshness challenges, Hello, Heartbeat, odometry, OS scheduling, and controller service",
         },
         counts: CountEvidence {
             planned_periods: plan.planned_probes,
@@ -2821,7 +3689,7 @@ fn build_evidence(
                 as f64
                 * f64::from(UART_BITS_PER_BYTE_8N1)
                 / drain_elapsed_seconds,
-            measurement_window_boundary: "controller byte/record counters exclude admission; the stream window ends and the receive-only drain window begins when the host processes the final successful write-and-flush completion",
+            measurement_window_boundary: "controller byte/record counters and diagnostic throughput exclude startup quarantine, record alignment, candidate observation, freshness challenge attempts, and post-match liveness; the measured stream starts only after final admission, then ends and the receive-only drain begins when the host processes the final successful measured write-and-flush completion",
         },
         liveness: LivenessEvidence {
             controller_hello_messages_validated_including_admission: outcome.liveness.hello.count,
@@ -2849,8 +3717,8 @@ fn build_evidence(
             .latest_safe_heartbeat_at
             .is_some(),
         integrity_pattern_boundary: "the deterministic 20-byte pattern discriminates intended load and construction only; it is public and is not authentication",
-        controller_clock_boundary: "wrapping-forward order is checked independently for Heartbeat uptime, odometry measurement uptime, diagnostic request receipt, and diagnostic response preparation; cross-stream timestamp order is not assumed because measurement and queueing times differ",
-        evidence_boundary: "the host input queue was cleared once; subsequently delivered bytes through the first zero delimiter were excluded, while upstream and in-flight bytes were not measured; measurements begin only after strict post-boundary identity admission and cover software-observed host UART timing, decoded controller claims, and queue-depth samples for this run; no wheel motion, motor current, physical safety, or performance improvement is claimed",
+        controller_clock_boundary: "runtime wrapping-forward order is checked independently for Heartbeat uptime, odometry measurement uptime, diagnostic request receipt, and diagnostic response preparation; freshness admission additionally requires strict report-to-Heartbeat order and caps freshness controller deltas by ceil(host elapsed milliseconds) plus 10 percent and 100 milliseconds; cross-stream runtime timestamp order is otherwise not assumed because measurement and queueing times differ",
+        evidence_boundary: "the host input queue is cleared once, all bytes delivered during the declared bounded raw quarantine are recorded and discarded, and bytes are then discarded through one explicit zero delimiter; strict decoding starts at that known boundary and never resynchronizes; a safe exact candidate permits only one to three recorded reserved-sequence motor-inert nonce challenges, only the latest outstanding exact echo may match, and a subsequently decoded exact Hello plus strictly-forward idle-safe Heartbeat is required before final admission; all startup and freshness traffic/timing is excluded from benchmark metrics; measurements cover software-observed host UART timing, decoded controller claims, and queue-depth samples for this run; no wheel motion, motor current, physical safety, or performance improvement is claimed",
     })
 }
 
@@ -2914,9 +3782,14 @@ async fn main() -> Result<(), QualificationError> {
         mut framed,
     } = admit_controller(
         &mut port,
-        FramedSerialReader::new(),
-        exact,
-        cli.admission_timeout_ms,
+        AdmissionParameters {
+            exact,
+            timeout_ms: cli.admission_timeout_ms,
+            run_id,
+            serial_write_timeout: cli.serial_write_timeout_ms,
+            quarantine_duration: Duration::from_millis(INITIAL_INPUT_QUARANTINE_MS),
+            challenge_retry_interval: Duration::from_millis(FRESHNESS_CHALLENGE_RETRY_MS),
+        },
         &mut clocks,
     )
     .await?;
@@ -2952,6 +3825,8 @@ mod tests {
     use super::*;
     use std::io;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::task::{Context, Poll};
 
     use robot_protocol::v2::{
@@ -2999,6 +3874,23 @@ mod tests {
         }
     }
 
+    struct AlwaysReadyReader {
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for AlwaysReadyReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            let ready_bytes = [0x55_u8; 512];
+            buffer.put_slice(&ready_bytes[..buffer.remaining().min(ready_bytes.len())]);
+            Poll::Ready(Ok(()))
+        }
+    }
+
     struct FlushPendingWriter;
 
     impl AsyncWrite for FlushPendingWriter {
@@ -3023,6 +3915,155 @@ mod tests {
         ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    async fn read_one_uart_message<R>(reader: &mut R) -> Message
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut decoder = UartStreamDecoder::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            reader
+                .read_exact(&mut byte)
+                .await
+                .expect("test controller reads a complete host record");
+            if let Some(decoded) = decoder.push(byte[0]) {
+                return decoded.expect("host writes a valid KRP2 record");
+            }
+        }
+    }
+
+    async fn serve_fresh_admission(
+        controller: tokio::io::DuplexStream,
+        trailing_bytes: Option<Vec<u8>>,
+    ) -> Vec<TransportDiagnosticProbe> {
+        serve_admission_scenario(controller, Vec::new(), 0, trailing_bytes).await
+    }
+
+    async fn serve_admission_scenario(
+        mut controller: tokio::io::DuplexStream,
+        startup_backlog: Vec<u8>,
+        respond_to_attempt_index: usize,
+        trailing_bytes: Option<Vec<u8>>,
+    ) -> Vec<TransportDiagnosticProbe> {
+        if !startup_backlog.is_empty() {
+            controller
+                .write_all(&startup_backlog)
+                .await
+                .expect("test stale startup backlog");
+        }
+        write_test_candidate(&mut controller).await;
+
+        let mut probes = Vec::new();
+        for attempt_index in 0..=respond_to_attempt_index {
+            let Message::TransportDiagnosticProbe(probe) =
+                read_one_uart_message(&mut controller).await
+            else {
+                panic!("admission writes only diagnostic freshness probes");
+            };
+            probes.push(probe);
+            if attempt_index != respond_to_attempt_index {
+                continue;
+            }
+        }
+        let probe = *probes
+            .last()
+            .expect("at least one freshness challenge is read");
+        let response = report(
+            probe.run_id,
+            probe.sequence,
+            probe.host_elapsed_ns_token,
+            2_000,
+        );
+        controller
+            .write_all(
+                UartRecord::encode(Message::TransportDiagnosticReport(response))
+                    .expect("freshness report")
+                    .as_bytes(),
+            )
+            .await
+            .expect("freshness report write");
+        write_test_post_match_liveness(&mut controller, 2_002).await;
+
+        if let Some(bytes) = trailing_bytes {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            controller
+                .write_all(&bytes)
+                .await
+                .expect("trailing strict-failure bytes");
+        }
+        probes
+    }
+
+    async fn write_test_candidate(controller: &mut tokio::io::DuplexStream) {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        controller
+            .write_all(&[0x55, 0])
+            .await
+            .expect("test startup boundary");
+        controller
+            .write_all(
+                UartRecord::encode(Message::ControllerHello(hello()))
+                    .expect("candidate Hello")
+                    .as_bytes(),
+            )
+            .await
+            .expect("candidate Hello write");
+        controller
+            .write_all(
+                UartRecord::encode(Message::Heartbeat(heartbeat(1_000)))
+                    .expect("candidate Heartbeat")
+                    .as_bytes(),
+            )
+            .await
+            .expect("candidate Heartbeat write");
+    }
+
+    async fn write_test_post_match_liveness(
+        controller: &mut tokio::io::DuplexStream,
+        heartbeat_uptime_ms: u32,
+    ) {
+        controller
+            .write_all(
+                UartRecord::encode(Message::ControllerHello(hello()))
+                    .expect("post-match Hello")
+                    .as_bytes(),
+            )
+            .await
+            .expect("post-match Hello write");
+        controller
+            .write_all(
+                UartRecord::encode(Message::Heartbeat(heartbeat(heartbeat_uptime_ms)))
+                    .expect("post-match Heartbeat")
+                    .as_bytes(),
+            )
+            .await
+            .expect("post-match Heartbeat write");
+    }
+
+    async fn read_test_freshness_probe(
+        controller: &mut tokio::io::DuplexStream,
+    ) -> TransportDiagnosticProbe {
+        let Message::TransportDiagnosticProbe(probe) = read_one_uart_message(controller).await
+        else {
+            panic!("admission writes only diagnostic freshness probes");
+        };
+        probe
+    }
+
+    async fn write_test_diagnostic_report(
+        controller: &mut tokio::io::DuplexStream,
+        report: TransportDiagnosticReport,
+    ) {
+        controller
+            .write_all(
+                UartRecord::encode(Message::TransportDiagnosticReport(report))
+                    .expect("test diagnostic report")
+                    .as_bytes(),
+            )
+            .await
+            .expect("test diagnostic report write");
     }
 
     fn controller_uid() -> ControllerUid {
@@ -3054,6 +4095,51 @@ mod tests {
             firmware_build_id: 0x0002_0002,
             fingerprint: fingerprint(),
             capabilities: capabilities(),
+        }
+    }
+
+    fn test_admission_parameters(run_id: u64) -> AdmissionParameters {
+        AdmissionParameters {
+            exact: exact_controller(),
+            timeout_ms: 1_000,
+            run_id: TransportDiagnosticRunId::try_new(run_id).expect("nonzero run ID"),
+            serial_write_timeout: SerialWriteTimeout(Duration::from_millis(10)),
+            quarantine_duration: Duration::from_millis(1),
+            challenge_retry_interval: Duration::from_millis(5),
+        }
+    }
+
+    fn freshness_admission_evidence() -> FreshnessAdmissionEvidence {
+        let mut challenge = FreshnessChallengeEvidence::new();
+        challenge
+            .record_written(FreshnessChallengeAttemptEvidence {
+                run_id: 1,
+                reserved_sequence: FRESHNESS_CHALLENGE_SEQUENCE,
+                host_elapsed_ns_token: 2,
+                encoded_bytes_written: 74,
+            })
+            .expect("one bounded challenge");
+        challenge.matched_attempt_index_zero_based = Some(0);
+        FreshnessAdmissionEvidence {
+            boundary: FreshnessBoundaryEvidence {
+                input_quarantine_target_ms: 1,
+                input_quarantine_elapsed_ns: 1_000_000,
+                input_quarantine_bytes_discarded: 0,
+                input_quarantine_delimiters_discarded: 0,
+                boundary_alignment_bytes_discarded_including_delimiter: 1,
+                strict_record_boundary_established: true,
+            },
+            challenge,
+            pre_challenge_reports_discarded: 0,
+            nonmatching_reports_discarded_before_match: 0,
+            earlier_attempt_reports_discarded_after_later_challenge: 0,
+            nonforward_heartbeats_discarded_after_match: 0,
+            matched_report_request_received_uptime_ms_wrapping: 1,
+            matched_report_response_prepared_uptime_ms_wrapping: 2,
+            matched_report_controller_service_ms: 1,
+            matched_report_host_elapsed_controller_clock_upper_bound_ms: 100,
+            admitted_heartbeat_delta_after_report_ms: 1,
+            admitted_heartbeat_host_elapsed_controller_clock_upper_bound_ms: 100,
         }
     }
 
@@ -3194,10 +4280,10 @@ mod tests {
                 maximum: MAX_UART_RECORD_BYTES - 1,
             }
         );
-        assert_eq!(wire.receive_phase, ReceivePhaseEvidence::ReadOnlyAdmission);
+        assert_eq!(wire.receive_phase, ReceivePhaseEvidence::ReadOnlyCandidate);
         assert_eq!(
             wire.host_payload_write_boundary,
-            HostPayloadWriteBoundary::NotInvokedBeforeAdmissionByProgramStructure
+            HostPayloadWriteBoundary::NotInvokedBeforeFreshnessChallengeByProgramStructure
         );
         assert_eq!(
             wire.total_bytes_delivered_after_host_input_clear_through_failing_read,
@@ -3259,10 +4345,10 @@ mod tests {
             .expect("machine-readable evidence marker");
         let json: serde_json::Value =
             serde_json::from_str(evidence_json).expect("valid failure evidence JSON");
-        assert_eq!(json["receive_phase"], "read_only_admission");
+        assert_eq!(json["receive_phase"], "read_only_candidate");
         assert_eq!(
             json["host_payload_write_boundary"],
-            "not_invoked_before_admission_by_program_structure"
+            "not_invoked_before_freshness_challenge_by_program_structure"
         );
         assert_eq!(
             json["nonzero_run_bytes_at_first_decode_failure"],
@@ -3304,7 +4390,7 @@ mod tests {
         let QualificationError::Decode { wire, .. } = error else {
             panic!("expected a decode failure");
         };
-        assert_eq!(wire.receive_phase, ReceivePhaseEvidence::ReadOnlyAdmission);
+        assert_eq!(wire.receive_phase, ReceivePhaseEvidence::ReadOnlyCandidate);
         assert_eq!(
             wire.total_bytes_delivered_after_host_input_clear_through_failing_read,
             all_delivered.len()
@@ -3332,6 +4418,112 @@ mod tests {
         );
         assert_eq!(wire.post_boundary_parser_events_including_failure, 2);
         assert_eq!(reader.polls, 2);
+    }
+
+    #[tokio::test]
+    async fn established_boundary_failure_excludes_raw_discarded_bytes_from_decoder_count() {
+        let startup_discarded = [0xaa, 0, 0xbb, 0];
+        let mut wire_trace = WireTrace::new();
+        for byte in startup_discarded {
+            let _completed_nonzero_run = wire_trace.observe(byte);
+        }
+        wire_trace.note_initial_synchronization_delimiter();
+        let boundary = EstablishedFreshnessBoundary {
+            wire_trace,
+            evidence: FreshnessBoundaryEvidence {
+                input_quarantine_target_ms: 1_000,
+                input_quarantine_elapsed_ns: 1_000_000_000,
+                input_quarantine_bytes_discarded: 2,
+                input_quarantine_delimiters_discarded: 1,
+                boundary_alignment_bytes_discarded_including_delimiter: 2,
+                strict_record_boundary_established: true,
+            },
+        };
+        let mut failing_chunk = vec![1; MAX_UART_RECORD_BYTES];
+        let delivered_suffix = [0, 9, 0];
+        failing_chunk.extend_from_slice(&delivered_suffix);
+        let mut reader = ChunkReader::one(failing_chunk.clone());
+        let mut framed = FramedSerialReader::from_established_boundary(boundary);
+
+        let error = framed
+            .next(&mut reader)
+            .await
+            .expect_err("oversized first strict record must fail");
+        let QualificationError::Decode { wire, .. } = error else {
+            panic!("expected a decode failure");
+        };
+
+        assert_eq!(
+            wire.total_bytes_delivered_after_host_input_clear_through_failing_read,
+            startup_discarded.len() + failing_chunk.len()
+        );
+        assert_eq!(
+            wire.total_bytes_decoder_processed_through_failure,
+            MAX_UART_RECORD_BYTES
+        );
+        assert_eq!(
+            wire.first_decode_failure_after_processed_byte_count,
+            MAX_UART_RECORD_BYTES
+        );
+        assert_eq!(
+            wire.current_read_bytes_decoder_processed_through_failure,
+            MAX_UART_RECORD_BYTES
+        );
+        assert_eq!(
+            wire.already_delivered_unprocessed_bytes_after_failure,
+            delivered_suffix.len()
+        );
+        assert_eq!(
+            wire.initial_synchronization_delimiter_offset_zero_based,
+            Some(startup_discarded.len() - 1)
+        );
+        assert_eq!(
+            wire.first_delimiter_after_failure_offset_zero_based,
+            Some(startup_discarded.len() + MAX_UART_RECORD_BYTES)
+        );
+        assert_eq!(reader.polls, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn perpetually_ready_input_cannot_suppress_the_quarantine_deadline() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let advance_after_first_read = Arc::clone(&polls);
+        let clock_task = tokio::spawn(async move {
+            while advance_after_first_read.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_millis(2)).await;
+        });
+        let mut reader = AlwaysReadyReader {
+            polls: Arc::clone(&polls),
+        };
+        let started_at = Instant::now();
+        let deadline = started_at
+            .checked_add(Duration::from_millis(1))
+            .expect("bounded test deadline");
+
+        let error = match establish_freshness_boundary(
+            &mut reader,
+            started_at,
+            deadline,
+            1,
+            Duration::from_millis(1),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("ready reads cannot outrun the explicit quarantine deadline"),
+        };
+        let QualificationError::AdmissionTimeout(evidence) = error else {
+            panic!("expected an input-quarantine timeout");
+        };
+
+        assert_eq!(evidence.stage, AdmissionStage::InputQuarantine);
+        clock_task.await.expect("test clock task joins");
+        assert!(
+            (1..16).contains(&polls.load(Ordering::SeqCst)),
+            "the fixed quarantine must not spin to a byte or record budget"
+        );
     }
 
     #[tokio::test]
@@ -3364,37 +4556,31 @@ mod tests {
         assert_eq!(reader.polls, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn diagnostic_phase_failure_never_claims_that_prior_host_writes_were_impossible() {
-        let mut admission_chunk = vec![0];
-        admission_chunk.extend_from_slice(
-            UartRecord::encode(Message::ControllerHello(hello()))
-                .expect("Hello record")
-                .as_bytes(),
-        );
-        admission_chunk.extend_from_slice(
-            UartRecord::encode(Message::Heartbeat(heartbeat(1_000)))
-                .expect("Heartbeat record")
-                .as_bytes(),
-        );
         let mut failing_chunk = vec![1; MAX_UART_RECORD_BYTES];
         failing_chunk.push(0);
-        let mut reader = ChunkReader::from_chunks([admission_chunk, failing_chunk]);
+        let (mut serial, controller) = tokio::io::duplex(4_096);
+        let controller_task = tokio::spawn(serve_fresh_admission(controller, Some(failing_chunk)));
         let mut clocks = ControllerClockTrackers::new();
         let mut admitted = admit_controller(
-            &mut reader,
-            FramedSerialReader::new(),
-            exact_controller(),
-            1_000,
+            &mut serial,
+            AdmissionParameters {
+                exact: exact_controller(),
+                timeout_ms: 1_000,
+                run_id: TransportDiagnosticRunId::try_new(7).expect("nonzero run ID"),
+                serial_write_timeout: SerialWriteTimeout(Duration::from_millis(10)),
+                quarantine_duration: Duration::from_millis(1),
+                challenge_retry_interval: Duration::from_millis(5),
+            },
             &mut clocks,
         )
         .await
         .expect("exact idle controller admission");
-        assert_eq!(reader.polls, 1);
 
         let error = admitted
             .framed
-            .next(&mut reader)
+            .next(&mut serial)
             .await
             .expect_err("oversized record must remain a strict failure");
         let QualificationError::Decode { wire, .. } = error else {
@@ -3405,30 +4591,25 @@ mod tests {
             wire.host_payload_write_boundary,
             HostPayloadWriteBoundary::PossibleBeforeFailureNotQuantified
         );
-        assert_eq!(reader.polls, 2);
+        controller_task.await.expect("test controller task joins");
     }
 
-    #[tokio::test]
-    async fn successful_read_only_admission_is_the_only_transition_to_diagnostic_phase() {
-        let mut chunk = vec![0];
-        chunk.extend_from_slice(
-            UartRecord::encode(Message::ControllerHello(hello()))
-                .expect("Hello record")
-                .as_bytes(),
-        );
-        chunk.extend_from_slice(
-            UartRecord::encode(Message::Heartbeat(heartbeat(1_000)))
-                .expect("Heartbeat record")
-                .as_bytes(),
-        );
-        let mut reader = ChunkReader::one(chunk);
+    #[tokio::test(start_paused = true)]
+    async fn successful_nonce_admission_is_the_only_transition_to_diagnostic_phase() {
+        let (mut serial, controller) = tokio::io::duplex(4_096);
+        let controller_task = tokio::spawn(serve_fresh_admission(controller, None));
         let mut clocks = ControllerClockTrackers::new();
 
         let admitted = admit_controller(
-            &mut reader,
-            FramedSerialReader::new(),
-            exact_controller(),
-            1_000,
+            &mut serial,
+            AdmissionParameters {
+                exact: exact_controller(),
+                timeout_ms: 1_000,
+                run_id: TransportDiagnosticRunId::try_new(8).expect("nonzero run ID"),
+                serial_write_timeout: SerialWriteTimeout(Duration::from_millis(10)),
+                quarantine_duration: Duration::from_millis(1),
+                challenge_retry_interval: Duration::from_millis(5),
+            },
             &mut clocks,
         )
         .await
@@ -3437,8 +4618,529 @@ mod tests {
         fn require_diagnostic_phase(_: &FramedSerialReader<DiagnosticStreamReceive>) {}
         require_diagnostic_phase(&admitted.framed);
         assert_eq!(admitted.admission.hello, hello());
-        assert_eq!(admitted.admission.heartbeat, heartbeat(1_000));
-        assert_eq!(reader.polls, 1);
+        assert_eq!(admitted.admission.heartbeat, heartbeat(2_002));
+        assert_eq!(
+            admitted
+                .admission
+                .freshness
+                .challenge
+                .matched_attempt_index_zero_based,
+            Some(0)
+        );
+        controller_task.await.expect("test controller task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_vcp_backlog_is_quarantined_before_nonce_admission() {
+        let mut stale_backlog = vec![0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0];
+        for message in [
+            Message::Heartbeat(heartbeat(80_500)),
+            Message::Heartbeat(heartbeat(80_750)),
+            Message::ControllerHello(hello()),
+            Message::Heartbeat(heartbeat(81_000)),
+        ] {
+            stale_backlog.extend_from_slice(
+                UartRecord::encode(message)
+                    .expect("stale KRP2 record")
+                    .as_bytes(),
+            );
+        }
+        stale_backlog.extend_from_slice(&[0x08, 0x4b, 0x52]);
+        let stale_report = UartRecord::encode(Message::TransportDiagnosticReport(report(
+            TransportDiagnosticRunId::try_new(99).expect("nonzero stale run ID"),
+            TransportDiagnosticSequence::new(0),
+            HostElapsedNsToken::new(591_100),
+            1_672_521,
+        )))
+        .expect("stale diagnostic record");
+        stale_backlog.extend_from_slice(
+            stale_report
+                .as_bytes()
+                .strip_suffix(&[0])
+                .expect("UART record ends in one delimiter"),
+        );
+        assert_ne!(stale_backlog.last(), Some(&0));
+        assert_eq!(stale_backlog.len(), 330);
+        assert_eq!(
+            stale_backlog
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, &byte)| (byte == 0).then_some(offset))
+                .collect::<Vec<_>>(),
+            [6, 65, 124, 194, 253]
+        );
+
+        let backlog_bytes = stale_backlog.len();
+        let backlog_delimiters = stale_backlog.iter().filter(|&&byte| byte == 0).count();
+        let (mut serial, controller) = tokio::io::duplex(8_192);
+        let controller_task =
+            tokio::spawn(serve_admission_scenario(controller, stale_backlog, 0, None));
+        let mut clocks = ControllerClockTrackers::new();
+        let admitted = admit_controller(
+            &mut serial,
+            AdmissionParameters {
+                exact: exact_controller(),
+                timeout_ms: 1_000,
+                run_id: TransportDiagnosticRunId::try_new(9).expect("nonzero current run ID"),
+                serial_write_timeout: SerialWriteTimeout(Duration::from_millis(10)),
+                quarantine_duration: Duration::from_millis(1),
+                challenge_retry_interval: Duration::from_millis(5),
+            },
+            &mut clocks,
+        )
+        .await
+        .expect("stale backlog cannot satisfy the nonce admission");
+
+        assert_eq!(
+            admitted
+                .admission
+                .freshness
+                .boundary
+                .input_quarantine_bytes_discarded,
+            backlog_bytes
+        );
+        assert_eq!(
+            admitted
+                .admission
+                .freshness
+                .boundary
+                .input_quarantine_delimiters_discarded,
+            backlog_delimiters
+        );
+        assert_eq!(
+            admitted
+                .admission
+                .freshness
+                .boundary
+                .boundary_alignment_bytes_discarded_including_delimiter,
+            2
+        );
+        assert_eq!(
+            admitted
+                .framed
+                .wire_trace
+                .snapshot()
+                .initial_synchronization_delimiter_offset,
+            Some(backlog_bytes + 1)
+        );
+        let probes = controller_task.await.expect("test controller task joins");
+        assert_eq!(probes.len(), 1);
+        assert_eq!(
+            probes[0].run_id,
+            TransportDiagnosticRunId::try_new(9).expect("nonzero current run ID")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_best_effort_freshness_report_is_retried_with_a_distinct_tuple() {
+        let (mut serial, controller) = tokio::io::duplex(4_096);
+        let controller_task =
+            tokio::spawn(serve_admission_scenario(controller, Vec::new(), 1, None));
+        let mut clocks = ControllerClockTrackers::new();
+        let admitted = admit_controller(
+            &mut serial,
+            AdmissionParameters {
+                exact: exact_controller(),
+                timeout_ms: 1_000,
+                run_id: TransportDiagnosticRunId::try_new(10).expect("nonzero run ID"),
+                serial_write_timeout: SerialWriteTimeout(Duration::from_millis(10)),
+                quarantine_duration: Duration::from_millis(1),
+                challenge_retry_interval: Duration::from_millis(5),
+            },
+            &mut clocks,
+        )
+        .await
+        .expect("second bounded challenge admits the controller");
+
+        let challenge = admitted.admission.freshness.challenge;
+        assert_eq!(challenge.attempts_written, 2);
+        assert_eq!(challenge.matched_attempt_index_zero_based, Some(1));
+        let probes = controller_task.await.expect("test controller task joins");
+        assert_eq!(probes.len(), 2);
+        assert_eq!(probes[0].sequence.get(), FRESHNESS_CHALLENGE_SEQUENCE);
+        assert_eq!(probes[1].sequence.get(), FRESHNESS_CHALLENGE_SEQUENCE - 1);
+        assert_ne!(
+            probes[0].host_elapsed_ns_token,
+            probes[1].host_elapsed_ns_token
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_exact_captured_challenge_tuple_can_admit_after_the_boundary() {
+        let (mut serial, mut controller) = tokio::io::duplex(4_096);
+        let controller_task = tokio::spawn(async move {
+            write_test_candidate(&mut controller).await;
+            let probe = read_test_freshness_probe(&mut controller).await;
+
+            controller
+                .write_all(
+                    UartRecord::encode(Message::ControllerHello(hello()))
+                        .expect("pre-report Hello")
+                        .as_bytes(),
+                )
+                .await
+                .expect("pre-report Hello write");
+            controller
+                .write_all(
+                    UartRecord::encode(Message::Heartbeat(heartbeat(1_500)))
+                        .expect("pre-report Heartbeat")
+                        .as_bytes(),
+                )
+                .await
+                .expect("pre-report Heartbeat write");
+
+            let mut wrong_token = report(
+                probe.run_id,
+                probe.sequence,
+                probe.host_elapsed_ns_token,
+                2_000,
+            );
+            wrong_token.host_elapsed_ns_token =
+                HostElapsedNsToken::new(probe.host_elapsed_ns_token.get().wrapping_add(1));
+            write_test_diagnostic_report(&mut controller, wrong_token).await;
+            write_test_diagnostic_report(
+                &mut controller,
+                report(
+                    probe.run_id,
+                    probe.sequence,
+                    probe.host_elapsed_ns_token,
+                    2_000,
+                ),
+            )
+            .await;
+            write_test_post_match_liveness(&mut controller, 2_002).await;
+        });
+        let mut clocks = ControllerClockTrackers::new();
+        let admitted = admit_controller(&mut serial, test_admission_parameters(15), &mut clocks)
+            .await
+            .expect("only the exact challenge tuple admits");
+
+        assert_eq!(
+            admitted
+                .admission
+                .freshness
+                .nonmatching_reports_discarded_before_match,
+            1
+        );
+        assert_eq!(
+            admitted
+                .admission
+                .freshness
+                .challenge
+                .matched_attempt_index_zero_based,
+            Some(0)
+        );
+        controller_task.await.expect("test controller task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_dropped_freshness_reports_exhaust_the_typed_attempt_budget() {
+        let (mut serial, mut controller) = tokio::io::duplex(4_096);
+        let (transcript_tx, transcript_rx) = tokio::sync::oneshot::channel();
+        let controller_task = tokio::spawn(async move {
+            write_test_candidate(&mut controller).await;
+            let mut probes = Vec::new();
+            for _ in 0..MAX_FRESHNESS_CHALLENGE_ATTEMPTS {
+                probes.push(read_test_freshness_probe(&mut controller).await);
+            }
+            transcript_tx
+                .send(probes)
+                .expect("test receives the probe transcript");
+            std::future::pending::<()>().await;
+        });
+        let mut parameters = test_admission_parameters(16);
+        parameters.timeout_ms = 30;
+        let mut clocks = ControllerClockTrackers::new();
+        let error = match admit_controller(&mut serial, parameters, &mut clocks).await {
+            Err(error) => error,
+            Ok(_) => panic!("three dropped reports must time out"),
+        };
+
+        let QualificationError::AdmissionTimeout(evidence) = error else {
+            panic!("expected a typed freshness timeout");
+        };
+        assert_eq!(evidence.stage, AdmissionStage::FreshnessChallenge);
+        assert!(!evidence.challenge_report_matched);
+        let challenge = evidence
+            .freshness_challenge
+            .expect("all written attempts are retained");
+        assert_eq!(challenge.attempts_written, MAX_FRESHNESS_CHALLENGE_ATTEMPTS);
+        assert_eq!(challenge.matched_attempt_index_zero_based, None);
+        let probes = transcript_rx.await.expect("probe transcript");
+        assert_eq!(probes.len(), MAX_FRESHNESS_CHALLENGE_ATTEMPTS);
+        assert_eq!(
+            probes
+                .iter()
+                .map(|probe| probe.sequence.get())
+                .collect::<Vec<_>>(),
+            [
+                FRESHNESS_CHALLENGE_SEQUENCE,
+                FRESHNESS_CHALLENGE_SEQUENCE - 1,
+                FRESHNESS_CHALLENGE_SEQUENCE - 2,
+            ]
+        );
+        controller_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn strict_decode_failure_after_retry_is_terminal_and_retains_both_writes() {
+        let (mut serial, mut controller) = tokio::io::duplex(4_096);
+        let controller_task = tokio::spawn(async move {
+            write_test_candidate(&mut controller).await;
+            let first = read_test_freshness_probe(&mut controller).await;
+            let second = read_test_freshness_probe(&mut controller).await;
+            let mut malformed = vec![1; MAX_UART_RECORD_BYTES];
+            malformed.push(0);
+            controller
+                .write_all(&malformed)
+                .await
+                .expect("malformed post-retry record");
+            [first, second]
+        });
+        let mut clocks = ControllerClockTrackers::new();
+        let error =
+            match admit_controller(&mut serial, test_admission_parameters(17), &mut clocks).await {
+                Err(error) => error,
+                Ok(_) => panic!("strict framing failure is terminal"),
+            };
+
+        let QualificationError::Decode { wire, .. } = error else {
+            panic!("expected a strict decode failure");
+        };
+        assert_eq!(wire.receive_phase, ReceivePhaseEvidence::FreshnessAdmission);
+        assert_eq!(
+            wire.host_payload_write_boundary,
+            HostPayloadWriteBoundary::OneToThreeMotorInertFreshnessChallengesWritten
+        );
+        let challenge = wire
+            .freshness_challenge
+            .expect("failure records completed freshness writes");
+        assert_eq!(challenge.attempts_written, 2);
+        assert_eq!(challenge.matched_attempt_index_zero_based, None);
+        let probes = controller_task.await.expect("test controller task joins");
+        assert_eq!(probes.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn matched_report_without_new_liveness_times_out_post_match() {
+        let (mut serial, mut controller) = tokio::io::duplex(4_096);
+        let controller_task = tokio::spawn(async move {
+            write_test_candidate(&mut controller).await;
+            let probe = read_test_freshness_probe(&mut controller).await;
+            write_test_diagnostic_report(
+                &mut controller,
+                report(
+                    probe.run_id,
+                    probe.sequence,
+                    probe.host_elapsed_ns_token,
+                    2_000,
+                ),
+            )
+            .await;
+            std::future::pending::<()>().await;
+        });
+        let mut parameters = test_admission_parameters(18);
+        parameters.timeout_ms = 30;
+        let mut clocks = ControllerClockTrackers::new();
+        let error = match admit_controller(&mut serial, parameters, &mut clocks).await {
+            Err(error) => error,
+            Ok(_) => panic!("a report alone cannot admit"),
+        };
+
+        let QualificationError::AdmissionTimeout(evidence) = error else {
+            panic!("expected a post-match liveness timeout");
+        };
+        assert_eq!(evidence.stage, AdmissionStage::PostMatchLiveness);
+        assert!(evidence.challenge_report_matched);
+        assert!(!evidence.stage_hello_observed);
+        assert!(!evidence.stage_idle_safe_heartbeat_observed);
+        assert_eq!(
+            evidence
+                .freshness_challenge
+                .expect("matched challenge retained")
+                .matched_attempt_index_zero_based,
+            Some(0)
+        );
+        controller_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_report_after_post_match_liveness_cannot_cross_admission_boundary() {
+        let (mut serial, mut controller) = tokio::io::duplex(4_096);
+        let controller_task = tokio::spawn(async move {
+            write_test_candidate(&mut controller).await;
+            let probe = read_test_freshness_probe(&mut controller).await;
+            let exact_report = report(
+                probe.run_id,
+                probe.sequence,
+                probe.host_elapsed_ns_token,
+                2_000,
+            );
+            let mut one_read_batch = Vec::new();
+            for message in [
+                Message::TransportDiagnosticReport(exact_report),
+                Message::ControllerHello(hello()),
+                Message::Heartbeat(heartbeat(2_002)),
+                Message::TransportDiagnosticReport(exact_report),
+            ] {
+                one_read_batch.extend_from_slice(
+                    UartRecord::encode(message)
+                        .expect("coalesced admission record")
+                        .as_bytes(),
+                );
+            }
+            assert!(one_read_batch.len() <= 512);
+            controller
+                .write_all(&one_read_batch)
+                .await
+                .expect("one coalesced admission batch");
+        });
+        let mut clocks = ControllerClockTrackers::new();
+        let error =
+            match admit_controller(&mut serial, test_admission_parameters(22), &mut clocks).await {
+                Err(error) => error,
+                Ok(_) => panic!("an already-decoded repeated freshness tuple cannot be admitted"),
+            };
+
+        assert!(matches!(
+            error,
+            QualificationError::RepeatedFreshnessTupleAfterMatch
+        ));
+        controller_task.await.expect("test controller task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_earlier_attempt_cannot_admit_while_latest_is_outstanding() {
+        let (mut serial, mut controller) = tokio::io::duplex(4_096);
+        let controller_task = tokio::spawn(async move {
+            write_test_candidate(&mut controller).await;
+            let first = read_test_freshness_probe(&mut controller).await;
+            let second = read_test_freshness_probe(&mut controller).await;
+
+            write_test_diagnostic_report(
+                &mut controller,
+                report(
+                    first.run_id,
+                    first.sequence,
+                    first.host_elapsed_ns_token,
+                    2_000,
+                ),
+            )
+            .await;
+            write_test_post_match_liveness(&mut controller, 2_002).await;
+
+            write_test_diagnostic_report(
+                &mut controller,
+                report(
+                    second.run_id,
+                    second.sequence,
+                    second.host_elapsed_ns_token,
+                    2_250,
+                ),
+            )
+            .await;
+            write_test_post_match_liveness(&mut controller, 2_252).await;
+        });
+        let mut clocks = ControllerClockTrackers::new();
+        let admitted = admit_controller(&mut serial, test_admission_parameters(19), &mut clocks)
+            .await
+            .expect("only the latest outstanding response admits");
+
+        assert_eq!(
+            admitted
+                .admission
+                .freshness
+                .earlier_attempt_reports_discarded_after_later_challenge,
+            1
+        );
+        assert_eq!(
+            admitted
+                .admission
+                .freshness
+                .challenge
+                .matched_attempt_index_zero_based,
+            Some(1)
+        );
+        assert_eq!(admitted.admission.heartbeat, heartbeat(2_252));
+        controller_task.await.expect("test controller task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn freshness_report_rejects_implausible_forward_controller_service_time() {
+        let (mut serial, mut controller) = tokio::io::duplex(4_096);
+        let controller_task = tokio::spawn(async move {
+            write_test_candidate(&mut controller).await;
+            let probe = read_test_freshness_probe(&mut controller).await;
+            let mut implausible =
+                report(probe.run_id, probe.sequence, probe.host_elapsed_ns_token, 0);
+            implausible.response_prepared_at = ControllerUptimeMsWrapping::new(1_000_000_000);
+            write_test_diagnostic_report(&mut controller, implausible).await;
+        });
+        let mut clocks = ControllerClockTrackers::new();
+        let error =
+            match admit_controller(&mut serial, test_admission_parameters(20), &mut clocks).await {
+                Err(error) => error,
+                Ok(_) => panic!("multi-day-scale service cannot fit the host observation"),
+            };
+
+        assert!(matches!(
+            error,
+            QualificationError::ControllerClockHostBoundExceeded {
+                stream: "freshness diagnostic request-to-response service",
+                ..
+            }
+        ));
+        controller_task.await.expect("test controller task joins");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_report_heartbeat_rejects_implausible_forward_controller_jump() {
+        let (mut serial, mut controller) = tokio::io::duplex(4_096);
+        let controller_task = tokio::spawn(async move {
+            write_test_candidate(&mut controller).await;
+            let probe = read_test_freshness_probe(&mut controller).await;
+            write_test_diagnostic_report(
+                &mut controller,
+                report(
+                    probe.run_id,
+                    probe.sequence,
+                    probe.host_elapsed_ns_token,
+                    2_000,
+                ),
+            )
+            .await;
+            controller
+                .write_all(
+                    UartRecord::encode(Message::ControllerHello(hello()))
+                        .expect("post-report Hello")
+                        .as_bytes(),
+                )
+                .await
+                .expect("post-report Hello write");
+            controller
+                .write_all(
+                    UartRecord::encode(Message::Heartbeat(heartbeat(1_000_002_001)))
+                        .expect("implausible post-report Heartbeat")
+                        .as_bytes(),
+                )
+                .await
+                .expect("implausible post-report Heartbeat write");
+        });
+        let mut clocks = ControllerClockTrackers::new();
+        let error =
+            match admit_controller(&mut serial, test_admission_parameters(21), &mut clocks).await {
+                Err(error) => error,
+                Ok(_) => panic!("multi-day-scale heartbeat jump cannot fit the host observation"),
+            };
+
+        assert!(matches!(
+            error,
+            QualificationError::ControllerClockHostBoundExceeded {
+                stream: "post-diagnostic Heartbeat",
+                ..
+            }
+        ));
+        controller_task.await.expect("test controller task joins");
     }
 
     fn report(
@@ -3513,6 +5215,11 @@ mod tests {
         assert!(SerialWriteTimeout::from_str("100").is_ok());
         assert!(SerialWriteTimeout::from_str("6").is_err());
         assert!(SerialWriteTimeout::from_str("101").is_err());
+        assert!(parse_admission_timeout_ms("3999").is_err());
+        assert_eq!(
+            parse_admission_timeout_ms("4000").expect("minimum complete startup deadline"),
+            4_000
+        );
         assert!(matches!(
             ProbeRateHz::from_str("60"),
             Err(ArgumentError::UnsupportedBenchmarkRate { actual_hz: 60 })
@@ -3578,19 +5285,83 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn unsafe_candidate_times_out_without_any_host_payload_write() {
+        let (mut serial, mut controller) = tokio::io::duplex(4_096);
+        let controller_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            controller
+                .write_all(&[0x55, 0])
+                .await
+                .expect("test startup boundary");
+            controller
+                .write_all(
+                    UartRecord::encode(Message::ControllerHello(hello()))
+                        .expect("candidate Hello")
+                        .as_bytes(),
+                )
+                .await
+                .expect("candidate Hello write");
+            let mut unsafe_heartbeat = heartbeat(1_000);
+            unsafe_heartbeat.readiness = ReadinessFlags::try_from_bits(
+                ReadinessFlags::WATCHDOG_RUNNING | ReadinessFlags::SESSION_ESTABLISHED,
+            )
+            .expect("known readiness bits");
+            controller
+                .write_all(
+                    UartRecord::encode(Message::Heartbeat(unsafe_heartbeat))
+                        .expect("unsafe candidate Heartbeat")
+                        .as_bytes(),
+                )
+                .await
+                .expect("unsafe candidate Heartbeat write");
+
+            let mut observed_host_payload = [0_u8; 1];
+            match tokio::time::timeout(
+                Duration::from_millis(40),
+                controller.read(&mut observed_host_payload),
+            )
+            .await
+            {
+                Ok(Ok(count)) => count,
+                Ok(Err(error)) => panic!("test controller read failed: {error}"),
+                Err(_) => 0,
+            }
+        });
+        let mut parameters = test_admission_parameters(23);
+        parameters.timeout_ms = 30;
+        let mut clocks = ControllerClockTrackers::new();
+        let error = match admit_controller(&mut serial, parameters, &mut clocks).await {
+            Err(error) => error,
+            Ok(_) => panic!("unsafe candidate cannot reach the freshness challenge"),
+        };
+
+        let QualificationError::AdmissionTimeout(evidence) = error else {
+            panic!("unsafe candidate must time out in read-only selection");
+        };
+        assert_eq!(evidence.stage, AdmissionStage::ReadOnlyCandidate);
+        assert!(evidence.stage_hello_observed);
+        assert!(!evidence.stage_idle_safe_heartbeat_observed);
+        assert_eq!(
+            controller_task.await.expect("test controller task joins"),
+            0,
+            "no payload byte may be written before an exact idle-safe candidate"
+        );
+    }
+
     #[test]
     fn admission_heartbeat_freshness_uses_the_advertised_watchdog_bound() {
         let received_at = Instant::now();
         let admitted_hello = hello();
         let bound = Duration::from_millis(u64::from(admitted_hello.watchdog_nominal_period.get()));
-        assert!(admission_heartbeat_is_fresh(
+        assert!(heartbeat_within_watchdog_bound(
             admitted_hello,
             received_at,
             received_at
                 .checked_add(bound)
                 .expect("small watchdog duration")
         ));
-        assert!(!admission_heartbeat_is_fresh(
+        assert!(!heartbeat_within_watchdog_bound(
             admitted_hello,
             received_at,
             received_at
@@ -3598,12 +5369,80 @@ mod tests {
                 .and_then(|instant| instant.checked_add(Duration::from_nanos(1)))
                 .expect("small watchdog duration")
         ));
-        assert!(!admission_heartbeat_is_fresh(
+        assert!(!heartbeat_within_watchdog_bound(
             admitted_hello,
             received_at,
             received_at
                 .checked_sub(Duration::from_nanos(1))
                 .expect("small backwards duration")
+        ));
+    }
+
+    #[test]
+    fn post_match_controller_time_requires_strict_wrapping_forward_order() {
+        let previous = ControllerUptimeMsWrapping::new(100);
+        assert!(!controller_uptime_strictly_follows(previous, previous));
+        assert!(controller_uptime_strictly_follows(
+            ControllerUptimeMsWrapping::new(101),
+            previous
+        ));
+        assert!(controller_uptime_strictly_follows(
+            ControllerUptimeMsWrapping::new(100_u32.wrapping_add(0x7fff_ffff)),
+            previous
+        ));
+        assert!(!controller_uptime_strictly_follows(
+            ControllerUptimeMsWrapping::new(100_u32.wrapping_add(0x8000_0000)),
+            previous
+        ));
+        assert!(!controller_uptime_strictly_follows(
+            ControllerUptimeMsWrapping::new(99),
+            previous
+        ));
+        assert!(controller_uptime_strictly_follows(
+            ControllerUptimeMsWrapping::new(1),
+            ControllerUptimeMsWrapping::new(u32::MAX)
+        ));
+    }
+
+    #[test]
+    fn freshness_report_is_bound_to_identity_run_sequence_and_token() {
+        let exact = exact_controller();
+        let run_id = TransportDiagnosticRunId::try_new(11).expect("nonzero run ID");
+        let token = HostElapsedNsToken::new(12);
+        let challenge = FreshnessChallenge::new(exact, run_id, 0, token, Instant::now())
+            .expect("challenge encodes");
+        let valid = report(run_id, challenge.sequence, token, 100);
+        validate_controller_identity(exact, valid.controller_uid, valid.boot_id)
+            .expect("identity matches");
+        assert!(challenge.matches(valid));
+
+        let mut wrong_run = valid;
+        wrong_run.run_id = TransportDiagnosticRunId::try_new(13).expect("nonzero run ID");
+        assert!(!challenge.matches(wrong_run));
+        let mut wrong_sequence = valid;
+        wrong_sequence.sequence =
+            TransportDiagnosticSequence::new(challenge.sequence.get().wrapping_sub(1));
+        assert!(!challenge.matches(wrong_sequence));
+        let mut wrong_token = valid;
+        wrong_token.host_elapsed_ns_token = HostElapsedNsToken::new(token.get().wrapping_add(1));
+        assert!(!challenge.matches(wrong_token));
+
+        let mut wrong_uid = valid;
+        wrong_uid.controller_uid =
+            ControllerUid::try_new([0x22; 12]).expect("nonzero alternate UID");
+        assert!(challenge.matches(wrong_uid));
+        assert!(matches!(
+            validate_controller_identity(exact, wrong_uid.controller_uid, wrong_uid.boot_id),
+            Err(QualificationError::IdentityMismatch {
+                field: "controller_uid"
+            })
+        ));
+        let mut wrong_boot = valid;
+        wrong_boot.boot_id = ControllerBootId::try_new(14).expect("nonzero alternate boot ID");
+        assert!(challenge.matches(wrong_boot));
+        assert!(matches!(
+            validate_controller_identity(exact, wrong_boot.controller_uid, wrong_boot.boot_id),
+            Err(QualificationError::IdentityMismatch { field: "boot_id" })
         ));
     }
 
@@ -3833,6 +5672,7 @@ mod tests {
             heartbeat: heartbeat(1),
             hello_received_at: admitted_at,
             heartbeat_received_at: admitted_at,
+            freshness: freshness_admission_evidence(),
         })
         .expect("bounded liveness policy");
 
