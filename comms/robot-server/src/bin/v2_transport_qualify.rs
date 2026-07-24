@@ -681,6 +681,9 @@ enum QualificationError {
     HeartbeatNotIdleSafe {
         detail: &'static str,
     },
+    HeartbeatReportsFaults {
+        bits: u32,
+    },
     UnexpectedControllerMessage {
         kind: robot_protocol::v2::MessageKind,
     },
@@ -850,6 +853,10 @@ impl fmt::Display for QualificationError {
             Self::HeartbeatNotIdleSafe { detail } => {
                 write!(formatter, "Heartbeat is not idle-safe: {detail}")
             }
+            Self::HeartbeatReportsFaults { bits } => write!(
+                formatter,
+                "Heartbeat is not idle-safe: controller fault bits are 0x{bits:08x}"
+            ),
             Self::UnexpectedControllerMessage { kind } => {
                 write!(formatter, "unexpected controller message {kind:?}")
             }
@@ -2175,8 +2182,8 @@ fn validate_idle_heartbeat(
         });
     }
     if !heartbeat.faults.is_clear() {
-        return Err(QualificationError::HeartbeatNotIdleSafe {
-            detail: "heartbeat reports controller faults",
+        return Err(QualificationError::HeartbeatReportsFaults {
+            bits: heartbeat.faults.bits(),
         });
     }
     let forbidden = ReadinessFlags::SESSION_ESTABLISHED | ReadinessFlags::DEADLINE_ARMED;
@@ -5279,7 +5286,9 @@ mod tests {
             .expect("known fault bit");
         assert!(matches!(
             validate_idle_heartbeat(exact, faulted),
-            Err(QualificationError::HeartbeatNotIdleSafe { .. })
+            Err(QualificationError::HeartbeatReportsFaults {
+                bits: ControllerFaults::MOTOR_DRIVER
+            })
         ));
     }
 
