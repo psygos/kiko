@@ -58,6 +58,7 @@ EXPECTED_MOTOR_INERT_MAIN_SHA256=270e553f5c18a53393f0234f334d3ccc71be32ac7827240
 STLINK_SERIAL=066EFF313946303143221230
 STM32_SERIAL_BY_ID=/dev/serial/by-id/usb-STMicroelectronics_STM32_STLink_066EFF313946303143221230-if02
 EXPECTED_CONTROLLER_UID_HEX=2c0018001750314242353320
+readonly EXPECTED_ACTUATOR_CONFIG_FINGERPRINT_HEX=4b494b4f2d4e4f2d4143542d56312121
 CARGO=/home/makerspace/.cargo/bin/cargo
 RUSTC=/home/makerspace/.cargo/bin/rustc
 PYTHON=/usr/bin/python3
@@ -67,6 +68,8 @@ test -x "$RUSTC"
 test -x "$PYTHON"
 test "$(git -C "$REPO" rev-parse HEAD)" = "$EXPECTED_FIRMWARE_REVISION"
 test -z "$(git -C "$REPO" status --porcelain=v1 --untracked-files=all)"
+test "$EXPECTED_ACTUATOR_CONFIG_FINGERPRINT_HEX" = \
+  "4b494b4f2d4e4f2d4143542d56312121"
 test -L "$STM32_SERIAL_BY_ID"
 test -c "$(readlink -f "$STM32_SERIAL_BY_ID")"
 test ! -e "$EVIDENCE_DIR"
@@ -505,7 +508,7 @@ expected = {
     "controller_uid_hex": sys.argv[3],
     "firmware_abi": 2,
     "firmware_build_id": 131074,
-    "actuator_config_fingerprint_hex": "4b494b4f2d4e4f2d4143542d56312121",
+    "actuator_config_fingerprint_hex": sys.argv[4],
     "capabilities_bits": 319,
     "supports_required_safety_capabilities": False,
     "maximum_absolute_pwm_percent": 0,
@@ -548,6 +551,7 @@ print(observed["controller_uid_hex"], boot_id)
     "$stem.json" \
     "$STM32_SERIAL_BY_ID" \
     "$EXPECTED_CONTROLLER_UID_HEX" \
+    "$EXPECTED_ACTUATOR_CONFIG_FINGERPRINT_HEX" \
     >"$stem.checked-values"
   test -s "$stem.checked-values"
   sha256sum "$stem.checked-values"
@@ -601,7 +605,7 @@ run_and_check_motor_inert_transport() {
     --boot-id "$boot_id" \
     --firmware-abi 2 \
     --firmware-build-id 0x00020002 \
-    --actuator-config-fingerprint-hex 4b494b4f2d4e4f2d4143542d56312121 \
+    --actuator-config-fingerprint-hex "$EXPECTED_ACTUATOR_CONFIG_FINGERPRINT_HEX" \
     --capabilities-bits 319 \
     --rate-hz "$rate_hz" \
     --duration-ms 10000 \
@@ -641,8 +645,9 @@ with open(sys.argv[1], "r", encoding="utf-8") as source:
 
 serial_path = sys.argv[2]
 controller_uid = sys.argv[3]
-boot_id = int(sys.argv[4], 10)
-rate_hz = int(sys.argv[5], 10)
+actuator_config_fingerprint_hex = sys.argv[4]
+boot_id = int(sys.argv[5], 10)
+rate_hz = int(sys.argv[6], 10)
 planned_periods = rate_hz * 10
 
 def exact(path, expected):
@@ -673,7 +678,7 @@ exact(("identity", "firmware_abi"), 2)
 exact(("identity", "firmware_build_id"), 131074)
 exact(
     ("identity", "actuator_config_fingerprint_hex"),
-    "4b494b4f2d4e4f2d4143542d56312121",
+    actuator_config_fingerprint_hex,
 )
 exact(("identity", "capabilities_bits"), 319)
 exact(("identity", "max_abs_pwm_percent"), 0)
@@ -712,6 +717,7 @@ print("qualified")
     "$stem.json" \
     "$STM32_SERIAL_BY_ID" \
     "$EXPECTED_CONTROLLER_UID_HEX" \
+    "$EXPECTED_ACTUATOR_CONFIG_FINGERPRINT_HEX" \
     "$boot_id" \
     "$rate_hz" \
     >"$stem.checked"

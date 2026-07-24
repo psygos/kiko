@@ -308,6 +308,57 @@ their 393,216-byte padded main images were byte-identical at
 The build roots are `/home/makerspace/kiko-build-repro/6cc59a1-path-{a,b}`.
 That rehearsal opened no debugger, serial device, camera, or actuator.
 
+The next attended restart used the fresh mode-`0700` evidence directory
+`/home/makerspace/kiko-hardware-evidence/20260724T175852IST-6cc59a1-attended-inert-restart4`
+and exact firmware source revision
+`6cc59a1a3972c44df77dfd2cc02920ba40d896a2`. Under the operator-confirmed
+safety gate, motor power was reported to remain independently disconnected.
+Two fresh connect-under-reset 512 KiB backups were byte-identical at
+`dfda9a32a6dede174ce55a29acfb59fc754277c421d23db886c8155d0f40dd55`;
+the duplicate option reads remained
+`d292558017cf9ca0a2e40e262a5c1daa4b305ccf084ce06128133d282f905115`.
+Independent absolute-path-remapped builds reproduced ELF
+`fe1f055c076d700fd65d0f02db2a55163f82b7789b3bb2bf8b0ee25ede130dcc`
+and padded main
+`270e553f5c18a53393f0234f334d3ccc71be32ac7827240b54c939c6d6def38d`.
+The main write and same-session readback compared byte-for-byte at that
+`270e...` hash, and sector 7 remained byte-identical at
+`b5a41c3758763bbec72769fab4a2533bf2db0b6312d93d25a695f9e4b9e02260`.
+
+After the exact-target reset and privileged no-owner check, the prebuilt
+read-only identity probe passed the complete strict schema-2 check. Its JSON,
+empty stderr, captured zero status, and checked-values hashes are respectively
+`ec5a135a726ce53b852928f963ebc28948fa3a4ba2e8ed89b95ec60fe12c22ab`,
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+`9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa`,
+and
+`1504d3c3b881b47724465909eefd7ab8fbea81bc17a7e26abfed01adc88292bd`.
+It reported controller UID `2c0018001750314242353320` and boot ID
+`12638770094519703627`.
+This proves only the captured software identity under the probe's documented
+boundary; it does not prove physical output behavior.
+
+The subsequent interactive 20 Hz invocation accidentally omitted the `4e`
+byte from the checked-in 32-character actuator fingerprint, producing
+`4b494b4f2d4f2d4143542d56312121`. The typed CLI rejected that 30-character
+value and returned status 2. Its empty JSON hash was
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+stderr hash was
+`40062daae29450e27ae459bc6b3c118abf251888d7a34ab9ed44267cdf51ebb9`,
+and status-file hash was
+`53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3`.
+Source inspection confirms the first serial open is reachable only after
+`Cli::parse()` returns successfully, so this invocation neither opened,
+cleared, read, nor wrote the UART. The checked-in runbook had the correct
+value; its setup now binds that value immutably, checks it against the
+canonical literal, and supplies it to the identity-output checker and
+qualifier CLI/output checker.
+
+The fail-fast shell exited. No 50 Hz qualifier, later serial access, journal
+operation, candidate flash, session, PWM, or motor command was issued in this
+attended run. The directory remains failed evidence and must not be reused.
+Qualification still requires a complete fresh evidence run.
+
 ## Exact remaining gate
 
 Before the wheel-attach sentence is allowed:
