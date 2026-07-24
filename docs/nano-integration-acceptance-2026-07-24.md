@@ -359,6 +359,78 @@ operation, candidate flash, session, PWM, or motor command was issued in this
 attended run. The directory remains failed evidence and must not be reused.
 Qualification still requires a complete fresh evidence run.
 
+The corrected restart used the fresh mode-`0700` evidence directory
+`/home/makerspace/kiko-hardware-evidence/20260724T181500IST-6cc59a1-attended-inert-restart5`
+at exact firmware source revision
+`6cc59a1a3972c44df77dfd2cc02920ba40d896a2`. Motor power was
+operator-reported, but not independently instrumented, to remain disconnected.
+Two new connect-under-reset 512 KiB backups again matched at
+`dfda9a32a6dede174ce55a29acfb59fc754277c421d23db886c8155d0f40dd55`,
+and the duplicate option reads matched at
+`d292558017cf9ca0a2e40e262a5c1daa4b305ccf084ce06128133d282f905115`.
+The fresh build reproduced ELF
+`fe1f055c076d700fd65d0f02db2a55163f82b7789b3bb2bf8b0ee25ede130dcc`
+and padded main
+`270e553f5c18a53393f0234f334d3ccc71be32ac7827240b54c939c6d6def38d`.
+The main write and readback matched at that `270e...` hash, while sector 7
+remained
+`b5a41c3758763bbec72769fab4a2533bf2db0b6312d93d25a695f9e4b9e02260`.
+
+After the exact-target reset and no-owner check, the read-only identity probe
+again passed the complete schema-2 check. Its JSON, empty stderr, zero-status
+file, and checked-values hashes were respectively
+`ec5a135a726ce53b852928f963ebc28948fa3a4ba2e8ed89b95ec60fe12c22ab`,
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+`9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa`,
+and
+`1504d3c3b881b47724465909eefd7ab8fbea81bc17a7e26abfed01adc88292bd`.
+It reported controller UID `2c0018001750314242353320` and boot ID
+`12638770094519703627`.
+
+The subsequent corrected 20 Hz qualifier opened the UART but returned status
+1 with empty JSON and the strict primary error
+`Error: Decode(OversizedRecord { maximum: 73 })`. Its JSON, stderr, and
+status-file hashes were respectively
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+`cd80431c799d27f2a1e5af5479a328ac5da5cd0092b44230f00b97d7a3742321`,
+and
+`4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865`;
+the status file contains `1`. That qualifier error does not encode the
+qualifier phase at failure or whether any diagnostic write had already
+occurred, so both facts remain unknown. Fail-fast stopped the run: no 50 Hz
+qualifier or later scripted phase followed. The directory is failed evidence
+and must not be reused.
+
+A deliberately qualifier-first diagnostic restart then used the fresh
+mode-`0700` evidence directory
+`/home/makerspace/kiko-hardware-evidence/20260724T183340IST-6cc59a1-qualifier-first-diagnostic-restart6`
+at the same exact source revision. Motor power was again operator-reported,
+not independently instrumented, to remain disconnected. Its fresh duplicate
+full backups, option reads, ELF, padded main, same-session main readback, and
+preserved sector-7 hashes were the same pinned values from restart 5:
+`dfda9a32a6dede174ce55a29acfb59fc754277c421d23db886c8155d0f40dd55`,
+`d292558017cf9ca0a2e40e262a5c1daa4b305ccf084ce06128133d282f905115`,
+`fe1f055c076d700fd65d0f02db2a55163f82b7789b3bb2bf8b0ee25ede130dcc`,
+`270e553f5c18a53393f0234f334d3ccc71be32ac7827240b54c939c6d6def38d`
+for both the padded main and its readback, and
+`b5a41c3758763bbec72769fab4a2533bf2db0b6312d93d25a695f9e4b9e02260`,
+in that order.
+
+After the exact-target reset and no-owner check, the corrected 20 Hz qualifier
+was the first UART opener; no identity probe preceded it. It produced the same
+strict oversized-record error and status `1`. Its exact empty JSON, stderr,
+and status-file hashes were
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+`cd80431c799d27f2a1e5af5479a328ac5da5cd0092b44230f00b97d7a3742321`,
+and
+`4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865`.
+This rules out the identity probe's close/reopen boundary as the sole cause of
+the observed failure. It does not identify the producer or corruption
+mechanism, and the qualifier still does not encode its failure phase or
+whether it had already made a diagnostic write. Fail-fast stopped the run, so
+no 50 Hz qualifier or later scripted phase followed. This directory is also
+failed evidence and must not be reused.
+
 ## Exact remaining gate
 
 Before the wheel-attach sentence is allowed:
