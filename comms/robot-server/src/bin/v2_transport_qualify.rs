@@ -1647,15 +1647,13 @@ where
         }
         match timed.message {
             Message::ControllerHello(value) => {
-                if validate_hello(exact, value).is_ok() {
-                    hello = Some(value);
-                }
+                validate_hello(exact, value)?;
+                hello = Some(value);
             }
             Message::Heartbeat(value) => {
-                if validate_idle_heartbeat(exact, value).is_ok() {
-                    saw_idle_heartbeat = true;
-                    heartbeat = Some(value);
-                }
+                validate_idle_heartbeat(exact, value)?;
+                saw_idle_heartbeat = true;
+                heartbeat = Some(value);
             }
             Message::TransportDiagnosticReport(_) => {
                 pre_challenge_reports_discarded = pre_challenge_reports_discarded
@@ -5286,7 +5284,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn unsafe_candidate_times_out_without_any_host_payload_write() {
+    async fn unsafe_candidate_propagates_typed_error_without_any_host_payload_write() {
         let (mut serial, mut controller) = tokio::io::duplex(4_096);
         let controller_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -5336,12 +5334,12 @@ mod tests {
             Ok(_) => panic!("unsafe candidate cannot reach the freshness challenge"),
         };
 
-        let QualificationError::AdmissionTimeout(evidence) = error else {
-            panic!("unsafe candidate must time out in read-only selection");
-        };
-        assert_eq!(evidence.stage, AdmissionStage::ReadOnlyCandidate);
-        assert!(evidence.stage_hello_observed);
-        assert!(!evidence.stage_idle_safe_heartbeat_observed);
+        assert!(matches!(
+            error,
+            QualificationError::HeartbeatNotIdleSafe {
+                detail: "heartbeat reports a session or armed deadline"
+            }
+        ));
         assert_eq!(
             controller_task.await.expect("test controller task joins"),
             0,
