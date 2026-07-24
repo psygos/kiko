@@ -151,6 +151,14 @@ correlated only. This evidence does not establish whether the raw temperature
 was physical heat, an electrical/telemetry fault, or another cause, and it
 does not qualify the head thermally.
 
+After the build had completed, the recovered child ran for about 170 seconds
+and reported a second `bow overtemp 79` at `07:18:12`, followed by the same OAK
+`X_LINK_ERROR`; the guardian recovered it again at `07:18:22`. This recurrence
+means the first fault must not be explained away as build-resource pressure.
+It still does not identify the physical or electrical cause. The head remains
+unqualified and requires attended support, independent power control, and
+read-only thermal/electrical diagnosis before any ownership handoff.
+
 No process was killed, no live device owner was deliberately displaced, and no
 firmware, installed service, or deployment file was changed. The only Nano
 mutation was fetching/checking out the exact revision in the separate
