@@ -234,6 +234,80 @@ procedure therefore removes that probe, enumerates the ST-Link through
 USB/sysfs without target attach, and requires the next evidence run to begin
 again with fresh duplicate connect-under-reset backups.
 
+The next complete restart used the new mode-`0700` directory
+`/home/makerspace/kiko-hardware-evidence/20260724T164932IST-1c543c2-attended-inert-restart3`
+and exact source revision
+`1c543c27185e5b41d54cc93ea40980406a573a7d`. USB/sysfs enumeration found
+exactly one `0483:374b` ST-Link, tied serial
+`066EFF313946303143221230` to the persistent VCP, and did not attach to the
+target. Its JSON SHA-256 is
+`5dac5ac52003ca5aaa34c043a259ac0349e0794105288fc80c18cb5af2bc7f87`.
+
+Two fresh connect-under-reset 512 KiB reads were byte-identical at SHA-256
+`768dfb8ce3beda16031740b2b4b6ccbb532ee3451f46179bf539c086f22b64cd`.
+Their executable prefix was the previously installed motor-inert main image
+`6974f25ce983a056f78f02180de8c4d018b4509b84314edc1ddc3b5077c02d49`;
+sector 7 remained
+`b5a41c3758763bbec72769fab4a2533bf2db0b6312d93d25a695f9e4b9e02260`.
+The old full-bank hash differs from the earlier pre-flash backup because its
+main prefix had been replaced; this is expected and does not imply a sector-7
+change. Two 16-byte option reads again matched at
+`d292558017cf9ca0a2e40e262a5c1daa4b305ccf084ce06128133d282f905115`.
+
+The new build reproduced ELF SHA-256
+`fe1f055c076d700fd65d0f02db2a55163f82b7789b3bb2bf8b0ee25ede130dcc`
+and padded main SHA-256
+`270e553f5c18a53393f0234f334d3ccc71be32ac7827240b54c939c6d6def38d`.
+OpenOCD connected under reset to device ID `0x10006421`, reported 512 KiB
+flash, programmed and verified only the 384 KiB main region, read it back at
+the same `270e...` hash, and independently re-read unchanged sector 7 at
+`b5a4...`. A separate invocation then issued the exact-target `reset run`.
+Motor power remained physically disconnected.
+
+The privileged no-owner check passed immediately before the first serial
+open. The read-only schema-2 identity probe nevertheless again returned status
+1 with empty stdout and
+`Error: Decode(OversizedRecord { maximum: 73 })`. The output SHA-256 is the
+empty-file hash
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
+stderr is
+`cd80431c799d27f2a1e5af5479a328ac5da5cd0092b44230f00b97d7a3742321`;
+the captured status file is
+`4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865`
+and contains `1`. The fail-fast shell closed the SSH session. No 20/50 Hz
+qualifier, journal operation, candidate flash, session, PWM, motor command, or
+later serial access followed. A new SSH connection read only those preserved
+files.
+
+Under the flashed motor-inert image's specified idle behavior, the only
+legitimate output records are a 70-byte delimited `ControllerHello` and
+59-byte delimited `Heartbeat`; their nonzero COBS bodies are 69 and 58 bytes
+respectively. The 74th consecutive post-boundary nonzero byte is therefore not
+a valid idle KRP2 record or an off-by-one maximum. The current evidence still
+cannot distinguish a lost delimiter, reset-fragment concatenation, wrong
+producer, or line corruption. The next run must preserve strict failure while
+capturing bounded raw-wire evidence through the earliest terminating delimiter
+when one is observed, or otherwise record the exact bounded stop.
+
+Commit `6cc59a1a3972c44df77dfd2cc02920ba40d896a2` makes that next observation
+failure-discriminating without adding a serial transmit path. The read-only
+probe now preserves the original typed decoder failure, captures a bounded
+wire suffix plus delimiter/run accounting and a non-cryptographic full-trace
+fingerprint, enforces exclusive deadline commits, and retains typed secondary
+read and output failures. Its exact source file SHA-256 is
+`6813e688e28de5d456c0c50ffbd11393f79364c69293ffaaa7472d917a60d05b`;
+two independent exact-byte audits found no remaining actionable issue. All 36
+`robot-server` bin tests passed both on macOS and natively on the Nano.
+
+Two clean Nano checkouts at that revision independently rebuilt the
+motor-inert firmware with their absolute roots remapped to `/kiko-source`.
+Their ELFs were byte-identical at
+`fe1f055c076d700fd65d0f02db2a55163f82b7789b3bb2bf8b0ee25ede130dcc`;
+their 393,216-byte padded main images were byte-identical at
+`270e553f5c18a53393f0234f334d3ccc71be32ac7827240b54c939c6d6def38d`.
+The build roots are `/home/makerspace/kiko-build-repro/6cc59a1-path-{a,b}`.
+That rehearsal opened no debugger, serial device, camera, or actuator.
+
 ## Exact remaining gate
 
 Before the wheel-attach sentence is allowed:

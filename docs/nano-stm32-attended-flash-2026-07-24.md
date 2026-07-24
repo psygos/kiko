@@ -52,7 +52,7 @@ umask 077
 
 REPO=/ABSOLUTE/CLEAN/KIKO/CHECKOUT
 EVIDENCE_DIR=/ABSOLUTE/NEW/NONEXISTENT/EVIDENCE-DIRECTORY
-EXPECTED_FIRMWARE_REVISION=1c543c27185e5b41d54cc93ea40980406a573a7d
+EXPECTED_FIRMWARE_REVISION=6cc59a1a3972c44df77dfd2cc02920ba40d896a2
 EXPECTED_MOTOR_INERT_ELF_SHA256=fe1f055c076d700fd65d0f02db2a55163f82b7789b3bb2bf8b0ee25ede130dcc
 EXPECTED_MOTOR_INERT_MAIN_SHA256=270e553f5c18a53393f0234f334d3ccc71be32ac7827240b54c939c6d6def38d
 STLINK_SERIAL=066EFF313946303143221230
@@ -312,7 +312,7 @@ checkout path. The pinned revision, lockfile, compiler identity, target, and
 flags record build provenance; the final hashes reject any resulting output
 byte difference, but do not prove that no other inputs could produce the same
 bytes. A Nano rehearsal at revision
-`1c543c27185e5b41d54cc93ea40980406a573a7d` built independently from
+`6cc59a1a3972c44df77dfd2cc02920ba40d896a2` built independently from
 `/home/makerspace/kiko-codex-native-check` and
 `/home/makerspace/kiko-stm32-flash-5526fc0`, each remapped to
 `/kiko-source`. The two ELFs compared byte-for-byte at SHA-256
@@ -320,7 +320,8 @@ bytes. A Nano rehearsal at revision
 the two 393,216-byte padded images compared byte-for-byte at SHA-256
 `270e553f5c18a53393f0234f334d3ccc71be32ac7827240b54c939c6d6def38d`.
 The evidence roots are
-`/home/makerspace/kiko-build-repro/1c543c2-path-{a,b}`. That rehearsal
+`/home/makerspace/kiko-build-repro/6cc59a1-path-{a,b}`. The same revision
+passed all 36 native `robot-server` bin tests on the Nano. That rehearsal
 performed no debugger, serial, firmware, or actuator operation.
 
 ## Prebuild the host evidence tools
@@ -558,6 +559,16 @@ read -r CONTROLLER_UID_HEX BOOT_ID trailing_value \
 test -z "${trailing_value:-}"
 test "$CONTROLLER_UID_HEX" = "$EXPECTED_CONTROLLER_UID_HEX"
 ```
+
+A strict decode failure remains a failed identity run. The probe adds one
+machine-readable `failure_wire_evidence_json=` object to standard error while
+preserving the typed decoder error as primary. After the first oversized
+record it remains read-only and traces only through the earliest bounded stop:
+the next zero delimiter, 4,096 additional bytes, the exclusive 250 ms
+completion deadline, the original probe deadline, the 65,536-byte global
+observation budget, EOF, a typed read failure, or a checked counter failure.
+The capture helper hashes that standard error before stopping, so do not retry
+or continue in the same evidence directory.
 
 A successful fresh owner cleared only its host input queue once and excluded
 subsequently delivered bytes through the first zero delimiter. It did not
