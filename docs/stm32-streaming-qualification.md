@@ -97,6 +97,16 @@ an exact controller identity, and a fresh idle-safe heartbeat. It never creates
 a control session and never sends PWM. Run a separate process for each exact
 rate and retain each JSON output:
 
+Each fresh host owner first claims the exact TTY exclusively, clears only the
+host input queue once, and excludes subsequently delivered bytes through the
+first zero delimiter. This establishes one explicit record boundary even when
+the previous owner closed mid-record. The clear does not prove that upstream
+ST-Link, USB, or in-flight bytes were absent. After that one delimiter, the
+canonical decoder is strict: any empty, malformed, or oversized record fails
+the probe or faults the runtime; no later error is relabelled as startup
+synchronization. Successful identity and qualification outputs use schema 2
+and state this boundary explicitly.
+
 ```text
 cargo run --locked -p robot-server --bin v2_transport_qualify -- \
   --serial-device /dev/serial/by-id/REPLACE_WITH_EXACT_STM32_ID \

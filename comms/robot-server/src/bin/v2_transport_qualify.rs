@@ -2655,7 +2655,7 @@ fn build_evidence(
             .is_some(),
         integrity_pattern_boundary: "the deterministic 20-byte pattern discriminates intended load and construction only; it is public and is not authentication",
         controller_clock_boundary: "wrapping-forward order is checked independently for Heartbeat uptime, odometry measurement uptime, diagnostic request receipt, and diagnostic response preparation; cross-stream timestamp order is not assumed because measurement and queueing times differ",
-        evidence_boundary: "pre-open queued input and one initial unknown record prefix are excluded; measurements begin only after strict post-boundary identity admission and cover software-observed host UART timing, decoded controller claims, and queue-depth samples for this run; no wheel motion, motor current, physical safety, or performance improvement is claimed",
+        evidence_boundary: "the host input queue was cleared once; subsequently delivered bytes through the first zero delimiter were excluded, while upstream and in-flight bytes were not measured; measurements begin only after strict post-boundary identity admission and cover software-observed host UART timing, decoded controller claims, and queue-depth samples for this run; no wheel motion, motor current, physical safety, or performance improvement is claimed",
     })
 }
 

@@ -341,7 +341,7 @@ fn write_observation(
         "watchdog_nominal_period_ms": hello.watchdog_nominal_period.get(),
         "neutral_output": neutral_output_name(hello.neutral_output),
         "physical_stop_semantics": stop_semantics_name(hello.physical_stop_semantics),
-        "evidence_boundary": "decoded software claim after one host-input clear and one discarded initial record suffix; no serial bytes were transmitted and no physical behavior was observed"
+        "evidence_boundary": "the host input queue was cleared once; subsequently delivered bytes through the first zero delimiter were excluded, including any upstream or in-flight bytes delivered after that clear; the result is one decoded software claim, no serial bytes were transmitted, and no physical behavior was observed"
     });
     let stdout = std::io::stdout();
     serde_json::to_writer_pretty(stdout.lock(), &observation)
