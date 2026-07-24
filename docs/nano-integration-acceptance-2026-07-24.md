@@ -111,28 +111,50 @@ cold power boot, device presence, USB exclusivity, physical watchdog and
 E-stop behavior, stopping distance, head torque, camera streaming, SLAM
 accuracy, MPC tracking, and performance.
 
-Portable pure/support crates compiled for Linux aarch64. A complete local
-Linux-aarch64 Kiko link was not claimed because this macOS host has no matching
-GNU cross sysroot. CI contains the exact Linux-aarch64 compile graph; a native
-Nano check remains part of deployment qualification.
+Portable pure/support crates compiled for Linux aarch64. The macOS host did not
+claim a GNU-cross-sysroot Kiko link. A later native Nano check moved only the
+separate clean compile-check checkout to exact revision
+`e723fc722a66741b59ef1dfcdac86c99ba1abe97`, then ran:
+
+```text
+OAK_SYS_CHECK_ONLY=1 cargo test --locked -p kiko-slam \
+  --features nano-agent --lib navigation::nano_bootstrap::tests
+```
+
+The fresh aarch64 Linux build completed in 5 minutes 29 seconds and all 19
+focused bootstrap tests passed. This proves the compile-only OAK graph links
+and the new startup logic executes on that Nano CPU/OS. It does not prove a
+native DepthAI link, device ownership, camera capture, serial traffic, timing,
+temperature, deployment, or actuation.
 
 ## Live Nano evidence preserved
 
 The read-only Nano audit found:
 
-- the Fable guardian and face-follow child still running and owning OAK, head,
-  and eyes;
+- the Fable guardian still running and owning the head/eye/OAK lifecycle;
 - the Fable dirty worktree preserved on
   `codex/fable-preserved-20260724`;
-- the clean `/home/makerspace/kiko` checkout untouched;
+- the separate `/home/makerspace/kiko-codex-native-check` checkout clean and
+  detached at the exact pushed integration revision above;
 - the STM32 serial endpoint present but emitting legacy ASCII `ODO,...`
   telemetry rather than KRP2;
 - the OAK currently opened by Fable in forced USB High-Speed mode, so its
   observed 480 Mbit/s link is not a valid SuperSpeed failure diagnosis;
 - no installed canonical Kiko service or immutable `/opt/kiko` deployment.
 
-No process was killed, no live device owner was displaced, and no firmware or
-deployment file was changed while collecting that evidence.
+At `2026-07-24T07:15:10+05:30`, while the compile-only build was running, the
+Fable child reported `bow overtemp 93`, began its park path, and then logged an
+OAK `X_LINK_ERROR`. The guardian respawned it at `07:15:17`; the new admission
+reported raw servo temperatures `32`, `31`, `35`, and `35`, re-established
+natural hold, and resumed eye acts. The build and the fault are temporally
+correlated only. This evidence does not establish whether the raw temperature
+was physical heat, an electrical/telemetry fault, or another cause, and it
+does not qualify the head thermally.
+
+No process was killed, no live device owner was deliberately displaced, and no
+firmware, installed service, or deployment file was changed. The only Nano
+mutation was fetching/checking out the exact revision in the separate
+compile-check tree and writing ignored Cargo build artifacts.
 
 ## Exact remaining gate
 
