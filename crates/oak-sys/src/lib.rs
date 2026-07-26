@@ -5,6 +5,11 @@
 
 use thiserror::Error;
 
+#[cfg(feature = "opencv-face-detector")]
+mod opencv_face_ffi;
+#[cfg(all(feature = "opencv-face-detector", any(test, not(oak_sys_check_only))))]
+use opencv_face_ffi::ffi as face_ffi;
+
 // ============================================================================
 // FFI MODULE - Raw C++ interface (not re-exported publicly)
 // ============================================================================
@@ -73,14 +78,6 @@ mod ffi {
         RectifiedLeft,
         RectifiedRight,
         Rgb,
-    }
-
-    #[cfg(feature = "opencv-face-detector")]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum RawHaarFaceDetectionSource {
-        Frontal,
-        Profile,
-        MirroredProfile,
     }
 
     #[derive(Debug, Clone)]
@@ -229,33 +226,6 @@ mod ffi {
         pub product_name: String,
     }
 
-    #[cfg(feature = "opencv-face-detector")]
-    #[derive(Debug, Clone, Copy)]
-    struct RawOpenCvHaarFaceDetectorConfig {
-        scale_factor: f64,
-        frontal_minimum_neighbors: u32,
-        profile_minimum_neighbors: u32,
-        minimum_face_width: u32,
-        minimum_face_height: u32,
-    }
-
-    #[cfg(feature = "opencv-face-detector")]
-    #[derive(Debug, Clone, Copy)]
-    struct RawHaarFaceDetection {
-        x: i64,
-        y: i64,
-        width: i64,
-        height: i64,
-        detector_level_weight: f64,
-        source: RawHaarFaceDetectionSource,
-    }
-
-    #[cfg(feature = "opencv-face-detector")]
-    #[derive(Debug)]
-    struct RawHaarFaceDetectionBatch {
-        detections: Vec<RawHaarFaceDetection>,
-    }
-
     #[cfg(not(oak_sys_check_only))]
     unsafe extern "C++" {
         include!("oak_device.hpp");
@@ -281,26 +251,6 @@ mod ffi {
         fn get_imu_batch(self: Pin<&mut OakDevice>) -> Result<ImuBatchResult>;
         fn get_stereo_baseline_m(self: &OakDevice) -> Result<f32>;
         fn close(self: Pin<&mut OakDevice>) -> Result<()>;
-    }
-
-    #[cfg(all(feature = "opencv-face-detector", not(oak_sys_check_only)))]
-    unsafe extern "C++" {
-        include!("opencv_face_detector.hpp");
-
-        type OpenCvHaarFaceDetector;
-
-        fn create_opencv_haar_face_detector(
-            frontal_cascade_xml: &[u8],
-            profile_cascade_xml: &[u8],
-            config: &RawOpenCvHaarFaceDetectorConfig,
-        ) -> Result<UniquePtr<OpenCvHaarFaceDetector>>;
-        fn detect(
-            self: Pin<&mut OpenCvHaarFaceDetector>,
-            tightly_packed_bgr: &[u8],
-            width: u32,
-            height: u32,
-            stride_bytes: u32,
-        ) -> Result<RawHaarFaceDetectionBatch>;
     }
 }
 
@@ -1287,8 +1237,8 @@ impl OpenCvHaarFaceDetectorConfig {
     }
 
     #[cfg(not(oak_sys_check_only))]
-    fn to_ffi(&self) -> ffi::RawOpenCvHaarFaceDetectorConfig {
-        ffi::RawOpenCvHaarFaceDetectorConfig {
+    fn to_ffi(&self) -> face_ffi::RawOpenCvHaarFaceDetectorConfig {
+        face_ffi::RawOpenCvHaarFaceDetectorConfig {
             scale_factor: self.scale_factor,
             frontal_minimum_neighbors: self.frontal_minimum_neighbors,
             profile_minimum_neighbors: self.profile_minimum_neighbors,
@@ -1595,7 +1545,7 @@ pub enum HaarFaceDetectionError {
 #[cfg(feature = "opencv-face-detector")]
 pub struct OpenCvHaarFaceDetector {
     #[cfg(not(oak_sys_check_only))]
-    inner: cxx::UniquePtr<ffi::OpenCvHaarFaceDetector>,
+    inner: cxx::UniquePtr<face_ffi::OpenCvHaarFaceDetector>,
     config: OpenCvHaarFaceDetectorConfig,
 }
 
@@ -1625,7 +1575,7 @@ impl OpenCvHaarFaceDetector {
         #[cfg(not(oak_sys_check_only))]
         {
             let raw_config = config.to_ffi();
-            let inner = ffi::create_opencv_haar_face_detector(
+            let inner = face_ffi::create_opencv_haar_face_detector(
                 frontal_cascade_xml,
                 profile_cascade_xml,
                 &raw_config,
@@ -1730,7 +1680,7 @@ fn validate_haar_detector_frame(frame: &ImageFrame) -> Result<(), HaarFaceDetect
 
 #[cfg(all(feature = "opencv-face-detector", any(test, not(oak_sys_check_only))))]
 fn parse_raw_haar_face_detection_batch(
-    raw: ffi::RawHaarFaceDetectionBatch,
+    raw: face_ffi::RawHaarFaceDetectionBatch,
     frame: &ImageFrame,
     maximum_retained_detections: u32,
 ) -> Result<HaarFaceDetectionBatch, HaarFaceDetectionError> {
@@ -1745,9 +1695,9 @@ fn parse_raw_haar_face_detection_batch(
     let mut batch_source = None;
     for (detection_index, raw) in raw.detections.into_iter().enumerate() {
         let source = match raw.source {
-            ffi::RawHaarFaceDetectionSource::Frontal => HaarFaceDetectionSource::Frontal,
-            ffi::RawHaarFaceDetectionSource::Profile => HaarFaceDetectionSource::Profile,
-            ffi::RawHaarFaceDetectionSource::MirroredProfile => {
+            face_ffi::RawHaarFaceDetectionSource::Frontal => HaarFaceDetectionSource::Frontal,
+            face_ffi::RawHaarFaceDetectionSource::Profile => HaarFaceDetectionSource::Profile,
+            face_ffi::RawHaarFaceDetectionSource::MirroredProfile => {
                 HaarFaceDetectionSource::MirroredProfile
             }
             _ => {
@@ -3494,9 +3444,9 @@ mod tests {
         width: i64,
         height: i64,
         detector_level_weight: f64,
-        source: ffi::RawHaarFaceDetectionSource,
-    ) -> ffi::RawHaarFaceDetection {
-        ffi::RawHaarFaceDetection {
+        source: face_ffi::RawHaarFaceDetectionSource,
+    ) -> face_ffi::RawHaarFaceDetection {
+        face_ffi::RawHaarFaceDetection {
             x,
             y,
             width,
@@ -3638,7 +3588,7 @@ mod tests {
             DeviceFrameSequence::try_from_i64(9001).expect("test sequence");
         frame.host_delivery_sequence = FrameDeliverySequence::new(42);
         frame.timestamp = Timestamp::try_from_nanos(123_456).expect("test timestamp");
-        let raw = ffi::RawHaarFaceDetectionBatch {
+        let raw = face_ffi::RawHaarFaceDetectionBatch {
             detections: vec![
                 raw_haar_detection(
                     20,
@@ -3646,7 +3596,7 @@ mod tests {
                     10,
                     12,
                     -2.0,
-                    ffi::RawHaarFaceDetectionSource::Frontal,
+                    face_ffi::RawHaarFaceDetectionSource::Frontal,
                 ),
                 raw_haar_detection(
                     10,
@@ -3654,10 +3604,24 @@ mod tests {
                     10,
                     10,
                     4.0,
-                    ffi::RawHaarFaceDetectionSource::Frontal,
+                    face_ffi::RawHaarFaceDetectionSource::Frontal,
                 ),
-                raw_haar_detection(5, 5, 20, 10, 4.0, ffi::RawHaarFaceDetectionSource::Frontal),
-                raw_haar_detection(1, 1, 5, 5, 8.0, ffi::RawHaarFaceDetectionSource::Frontal),
+                raw_haar_detection(
+                    5,
+                    5,
+                    20,
+                    10,
+                    4.0,
+                    face_ffi::RawHaarFaceDetectionSource::Frontal,
+                ),
+                raw_haar_detection(
+                    1,
+                    1,
+                    5,
+                    5,
+                    8.0,
+                    face_ffi::RawHaarFaceDetectionSource::Frontal,
+                ),
             ],
         };
         let batch = parse_raw_haar_face_detection_batch(raw, &frame, 3).expect("valid raw batch");
@@ -3700,7 +3664,7 @@ mod tests {
     #[test]
     fn widest_negative_level_weight_survives_retained_cap() {
         let frame = detector_rgb_frame(100, 80);
-        let raw = ffi::RawHaarFaceDetectionBatch {
+        let raw = face_ffi::RawHaarFaceDetectionBatch {
             detections: vec![
                 raw_haar_detection(
                     5,
@@ -3708,7 +3672,7 @@ mod tests {
                     30,
                     10,
                     -100.0,
-                    ffi::RawHaarFaceDetectionSource::Frontal,
+                    face_ffi::RawHaarFaceDetectionSource::Frontal,
                 ),
                 raw_haar_detection(
                     10,
@@ -3716,7 +3680,7 @@ mod tests {
                     29,
                     60,
                     1_000_000.0,
-                    ffi::RawHaarFaceDetectionSource::Frontal,
+                    face_ffi::RawHaarFaceDetectionSource::Frontal,
                 ),
             ],
         };
@@ -3733,9 +3697,17 @@ mod tests {
     #[test]
     fn raw_haar_parser_validates_candidates_beyond_the_retained_cap() {
         let frame = detector_rgb_frame(40, 30);
-        let valid =
-            || raw_haar_detection(1, 1, 10, 10, 1.0, ffi::RawHaarFaceDetectionSource::Frontal);
-        let raw = ffi::RawHaarFaceDetectionBatch {
+        let valid = || {
+            raw_haar_detection(
+                1,
+                1,
+                10,
+                10,
+                1.0,
+                face_ffi::RawHaarFaceDetectionSource::Frontal,
+            )
+        };
+        let raw = face_ffi::RawHaarFaceDetectionBatch {
             detections: vec![
                 valid(),
                 valid(),
@@ -3745,7 +3717,7 @@ mod tests {
                     10,
                     10,
                     f64::NAN,
-                    ffi::RawHaarFaceDetectionSource::Frontal,
+                    face_ffi::RawHaarFaceDetectionSource::Frontal,
                 ),
             ],
         };
@@ -3762,10 +3734,16 @@ mod tests {
     #[test]
     fn raw_haar_parser_rejects_results_above_the_absolute_native_limit() {
         let frame = detector_rgb_frame(40, 30);
-        let detection =
-            raw_haar_detection(1, 1, 10, 10, 1.0, ffi::RawHaarFaceDetectionSource::Frontal);
+        let detection = raw_haar_detection(
+            1,
+            1,
+            10,
+            10,
+            1.0,
+            face_ffi::RawHaarFaceDetectionSource::Frontal,
+        );
         let count = MAXIMUM_NATIVE_HAAR_FACE_DETECTIONS as usize + 1;
-        let raw = ffi::RawHaarFaceDetectionBatch {
+        let raw = face_ffi::RawHaarFaceDetectionBatch {
             detections: vec![detection; count],
         };
         assert_eq!(
@@ -3782,14 +3760,14 @@ mod tests {
     fn raw_haar_parser_rejects_nonfinite_weights_unknown_sources_and_bad_rectangles() {
         let frame = detector_rgb_frame(40, 30);
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let raw = ffi::RawHaarFaceDetectionBatch {
+            let raw = face_ffi::RawHaarFaceDetectionBatch {
                 detections: vec![raw_haar_detection(
                     1,
                     1,
                     10,
                     10,
                     value,
-                    ffi::RawHaarFaceDetectionSource::Frontal,
+                    face_ffi::RawHaarFaceDetectionSource::Frontal,
                 )],
             };
             assert!(matches!(
@@ -3801,14 +3779,14 @@ mod tests {
             ));
         }
 
-        let raw = ffi::RawHaarFaceDetectionBatch {
+        let raw = face_ffi::RawHaarFaceDetectionBatch {
             detections: vec![raw_haar_detection(
                 1,
                 1,
                 10,
                 10,
                 1.0,
-                ffi::RawHaarFaceDetectionSource { repr: u8::MAX },
+                face_ffi::RawHaarFaceDetectionSource { repr: u8::MAX },
             )],
         };
         assert_eq!(
@@ -3818,19 +3796,19 @@ mod tests {
 
         for (raw_source, expected_source) in [
             (
-                ffi::RawHaarFaceDetectionSource::Frontal,
+                face_ffi::RawHaarFaceDetectionSource::Frontal,
                 HaarFaceDetectionSource::Frontal,
             ),
             (
-                ffi::RawHaarFaceDetectionSource::Profile,
+                face_ffi::RawHaarFaceDetectionSource::Profile,
                 HaarFaceDetectionSource::Profile,
             ),
             (
-                ffi::RawHaarFaceDetectionSource::MirroredProfile,
+                face_ffi::RawHaarFaceDetectionSource::MirroredProfile,
                 HaarFaceDetectionSource::MirroredProfile,
             ),
         ] {
-            let raw = ffi::RawHaarFaceDetectionBatch {
+            let raw = face_ffi::RawHaarFaceDetectionBatch {
                 detections: vec![raw_haar_detection(1, 1, 10, 10, 1.0, raw_source)],
             };
             let parsed =
@@ -3838,10 +3816,24 @@ mod tests {
             assert_eq!(parsed.detections()[0].source(), expected_source);
         }
 
-        let raw = ffi::RawHaarFaceDetectionBatch {
+        let raw = face_ffi::RawHaarFaceDetectionBatch {
             detections: vec![
-                raw_haar_detection(1, 1, 10, 10, 1.0, ffi::RawHaarFaceDetectionSource::Frontal),
-                raw_haar_detection(2, 2, 10, 10, 1.0, ffi::RawHaarFaceDetectionSource::Profile),
+                raw_haar_detection(
+                    1,
+                    1,
+                    10,
+                    10,
+                    1.0,
+                    face_ffi::RawHaarFaceDetectionSource::Frontal,
+                ),
+                raw_haar_detection(
+                    2,
+                    2,
+                    10,
+                    10,
+                    1.0,
+                    face_ffi::RawHaarFaceDetectionSource::Profile,
+                ),
             ],
         };
         assert_eq!(
@@ -3863,14 +3855,14 @@ mod tests {
             (i64::MAX, 0, 1, 1),
             (0, i64::MAX, 1, 1),
         ] {
-            let raw = ffi::RawHaarFaceDetectionBatch {
+            let raw = face_ffi::RawHaarFaceDetectionBatch {
                 detections: vec![raw_haar_detection(
                     x,
                     y,
                     width,
                     height,
                     -100.0,
-                    ffi::RawHaarFaceDetectionSource::Profile,
+                    face_ffi::RawHaarFaceDetectionSource::Profile,
                 )],
             };
             assert!(matches!(

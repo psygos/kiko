@@ -1,4 +1,4 @@
-#include "oak-sys/src/lib.rs.h"
+#include "oak-sys/src/opencv_face_ffi.rs.h"
 #include "opencv_face_detector.hpp"
 
 #include <opencv2/core.hpp>

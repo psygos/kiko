@@ -425,6 +425,7 @@ fn emit_rerun_directives() {
     println!("cargo:rustc-check-cfg=cfg(oak_sys_check_only)");
     for path in [
         "src/lib.rs",
+        "src/opencv_face_ffi.rs",
         "cpp/oak_device.hpp",
         "cpp/oak_device.cpp",
         "cpp/opencv_face_detector.hpp",
@@ -434,6 +435,14 @@ fn emit_rerun_directives() {
     }
     for variable in INPUT_ENV_VARS {
         println!("cargo:rerun-if-env-changed={variable}");
+    }
+}
+
+fn bridge_sources(opencv_face_detector: bool) -> &'static [&'static str] {
+    if opencv_face_detector {
+        &["src/lib.rs", "src/opencv_face_ffi.rs"]
+    } else {
+        &["src/lib.rs"]
     }
 }
 
@@ -485,7 +494,7 @@ fn main() {
         .unwrap_or_else(|error| panic!("oak-sys native dependency discovery failed: {error}"));
     let paths = discover(&inputs)
         .unwrap_or_else(|error| panic!("oak-sys native dependency discovery failed: {error}"));
-    let mut build = cxx_build::bridge("src/lib.rs");
+    let mut build = cxx_build::bridges(bridge_sources(inputs.opencv_face_detector).iter().copied());
     build
         .file("cpp/oak_device.cpp")
         .include("cpp")
@@ -549,6 +558,15 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).expect("remove test directory");
         }
+    }
+
+    #[test]
+    fn face_feature_selects_its_complete_cxx_bridge_surface() {
+        assert_eq!(bridge_sources(false), ["src/lib.rs"]);
+        assert_eq!(
+            bridge_sources(true),
+            ["src/lib.rs", "src/opencv_face_ffi.rs"]
+        );
     }
 
     #[test]
