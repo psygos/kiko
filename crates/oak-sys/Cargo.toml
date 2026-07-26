@@ -6,6 +6,7 @@ description = "FFI bindings to OAK-D camera via DepthAI"
 
 [features]
 default = []
+opencv-face-detector = []
 rerun-view = ["dep:rerun"]
 
 [dependencies]

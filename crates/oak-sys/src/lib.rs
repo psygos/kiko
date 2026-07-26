@@ -75,6 +75,14 @@ mod ffi {
         Rgb,
     }
 
+    #[cfg(feature = "opencv-face-detector")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RawHaarFaceDetectionSource {
+        Frontal,
+        Profile,
+        MirroredProfile,
+    }
+
     #[derive(Debug, Clone)]
     pub struct DeviceConfig {
         pub maximum_usb_speed: UsbSpeed,
@@ -221,6 +229,33 @@ mod ffi {
         pub product_name: String,
     }
 
+    #[cfg(feature = "opencv-face-detector")]
+    #[derive(Debug, Clone, Copy)]
+    struct RawOpenCvHaarFaceDetectorConfig {
+        scale_factor: f64,
+        frontal_minimum_neighbors: u32,
+        profile_minimum_neighbors: u32,
+        minimum_face_width: u32,
+        minimum_face_height: u32,
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    #[derive(Debug, Clone, Copy)]
+    struct RawHaarFaceDetection {
+        x: i64,
+        y: i64,
+        width: i64,
+        height: i64,
+        detector_level_weight: f64,
+        source: RawHaarFaceDetectionSource,
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    #[derive(Debug)]
+    struct RawHaarFaceDetectionBatch {
+        detections: Vec<RawHaarFaceDetection>,
+    }
+
     #[cfg(not(oak_sys_check_only))]
     unsafe extern "C++" {
         include!("oak_device.hpp");
@@ -246,6 +281,26 @@ mod ffi {
         fn get_imu_batch(self: Pin<&mut OakDevice>) -> Result<ImuBatchResult>;
         fn get_stereo_baseline_m(self: &OakDevice) -> Result<f32>;
         fn close(self: Pin<&mut OakDevice>) -> Result<()>;
+    }
+
+    #[cfg(all(feature = "opencv-face-detector", not(oak_sys_check_only)))]
+    unsafe extern "C++" {
+        include!("opencv_face_detector.hpp");
+
+        type OpenCvHaarFaceDetector;
+
+        fn create_opencv_haar_face_detector(
+            frontal_cascade_xml: &[u8],
+            profile_cascade_xml: &[u8],
+            config: &RawOpenCvHaarFaceDetectorConfig,
+        ) -> Result<UniquePtr<OpenCvHaarFaceDetector>>;
+        fn detect(
+            self: Pin<&mut OpenCvHaarFaceDetector>,
+            tightly_packed_bgr: &[u8],
+            width: u32,
+            height: u32,
+            stride_bytes: u32,
+        ) -> Result<RawHaarFaceDetectionBatch>;
     }
 }
 
@@ -1092,6 +1147,701 @@ impl ImageFrame {
     pub fn into_pixels(self) -> Vec<u8> {
         self.data
     }
+}
+
+// ============================================================================
+// OPTIONAL HOST-SIDE OPENCV HAAR FACE DETECTOR
+// ============================================================================
+
+/// Hard upper bound for detections retained in one public result batch.
+#[cfg(feature = "opencv-face-detector")]
+pub const MAXIMUM_RETAINED_HAAR_FACE_DETECTIONS: u32 = 256;
+
+/// Absolute upper bound for native candidates admitted across the CXX result
+/// boundary before deterministic retained-output capping.
+///
+/// This bounds bridge materialization, not OpenCV's internal cascade-search
+/// work or temporary allocations.
+#[cfg(feature = "opencv-face-detector")]
+pub const MAXIMUM_NATIVE_HAAR_FACE_DETECTIONS: u32 = 4096;
+
+/// Per-axis bound for frames admitted to the host Haar detector.
+#[cfg(feature = "opencv-face-detector")]
+pub const MAXIMUM_HAAR_FACE_FRAME_DIMENSION: u32 = 4096;
+
+/// Total-pixel bound for frames admitted to the host Haar detector. This
+/// admits UHD 3840x2160 while bounding BGR and grayscale working sets.
+#[cfg(feature = "opencv-face-detector")]
+pub const MAXIMUM_HAAR_FACE_FRAME_PIXELS: u64 = 8_388_608;
+
+/// Per-cascade byte bound, aligned with the Nano deployment asset cap.
+#[cfg(feature = "opencv-face-detector")]
+pub const MAXIMUM_OPENCV_HAAR_CASCADE_XML_BYTES: usize = 4 * 1_024 * 1_024;
+
+/// Bounded OpenCV Haar search parameters.
+///
+/// Cascade identity and bytes are supplied separately to
+/// [`OpenCvHaarFaceDetector::load`]. Keeping file paths out of this domain type
+/// prevents a checked deployment asset from being reopened by name later.
+#[cfg(feature = "opencv-face-detector")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenCvHaarFaceDetectorConfig {
+    scale_factor: f64,
+    frontal_minimum_neighbors: u32,
+    profile_minimum_neighbors: u32,
+    minimum_face_width: u32,
+    minimum_face_height: u32,
+    maximum_retained_detections: u32,
+}
+
+#[cfg(feature = "opencv-face-detector")]
+impl OpenCvHaarFaceDetectorConfig {
+    pub fn try_new(
+        scale_factor: f64,
+        frontal_minimum_neighbors: u32,
+        profile_minimum_neighbors: u32,
+        minimum_face_width: u32,
+        minimum_face_height: u32,
+        maximum_retained_detections: u32,
+    ) -> Result<Self, OpenCvHaarFaceDetectorConfigError> {
+        let config = Self {
+            scale_factor,
+            frontal_minimum_neighbors,
+            profile_minimum_neighbors,
+            minimum_face_width,
+            minimum_face_height,
+            maximum_retained_detections,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub const fn scale_factor(&self) -> f64 {
+        self.scale_factor
+    }
+
+    pub const fn frontal_minimum_neighbors(&self) -> u32 {
+        self.frontal_minimum_neighbors
+    }
+
+    pub const fn profile_minimum_neighbors(&self) -> u32 {
+        self.profile_minimum_neighbors
+    }
+
+    pub const fn minimum_face_width(&self) -> u32 {
+        self.minimum_face_width
+    }
+
+    pub const fn minimum_face_height(&self) -> u32 {
+        self.minimum_face_height
+    }
+
+    pub const fn maximum_retained_detections(&self) -> u32 {
+        self.maximum_retained_detections
+    }
+
+    fn validate(&self) -> Result<(), OpenCvHaarFaceDetectorConfigError> {
+        if !self.scale_factor.is_finite() || self.scale_factor <= 1.0 {
+            return Err(OpenCvHaarFaceDetectorConfigError::InvalidScaleFactor {
+                value: self.scale_factor,
+            });
+        }
+        for (field, value) in [
+            ("frontal_minimum_neighbors", self.frontal_minimum_neighbors),
+            ("profile_minimum_neighbors", self.profile_minimum_neighbors),
+        ] {
+            if value == 0 {
+                return Err(OpenCvHaarFaceDetectorConfigError::ZeroMinimumNeighbors { field });
+            }
+            if value > i32::MAX as u32 {
+                return Err(
+                    OpenCvHaarFaceDetectorConfigError::ParameterExceedsOpenCvInt { field, value },
+                );
+            }
+        }
+        for (field, value) in [
+            ("minimum_face_width", self.minimum_face_width),
+            ("minimum_face_height", self.minimum_face_height),
+        ] {
+            if value == 0 {
+                return Err(OpenCvHaarFaceDetectorConfigError::ZeroMinimumFaceDimension { field });
+            }
+            if value > i32::MAX as u32 {
+                return Err(
+                    OpenCvHaarFaceDetectorConfigError::ParameterExceedsOpenCvInt { field, value },
+                );
+            }
+        }
+        if self.maximum_retained_detections == 0 {
+            return Err(OpenCvHaarFaceDetectorConfigError::ZeroMaximumRetainedDetections);
+        }
+        if self.maximum_retained_detections > MAXIMUM_RETAINED_HAAR_FACE_DETECTIONS {
+            return Err(
+                OpenCvHaarFaceDetectorConfigError::MaximumRetainedDetectionsExceedsLimit {
+                    value: self.maximum_retained_detections,
+                    limit: MAXIMUM_RETAINED_HAAR_FACE_DETECTIONS,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(oak_sys_check_only))]
+    fn to_ffi(&self) -> ffi::RawOpenCvHaarFaceDetectorConfig {
+        ffi::RawOpenCvHaarFaceDetectorConfig {
+            scale_factor: self.scale_factor,
+            frontal_minimum_neighbors: self.frontal_minimum_neighbors,
+            profile_minimum_neighbors: self.profile_minimum_neighbors,
+            minimum_face_width: self.minimum_face_width,
+            minimum_face_height: self.minimum_face_height,
+        }
+    }
+}
+
+#[cfg(feature = "opencv-face-detector")]
+fn validate_cascade_xml(
+    cascade: &'static str,
+    xml: &[u8],
+) -> Result<(), OpenCvHaarFaceDetectorLoadError> {
+    if xml.is_empty() {
+        return Err(OpenCvHaarFaceDetectorLoadError::EmptyCascadeXml { cascade });
+    }
+    if xml.len() > MAXIMUM_OPENCV_HAAR_CASCADE_XML_BYTES {
+        return Err(
+            OpenCvHaarFaceDetectorLoadError::CascadeXmlExceedsByteLimit {
+                cascade,
+                actual_bytes: xml.len(),
+                maximum_bytes: MAXIMUM_OPENCV_HAAR_CASCADE_XML_BYTES,
+            },
+        );
+    }
+    if xml.contains(&0) {
+        return Err(OpenCvHaarFaceDetectorLoadError::CascadeXmlContainsNul { cascade });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "opencv-face-detector")]
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum OpenCvHaarFaceDetectorConfigError {
+    #[error("OpenCV Haar scale factor must be finite and greater than 1, got {value}")]
+    InvalidScaleFactor { value: f64 },
+
+    #[error("OpenCV Haar {field} count must be nonzero")]
+    ZeroMinimumNeighbors { field: &'static str },
+
+    #[error("OpenCV Haar {field} must be nonzero")]
+    ZeroMinimumFaceDimension { field: &'static str },
+
+    #[error("OpenCV Haar {field}={value} exceeds OpenCV's signed-int range")]
+    ParameterExceedsOpenCvInt { field: &'static str, value: u32 },
+
+    #[error("OpenCV Haar maximum retained-detection count must be nonzero")]
+    ZeroMaximumRetainedDetections,
+
+    #[error("OpenCV Haar maximum retained-detection count {value} exceeds hard limit {limit}")]
+    MaximumRetainedDetectionsExceedsLimit { value: u32, limit: u32 },
+}
+
+/// Which exact cascade/search orientation produced a face rectangle.
+#[cfg(feature = "opencv-face-detector")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HaarFaceDetectionSource {
+    Frontal,
+    Profile,
+    MirroredProfile,
+}
+
+/// A validated rectangle in the source frame's pixel grid.
+#[cfg(feature = "opencv-face-detector")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FacePixelRectangle {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(feature = "opencv-face-detector")]
+impl FacePixelRectangle {
+    pub const fn x(self) -> u32 {
+        self.x
+    }
+
+    pub const fn y(self) -> u32 {
+        self.y
+    }
+
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+
+    pub fn right(self) -> u32 {
+        self.x
+            .checked_add(self.width)
+            .expect("validated face rectangle right edge")
+    }
+
+    pub fn bottom(self) -> u32 {
+        self.y
+            .checked_add(self.height)
+            .expect("validated face rectangle bottom edge")
+    }
+
+    pub const fn area(self) -> u64 {
+        self.width as u64 * self.height as u64
+    }
+}
+
+/// One validated OpenCV cascade detection.
+///
+/// `detector_level_weight` is OpenCV's finite, opaque cascade level weight. It
+/// is not a calibrated confidence or probability, and retained-output
+/// selection uses it only after rectangle width and height.
+#[cfg(feature = "opencv-face-detector")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HaarFaceDetection {
+    bounds: FacePixelRectangle,
+    source: HaarFaceDetectionSource,
+    detector_level_weight: f64,
+}
+
+#[cfg(feature = "opencv-face-detector")]
+impl HaarFaceDetection {
+    pub const fn bounds(self) -> FacePixelRectangle {
+        self.bounds
+    }
+
+    pub const fn source(self) -> HaarFaceDetectionSource {
+        self.source
+    }
+
+    pub const fn detector_level_weight(self) -> f64 {
+        self.detector_level_weight
+    }
+}
+
+/// A detector result bound to the exact borrowed RGB frame.
+#[cfg(feature = "opencv-face-detector")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct HaarFaceDetectionBatch {
+    stream: StreamId,
+    device_capture_sequence: DeviceFrameSequence,
+    host_delivery_sequence: FrameDeliverySequence,
+    timestamp: Timestamp,
+    timestamp_reference: CameraTimestampReference,
+    width: u32,
+    height: u32,
+    native_detection_count: usize,
+    detections: Vec<HaarFaceDetection>,
+}
+
+#[cfg(feature = "opencv-face-detector")]
+impl HaarFaceDetectionBatch {
+    pub const fn stream(&self) -> StreamId {
+        self.stream
+    }
+
+    pub const fn device_capture_sequence(&self) -> DeviceFrameSequence {
+        self.device_capture_sequence
+    }
+
+    pub const fn host_delivery_sequence(&self) -> FrameDeliverySequence {
+        self.host_delivery_sequence
+    }
+
+    pub const fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    pub const fn timestamp_reference(&self) -> CameraTimestampReference {
+        self.timestamp_reference
+    }
+
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Candidate count returned by the first nonempty native cascade search,
+    /// before the deterministic Rust-side output cap.
+    pub const fn native_detection_count(&self) -> usize {
+        self.native_detection_count
+    }
+
+    pub fn was_truncated(&self) -> bool {
+        self.native_detection_count > self.detections.len()
+    }
+
+    /// Retained detections, ordered by descending rectangle width, then
+    /// descending height, then descending opaque detector level weight, with
+    /// deterministic coordinate/source tie-breaks.
+    pub fn detections(&self) -> &[HaarFaceDetection] {
+        &self.detections
+    }
+
+    pub fn into_detections(self) -> Vec<HaarFaceDetection> {
+        self.detections
+    }
+}
+
+#[cfg(feature = "opencv-face-detector")]
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum OpenCvHaarFaceDetectorLoadError {
+    #[error("{cascade} OpenCV Haar cascade XML must not be empty")]
+    EmptyCascadeXml { cascade: &'static str },
+
+    #[error(
+        "{cascade} OpenCV Haar cascade XML is {actual_bytes} bytes, exceeding hard limit {maximum_bytes}"
+    )]
+    CascadeXmlExceedsByteLimit {
+        cascade: &'static str,
+        actual_bytes: usize,
+        maximum_bytes: usize,
+    },
+
+    #[error("{cascade} OpenCV Haar cascade XML must not contain an embedded NUL")]
+    CascadeXmlContainsNul { cascade: &'static str },
+
+    #[error("OpenCV Haar face detector is disabled by OAK_SYS_CHECK_ONLY=1")]
+    CompileOnlyNativeDisabled,
+
+    #[error("OpenCV failed to parse the supplied Haar cascade XML bytes: {message}")]
+    Native { message: String },
+
+    #[error("OpenCV returned a null Haar face detector")]
+    NullDetector,
+}
+
+#[cfg(feature = "opencv-face-detector")]
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum HaarFaceDetectionError {
+    #[error("OpenCV Haar face detection requires an RGB/BGR frame, got {stream:?}")]
+    NonRgbFrame { stream: StreamId },
+
+    #[error(
+        "RGB frame is not tightly packed BGR888: {width}x{height}, stride={stride_bytes}, bytes={data_len}"
+    )]
+    InvalidBgrFrameLayout {
+        width: u32,
+        height: u32,
+        stride_bytes: u32,
+        data_len: usize,
+    },
+
+    #[error(
+        "RGB frame {width}x{height} exceeds Haar detector limits: each axis <= {maximum_dimension}, total pixels <= {maximum_pixels}"
+    )]
+    FrameDimensionsExceedDetectorLimit {
+        width: u32,
+        height: u32,
+        maximum_dimension: u32,
+        maximum_pixels: u64,
+    },
+
+    #[error("OpenCV Haar face detector is disabled by OAK_SYS_CHECK_ONLY=1")]
+    CompileOnlyNativeDisabled,
+
+    #[error("OpenCV Haar face detection failed: {message}")]
+    Native { message: String },
+
+    #[error("native face detection {detection_index} has an unrecognized source kind")]
+    InvalidSource { detection_index: usize },
+
+    #[error(
+        "native Haar result count {count} exceeds absolute bridge limit {limit}; OpenCV internal search work is not represented by this limit"
+    )]
+    NativeDetectionCountExceedsLimit { count: usize, limit: u32 },
+
+    #[error(
+        "native face detection {detection_index} changed source from {expected:?} to {actual:?} within one fallback batch"
+    )]
+    InconsistentSource {
+        detection_index: usize,
+        expected: HaarFaceDetectionSource,
+        actual: HaarFaceDetectionSource,
+    },
+
+    #[error(
+        "native face detection {detection_index} has a non-finite detector level weight {value}"
+    )]
+    NonFiniteDetectorLevelWeight { detection_index: usize, value: f64 },
+
+    #[error(
+        "native face detection {detection_index} has invalid rectangle ({x},{y},{width},{height}) for frame {frame_width}x{frame_height}"
+    )]
+    InvalidRectangle {
+        detection_index: usize,
+        x: i64,
+        y: i64,
+        width: i64,
+        height: i64,
+        frame_width: u32,
+        frame_height: u32,
+    },
+}
+
+/// Separately owned host detector. It owns no OAK device or DepthAI pipeline.
+///
+/// Successful compilation is not deployment-target runtime qualification of
+/// OpenCV, either supplied cascade, or detector latency.
+#[cfg(feature = "opencv-face-detector")]
+pub struct OpenCvHaarFaceDetector {
+    #[cfg(not(oak_sys_check_only))]
+    inner: cxx::UniquePtr<ffi::OpenCvHaarFaceDetector>,
+    config: OpenCvHaarFaceDetectorConfig,
+}
+
+#[cfg(feature = "opencv-face-detector")]
+impl OpenCvHaarFaceDetector {
+    /// Parse and load two exact, already-retained cascade XML payloads.
+    ///
+    /// Each payload is bounded and rejected when empty or when it contains an
+    /// embedded NUL. The C++ boundary copies both borrowed slices before
+    /// parsing them from memory; neither classifier nor this detector retains
+    /// a Rust borrow. OpenCV performs the format-specific parse, so malformed
+    /// or unsupported classifier XML is returned as a typed native load error.
+    pub fn load(
+        frontal_cascade_xml: &[u8],
+        profile_cascade_xml: &[u8],
+        config: OpenCvHaarFaceDetectorConfig,
+    ) -> Result<Self, OpenCvHaarFaceDetectorLoadError> {
+        validate_cascade_xml("frontal", frontal_cascade_xml)?;
+        validate_cascade_xml("profile", profile_cascade_xml)?;
+
+        #[cfg(oak_sys_check_only)]
+        {
+            let _ = (frontal_cascade_xml, profile_cascade_xml, config);
+            Err(OpenCvHaarFaceDetectorLoadError::CompileOnlyNativeDisabled)
+        }
+
+        #[cfg(not(oak_sys_check_only))]
+        {
+            let raw_config = config.to_ffi();
+            let inner = ffi::create_opencv_haar_face_detector(
+                frontal_cascade_xml,
+                profile_cascade_xml,
+                &raw_config,
+            )
+            .map_err(|error| OpenCvHaarFaceDetectorLoadError::Native {
+                message: error.what().to_owned(),
+            })?;
+            if inner.is_null() {
+                return Err(OpenCvHaarFaceDetectorLoadError::NullDetector);
+            }
+            Ok(Self { inner, config })
+        }
+    }
+
+    pub fn config(&self) -> &OpenCvHaarFaceDetectorConfig {
+        &self.config
+    }
+
+    /// Detect faces by borrowing this frame's tightly packed BGR bytes.
+    ///
+    /// Native preprocessing converts BGR to grayscale and equalizes its
+    /// histogram. Search then stops at the first nonempty source in this
+    /// order: frontal, profile, then profile on a horizontally mirrored
+    /// equalized image. Mirrored rectangles are mapped back into this frame's
+    /// grid. Input dimensions and CXX/public boundary results have explicit
+    /// limits; those result limits do not bound work OpenCV performs
+    /// internally before returning candidates. Valid candidates are retained
+    /// widest first, then tallest, before using the opaque finite level weight
+    /// and deterministic coordinate/source tie-breaks.
+    pub fn detect(
+        &mut self,
+        frame: &ImageFrame,
+    ) -> Result<HaarFaceDetectionBatch, HaarFaceDetectionError> {
+        validate_haar_detector_frame(frame)?;
+
+        #[cfg(oak_sys_check_only)]
+        {
+            let _ = frame;
+            Err(HaarFaceDetectionError::CompileOnlyNativeDisabled)
+        }
+
+        #[cfg(not(oak_sys_check_only))]
+        {
+            let raw = self
+                .inner
+                .pin_mut()
+                .detect(
+                    frame.pixels(),
+                    frame.width,
+                    frame.height,
+                    frame.stride_bytes,
+                )
+                .map_err(|error| HaarFaceDetectionError::Native {
+                    message: error.what().to_owned(),
+                })?;
+            parse_raw_haar_face_detection_batch(raw, frame, self.config.maximum_retained_detections)
+        }
+    }
+}
+
+#[cfg(feature = "opencv-face-detector")]
+fn validate_haar_detector_frame(frame: &ImageFrame) -> Result<(), HaarFaceDetectionError> {
+    if frame.stream != StreamId::Rgb {
+        return Err(HaarFaceDetectionError::NonRgbFrame {
+            stream: frame.stream,
+        });
+    }
+    let frame_pixels = u64::from(frame.width) * u64::from(frame.height);
+    if frame.width > MAXIMUM_HAAR_FACE_FRAME_DIMENSION
+        || frame.height > MAXIMUM_HAAR_FACE_FRAME_DIMENSION
+        || frame_pixels > MAXIMUM_HAAR_FACE_FRAME_PIXELS
+    {
+        return Err(HaarFaceDetectionError::FrameDimensionsExceedDetectorLimit {
+            width: frame.width,
+            height: frame.height,
+            maximum_dimension: MAXIMUM_HAAR_FACE_FRAME_DIMENSION,
+            maximum_pixels: MAXIMUM_HAAR_FACE_FRAME_PIXELS,
+        });
+    }
+    let expected_stride = frame.width.checked_mul(3);
+    let expected_len = expected_stride.and_then(|stride| {
+        usize::try_from(stride).ok().and_then(|stride| {
+            usize::try_from(frame.height)
+                .ok()
+                .and_then(|height| stride.checked_mul(height))
+        })
+    });
+    if frame.width == 0
+        || frame.height == 0
+        || expected_stride != Some(frame.stride_bytes)
+        || expected_len != Some(frame.data.len())
+    {
+        return Err(HaarFaceDetectionError::InvalidBgrFrameLayout {
+            width: frame.width,
+            height: frame.height,
+            stride_bytes: frame.stride_bytes,
+            data_len: frame.data.len(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "opencv-face-detector", any(test, not(oak_sys_check_only))))]
+fn parse_raw_haar_face_detection_batch(
+    raw: ffi::RawHaarFaceDetectionBatch,
+    frame: &ImageFrame,
+    maximum_retained_detections: u32,
+) -> Result<HaarFaceDetectionBatch, HaarFaceDetectionError> {
+    let native_detection_count = raw.detections.len();
+    if native_detection_count > MAXIMUM_NATIVE_HAAR_FACE_DETECTIONS as usize {
+        return Err(HaarFaceDetectionError::NativeDetectionCountExceedsLimit {
+            count: native_detection_count,
+            limit: MAXIMUM_NATIVE_HAAR_FACE_DETECTIONS,
+        });
+    }
+    let mut detections = Vec::with_capacity(native_detection_count);
+    let mut batch_source = None;
+    for (detection_index, raw) in raw.detections.into_iter().enumerate() {
+        let source = match raw.source {
+            ffi::RawHaarFaceDetectionSource::Frontal => HaarFaceDetectionSource::Frontal,
+            ffi::RawHaarFaceDetectionSource::Profile => HaarFaceDetectionSource::Profile,
+            ffi::RawHaarFaceDetectionSource::MirroredProfile => {
+                HaarFaceDetectionSource::MirroredProfile
+            }
+            _ => {
+                return Err(HaarFaceDetectionError::InvalidSource { detection_index });
+            }
+        };
+        if let Some(expected) = batch_source {
+            if source != expected {
+                return Err(HaarFaceDetectionError::InconsistentSource {
+                    detection_index,
+                    expected,
+                    actual: source,
+                });
+            }
+        } else {
+            batch_source = Some(source);
+        }
+        if !raw.detector_level_weight.is_finite() {
+            return Err(HaarFaceDetectionError::NonFiniteDetectorLevelWeight {
+                detection_index,
+                value: raw.detector_level_weight,
+            });
+        }
+        let rectangle_is_valid = raw.x >= 0
+            && raw.y >= 0
+            && raw.width > 0
+            && raw.height > 0
+            && u32::try_from(raw.x)
+                .ok()
+                .zip(u32::try_from(raw.width).ok())
+                .and_then(|(x, width)| x.checked_add(width))
+                .is_some_and(|right| right <= frame.width)
+            && u32::try_from(raw.y)
+                .ok()
+                .zip(u32::try_from(raw.height).ok())
+                .and_then(|(y, height)| y.checked_add(height))
+                .is_some_and(|bottom| bottom <= frame.height);
+        if !rectangle_is_valid {
+            return Err(HaarFaceDetectionError::InvalidRectangle {
+                detection_index,
+                x: raw.x,
+                y: raw.y,
+                width: raw.width,
+                height: raw.height,
+                frame_width: frame.width,
+                frame_height: frame.height,
+            });
+        }
+        let bounds = FacePixelRectangle {
+            x: u32::try_from(raw.x).expect("validated face x"),
+            y: u32::try_from(raw.y).expect("validated face y"),
+            width: u32::try_from(raw.width).expect("validated face width"),
+            height: u32::try_from(raw.height).expect("validated face height"),
+        };
+        detections.push(HaarFaceDetection {
+            bounds,
+            source,
+            detector_level_weight: raw.detector_level_weight,
+        });
+    }
+
+    detections.sort_by(compare_haar_face_detections);
+    detections.truncate(maximum_retained_detections as usize);
+    Ok(HaarFaceDetectionBatch {
+        stream: frame.stream,
+        device_capture_sequence: frame.device_capture_sequence,
+        host_delivery_sequence: frame.host_delivery_sequence,
+        timestamp: frame.timestamp,
+        timestamp_reference: frame.timestamp_reference,
+        width: frame.width,
+        height: frame.height,
+        native_detection_count,
+        detections,
+    })
+}
+
+#[cfg(all(feature = "opencv-face-detector", any(test, not(oak_sys_check_only))))]
+fn compare_haar_face_detections(
+    left: &HaarFaceDetection,
+    right: &HaarFaceDetection,
+) -> std::cmp::Ordering {
+    right
+        .bounds
+        .width
+        .cmp(&left.bounds.width)
+        .then_with(|| right.bounds.height.cmp(&left.bounds.height))
+        .then_with(|| {
+            right
+                .detector_level_weight
+                .total_cmp(&left.detector_level_weight)
+        })
+        .then_with(|| left.bounds.y.cmp(&right.bounds.y))
+        .then_with(|| left.bounds.x.cmp(&right.bounds.x))
+        .then_with(|| left.source.cmp(&right.source))
 }
 
 /// A valid depth frame
@@ -2713,5 +3463,489 @@ mod tests {
         }
         .magnitude()
         .is_finite());
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    fn valid_haar_detector_config(
+        maximum_retained_detections: u32,
+    ) -> OpenCvHaarFaceDetectorConfig {
+        OpenCvHaarFaceDetectorConfig::try_new(1.15, 6, 4, 30, 30, maximum_retained_detections)
+            .expect("valid Haar detector config")
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    fn detector_rgb_frame(width: u32, height: u32) -> ImageFrame {
+        let stride = width.checked_mul(3).expect("test RGB stride");
+        let length = usize::try_from(stride)
+            .expect("test stride fits usize")
+            .checked_mul(usize::try_from(height).expect("test height fits usize"))
+            .expect("test RGB payload length");
+        parse_image_result(
+            raw_image(StreamId::Rgb, width, height, stride, vec![0; length]),
+            0,
+        )
+        .expect("valid detector RGB frame")
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    fn raw_haar_detection(
+        x: i64,
+        y: i64,
+        width: i64,
+        height: i64,
+        detector_level_weight: f64,
+        source: ffi::RawHaarFaceDetectionSource,
+    ) -> ffi::RawHaarFaceDetection {
+        ffi::RawHaarFaceDetection {
+            x,
+            y,
+            width,
+            height,
+            detector_level_weight,
+            source,
+        }
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    #[test]
+    fn haar_detector_config_rejects_every_weak_search_parameter() {
+        let valid = valid_haar_detector_config(8);
+        assert_eq!(valid.scale_factor(), 1.15);
+        assert_eq!(valid.frontal_minimum_neighbors(), 6);
+        assert_eq!(valid.profile_minimum_neighbors(), 4);
+        assert_eq!(
+            (valid.minimum_face_width(), valid.minimum_face_height()),
+            (30, 30)
+        );
+        assert_eq!(valid.maximum_retained_detections(), 8);
+
+        let build = |scale_factor: f64,
+                     frontal_neighbors: u32,
+                     profile_neighbors: u32,
+                     width: u32,
+                     height: u32,
+                     maximum: u32| {
+            OpenCvHaarFaceDetectorConfig::try_new(
+                scale_factor,
+                frontal_neighbors,
+                profile_neighbors,
+                width,
+                height,
+                maximum,
+            )
+        };
+        for scale_factor in [1.0, 0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                build(scale_factor, 6, 4, 30, 30, 1),
+                Err(OpenCvHaarFaceDetectorConfigError::InvalidScaleFactor { .. })
+            ));
+        }
+        for (frontal_neighbors, profile_neighbors, expected_field) in [
+            (0, 4, "frontal_minimum_neighbors"),
+            (6, 0, "profile_minimum_neighbors"),
+        ] {
+            assert!(matches!(
+                build(1.1, frontal_neighbors, profile_neighbors, 30, 30, 1),
+                Err(OpenCvHaarFaceDetectorConfigError::ZeroMinimumNeighbors {
+                    field
+                }) if field == expected_field
+            ));
+        }
+        for (width, height, expected_field) in [
+            (0, 30, "minimum_face_width"),
+            (30, 0, "minimum_face_height"),
+        ] {
+            assert!(matches!(
+                build(1.1, 6, 4, width, height, 1),
+                Err(
+                    OpenCvHaarFaceDetectorConfigError::ZeroMinimumFaceDimension {
+                        field
+                    }
+                ) if field == expected_field
+            ));
+        }
+        for (frontal_neighbors, profile_neighbors, width, height, expected_field) in [
+            (i32::MAX as u32 + 1, 4, 30, 30, "frontal_minimum_neighbors"),
+            (6, i32::MAX as u32 + 1, 30, 30, "profile_minimum_neighbors"),
+            (6, 4, i32::MAX as u32 + 1, 30, "minimum_face_width"),
+            (6, 4, 30, i32::MAX as u32 + 1, "minimum_face_height"),
+        ] {
+            assert!(matches!(
+                build(
+                    1.1,
+                    frontal_neighbors,
+                    profile_neighbors,
+                    width,
+                    height,
+                    1,
+                ),
+                Err(
+                    OpenCvHaarFaceDetectorConfigError::ParameterExceedsOpenCvInt {
+                        field,
+                        ..
+                    }
+                ) if field == expected_field
+            ));
+        }
+        assert!(matches!(
+            build(1.1, 6, 4, 30, 30, 0),
+            Err(OpenCvHaarFaceDetectorConfigError::ZeroMaximumRetainedDetections)
+        ));
+        assert_eq!(
+            build(1.1, 6, 4, 30, 30, MAXIMUM_RETAINED_HAAR_FACE_DETECTIONS + 1,),
+            Err(
+                OpenCvHaarFaceDetectorConfigError::MaximumRetainedDetectionsExceedsLimit {
+                    value: MAXIMUM_RETAINED_HAAR_FACE_DETECTIONS + 1,
+                    limit: MAXIMUM_RETAINED_HAAR_FACE_DETECTIONS,
+                }
+            )
+        );
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    #[test]
+    fn haar_cascade_xml_boundary_rejects_empty_nul_and_oversize_payloads() {
+        assert_eq!(
+            validate_cascade_xml("frontal", b""),
+            Err(OpenCvHaarFaceDetectorLoadError::EmptyCascadeXml { cascade: "frontal" })
+        );
+        assert_eq!(
+            validate_cascade_xml("profile", b"<xml>\0</xml>"),
+            Err(OpenCvHaarFaceDetectorLoadError::CascadeXmlContainsNul { cascade: "profile" })
+        );
+
+        let at_limit = vec![b'x'; MAXIMUM_OPENCV_HAAR_CASCADE_XML_BYTES];
+        assert_eq!(validate_cascade_xml("frontal", &at_limit), Ok(()));
+
+        let above_limit = vec![b'x'; MAXIMUM_OPENCV_HAAR_CASCADE_XML_BYTES + 1];
+        assert_eq!(
+            validate_cascade_xml("profile", &above_limit),
+            Err(
+                OpenCvHaarFaceDetectorLoadError::CascadeXmlExceedsByteLimit {
+                    cascade: "profile",
+                    actual_bytes: MAXIMUM_OPENCV_HAAR_CASCADE_XML_BYTES + 1,
+                    maximum_bytes: MAXIMUM_OPENCV_HAAR_CASCADE_XML_BYTES,
+                }
+            )
+        );
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    #[test]
+    fn raw_haar_results_are_fully_validated_sorted_capped_and_frame_stamped() {
+        let mut frame = detector_rgb_frame(100, 80);
+        frame.device_capture_sequence =
+            DeviceFrameSequence::try_from_i64(9001).expect("test sequence");
+        frame.host_delivery_sequence = FrameDeliverySequence::new(42);
+        frame.timestamp = Timestamp::try_from_nanos(123_456).expect("test timestamp");
+        let raw = ffi::RawHaarFaceDetectionBatch {
+            detections: vec![
+                raw_haar_detection(
+                    20,
+                    20,
+                    10,
+                    12,
+                    -2.0,
+                    ffi::RawHaarFaceDetectionSource::Frontal,
+                ),
+                raw_haar_detection(
+                    10,
+                    10,
+                    10,
+                    10,
+                    4.0,
+                    ffi::RawHaarFaceDetectionSource::Frontal,
+                ),
+                raw_haar_detection(5, 5, 20, 10, 4.0, ffi::RawHaarFaceDetectionSource::Frontal),
+                raw_haar_detection(1, 1, 5, 5, 8.0, ffi::RawHaarFaceDetectionSource::Frontal),
+            ],
+        };
+        let batch = parse_raw_haar_face_detection_batch(raw, &frame, 3).expect("valid raw batch");
+        assert_eq!(batch.stream(), StreamId::Rgb);
+        assert_eq!(batch.device_capture_sequence().as_i64(), 9001);
+        assert_eq!(batch.host_delivery_sequence().as_u64(), 42);
+        assert_eq!(batch.timestamp().as_nanos(), 123_456);
+        assert_eq!(
+            batch.timestamp_reference(),
+            CameraTimestampReference::ExposureMidpoint
+        );
+        assert_eq!((batch.width(), batch.height()), (100, 80));
+        assert_eq!(batch.native_detection_count(), 4);
+        assert!(batch.was_truncated());
+        assert_eq!(batch.detections().len(), 3);
+
+        let ordered = batch
+            .detections()
+            .iter()
+            .map(|detection| {
+                (
+                    detection.bounds().width(),
+                    detection.bounds().height(),
+                    detection.detector_level_weight(),
+                    detection.source(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            [
+                (20, 10, 4.0, HaarFaceDetectionSource::Frontal),
+                (10, 12, -2.0, HaarFaceDetectionSource::Frontal),
+                (10, 10, 4.0, HaarFaceDetectionSource::Frontal),
+            ]
+        );
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    #[test]
+    fn widest_negative_level_weight_survives_retained_cap() {
+        let frame = detector_rgb_frame(100, 80);
+        let raw = ffi::RawHaarFaceDetectionBatch {
+            detections: vec![
+                raw_haar_detection(
+                    5,
+                    5,
+                    30,
+                    10,
+                    -100.0,
+                    ffi::RawHaarFaceDetectionSource::Frontal,
+                ),
+                raw_haar_detection(
+                    10,
+                    10,
+                    29,
+                    60,
+                    1_000_000.0,
+                    ffi::RawHaarFaceDetectionSource::Frontal,
+                ),
+            ],
+        };
+
+        let batch = parse_raw_haar_face_detection_batch(raw, &frame, 1)
+            .expect("finite negative level weights are valid");
+        assert!(batch.was_truncated());
+        assert_eq!(batch.detections().len(), 1);
+        assert_eq!(batch.detections()[0].bounds().width(), 30);
+        assert_eq!(batch.detections()[0].detector_level_weight(), -100.0);
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    #[test]
+    fn raw_haar_parser_validates_candidates_beyond_the_retained_cap() {
+        let frame = detector_rgb_frame(40, 30);
+        let valid =
+            || raw_haar_detection(1, 1, 10, 10, 1.0, ffi::RawHaarFaceDetectionSource::Frontal);
+        let raw = ffi::RawHaarFaceDetectionBatch {
+            detections: vec![
+                valid(),
+                valid(),
+                raw_haar_detection(
+                    1,
+                    1,
+                    10,
+                    10,
+                    f64::NAN,
+                    ffi::RawHaarFaceDetectionSource::Frontal,
+                ),
+            ],
+        };
+        assert!(matches!(
+            parse_raw_haar_face_detection_batch(raw, &frame, 1),
+            Err(HaarFaceDetectionError::NonFiniteDetectorLevelWeight {
+                detection_index: 2,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    #[test]
+    fn raw_haar_parser_rejects_results_above_the_absolute_native_limit() {
+        let frame = detector_rgb_frame(40, 30);
+        let detection =
+            raw_haar_detection(1, 1, 10, 10, 1.0, ffi::RawHaarFaceDetectionSource::Frontal);
+        let count = MAXIMUM_NATIVE_HAAR_FACE_DETECTIONS as usize + 1;
+        let raw = ffi::RawHaarFaceDetectionBatch {
+            detections: vec![detection; count],
+        };
+        assert_eq!(
+            parse_raw_haar_face_detection_batch(raw, &frame, 1),
+            Err(HaarFaceDetectionError::NativeDetectionCountExceedsLimit {
+                count,
+                limit: MAXIMUM_NATIVE_HAAR_FACE_DETECTIONS,
+            })
+        );
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    #[test]
+    fn raw_haar_parser_rejects_nonfinite_weights_unknown_sources_and_bad_rectangles() {
+        let frame = detector_rgb_frame(40, 30);
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let raw = ffi::RawHaarFaceDetectionBatch {
+                detections: vec![raw_haar_detection(
+                    1,
+                    1,
+                    10,
+                    10,
+                    value,
+                    ffi::RawHaarFaceDetectionSource::Frontal,
+                )],
+            };
+            assert!(matches!(
+                parse_raw_haar_face_detection_batch(raw, &frame, 1),
+                Err(HaarFaceDetectionError::NonFiniteDetectorLevelWeight {
+                    detection_index: 0,
+                    ..
+                })
+            ));
+        }
+
+        let raw = ffi::RawHaarFaceDetectionBatch {
+            detections: vec![raw_haar_detection(
+                1,
+                1,
+                10,
+                10,
+                1.0,
+                ffi::RawHaarFaceDetectionSource { repr: u8::MAX },
+            )],
+        };
+        assert_eq!(
+            parse_raw_haar_face_detection_batch(raw, &frame, 1),
+            Err(HaarFaceDetectionError::InvalidSource { detection_index: 0 })
+        );
+
+        for (raw_source, expected_source) in [
+            (
+                ffi::RawHaarFaceDetectionSource::Frontal,
+                HaarFaceDetectionSource::Frontal,
+            ),
+            (
+                ffi::RawHaarFaceDetectionSource::Profile,
+                HaarFaceDetectionSource::Profile,
+            ),
+            (
+                ffi::RawHaarFaceDetectionSource::MirroredProfile,
+                HaarFaceDetectionSource::MirroredProfile,
+            ),
+        ] {
+            let raw = ffi::RawHaarFaceDetectionBatch {
+                detections: vec![raw_haar_detection(1, 1, 10, 10, 1.0, raw_source)],
+            };
+            let parsed =
+                parse_raw_haar_face_detection_batch(raw, &frame, 1).expect("known source kind");
+            assert_eq!(parsed.detections()[0].source(), expected_source);
+        }
+
+        let raw = ffi::RawHaarFaceDetectionBatch {
+            detections: vec![
+                raw_haar_detection(1, 1, 10, 10, 1.0, ffi::RawHaarFaceDetectionSource::Frontal),
+                raw_haar_detection(2, 2, 10, 10, 1.0, ffi::RawHaarFaceDetectionSource::Profile),
+            ],
+        };
+        assert_eq!(
+            parse_raw_haar_face_detection_batch(raw, &frame, 2),
+            Err(HaarFaceDetectionError::InconsistentSource {
+                detection_index: 1,
+                expected: HaarFaceDetectionSource::Frontal,
+                actual: HaarFaceDetectionSource::Profile,
+            })
+        );
+
+        for (x, y, width, height) in [
+            (-1, 0, 1, 1),
+            (0, -1, 1, 1),
+            (0, 0, 0, 1),
+            (0, 0, 1, 0),
+            (39, 0, 2, 1),
+            (0, 29, 1, 2),
+            (i64::MAX, 0, 1, 1),
+            (0, i64::MAX, 1, 1),
+        ] {
+            let raw = ffi::RawHaarFaceDetectionBatch {
+                detections: vec![raw_haar_detection(
+                    x,
+                    y,
+                    width,
+                    height,
+                    -100.0,
+                    ffi::RawHaarFaceDetectionSource::Profile,
+                )],
+            };
+            assert!(matches!(
+                parse_raw_haar_face_detection_batch(raw, &frame, 1),
+                Err(HaarFaceDetectionError::InvalidRectangle {
+                    detection_index: 0,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(feature = "opencv-face-detector")]
+    #[test]
+    fn haar_detector_accepts_only_exact_tightly_packed_rgb_frames() {
+        let mono = parse_image_result(raw_image(StreamId::MonoLeft, 2, 2, 2, vec![0; 4]), 0)
+            .expect("valid mono frame");
+        assert_eq!(
+            validate_haar_detector_frame(&mono),
+            Err(HaarFaceDetectionError::NonRgbFrame {
+                stream: StreamId::MonoLeft,
+            })
+        );
+
+        let mut rgb = detector_rgb_frame(2, 2);
+        rgb.stride_bytes = 7;
+        assert!(matches!(
+            validate_haar_detector_frame(&rgb),
+            Err(HaarFaceDetectionError::InvalidBgrFrameLayout { .. })
+        ));
+        rgb.stride_bytes = 6;
+        rgb.data.pop();
+        assert!(matches!(
+            validate_haar_detector_frame(&rgb),
+            Err(HaarFaceDetectionError::InvalidBgrFrameLayout { .. })
+        ));
+
+        let mut oversized = detector_rgb_frame(1, 1);
+        oversized.width = MAXIMUM_HAAR_FACE_FRAME_DIMENSION + 1;
+        assert_eq!(
+            validate_haar_detector_frame(&oversized),
+            Err(HaarFaceDetectionError::FrameDimensionsExceedDetectorLimit {
+                width: MAXIMUM_HAAR_FACE_FRAME_DIMENSION + 1,
+                height: 1,
+                maximum_dimension: MAXIMUM_HAAR_FACE_FRAME_DIMENSION,
+                maximum_pixels: MAXIMUM_HAAR_FACE_FRAME_PIXELS,
+            })
+        );
+
+        oversized.width = MAXIMUM_HAAR_FACE_FRAME_DIMENSION;
+        oversized.height = MAXIMUM_HAAR_FACE_FRAME_PIXELS
+            .div_ceil(u64::from(MAXIMUM_HAAR_FACE_FRAME_DIMENSION))
+            as u32
+            + 1;
+        assert!(matches!(
+            validate_haar_detector_frame(&oversized),
+            Err(HaarFaceDetectionError::FrameDimensionsExceedDetectorLimit { .. })
+        ));
+
+        assert_eq!(
+            validate_haar_detector_frame(&detector_rgb_frame(640, 400)),
+            Ok(())
+        );
+    }
+
+    #[cfg(all(feature = "opencv-face-detector", oak_sys_check_only))]
+    #[test]
+    fn compile_only_feature_requires_no_opencv_runtime_or_cascade_files() {
+        assert!(matches!(
+            OpenCvHaarFaceDetector::load(
+                b"<opencv_storage><cascade/></opencv_storage>",
+                b"<opencv_storage><cascade/></opencv_storage>",
+                valid_haar_detector_config(8),
+            ),
+            Err(OpenCvHaarFaceDetectorLoadError::CompileOnlyNativeDisabled)
+        ));
     }
 }
