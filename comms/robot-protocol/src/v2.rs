@@ -2039,8 +2039,7 @@ impl core::fmt::Display for FrameError {
             }
             Self::BadMagic { actual } => write!(
                 formatter,
-                "V2 frame magic is {:02x?}, expected {:02x?}",
-                actual, MAGIC
+                "V2 frame magic is {actual:02x?}, expected {MAGIC:02x?}"
             ),
             Self::UnsupportedVersion { actual } => {
                 write!(formatter, "unsupported robot-protocol version {actual}")
