@@ -27,7 +27,7 @@
     "sha256_hex": "${CALIBRATION_ARTIFACT_SHA256}"
   },
   "live_graph_launch_asset": {
-    "relative_path": "nano-agent-launch-v2.json",
+    "relative_path": "nano-agent-launch-v3.json",
     "maximum_bytes": ${LIVE_GRAPH_LAUNCH_MAXIMUM_BYTES},
     "sha256_hex": "${LIVE_GRAPH_LAUNCH_SHA256}"
   }

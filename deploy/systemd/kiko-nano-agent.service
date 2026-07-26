@@ -17,7 +17,7 @@ ExecStartPre=+/opt/kiko/bin/kiko-nano-deployment-gate verify --marker /etc/kiko/
 # Keep the native search path on the production executable only. Applying it
 # service-wide would load unverified deployment libraries into ExecStartPre
 # before the root-owned gate could verify their exact bytes.
-ExecStart=/usr/bin/env LD_LIBRARY_PATH=/opt/kiko/deployment/lib /opt/kiko/bin/kiko-slam nano-agent --deployment-root /opt/kiko/deployment --launch-config nano-agent-launch-v2.json --state-root /var/lib/kiko-nano-agent
+ExecStart=/usr/bin/env LD_LIBRARY_PATH=/opt/kiko/deployment/lib /opt/kiko/bin/kiko-slam nano-agent --deployment-root /opt/kiko/deployment --launch-config nano-agent-launch-v3.json --state-root /var/lib/kiko-nano-agent
 Restart=no
 # Operational kill guard, not a proven graceful-shutdown bound. Parsed maxima
 # bound Rerun/controller/accessory attempts, but worker joins, dataset fsync and

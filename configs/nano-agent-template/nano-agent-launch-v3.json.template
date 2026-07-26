@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "agent_policy_asset": {
     "relative_path": "agent-policy-v3.json",
     "maximum_bytes": ${AGENT_POLICY_MAXIMUM_BYTES},
@@ -98,6 +98,18 @@
     "lightglue_backend": "${LIGHTGLUE_BACKEND}",
     "downscale_factor": ${INFERENCE_DOWNSCALE_FACTOR},
     "maximum_keypoints": ${INFERENCE_MAXIMUM_KEYPOINTS}
+  },
+  "face_perception": {
+    "frontal_face_cascade_asset": {
+      "relative_path": "models/opencv/haarcascade_frontalface_default.xml",
+      "maximum_bytes": ${FRONTAL_FACE_CASCADE_MAXIMUM_BYTES},
+      "sha256_hex": "${FRONTAL_FACE_CASCADE_SHA256}"
+    },
+    "profile_face_cascade_asset": {
+      "relative_path": "models/opencv/haarcascade_profileface.xml",
+      "maximum_bytes": ${PROFILE_FACE_CASCADE_MAXIMUM_BYTES},
+      "sha256_hex": "${PROFILE_FACE_CASCADE_SHA256}"
+    }
   },
   "rerun": {
     "kind": "serve_loopback",

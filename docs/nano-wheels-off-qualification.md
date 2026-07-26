@@ -87,10 +87,21 @@ staging root. The canonical installed layout is:
 ├── device-inventory-candidate-v2.json
 ├── nano-wheels-off-qualification-launch-v1.json
 ├── navigation-shadow-v1.json
+├── native-runtime-v1.json
 ├── artifacts/
 │   ├── calibration/<exact calibration asset>
 │   └── plant/<exact shadow-only plant asset>
-├── lib/<exact ONNX Runtime library>
+├── evidence/
+│   ├── render-input-v1.json
+│   └── render-evidence-v1.json
+├── lib/
+│   ├── <exact DepthAI core library>
+│   ├── <exact dynamic-calibration library>
+│   ├── <exact libusb 1.0 library>
+│   ├── <exact ONNX Runtime library>
+│   ├── libopencv_core.so.4.5d
+│   ├── libopencv_imgproc.so.4.5d
+│   └── libopencv_objdetect.so.4.5d
 └── models/<exact SuperPoint and LightGlue models>
 ```
 
@@ -106,8 +117,9 @@ guessing them:
   calibration, tracking-camera-to-base transform, and three later production
   approval IDs;
 - exact 32-byte calibration and plant SHA arrays;
-- exact byte counts and lowercase SHA-256 values for all ten launch-bound
-  assets; and
+- exact byte counts and lowercase SHA-256 values for every file in the
+  renderer's typed bundle plan, including the seven directly linked native
+  roles and `native-runtime-v1.json`; and
 - reviewed OAK, occupancy, inference, Rerun, and storage resource limits.
 
 The current physical connection assumptions may seed device discovery, but

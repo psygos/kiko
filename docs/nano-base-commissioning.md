@@ -26,8 +26,14 @@ binds every input by deployment-relative path, size ceiling, and SHA-256:
 - a controller-server V3 contract;
 - a device-inventory V3 manifest;
 - the exact calibration artifact;
-- canonical Nano-agent launch V2 and its policy, ORT models, SuperPoint model,
-  live graph, and calibration bindings.
+- canonical Nano-agent launch V3 and its policy, ORT models, SuperPoint model,
+  frontal/profile face cascades, live graph, and calibration bindings.
+
+Commissioning content-binds the nested launch-V3 cascade assets so it cannot
+accept a different production graph, but it deliberately does not construct or
+run the face detector. Its expression readiness is the scene-motion base lane
+only. Face detection and gaze attention are production-V3 readiness evidence,
+not commissioning evidence.
 
 The V3 server contract and V3 inventory must independently identify build
 `139265`, fingerprint `KIKO-WHEELON-CM1`, a 20% cap,
@@ -38,14 +44,16 @@ hashes, and identity disagreement reject before controller access.
 The live adapter then:
 
 1. retains the exact model bytes and pins the ORT runtime allocations;
-2. starts the manifest-bound head/eye expression worker and verifies natural
-   head hold plus eye ownership;
+2. starts the manifest-bound scene-motion-only head/eye expression worker and
+   verifies natural head hold plus eye ownership;
 3. opens the one exact OAK MXID and canonical graph in the same process;
 4. validates USB/stereo/calibration evidence;
-5. feeds borrowed OAK RGB frames to the expression engine;
+5. feeds borrowed OAK RGB frames to the scene-motion expression engine;
 6. derives body-frame FLU forward/lateral velocity from the visual transform
    and calibrated IMU yaw rate from the same clock epoch;
-7. proves at least one successful RGB expression frame before readiness.
+7. proves at least one successful scene-motion RGB expression frame before
+   readiness, without claiming detector construction, face output, or face
+   latency.
 
 There is no external OAK, velocity, IMU, or RGB injection seam. The process
 starts the sole in-process STM32 V3 owner only after four fresh attended claims
@@ -88,9 +96,12 @@ physical cut remain explicit trust boundaries.
 
 Before launch, coordinate release of any Fable or other OAK/head/eye owner.
 Do not kill unrelated processes. The previous head owner must release serial
-ownership while preserving torque at the natural pose; the canonical
-commissioning worker verifies and retains that hold before opening OAK. There
-must also be no competing STM32 serial or controller-UDP owner.
+ownership without issuing a torque-disable write, and the head must remain
+physically supported throughout. The canonical commissioning worker verifies
+and retains a fresh natural hold before opening OAK; absence of a
+torque-disable write does not prove physical torque continuity across power,
+protection, or owner changes. There must also be no competing STM32 serial or
+controller-UDP owner.
 
 The exact provisioning and command are in
 `configs/nano-base-commissioning-template/README.md`.
@@ -172,8 +183,9 @@ firmware lease and independent physical cut remain required backstops.
 
 The object destructor contains only a best-effort fallback. It cannot prove
 completion and must not be used as stop evidence. OAK closes before accessory
-release. Eye ownership must release cleanly; the head serial handoff must
-preserve the verified natural-position torque rather than disabling it.
+release. Eye ownership must release cleanly; the head release path must issue
+no torque-disable write and must report its exact serial result. Keep the head
+supported: cleanup does not prove physical torque continuity.
 
 If controller communication is unavailable or exact zero cannot be verified,
 use the independent physical power cut. Software stop semantics are

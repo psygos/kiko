@@ -4,7 +4,7 @@ This directory is a source template, not a qualified deployment and not
 evidence that any device or motion contract is satisfied. The canonical
 offline renderer and its strict input/evidence contract are documented in
 [`docs/nano-bundle-renderer.md`](../../docs/nano-bundle-renderer.md). The
-`nano-agent-launch-v2.json.template` file deliberately contains `${...}`
+`nano-agent-launch-v3.json.template` file deliberately contains `${...}`
 tokens, so it is not JSON and cannot be admitted until a deployment tool has
 replaced every token with measured or independently reviewed values.
 `native-runtime-v1.json.template` is likewise a non-deployable source
@@ -13,10 +13,12 @@ ceilings, and lowercase SHA-256 values. The complete offline qualification,
 native closure, Fable handoff, and qualified-only boot procedure is in
 `docs/nano-qualified-deployment.md`.
 
-Launch schema V2 replaces V1's aggregate navigation-record,
+Launch schema V3 retains V2's separate map and navigation-dataset contracts
+and adds mandatory, distinct, exact frontal/profile face-cascade bindings.
+V2 replaced V1's aggregate navigation-record,
 startup-evidence, and total-state fields with separate enforceable map and
-navigation-dataset contracts. Do not relabel a V1 document as V2: render and
-review the complete V2 storage section explicitly.
+navigation-dataset contracts. Do not relabel an older document as V3: render
+and review the complete V3 storage and `face_perception` sections explicitly.
 
 A qualified deployment must:
 
@@ -90,9 +92,13 @@ A qualified deployment must:
     selection. Autonomous motion remains gated until the live tracker proves
     current-map relocalization. The selected manifest hash does not
     content-address every dataset payload (including journal record bytes);
-13. install the rendered document as
-   `/opt/kiko/deployment/nano-agent-launch-v2.json`; and
-14. mint and verify the exact offline-install marker, then start
+13. stage the exact frontal and profile OpenCV cascade files at the two
+    launch-bound paths. Production bootstrap retains and verifies both files
+    before hardware acquisition; this binding is not by itself a claim that
+    detector execution has succeeded;
+14. install the rendered document as
+   `/opt/kiko/deployment/nano-agent-launch-v3.json`; and
+15. mint and verify the exact offline-install marker, then start
     `kiko-nano-agent.service` manually for qualification. The supplied service
     has no `[Install]` section and therefore is not automatically enabled at
     boot.
@@ -109,6 +115,36 @@ policy, production controller, inventory, navigation-actuation,
 native-runtime, and launch documents from domain types. Digest arrays and
 hexadecimal digests are derived from the same retained bytes, and the launch
 document is written last.
+
+The illustrative render-input template represents its bundle-dependent face
+asset field with one whole-value `${FACE_PERCEPTION_ASSETS_JSON}` token.
+Replace it in a deliberately prepared input with `null` for
+`wheels_off_qualification`; the strict renderer rejects cascade assets in
+that bundle. For `production`, replace it with the complete object below,
+using canonical absolute source paths. The strict renderer rejects production
+without both distinct assets.
+
+```json
+{
+  "frontal_face_cascade": {
+    "source_path": "/canonical/absolute/path/haarcascade_frontalface_default.xml",
+    "destination_relative_path": "models/opencv/haarcascade_frontalface_default.xml"
+  },
+  "profile_face_cascade": {
+    "source_path": "/canonical/absolute/path/haarcascade_profileface.xml",
+    "destination_relative_path": "models/opencv/haarcascade_profileface.xml"
+  }
+}
+```
+
+Both bundle kinds must provide the exact regular bytes for the current Nano's
+three directly linked OpenCV libraries as `opencv_core`, `opencv_imgproc`, and
+`opencv_objdetect`: the attended wheels-off binary also contains the
+production dispatch. Their accepted SONAMEs are pinned in the template and
+typed renderer. Face-cascade assets remain production-only. This direct
+closure does not make unstaged transitive OpenCV or OS libraries hermetic;
+complete the final-ELF loader-trace review in
+`docs/nano-qualified-deployment.md` before treating the runtime as ready.
 
 ## Native build and manual service installation
 

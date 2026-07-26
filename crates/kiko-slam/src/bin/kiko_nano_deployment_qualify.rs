@@ -26,15 +26,15 @@ use kiko_nano_deployment_gate::{
     write_qualification_marker,
 };
 use kiko_slam::navigation::{
-    NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1, NanoLaunchAssetRole,
-    load_nano_agent_launch_v2,
+    NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1, NanoFaceCascadeAssetRole,
+    NanoLaunchAssetRole, load_nano_agent_launch_v3,
 };
 use robot_server::config::ControllerServerConfigV1;
 use serde::Deserialize;
 
 const DEPLOYMENT_ROOT: &str = "/opt/kiko/deployment";
 const STATE_ROOT: &str = "/var/lib/kiko-nano-agent";
-const LAUNCH_RELATIVE_PATH: &str = "nano-agent-launch-v2.json";
+const LAUNCH_RELATIVE_PATH: &str = "nano-agent-launch-v3.json";
 const NATIVE_MANIFEST_RELATIVE_PATH: &str = "native-runtime-v1.json";
 const NATIVE_LIBRARY_SEARCH_RELATIVE_PATH: &str = "lib";
 const AGENT_BINARY: &str = "/opt/kiko/bin/kiko-slam";
@@ -138,6 +138,9 @@ enum NativeLibraryRole {
     DynamicCalibration,
     LibUsb1,
     OnnxRuntime,
+    OpenCvCore,
+    OpenCvImgproc,
+    OpenCvObjdetect,
     RuntimeDependency,
 }
 
@@ -148,6 +151,9 @@ impl NativeLibraryRole {
             "dynamic_calibration" => Ok(Self::DynamicCalibration),
             "libusb_1_0" => Ok(Self::LibUsb1),
             "onnxruntime" => Ok(Self::OnnxRuntime),
+            "opencv_core" => Ok(Self::OpenCvCore),
+            "opencv_imgproc" => Ok(Self::OpenCvImgproc),
+            "opencv_objdetect" => Ok(Self::OpenCvObjdetect),
             "runtime_dependency" => Ok(Self::RuntimeDependency),
             _ => Err(QualifyError::InvalidNativeRole {
                 actual: value.to_owned(),
@@ -161,7 +167,23 @@ impl NativeLibraryRole {
             Self::DynamicCalibration => "dynamic_calibration",
             Self::LibUsb1 => "libusb_1_0",
             Self::OnnxRuntime => "onnxruntime",
+            Self::OpenCvCore => "opencv_core",
+            Self::OpenCvImgproc => "opencv_imgproc",
+            Self::OpenCvObjdetect => "opencv_objdetect",
             Self::RuntimeDependency => "runtime_dependency",
+        }
+    }
+
+    const fn exact_nano_soname(self) -> Option<&'static str> {
+        match self {
+            Self::OpenCvCore => Some("libopencv_core.so.4.5d"),
+            Self::OpenCvImgproc => Some("libopencv_imgproc.so.4.5d"),
+            Self::OpenCvObjdetect => Some("libopencv_objdetect.so.4.5d"),
+            Self::DepthAiCore
+            | Self::DynamicCalibration
+            | Self::LibUsb1
+            | Self::OnnxRuntime
+            | Self::RuntimeDependency => None,
         }
     }
 }
@@ -216,7 +238,7 @@ fn run(cli: Cli) -> Result<(), QualifyError> {
     let state_root = PathBuf::from(STATE_ROOT);
     let launch_relative_path = ArtifactRelativePath::parse(LAUNCH_RELATIVE_PATH.to_owned())
         .map_err(|source| QualifyError::context("parse fixed launch relative path", source))?;
-    let loaded_launch = load_nano_agent_launch_v2(&deployment_root, launch_relative_path)
+    let loaded_launch = load_nano_agent_launch_v3(&deployment_root, launch_relative_path)
         .map_err(|source| QualifyError::context("load typed Nano launch graph", source))?;
     reject_template_sentinel("launch document", loaded_launch.source().bytes())?;
 
@@ -231,6 +253,25 @@ fn run(cli: Cli) -> Result<(), QualifyError> {
             reject_template_sentinel(marker_role, loaded.bytes())?;
         }
         loaded_assets.push((role, marker_role, loaded));
+    }
+    let mut loaded_face_assets = Vec::with_capacity(NanoFaceCascadeAssetRole::ALL.len());
+    for (role, marker_role) in [
+        (
+            NanoFaceCascadeAssetRole::FrontalFace,
+            "launch_asset:frontal_face_cascade",
+        ),
+        (
+            NanoFaceCascadeAssetRole::ProfileFace,
+            "launch_asset:profile_face_cascade",
+        ),
+    ] {
+        let loaded = loaded_launch
+            .launch()
+            .face_perception()
+            .asset(role)
+            .load_exact(&deployment_root)
+            .map_err(|source| QualifyError::context(format!("load exact {marker_role}"), source))?;
+        loaded_face_assets.push((marker_role, loaded));
     }
 
     let agent_policy_asset = loaded_asset(&loaded_assets, NanoLaunchAssetRole::AgentPolicy);
@@ -407,6 +448,16 @@ fn run(cli: Cli) -> Result<(), QualifyError> {
             asset,
         )?;
     }
+    for (marker_role, asset) in &loaded_face_assets {
+        add_retained_file(
+            &mut files,
+            &mut bindings,
+            &mut roles,
+            marker_role,
+            &deployment_root,
+            asset,
+        )?;
+    }
     add_retained_file(
         &mut files,
         &mut bindings,
@@ -567,7 +618,7 @@ fn require_policy_path_beneath(
 }
 
 fn bind_controller_to_manifest(
-    launch: &kiko_slam::navigation::NanoAgentLaunchV2,
+    launch: &kiko_slam::navigation::NanoAgentLaunchV3,
     controller: &ControllerServerConfigV1,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
 ) -> Result<(), QualifyError> {
@@ -611,7 +662,7 @@ fn bind_controller_to_manifest(
 
 fn bind_plant_to_manifest(
     deployment_root: &Path,
-    launch: &kiko_slam::navigation::NanoAgentLaunchV2,
+    launch: &kiko_slam::navigation::NanoAgentLaunchV3,
     launch_plant: &LoadedDeploymentAsset,
     policy: &NanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -685,7 +736,7 @@ fn bind_plant_to_manifest(
 
 fn bind_calibration_to_manifest(
     deployment_root: &Path,
-    launch: &kiko_slam::navigation::NanoAgentLaunchV2,
+    launch: &kiko_slam::navigation::NanoAgentLaunchV3,
     launch_calibration: &LoadedDeploymentAsset,
     policy: &NanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -807,6 +858,15 @@ fn parse_native_manifest(bytes: &[u8]) -> Result<ParsedNativeRuntimeManifest, Qu
             });
         }
         validate_soname(&library.soname)?;
+        if let Some(expected) = role.exact_nano_soname()
+            && library.soname != expected
+        {
+            return Err(QualifyError::WrongNativeSonameForRole {
+                role: role.marker_name(),
+                expected,
+                actual: library.soname,
+            });
+        }
         let relative_path = ArtifactRelativePath::parse(library.relative_path)
             .map_err(|source| QualifyError::context("parse native library path", source))?;
         let expected_parent = Path::new(NATIVE_LIBRARY_SEARCH_RELATIVE_PATH);
@@ -839,6 +899,9 @@ fn parse_native_manifest(bytes: &[u8]) -> Result<ParsedNativeRuntimeManifest, Qu
         NativeLibraryRole::DynamicCalibration,
         NativeLibraryRole::LibUsb1,
         NativeLibraryRole::OnnxRuntime,
+        NativeLibraryRole::OpenCvCore,
+        NativeLibraryRole::OpenCvImgproc,
+        NativeLibraryRole::OpenCvObjdetect,
     ] {
         if !parsed.iter().any(|library| library.role == role) {
             return Err(QualifyError::MissingNativeRole {
@@ -894,7 +957,7 @@ fn hex_nibble(byte: u8) -> u8 {
 }
 
 fn bind_onnx_runtime_to_launch(
-    launch: &kiko_slam::navigation::NanoAgentLaunchV2,
+    launch: &kiko_slam::navigation::NanoAgentLaunchV3,
     native: &ParsedNativeRuntimeManifest,
 ) -> Result<(), QualifyError> {
     let runtime = native
@@ -1189,6 +1252,11 @@ enum QualifyError {
     InvalidSoname {
         actual: String,
     },
+    WrongNativeSonameForRole {
+        role: &'static str,
+        expected: &'static str,
+        actual: String,
+    },
     NativeLibraryOutsideSearchDirectory {
         soname: String,
         path: String,
@@ -1340,6 +1408,14 @@ impl fmt::Display for QualifyError {
             Self::InvalidSoname { actual } => {
                 write!(formatter, "native library soname {actual:?} is invalid")
             }
+            Self::WrongNativeSonameForRole {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "native runtime role {role} requires Nano SONAME {expected:?}, got {actual:?}"
+            ),
             Self::NativeLibraryOutsideSearchDirectory { soname, path } => write!(
                 formatter,
                 "native library {soname} path {path:?} is not its direct lib-directory path"
@@ -1488,6 +1564,9 @@ mod tests {
             library("dynamic_calibration", "libdynamic_calibration.so", 'b'),
             library("libusb_1_0", "libusb-1.0.so.0", 'c'),
             library("onnxruntime", "libonnxruntime.so.1.23.2", 'd'),
+            library("opencv_core", "libopencv_core.so.4.5d", 'e'),
+            library("opencv_imgproc", "libopencv_imgproc.so.4.5d", 'f'),
+            library("opencv_objdetect", "libopencv_objdetect.so.4.5d", '1'),
         ]
         .join(",")
     }
@@ -1496,12 +1575,15 @@ mod tests {
     fn native_manifest_requires_the_complete_observed_non_system_runtime_set() {
         let parsed =
             parse_native_manifest(&native_manifest(&required_libraries())).expect("complete set");
-        assert_eq!(parsed.libraries.len(), 4);
+        assert_eq!(parsed.libraries.len(), 7);
 
         let missing = [
             library("depthai_core", "libdepthai-core.so", 'a'),
             library("dynamic_calibration", "libdynamic_calibration.so", 'b'),
             library("onnxruntime", "libonnxruntime.so.1.23.2", 'd'),
+            library("opencv_core", "libopencv_core.so.4.5d", 'e'),
+            library("opencv_imgproc", "libopencv_imgproc.so.4.5d", 'f'),
+            library("opencv_objdetect", "libopencv_objdetect.so.4.5d", '1'),
         ]
         .join(",");
         assert!(matches!(
@@ -1536,6 +1618,20 @@ mod tests {
         assert!(matches!(
             parse_native_manifest(&native_manifest(&outside)),
             Err(QualifyError::NativeLibraryOutsideSearchDirectory { .. })
+        ));
+    }
+
+    #[test]
+    fn native_manifest_rejects_relabelled_open_cv_soname() {
+        let relabelled =
+            required_libraries().replace("libopencv_objdetect.so.4.5d", "libopencv_objdetect.so");
+        assert!(matches!(
+            parse_native_manifest(&native_manifest(&relabelled)),
+            Err(QualifyError::WrongNativeSonameForRole {
+                role: "opencv_objdetect",
+                expected: "libopencv_objdetect.so.4.5d",
+                ..
+            })
         ));
     }
 

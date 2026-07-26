@@ -32,7 +32,7 @@ rendered assets by lower-case SHA-256 and byte limit:
 3. `commissioning/controller-server-v3.json`
 4. `commissioning/device-inventory-v3.json`
 5. the exact calibration artifact
-6. canonical `nano-agent-launch-v2.json`
+6. canonical `nano-agent-launch-v3.json`
 
 The nested canonical launch binds the exact agent-policy V3, OAK ORT models,
 SuperPoint model, live graph, and calibration. Commissioning admits its
@@ -41,7 +41,7 @@ opens the exact OAK MXID and graph in the same process. External camera,
 velocity, or IMU injection is not supported.
 
 Render leaf assets first, compute their exact sizes and SHA-256 digests, render
-the canonical `nano-agent-launch-v2.json`, then render the outer commissioning
+the canonical `nano-agent-launch-v3.json`, then render the outer commissioning
 launch last. Use a new commissioning session ID for each attempt. The state
 writer uses create-new semantics and will not overwrite a prior session.
 
@@ -91,12 +91,13 @@ convert the firmware. No hardware success is claimed by this template.
 
 Before the attended command:
 
-1. Coordinate a stop of the current Fable/OAK/head/eye owner. Do not kill
-   unrelated processes.
-2. Its head release must preserve servo torque at the natural hold; never
-   introduce an untensioned neck gap.
-3. Confirm there is no competing OAK, head-serial, eye-serial, STM32-serial, or
-   controller UDP owner.
+1. Coordinate a normal stop of all current OAK/head/eye owners, including
+   Fable where present. Do not kill unrelated processes.
+2. The prior head owner must issue no torque-disable write. Support the head
+   throughout the handoff; serial cleanup does not prove physical torque
+   continuity.
+3. Freshly check each exact OAK, head-serial, eye-serial, STM32-serial, and
+   controller UDP endpoint and confirm there is no competing owner.
 4. Confirm the head and eye by-ID paths, exact OAK MXID, STM32 by-ID path, and
    loopback endpoint match the rendered inventory.
 5. Place Kiko on a flat, high-friction test surface with both wheels attached,
@@ -110,6 +111,11 @@ session's exact launch/config/model digests, admitted stream identities, and
 clock epoch; its host timestamp is captured by the ceremony and the same
 prepared session must consume it within five seconds. It then starts the
 in-process V3 STM32 owner at exact zero.
+
+Commissioning parses and content-binds the nested launch-V3 face cascades but
+does not load or execute them. Its `scene_motion` expression mode proves only
+the base RGB-expression lane. Production launch V3 adds the separate mandatory
+face-perception lane and must qualify detector readiness and latency itself.
 
 Do not install this command as an unattended systemd service or boot task.
 

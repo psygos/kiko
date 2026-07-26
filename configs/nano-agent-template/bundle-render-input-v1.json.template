@@ -55,7 +55,8 @@
     "lightglue_model": {
       "source_path": "${LIGHTGLUE_MODEL_SOURCE_ABSOLUTE_PATH}",
       "destination_relative_path": "${LIGHTGLUE_MODEL_RELATIVE_PATH}"
-    }
+    },
+    "face_perception": ${FACE_PERCEPTION_ASSETS_JSON}
   },
   "native_libraries": [
     {
@@ -77,6 +78,21 @@
       "role": "onnxruntime",
       "soname": "${ONNXRUNTIME_SONAME}",
       "source_path": "${ONNXRUNTIME_SOURCE_ABSOLUTE_PATH}"
+    },
+    {
+      "role": "opencv_core",
+      "soname": "libopencv_core.so.4.5d",
+      "source_path": "${OPENCV_CORE_SOURCE_ABSOLUTE_PATH}"
+    },
+    {
+      "role": "opencv_imgproc",
+      "soname": "libopencv_imgproc.so.4.5d",
+      "source_path": "${OPENCV_IMGPROC_SOURCE_ABSOLUTE_PATH}"
+    },
+    {
+      "role": "opencv_objdetect",
+      "soname": "libopencv_objdetect.so.4.5d",
+      "source_path": "${OPENCV_OBJDETECT_SOURCE_ABSOLUTE_PATH}"
     }
   ],
   "runtime": {

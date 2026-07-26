@@ -18,6 +18,10 @@ use crate::input::{
 const MAX_RENDER_INPUT_BYTES: u64 = 1_048_576;
 const MAX_PRODUCTION_PROFILE_BYTES: u64 = 262_144;
 const MAX_SOURCE_ASSET_BYTES: u64 = 512 * 1_024 * 1_024;
+const MAX_OPENCV_HAAR_CASCADE_BYTES: u64 = 4 * 1_024 * 1_024;
+// Production V3 currently emits 23 deterministic leaves including source
+// evidence, the render manifest, and launch. Wheels-off emits fewer.
+const STAGED_BUNDLE_FILE_CAPACITY: usize = 23;
 const EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const PLAN_SCHEMA_VERSION: u32 = 1;
 const EVIDENCE_SCOPE: &str = "offline_staging_only_not_installation_or_hardware_qualification_v1";
@@ -249,7 +253,13 @@ struct LoadedAssets {
     navigation_shadow: LoadedSource,
     superpoint_model: LoadedSource,
     lightglue_model: LoadedSource,
+    face_perception: Option<LoadedFacePerceptionAssets>,
     native_libraries: BTreeMap<NativeLibraryRole, LoadedSource>,
+}
+
+struct LoadedFacePerceptionAssets {
+    frontal_face_cascade: LoadedSource,
+    profile_face_cascade: LoadedSource,
 }
 
 struct ProductionAdmission {
@@ -332,6 +342,7 @@ fn load_production_admission(
 ) -> Result<Option<ProductionAdmission>, RenderError> {
     let BundleSelection::Production {
         production_controller_profile_path,
+        ..
     } = &input.bundle
     else {
         return Ok(None);
@@ -382,6 +393,24 @@ fn load_assets(input: &RenderInput) -> Result<LoadedAssets, RenderError> {
         input.assets.lightglue_model.source_path.as_path(),
         MAX_SOURCE_ASSET_BYTES,
     )?;
+    let face_perception = input
+        .bundle
+        .face_perception()
+        .map(|face| {
+            Ok(LoadedFacePerceptionAssets {
+                frontal_face_cascade: LoadedSource::read(
+                    "frontal_face_cascade",
+                    face.frontal_face_cascade.source_path.as_path(),
+                    MAX_OPENCV_HAAR_CASCADE_BYTES,
+                )?,
+                profile_face_cascade: LoadedSource::read(
+                    "profile_face_cascade",
+                    face.profile_face_cascade.source_path.as_path(),
+                    MAX_OPENCV_HAAR_CASCADE_BYTES,
+                )?,
+            })
+        })
+        .transpose()?;
     let mut native_libraries = BTreeMap::new();
     for library in &input.native_libraries {
         let loaded = LoadedSource::read(
@@ -401,6 +430,7 @@ fn load_assets(input: &RenderInput) -> Result<LoadedAssets, RenderError> {
         navigation_shadow,
         superpoint_model,
         lightglue_model,
+        face_perception,
         native_libraries,
     })
 }
@@ -410,7 +440,7 @@ fn render_non_launch_files(
     mut loaded: LoadedAssets,
     production: Option<&ProductionControllerProfile>,
 ) -> Result<Vec<StagedFile>, RenderError> {
-    let mut staged = Vec::with_capacity(20);
+    let mut staged = Vec::with_capacity(STAGED_BUNDLE_FILE_CAPACITY);
 
     staged.push(StagedFile::retained(
         "calibration",
@@ -445,6 +475,23 @@ fn render_non_launch_files(
             .as_str(),
         loaded.lightglue_model,
     ));
+    if let Some(face) = input.bundle.face_perception() {
+        let loaded_face = loaded
+            .face_perception
+            .take()
+            .expect("parsed production face assets were loaded as one typed set");
+        staged.push(StagedFile::retained(
+            "frontal_face_cascade",
+            face.frontal_face_cascade.destination_relative_path.as_str(),
+            loaded_face.frontal_face_cascade,
+        ));
+        staged.push(StagedFile::retained(
+            "profile_face_cascade",
+            face.profile_face_cascade.destination_relative_path.as_str(),
+            loaded_face.profile_face_cascade,
+        ));
+    }
+    debug_assert!(loaded.face_perception.is_none());
     for library in &input.native_libraries {
         let source = loaded.native_libraries.remove(&library.role).ok_or(
             RenderError::DuplicateRoleAfterParsing {
@@ -1073,11 +1120,30 @@ fn render_launch(
             );
         }
         BundleSelection::Production { .. } => {
-            object.insert("schema_version".to_owned(), json!(2));
+            object.insert("schema_version".to_owned(), json!(3));
             let actuation = find_staged(staged, "navigation-actuation-v2.json")?;
             object.insert(
                 "physical_actuation_config_asset".to_owned(),
                 binding(actuation),
+            );
+            let face = input
+                .bundle
+                .face_perception()
+                .expect("production bundle carries parsed face assets");
+            let frontal = find_staged(
+                staged,
+                face.frontal_face_cascade.destination_relative_path.as_str(),
+            )?;
+            let profile = find_staged(
+                staged,
+                face.profile_face_cascade.destination_relative_path.as_str(),
+            )?;
+            object.insert(
+                "face_perception".to_owned(),
+                json!({
+                    "frontal_face_cascade_asset": binding(frontal),
+                    "profile_face_cascade_asset": binding(profile),
+                }),
             );
         }
     }
@@ -1144,6 +1210,20 @@ fn render_evidence_manifest(
             staged,
         )?,
     ];
+    if let Some(face) = input.bundle.face_perception() {
+        sources.push(SourceEvidence::from_staged_source(
+            "frontal_face_cascade",
+            face.frontal_face_cascade.source_path.as_path(),
+            face.frontal_face_cascade.destination_relative_path.as_str(),
+            staged,
+        )?);
+        sources.push(SourceEvidence::from_staged_source(
+            "profile_face_cascade",
+            face.profile_face_cascade.source_path.as_path(),
+            face.profile_face_cascade.destination_relative_path.as_str(),
+            staged,
+        )?);
+    }
     for library in &input.native_libraries {
         sources.push(SourceEvidence::from_staged_source(
             &format!("native_library_{}", library.role.as_str()),

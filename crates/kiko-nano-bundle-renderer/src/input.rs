@@ -120,6 +120,7 @@ struct AssetSetDto {
     navigation_shadow_source_path: PathBuf,
     superpoint_model: FileSourceDto,
     lightglue_model: FileSourceDto,
+    face_perception: Option<FacePerceptionAssetsDto>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +138,13 @@ struct FileSourceDto {
     destination_relative_path: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FacePerceptionAssetsDto {
+    frontal_face_cascade: FileSourceDto,
+    profile_face_cascade: FileSourceDto,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeLibraryRole {
@@ -144,14 +152,20 @@ pub enum NativeLibraryRole {
     DynamicCalibration,
     Libusb1_0,
     Onnxruntime,
+    OpencvCore,
+    OpencvImgproc,
+    OpencvObjdetect,
 }
 
 impl NativeLibraryRole {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::DepthaiCore,
         Self::DynamicCalibration,
         Self::Libusb1_0,
         Self::Onnxruntime,
+        Self::OpencvCore,
+        Self::OpencvImgproc,
+        Self::OpencvObjdetect,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -160,6 +174,20 @@ impl NativeLibraryRole {
             Self::DynamicCalibration => "dynamic_calibration",
             Self::Libusb1_0 => "libusb_1_0",
             Self::Onnxruntime => "onnxruntime",
+            Self::OpencvCore => "opencv_core",
+            Self::OpencvImgproc => "opencv_imgproc",
+            Self::OpencvObjdetect => "opencv_objdetect",
+        }
+    }
+
+    const fn exact_nano_soname(self) -> Option<&'static str> {
+        match self {
+            Self::OpencvCore => Some("libopencv_core.so.4.5d"),
+            Self::OpencvImgproc => Some("libopencv_imgproc.so.4.5d"),
+            Self::OpencvObjdetect => Some("libopencv_objdetect.so.4.5d"),
+            Self::DepthaiCore | Self::DynamicCalibration | Self::Libusb1_0 | Self::Onnxruntime => {
+                None
+            }
         }
     }
 }
@@ -319,6 +347,7 @@ pub(crate) enum BundleSelection {
     WheelsOffQualification,
     Production {
         production_controller_profile_path: Option<AbsoluteSourcePath>,
+        face_perception: FacePerceptionAssets,
     },
 }
 
@@ -333,7 +362,16 @@ impl BundleSelection {
     pub(crate) const fn launch_relative_path(&self) -> &'static str {
         match self {
             Self::WheelsOffQualification => "nano-wheels-off-qualification-launch-v1.json",
-            Self::Production { .. } => "nano-agent-launch-v2.json",
+            Self::Production { .. } => "nano-agent-launch-v3.json",
+        }
+    }
+
+    pub(crate) const fn face_perception(&self) -> Option<&FacePerceptionAssets> {
+        match self {
+            Self::WheelsOffQualification => None,
+            Self::Production {
+                face_perception, ..
+            } => Some(face_perception),
         }
     }
 }
@@ -404,6 +442,12 @@ pub(crate) struct ArtifactSource {
 pub(crate) struct FileSource {
     pub(crate) source_path: AbsoluteSourcePath,
     pub(crate) destination_relative_path: RelativeBundlePath,
+}
+
+#[derive(Debug)]
+pub(crate) struct FacePerceptionAssets {
+    pub(crate) frontal_face_cascade: FileSource,
+    pub(crate) profile_face_cascade: FileSource,
 }
 
 #[derive(Debug)]
@@ -540,23 +584,35 @@ impl RenderInput {
         }
 
         let robot_id = parse_text("robot_id", dto.robot_id)?;
-        let bundle = match dto.bundle {
-            BundleSelectionDto::WheelsOffQualification => BundleSelection::WheelsOffQualification,
-            BundleSelectionDto::Production {
-                production_controller_profile_path,
-            } => BundleSelection::Production {
+        let (assets, face_perception) = AssetSet::parse(dto.assets)?;
+        let bundle = match (dto.bundle, face_perception) {
+            (BundleSelectionDto::WheelsOffQualification, None) => {
+                BundleSelection::WheelsOffQualification
+            }
+            (BundleSelectionDto::WheelsOffQualification, Some(_)) => {
+                return Err(InputError::FacePerceptionAssetsForbiddenInQualification);
+            }
+            (
+                BundleSelectionDto::Production {
+                    production_controller_profile_path,
+                },
+                Some(face_perception),
+            ) => BundleSelection::Production {
                 production_controller_profile_path: production_controller_profile_path
                     .map(|path| {
                         parse_absolute_source_path("production_controller_profile_path", path)
                     })
                     .transpose()?,
+                face_perception,
             },
+            (BundleSelectionDto::Production { .. }, None) => {
+                return Err(InputError::ProductionFacePerceptionAssetsRequired);
+            }
         };
         let discovery = Discovery::parse(dto.discovery)?;
         if matches!(bundle, BundleSelection::WheelsOffQualification) {
             discovery.stm32.require_candidate_identity()?;
         }
-        let assets = AssetSet::parse(dto.assets)?;
         let native_libraries = parse_native_libraries(dto.native_libraries)?;
         let runtime = RuntimeEnvelope::parse(dto.runtime)?;
         if matches!(bundle, BundleSelection::WheelsOffQualification)
@@ -701,17 +757,38 @@ impl Stm32Discovery {
 }
 
 impl AssetSet {
-    fn parse(dto: AssetSetDto) -> Result<Self, InputError> {
-        Ok(Self {
-            calibration: parse_artifact_source("assets.calibration", dto.calibration)?,
-            plant: parse_artifact_source("assets.plant", dto.plant)?,
-            navigation_shadow_source_path: parse_absolute_source_path(
-                "assets.navigation_shadow_source_path",
-                dto.navigation_shadow_source_path,
-            )?,
-            superpoint_model: parse_file_source("assets.superpoint_model", dto.superpoint_model)?,
-            lightglue_model: parse_file_source("assets.lightglue_model", dto.lightglue_model)?,
-        })
+    fn parse(dto: AssetSetDto) -> Result<(Self, Option<FacePerceptionAssets>), InputError> {
+        let face_perception = dto
+            .face_perception
+            .map(|face| {
+                Ok(FacePerceptionAssets {
+                    frontal_face_cascade: parse_file_source(
+                        "assets.face_perception.frontal_face_cascade",
+                        face.frontal_face_cascade,
+                    )?,
+                    profile_face_cascade: parse_file_source(
+                        "assets.face_perception.profile_face_cascade",
+                        face.profile_face_cascade,
+                    )?,
+                })
+            })
+            .transpose()?;
+        Ok((
+            Self {
+                calibration: parse_artifact_source("assets.calibration", dto.calibration)?,
+                plant: parse_artifact_source("assets.plant", dto.plant)?,
+                navigation_shadow_source_path: parse_absolute_source_path(
+                    "assets.navigation_shadow_source_path",
+                    dto.navigation_shadow_source_path,
+                )?,
+                superpoint_model: parse_file_source(
+                    "assets.superpoint_model",
+                    dto.superpoint_model,
+                )?,
+                lightglue_model: parse_file_source("assets.lightglue_model", dto.lightglue_model)?,
+            },
+            face_perception,
+        ))
     }
 }
 
@@ -756,6 +833,15 @@ fn parse_native_libraries(dtos: Vec<NativeLibraryDto>) -> Result<Vec<NativeLibra
             return Err(InputError::DuplicateNativeLibraryRole { role: dto.role });
         }
         let soname = parse_soname(dto.soname)?;
+        if let Some(expected) = dto.role.exact_nano_soname()
+            && soname != expected
+        {
+            return Err(InputError::WrongNativeLibrarySoname {
+                role: dto.role,
+                expected,
+                actual: soname,
+            });
+        }
         let expected_relative = format!("lib/{soname}");
         libraries.push(NativeLibrary {
             role: dto.role,
@@ -768,8 +854,8 @@ fn parse_native_libraries(dtos: Vec<NativeLibraryDto>) -> Result<Vec<NativeLibra
         });
     }
     if NativeLibraryRole::ALL
-        .into_iter()
-        .any(|role| !seen.contains(&role))
+        .iter()
+        .any(|role| !seen.contains(role))
     {
         return Err(InputError::IncompleteNativeLibrarySet);
     }
@@ -1831,6 +1917,11 @@ pub enum InputError {
     DuplicateNativeLibraryRole {
         role: NativeLibraryRole,
     },
+    WrongNativeLibrarySoname {
+        role: NativeLibraryRole,
+        expected: &'static str,
+        actual: String,
+    },
     IncompleteNativeLibrarySet,
     NumericOutOfRange {
         field: &'static str,
@@ -1854,6 +1945,8 @@ pub enum InputError {
     CandidateControllerIdentityForbiddenInProduction,
     InvalidProductionControllerCapabilities,
     WarmStartForbiddenInQualification,
+    ProductionFacePerceptionAssetsRequired,
+    FacePerceptionAssetsForbiddenInQualification,
 }
 
 impl fmt::Display for InputError {
@@ -1915,9 +2008,18 @@ impl fmt::Display for InputError {
                 "native-library role {} appears more than once",
                 role.as_str()
             ),
+            Self::WrongNativeLibrarySoname {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "native-library role {} requires Nano SONAME {expected:?}, got {actual:?}",
+                role.as_str()
+            ),
             Self::IncompleteNativeLibrarySet => write!(
                 formatter,
-                "native libraries must contain exactly depthai_core, dynamic_calibration, libusb_1_0, and onnxruntime"
+                "native libraries must contain the exact four legacy roles and three direct OpenCV roles"
             ),
             Self::NumericOutOfRange { field } => write!(
                 formatter,
@@ -1970,6 +2072,12 @@ impl fmt::Display for InputError {
             ),
             Self::WarmStartForbiddenInQualification => formatter
                 .write_str("wheels-off qualification cannot replay persisted production map state"),
+            Self::ProductionFacePerceptionAssetsRequired => formatter.write_str(
+                "production rendering requires exact frontal and profile face-cascade sources",
+            ),
+            Self::FacePerceptionAssetsForbiddenInQualification => formatter.write_str(
+                "wheels-off qualification does not accept unused face-perception assets",
+            ),
         }
     }
 }

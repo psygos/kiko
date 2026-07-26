@@ -1414,7 +1414,7 @@ mod tests {
         assert_eq!(
             base.lines()
                 .filter(|line| {
-                    *line == "ExecStart=/usr/bin/env LD_LIBRARY_PATH=/opt/kiko/deployment/lib /opt/kiko/bin/kiko-slam nano-agent --deployment-root /opt/kiko/deployment --launch-config nano-agent-launch-v2.json --state-root /var/lib/kiko-nano-agent"
+                    *line == "ExecStart=/usr/bin/env LD_LIBRARY_PATH=/opt/kiko/deployment/lib /opt/kiko/bin/kiko-slam nano-agent --deployment-root /opt/kiko/deployment --launch-config nano-agent-launch-v3.json --state-root /var/lib/kiko-nano-agent"
                 })
                 .count(),
             1

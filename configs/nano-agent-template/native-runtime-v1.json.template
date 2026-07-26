@@ -29,6 +29,27 @@
       "relative_path": "lib/${ONNXRUNTIME_SONAME}",
       "maximum_bytes": ${ONNXRUNTIME_MAXIMUM_BYTES},
       "sha256_hex": "${ONNXRUNTIME_INSTALLED_SHA256}"
+    },
+    {
+      "role": "opencv_core",
+      "soname": "libopencv_core.so.4.5d",
+      "relative_path": "lib/libopencv_core.so.4.5d",
+      "maximum_bytes": ${OPENCV_CORE_MAXIMUM_BYTES},
+      "sha256_hex": "${OPENCV_CORE_INSTALLED_SHA256}"
+    },
+    {
+      "role": "opencv_imgproc",
+      "soname": "libopencv_imgproc.so.4.5d",
+      "relative_path": "lib/libopencv_imgproc.so.4.5d",
+      "maximum_bytes": ${OPENCV_IMGPROC_MAXIMUM_BYTES},
+      "sha256_hex": "${OPENCV_IMGPROC_INSTALLED_SHA256}"
+    },
+    {
+      "role": "opencv_objdetect",
+      "soname": "libopencv_objdetect.so.4.5d",
+      "relative_path": "lib/libopencv_objdetect.so.4.5d",
+      "maximum_bytes": ${OPENCV_OBJDETECT_MAXIMUM_BYTES},
+      "sha256_hex": "${OPENCV_OBJDETECT_INSTALLED_SHA256}"
     }
   ]
 }

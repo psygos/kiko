@@ -22,7 +22,10 @@ anything.
 
 The render input is schema V1. Its illustrative source template is
 `configs/nano-agent-template/bundle-render-input-v1.json.template`; the
-unresolved `${...}` fields make that file deliberately non-deployable.
+unresolved `${...}` fields make that file deliberately non-deployable. Its
+whole-value `${FACE_PERCEPTION_ASSETS_JSON}` token must become `null` for a
+`wheels_off_qualification` input or the complete two-cascade object for a
+`production` input. The strict renderer rejects either bundle/asset mismatch.
 
 Prepare the JSON input from one retained discovery record and reviewed source
 files. The strict parser:
@@ -35,8 +38,15 @@ files. The strict parser:
   `/dev/serial/by-id/<identity>` path;
 - parses controller, eye, OAK, accessory, stream, resource, geometry, and
   numeric identities into bounded domain values;
-- requires the four-role native closure: DepthAI core, dynamic calibration,
-  libusb 1.0, and ONNX Runtime;
+- requires the four legacy native roles—DepthAI core, dynamic calibration,
+  libusb 1.0, and ONNX Runtime—plus exact `opencv_core`, `opencv_imgproc`, and
+  `opencv_objdetect` roles for both bundle kinds. The attended wheels-off
+  binary includes the production dispatch under `nano-agent`, so its ELF
+  closure cannot truthfully omit the directly linked detector libraries even
+  though its qualification path rejects and never loads face-cascade assets.
+  The OpenCV roles are pinned to the current Nano's ELF SONAMEs
+  (`libopencv_core.so.4.5d`,
+  `libopencv_imgproc.so.4.5d`, and `libopencv_objdetect.so.4.5d`);
 - requires all artifact output paths to remain beneath `artifacts/`;
 - rejects unresolved `${` tokens in every JSON boundary; and
 - checks the exact provisional controller ABI, build, fingerprint, and
@@ -47,8 +57,10 @@ rendering does not prove those devices remain connected. The renderer never
 resolves a by-id path to a transient `ttyACM*` name.
 
 The navigation-shadow document, canonical calibration artifact, plant
-artifact, models, and native libraries are exact leaf sources. The renderer
-retains their exact bytes. The calibration input key is deliberately
+artifact, models, production frontal/profile face cascades, and native
+libraries are exact leaf sources. The renderer retains their exact bytes.
+Production requires both cascade sources as one typed set; wheels-off
+qualification rejects that unused set. The calibration input key is deliberately
 `assets.calibration`, not `camera_calibration`: the one artifact owns the
 exact OAK MXID, rectified stereo intrinsics/dimensions/baseline, raw IMU
 calibration, tracking-camera-to-base transform, and three approval calibration
@@ -75,8 +87,8 @@ read-only. A staging tree is still not a root-owned production installation.
 
 The renderer constructs and writes:
 
-1. exact calibration, plant, navigation-shadow, model, and native-library
-   leaves;
+1. exact calibration, plant, navigation-shadow, model, production
+   face-cascade, and native-library leaves;
 2. the native-runtime manifest, inventory, controller contract, motion
    contract when applicable, candidate policy when applicable, and agent
    policy;
@@ -114,6 +126,15 @@ match the discovery record at every controller identity field.
 If the profile path is absent, production rendering fails before loading any
 deployment leaf. The renderer does not silently manufacture a map-only
 actuation contract or downgrade production to the raw candidate profile.
+Production rendering likewise fails if either exact face-cascade source is
+absent; both are copied, hashed, and bound into launch V3.
+It also fails unless all three directly linked OpenCV shared-library sources
+are supplied under their pinned SONAMEs. The renderer copies the regular
+source bytes into `lib/<SONAME>` and hashes them; do not supply or install
+symlink objects as deployment leaves.
+The typed SONAME field is a required filename/role declaration, not an ELF
+dynamic-section parser. The target-side final-ELF `readelf` and loader-trace
+gate remains mandatory.
 Supplying a syntactically valid profile is still not proof that its physical
 claims are true; later typed deployment admission and attended physical gates
 remain authoritative.
@@ -214,7 +235,7 @@ contract:
 - `device-inventory-v1.json.template`;
 - `navigation-actuation-v2.json.template`;
 - `native-runtime-v1.json.template`; and
-- `nano-agent-launch-v2.json.template`.
+- `nano-agent-launch-v3.json.template`.
 
 These files document the on-disk shapes and remain intentionally invalid
 until expanded. Do not expand them with shell substitution or manually

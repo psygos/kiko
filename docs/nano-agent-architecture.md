@@ -63,12 +63,14 @@ Every cold boot starts with no base owner and follows this order:
    sessions close before the single production accessory owner opens either
    serial device.
 4. Start the production accessory owner before opening OAK or starting the
-   STM32 owner. The head owner first
-   observes each joint twice, admits the complete pose inside the exact policy
-   window and freshness budget, writes that same pose with bounded speed and
-   torque limits, enables or refreshes torque, and verifies two stopped
-   readbacks before any natural-pose transition. It performs no pre-observation
-   torque-disable.
+   STM32 owner. Its dedicated face-perception thread first constructs both
+   OpenCV classifiers from the exact retained launch-bound cascade bytes and
+   must publish bounded readiness; no head or eye actor starts after detector
+   construction fails or times out. The head owner then observes each joint
+   twice, admits the complete pose inside the exact policy window and freshness
+   budget, writes that same pose with bounded speed and torque limits, enables
+   or refreshes torque, and verifies two stopped readbacks before any
+   natural-pose transition. It performs no pre-observation torque-disable.
 5. Open only the exact OAK MXID, require SuperSpeed, and bit-exactly bind its
    observed rectified stereo geometry to the retained calibration artifact.
    Require the artifact's raw IMU and tracking-camera-to-base values to equal
@@ -231,12 +233,29 @@ byte-limit claim.
 
 ## Expression and head behavior
 
-The RGB expression path samples an already-owned OAK frame. It produces
-deterministic scene-motion intentions with explicit frame identity and
-freshness, mixes bounded reactions, and sends KEP2 eye intentions. No
-person/face detector is wired into this path yet, so the current runtime does
-not claim semantic human tracking. Stale RGB or a failed eye session returns
-the eyes to firmware fallback.
+The canonical V3 RGB expression path moves each already-owned OAK frame into a
+capacity-one detector lane after one authoritative ingress-time sample. That
+lane parses the frame identity once, borrows the same pixel allocation for the
+bound OpenCV frontal/profile cascades, applies the bounded Fable-derived face
+association policy, and moves the exact parsed frame and result into the
+existing expression actor. The actor combines deterministic scene motion with
+an `Important` face-attention intent and sends KEP2 eye intentions. Haar level
+weight is retained only as an opaque ranking value: it is not a probability,
+person identity, distance estimate, or `PersonObservation`. This provides
+face-directed eye attention, not semantic human identification, prediction,
+or safety occupancy. Stale RGB, detector failure, or a failed eye session is a
+typed terminal accessory fault which disarms the base; coordinated shutdown
+then attempts and verifies the eye release to firmware fallback and the
+hold-preserving release of the reviewed natural head pose. Missing release or
+join evidence is a shutdown failure, not a successful fallback claim.
+
+OpenCV is used only for this bounded, host-side Haar rectangle detector. The
+cascades are pretrained static assets; Kiko performs no online training or
+model update. This choice preserves the audited Fable behavior without adding
+a second OAK owner or making expression attention part of SLAM, MPC, obstacle
+avoidance, identity, or the safety case. Replacing it with an OAK-NPU detector
+is a separate measured optimization and accuracy qualification, not a current
+performance claim.
 
 The default head intention is always `NaturalHold`. RGB does not directly map
 to servo ticks. An optional, explicitly configured camera-to-neutral-head
@@ -267,15 +286,27 @@ supported commissioning action.
 
 Rerun is the shared high-bandwidth diagnostic view for decimated RGB, stereo,
 depth, pose, occupancy map, local costmap, selected goal, global path, MPC
-rollout, control-tick timing, and exact applied-controller evidence. RGB is
-copied only after strict BGR8 layout admission into a capacity-one,
-drop-oldest diagnostic queue; that copy cannot feed SLAM, expression, control,
-or safety. Capture-derived items use their device timeline and navigation
-items use their explicit host/tick timelines and frame transforms. Rerun does
-not currently publish the accessory health snapshot, semantic expression
-source, frontier candidate set, or complete supervisor state; those must not
-be inferred from the images. Rerun is not a safety authority or complete
-decision ledger.
+rollout, control-tick timing, exact applied-controller evidence, Haar face
+rectangles, and the selected face target. RGB is copied only after strict BGR8
+layout admission into a capacity-one, drop-oldest diagnostic queue; that copy
+cannot feed SLAM, expression, control, or safety.
+
+A face result can overlay only the RGB image with the exact same stream epoch,
+device capture sequence, host delivery sequence, timestamp/reference, and
+dimensions. RGB and detector-result identities use separate timelines, and
+timeline-domain switches explicitly clear sticky foreign time state. Every
+new RGB image clears the prior rectangles and target before an exact-key match
+is applied, so dropped, late, or unmatched detector work cannot remain visible
+on a newer frame. A matched empty batch is published as empty evidence rather
+than leaving an old face behind.
+
+Capture-derived items use their device timeline and navigation items use their
+explicit host/tick timelines and frame transforms. Haar rank and rectangles
+are not probability, identity, range, occupancy, collision, or navigation
+evidence. Rerun does not currently publish the accessory health snapshot,
+semantic expression source, frontier candidate set, or complete supervisor
+state; those must not be inferred from the images. Rerun is not a safety
+authority or complete decision ledger.
 
 The pinned Rerun SDK is output-only. A click adapter therefore submits the same
 typed `(map_epoch, revision, x_m, y_m)` command through the local control API;

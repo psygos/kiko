@@ -48,21 +48,30 @@ production manual velocity actuation remain disabled.
 
 Render into a staging directory, never directly into the live deployment:
 
-1. install the exact canonical calibration artifact, shadow-only plant,
-   navigation-shadow configuration, ONNX Runtime library, and model bytes.
+1. prepare the shared illustrative render input at
+   `../nano-agent-template/bundle-render-input-v1.json.template` with
+   `bundle.kind` equal to `wheels_off_qualification` and the whole-value
+   `FACE_PERCEPTION_ASSETS_JSON` token equal to `null`; qualification rejects
+   production cascade assets;
+2. install the exact canonical calibration artifact, shadow-only plant,
+   navigation-shadow configuration, model bytes, and all seven required direct
+   native-library roles: DepthAI core, dynamic calibration, libusb 1.0, ONNX
+   Runtime, OpenCV core, OpenCV imgproc, and OpenCV objdetect.
    The shared source schema is
    `../nano-agent-template/calibration-artifact-v1.json.template`; it binds
    one canonical OAK MXID to exact rectified stereo geometry, raw IMU
    calibration, tracking-camera-to-base transform, and three later production
    approval IDs;
-2. compute each installed leaf's exact byte count and lowercase SHA-256;
-3. render candidate inventory V2 from exact observed identities and the
+3. compute each installed leaf's exact byte count and lowercase SHA-256;
+4. render `native-runtime-v1.json` from the seven exact native leaves;
+5. render candidate inventory V2 from exact observed identities and the
    calibration/plant digests expressed as 32 decimal bytes;
-4. render the qualification agent policy and candidate server contract;
-5. copy the candidate controller policy without editing it;
-6. compute the byte count and lowercase SHA-256 of every rendered JSON input;
-7. render the launch document last from those exact values; and
-8. reject the staging tree if any `${` token remains or any rendered JSON
+6. render the qualification agent policy and candidate server contract;
+7. copy the candidate controller policy without editing it;
+8. compute the byte count and lowercase SHA-256 of every rendered JSON input;
+9. render the evidence manifest and launch document last from those exact
+   values; and
+10. reject the staging tree if any `${` token remains or any rendered JSON
    fails `jq -e .`.
 
 The deployment renderer must produce both the 64-character lowercase

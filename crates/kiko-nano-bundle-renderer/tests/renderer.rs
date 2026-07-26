@@ -9,7 +9,7 @@ use kiko_device_inventory::{
 };
 use kiko_nano_bundle_renderer::{RenderMode, render_bundle};
 use kiko_slam::navigation::{
-    NanoAgentLaunchV2, NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1,
+    NanoAgentLaunchV3, NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1,
     NanoWheelsOffQualificationLaunchV1, WheelsOffCandidateControllerBinding,
 };
 use robot_server::config::{ControllerServerConfig, ControllerServerConfigV1};
@@ -25,6 +25,23 @@ fn write_source(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
 
 fn canonical_root(temporary: &TempDir) -> PathBuf {
     fs::canonicalize(temporary.path()).expect("canonical temporary root")
+}
+
+fn add_production_face_assets(root: &Path, input: &mut Value) {
+    let frontal = write_source(root, "frontal.xml", b"frontal-cascade-exact");
+    let profile = write_source(root, "profile.xml", b"profile-cascade-exact");
+    input["assets"]["face_perception"] = json!({
+        "frontal_face_cascade": {
+            "source_path": frontal,
+            "destination_relative_path":
+                "models/opencv/haarcascade_frontalface_default.xml"
+        },
+        "profile_face_cascade": {
+            "source_path": profile,
+            "destination_relative_path":
+                "models/opencv/haarcascade_profileface.xml"
+        }
+    });
 }
 
 fn source_fixture() -> (TempDir, Value) {
@@ -85,6 +102,13 @@ fn source_fixture() -> (TempDir, Value) {
     let calibration_lib = write_source(&root, "libdynamic-calibration.so", b"calibration-exact");
     let libusb = write_source(&root, "libusb-1.0.so", b"libusb-exact");
     let onnx = write_source(&root, "libonnxruntime.so", b"onnxruntime-exact");
+    let opencv_core = write_source(&root, "libopencv_core.so.4.5d", b"opencv-core-exact");
+    let opencv_imgproc = write_source(&root, "libopencv_imgproc.so.4.5d", b"opencv-imgproc-exact");
+    let opencv_objdetect = write_source(
+        &root,
+        "libopencv_objdetect.so.4.5d",
+        b"opencv-objdetect-exact",
+    );
     let input = json!({
         "schema_version": 1,
         "bundle": { "kind": "wheels_off_qualification" },
@@ -164,6 +188,21 @@ fn source_fixture() -> (TempDir, Value) {
                 "role": "onnxruntime",
                 "soname": "libonnxruntime.so",
                 "source_path": onnx
+            },
+            {
+                "role": "opencv_core",
+                "soname": "libopencv_core.so.4.5d",
+                "source_path": opencv_core
+            },
+            {
+                "role": "opencv_imgproc",
+                "soname": "libopencv_imgproc.so.4.5d",
+                "source_path": opencv_imgproc
+            },
+            {
+                "role": "opencv_objdetect",
+                "soname": "libopencv_objdetect.so.4.5d",
+                "source_path": opencv_objdetect
             }
         ],
         "runtime": {
@@ -486,6 +525,7 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
 fn production_without_separate_profile_is_fail_closed() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
+    add_production_face_assets(&root, &mut input);
     input["bundle"] = json!({
         "kind": "production",
         "production_controller_profile_path": null
@@ -500,9 +540,53 @@ fn production_without_separate_profile_is_fail_closed() {
 }
 
 #[test]
+fn production_without_exact_face_assets_is_fail_closed() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    input["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": null
+    });
+    let input_path = write_input(&root, &input);
+    let error =
+        render_bundle(&input_path, RenderMode::DryRun).expect_err("face assets are mandatory");
+    assert!(
+        error
+            .to_string()
+            .contains("requires exact frontal and profile face-cascade")
+    );
+}
+
+#[test]
+fn production_open_cv_roles_require_the_observed_nano_sonames() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    add_production_face_assets(&root, &mut input);
+    input["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": null
+    });
+    let objdetect = input["native_libraries"]
+        .as_array_mut()
+        .expect("fixture native libraries")
+        .iter_mut()
+        .find(|library| library["role"] == "opencv_objdetect")
+        .expect("objdetect fixture");
+    objdetect["soname"] = json!("libopencv_objdetect.so");
+    let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
+        .expect_err("unversioned OpenCV SONAME must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("requires Nano SONAME \"libopencv_objdetect.so.4.5d\"")
+    );
+}
+
+#[test]
 fn production_derives_navigation_digest_and_loopback_port() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
+    add_production_face_assets(&root, &mut input);
     input["discovery"]["stm32"]["firmware_build_id"] = json!(196609);
     input["discovery"]["stm32"]["hardware_profile_fingerprint_hex"] =
         json!("4b494b4f2d3450574d2d50524f443121");
@@ -529,7 +613,7 @@ fn production_derives_navigation_digest_and_loopback_port() {
     assert_eq!(plan.bundle_kind, "production");
     assert_eq!(
         plan.files.last().unwrap().relative_path,
-        "nano-agent-launch-v2.json"
+        "nano-agent-launch-v3.json"
     );
     let navigation = fs::read(destination.join("navigation-shadow-v1.json")).unwrap();
     let actuation: Value = serde_json::from_slice(
@@ -566,9 +650,9 @@ fn production_derives_navigation_digest_and_loopback_port() {
         "udp://127.0.0.1:8081"
     );
     let launch_bytes =
-        fs::read(destination.join("nano-agent-launch-v2.json")).expect("production launch");
+        fs::read(destination.join("nano-agent-launch-v3.json")).expect("production launch");
     let typed_launch =
-        NanoAgentLaunchV2::parse_json(&launch_bytes).expect("typed production launch");
+        NanoAgentLaunchV3::parse_json(&launch_bytes).expect("typed production launch");
     let limits = typed_launch.storage().navigation_dataset_limits();
     assert_eq!(limits.maximum_bytes(), 8_589_934_592);
     assert_eq!(limits.maximum_files(), 65_536);
@@ -583,6 +667,45 @@ fn production_derives_navigation_digest_and_loopback_port() {
                 .expect("production calibration")
         )
     );
+    assert_eq!(
+        launch["face_perception"]["frontal_face_cascade_asset"]["sha256_hex"],
+        sha256_hex(
+            &fs::read(destination.join("models/opencv/haarcascade_frontalface_default.xml"))
+                .expect("production frontal cascade")
+        )
+    );
+    assert_eq!(
+        launch["face_perception"]["profile_face_cascade_asset"]["sha256_hex"],
+        sha256_hex(
+            &fs::read(destination.join("models/opencv/haarcascade_profileface.xml"))
+                .expect("production profile cascade")
+        )
+    );
+    let native: Value = serde_json::from_slice(
+        &fs::read(destination.join("native-runtime-v1.json")).expect("native manifest"),
+    )
+    .expect("native manifest JSON");
+    for (role, soname) in [
+        ("opencv_core", "libopencv_core.so.4.5d"),
+        ("opencv_imgproc", "libopencv_imgproc.so.4.5d"),
+        ("opencv_objdetect", "libopencv_objdetect.so.4.5d"),
+    ] {
+        let library = native["libraries"]
+            .as_array()
+            .expect("native library list")
+            .iter()
+            .find(|library| library["role"] == role)
+            .expect("required direct OpenCV role");
+        let relative_path = format!("lib/{soname}");
+        assert_eq!(library["soname"], soname);
+        assert_eq!(library["relative_path"], relative_path);
+        assert_eq!(
+            library["sha256_hex"],
+            sha256_hex(
+                &fs::read(destination.join(&relative_path)).expect("staged OpenCV direct library")
+            )
+        );
+    }
     let controller_bytes = fs::read(destination.join("controller-server-v1.json")).unwrap();
     let controller =
         ControllerServerConfigV1::parse_json(&controller_bytes).expect("production controller");
@@ -613,6 +736,7 @@ fn production_derives_navigation_digest_and_loopback_port() {
 fn candidate_controller_identity_cannot_be_relabelled_as_production() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
+    add_production_face_assets(&root, &mut input);
     let profile_path = root.join("candidate-relabelled-production.json");
     let mut profile = valid_production_profile();
     profile["controller"]["firmware_build_id"] = json!(135169);
@@ -637,6 +761,7 @@ fn candidate_controller_identity_cannot_be_relabelled_as_production() {
 fn production_profile_must_pass_the_authoritative_controller_parser() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
+    add_production_face_assets(&root, &mut input);
     input["discovery"]["stm32"]["firmware_build_id"] = json!(196609);
     input["discovery"]["stm32"]["hardware_profile_fingerprint_hex"] =
         json!("4b494b4f2d3450574d2d50524f443121");
@@ -659,6 +784,7 @@ fn production_profile_must_pass_the_authoritative_controller_parser() {
 fn production_warm_start_renders_the_exact_saved_map_and_dataset_pair() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
+    add_production_face_assets(&root, &mut input);
     input["discovery"]["stm32"]["firmware_build_id"] = json!(196609);
     input["discovery"]["stm32"]["hardware_profile_fingerprint_hex"] =
         json!("4b494b4f2d3450574d2d50524f443121");
@@ -718,6 +844,23 @@ fn qualification_rejects_production_warm_start_state() {
         error
             .to_string()
             .contains("cannot replay persisted production map state")
+    );
+}
+
+#[test]
+fn wheels_off_bundle_still_requires_direct_open_cv_elf_closure() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    input["native_libraries"]
+        .as_array_mut()
+        .expect("fixture native libraries")
+        .retain(|library| library["role"] != "opencv_core");
+    let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
+        .expect_err("qualification binary also carries production dispatch");
+    assert!(
+        error
+            .to_string()
+            .contains("exact four legacy roles and three direct OpenCV roles")
     );
 }
 
