@@ -3928,6 +3928,37 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "opencv-face-detector", not(oak_sys_check_only)))]
+    #[test]
+    #[ignore = "requires native OpenCV and explicit OAK_SYS_TEST_*_CASCADE_XML paths"]
+    fn native_haar_detector_loads_cascades_and_detects_a_blank_frame() {
+        let read_cascade = |variable: &'static str| {
+            let path = std::env::var_os(variable)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| panic!("{variable} must name an exact cascade XML file"));
+            std::fs::read(&path).unwrap_or_else(|error| {
+                panic!(
+                    "{variable} cascade {} could not be read: {error}",
+                    path.display()
+                )
+            })
+        };
+        let frontal = read_cascade("OAK_SYS_TEST_FRONTAL_CASCADE_XML");
+        let profile = read_cascade("OAK_SYS_TEST_PROFILE_CASCADE_XML");
+        let mut detector =
+            OpenCvHaarFaceDetector::load(&frontal, &profile, valid_haar_detector_config(8))
+                .expect("load native Haar cascades from exact retained bytes");
+
+        let frame = detector_rgb_frame(160, 120);
+        let batch = detector
+            .detect(&frame)
+            .expect("run native Haar detector on a valid blank BGR frame");
+        assert_eq!(batch.native_detection_count(), 0);
+        assert!(batch.detections().is_empty());
+        assert!(!batch.was_truncated());
+        assert_eq!((batch.width(), batch.height()), (160, 120));
+    }
+
     #[cfg(all(feature = "opencv-face-detector", oak_sys_check_only))]
     #[test]
     fn compile_only_feature_requires_no_opencv_runtime_or_cascade_files() {
