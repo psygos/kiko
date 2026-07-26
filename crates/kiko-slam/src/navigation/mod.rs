@@ -19,7 +19,7 @@ mod control_api;
 #[cfg(unix)]
 mod control_socket;
 mod coordinator;
-#[cfg(all(feature = "agent-runtime", feature = "record", unix))]
+#[cfg(all(any(feature = "nano-agent", feature = "nano-base-commissioning"), unix))]
 mod expression_bridge;
 mod frames;
 mod frontier;
@@ -34,7 +34,7 @@ mod local_costmap;
 mod manual_drive;
 mod manual_reference;
 pub mod mpc;
-#[cfg(all(feature = "agent-runtime", feature = "record", unix))]
+#[cfg(all(any(feature = "nano-agent", feature = "nano-base-commissioning"), unix))]
 mod nano_accessory_worker;
 #[cfg(all(
     feature = "agent-runtime",
@@ -58,6 +58,8 @@ mod nano_bootstrap;
     unix
 ))]
 mod nano_calibration_artifact;
+#[cfg(all(feature = "nano-face-perception", unix))]
+pub mod nano_face_perception;
 #[cfg(all(feature = "nano-agent", unix))]
 mod nano_map_persistence;
 #[cfg(all(
@@ -188,7 +190,7 @@ pub use coordinator::{
     PreparedMapPointGoal, ShadowNavigationCoordinator, StoredPlanFault, VisualAdmission,
     VisualAdmissionError, VisualAdmissionOutcome,
 };
-#[cfg(all(feature = "agent-runtime", feature = "record", unix))]
+#[cfg(all(any(feature = "nano-agent", feature = "nano-base-commissioning"), unix))]
 pub use expression_bridge::{
     RGB_EXPRESSION_HEAD_POLICY, RgbExpressionBridge, RgbExpressionBridgeError,
     RgbExpressionBridgeOutcome, RgbHeadGazeProjectionError,
@@ -270,17 +272,28 @@ pub use manual_reference::{
     FrontierYawScanCommandError, FrontierYawScanCommandV1, FrontierYawTurnDirectionV1,
     ManualMpcCommandError, ManualMpcCommandV1, ManualReferenceBuildError, NumericAuthorityLeaseId,
 };
-#[cfg(all(feature = "agent-runtime", feature = "record", unix))]
+#[cfg(all(any(feature = "nano-agent", feature = "nano-base-commissioning"), unix))]
 pub use nano_accessory_worker::{
-    MAX_NANO_ACCESSORY_HEALTH_PERIOD, NanoAccessoryComponentHealth, NanoAccessoryFaultWaitError,
-    NanoAccessoryFrameStats, NanoAccessoryFrameSubmitOutcome, NanoAccessoryHealthObserver,
-    NanoAccessoryHealthPeriod, NanoAccessoryHealthPeriodError, NanoAccessoryHealthStatusError,
-    NanoAccessoryReadyEvidence, NanoAccessoryRgbIngress, NanoAccessoryRuntimeHealth,
+    MAX_NANO_ACCESSORY_HEALTH_PERIOD, NANO_ACCESSORY_TERMINAL_PUBLICATION_TIMEOUT,
+    NanoAccessoryComponentHealth, NanoAccessoryFaultWaitError, NanoAccessoryFrameStats,
+    NanoAccessoryFrameSubmitOutcome, NanoAccessoryHealthObserver, NanoAccessoryHealthPeriod,
+    NanoAccessoryHealthPeriodError, NanoAccessoryHealthStatusError, NanoAccessoryOwnerState,
+    NanoAccessoryPerceptionReadyEvidence, NanoAccessoryReadyEvidence, NanoAccessoryRuntimeHealth,
     NanoAccessoryShutdownEvidence, NanoAccessoryTerminalFault, NanoAccessoryWorker,
     NanoAccessoryWorkerConfig, NanoAccessoryWorkerConfigError, NanoAccessoryWorkerExit,
     NanoAccessoryWorkerJoinError, NanoAccessoryWorkerStartError, NanoEyeActorStartupError,
     NanoEyeReadyEvidence, NanoEyeShutdownEvidence, NanoHeadActorStartupError,
     NanoHeadReadyEvidence, NanoHeadShutdownEvidence,
+};
+#[cfg(all(feature = "nano-agent", unix))]
+pub use nano_accessory_worker::{
+    NANO_FACE_PERCEPTION_JOIN_TIMEOUT, NANO_FACE_PERCEPTION_STARTUP_TIMEOUT,
+    NanoFaceCascadeAssetEvidence, NanoFaceDiagnosticFrame, NanoFaceDiagnosticReceiver,
+    NanoFaceDiagnosticStatsHandle, NanoFacePerceptionAssetEvidence, NanoFacePerceptionConfigError,
+    NanoFacePerceptionJoinEvidence, NanoFacePerceptionReadyEvidence,
+    NanoFacePerceptionRuntimeError, NanoFacePerceptionShutdownClass,
+    NanoFacePerceptionShutdownEvidence, NanoFacePerceptionStageStats,
+    NanoFacePerceptionStageStatsHandle, NanoFacePerceptionThreadExit,
 };
 #[cfg(all(
     feature = "agent-runtime",

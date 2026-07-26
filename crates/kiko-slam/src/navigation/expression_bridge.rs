@@ -16,16 +16,17 @@
 use std::fmt;
 
 use kiko_expression_core::{
-    ChannelOrder, ExpressionKind, FrameId, FreshnessWindow, HeadMotionPolicy, ImageLayout,
-    ImageLayoutError, MonotonicTimestamp, NonZeroDuration, ReactionInputs, ReactionMixer,
-    RgbFrameView, RgbObservation, StreamEpochId, TimeError,
+    ChannelOrder, ExpressionIntent, ExpressionKind, ExpressionPriority, FrameId, FreshnessWindow,
+    GazeTarget, HeadMotionPolicy, ImageLayout, ImageLayoutError, MonotonicTimestamp,
+    NonZeroDuration, PositiveUnitAmount, ReactionInputs, ReactionMixer, RgbFrameView,
+    RgbObservation, StreamEpochId, TimeError,
 };
 use kiko_expression_runtime::{
     AdaptError, CameraForwardDepthMeters, CameraToHeadGazeExtrinsics, EyeRenderStyle,
-    HeadGazeProjectionError, HeadRelativeGaze, MonotonicLatestAdmission, MonotonicLatestGap,
-    OakCameraTargetPoint, OakCameraTargetRay, PreparedEyeIntent, RayHeadGazeProjectionError,
-    SceneAnalysis, SceneMotionConfig, SceneMotionError, SceneMotionExtractor,
-    adapt_reaction_output,
+    FaceTargetState, FaceTrackingUpdate, HeadGazeProjectionError, HeadRelativeGaze,
+    MonotonicLatestAdmission, MonotonicLatestGap, OakCameraTargetPoint, OakCameraTargetRay,
+    PreparedEyeIntent, RayHeadGazeProjectionError, SceneAnalysis, SceneMotionConfig,
+    SceneMotionError, SceneMotionExtractor, adapt_reaction_output,
 };
 use kiko_eye_runtime::{ClockError, MonotonicClock};
 use oak_sys::{ImageFrame, StreamId};
@@ -34,6 +35,13 @@ use super::NanoRgbExpressionConfig;
 
 /// The RGB expression path can never request expressive head displacement.
 pub const RGB_EXPRESSION_HEAD_POLICY: HeadMotionPolicy = HeadMotionPolicy::NaturalHold;
+
+/// Semantic attention strength selected by policy for one associated face.
+///
+/// This is deliberately independent of OpenCV's arbitrary Haar level weight.
+/// It means “an established face target owns the Important gaze lane”; it is
+/// not a detector probability or a person-confidence claim.
+pub const FACE_ATTENTION_STRENGTH: PositiveUnitAmount = PositiveUnitAmount::ONE;
 
 /// Why the RGB domain seam cannot produce typed head-relative gaze geometry.
 ///
@@ -118,6 +126,11 @@ pub enum RgbExpressionBridgeError {
         actual_ns: i64,
     },
     SceneMotion(SceneMotionError),
+    FaceObservationMismatch {
+        frame: RgbObservation,
+        face: RgbObservation,
+    },
+    FaceAttentionFreshness(TimeError),
     Adapt(AdaptError),
 }
 
@@ -137,10 +150,12 @@ impl std::error::Error for RgbExpressionBridgeError {
             Self::Layout(source) => Some(source),
             Self::Freshness(source) => Some(source),
             Self::SceneMotion(source) => Some(source),
+            Self::FaceAttentionFreshness(source) => Some(source),
             Self::Adapt(source) => Some(source),
             Self::NotRgbStream { .. }
             | Self::NonTightBgrLayout { .. }
-            | Self::DeviceCaptureClockNotIncreasing { .. } => None,
+            | Self::DeviceCaptureClockNotIncreasing { .. }
+            | Self::FaceObservationMismatch { .. } => None,
         }
     }
 }
@@ -184,10 +199,7 @@ impl<F> IngressObservedRgbFrame<F> {
         Self { frame, observed_at }
     }
 
-    pub(super) const fn frame(&self) -> &F {
-        &self.frame
-    }
-
+    #[cfg(test)]
     pub(super) const fn observed_at(&self) -> MonotonicTimestamp {
         self.observed_at
     }
@@ -195,6 +207,55 @@ impl<F> IngressObservedRgbFrame<F> {
     fn into_parts(self) -> (F, MonotonicTimestamp) {
         (self.frame, self.observed_at)
     }
+}
+
+/// One OAK RGB frame after the weak transport metadata has been parsed into
+/// the expression domain exactly once.
+///
+/// Construction is private to [`parse_ingress_observed_oak_frame`], so the
+/// frame allocation and its [`RgbObservation`] cannot disagree. The original
+/// [`ImageFrame`] remains owned and is moved through perception without a
+/// pixel copy.
+pub(super) struct ParsedIngressRgbFrame {
+    frame: ImageFrame,
+    observation: RgbObservation,
+}
+
+impl ParsedIngressRgbFrame {
+    #[cfg(any(feature = "nano-agent", all(test, feature = "nano-face-perception")))]
+    pub(super) const fn frame(&self) -> &ImageFrame {
+        &self.frame
+    }
+
+    #[cfg(any(feature = "nano-agent", all(test, feature = "nano-face-perception")))]
+    pub(super) const fn observation(&self) -> RgbObservation {
+        self.observation
+    }
+
+    fn into_parts(self) -> (ImageFrame, RgbObservation) {
+        (self.frame, self.observation)
+    }
+}
+
+/// Parse an ingress-stamped OAK frame into one provenance-bearing domain
+/// value. Detection, tracking, and expression processing must carry this
+/// value rather than reconstructing an observation from loose fields.
+pub(super) fn parse_ingress_observed_oak_frame(
+    frame: IngressObservedRgbFrame<ImageFrame>,
+    stream_epoch: StreamEpochId,
+    freshness_ttl: NonZeroDuration,
+) -> Result<ParsedIngressRgbFrame, RgbExpressionBridgeError> {
+    let (frame, observed_at) = frame.into_parts();
+    let borrowed = BorrowedOakFrame::from(&frame);
+    let layout = parse_tight_bgr_layout(borrowed)?;
+    let freshness = FreshnessWindow::from_ttl(observed_at, freshness_ttl)
+        .map_err(RgbExpressionBridgeError::Freshness)?;
+    let observation = RgbObservation::new(
+        FrameId::new(stream_epoch, borrowed.capture_sequence),
+        layout,
+        freshness,
+    );
+    Ok(ParsedIngressRgbFrame { frame, observation })
 }
 
 /// Stateful, allocation-free RGB reaction boundary for one OAK stream epoch.
@@ -303,19 +364,53 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
     /// admission by a clone of this bridge's exact clock origin.
     pub(super) fn process_queued_oak_frame(
         &mut self,
-        frame: &IngressObservedRgbFrame<ImageFrame>,
+        frame: IngressObservedRgbFrame<ImageFrame>,
     ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
-        let borrowed = IngressObservedRgbFrame::new(frame.frame().into(), frame.observed_at());
-        self.process_ingress_observed_borrowed(borrowed)
+        let parsed = parse_ingress_observed_oak_frame(frame, self.stream_epoch, self.freshness)?;
+        self.process_parsed_queued_oak_frame(parsed, None)
     }
 
+    /// Mix one face-association result produced from this exact queued frame.
+    ///
+    /// The equality check prevents a valid face result from being retagged
+    /// onto a different camera frame, layout, or freshness window. Haar level
+    /// weights never enter the mixer.
+    #[cfg(feature = "nano-agent")]
+    pub(super) fn process_queued_oak_frame_with_face(
+        &mut self,
+        frame: ParsedIngressRgbFrame,
+        face: FaceTrackingUpdate,
+    ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
+        self.process_parsed_queued_oak_frame(frame, Some(face))
+    }
+
+    fn process_parsed_queued_oak_frame(
+        &mut self,
+        frame: ParsedIngressRgbFrame,
+        face: Option<FaceTrackingUpdate>,
+    ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
+        let now = self.clock.now().map_err(RgbExpressionBridgeError::Clock)?;
+        let (frame, observation) = frame.into_parts();
+        self.process_parsed_borrowed_at((&frame).into(), observation, now, face)
+    }
+
+    #[cfg(test)]
     fn process_ingress_observed_borrowed(
         &mut self,
         frame: IngressObservedRgbFrame<BorrowedOakFrame<'_>>,
     ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
+        self.process_ingress_observed_borrowed_with_face(frame, None)
+    }
+
+    #[cfg(test)]
+    fn process_ingress_observed_borrowed_with_face(
+        &mut self,
+        frame: IngressObservedRgbFrame<BorrowedOakFrame<'_>>,
+        face: Option<FaceTrackingUpdate>,
+    ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
         let (frame, observed_at) = frame.into_parts();
         let now = self.clock.now().map_err(RgbExpressionBridgeError::Clock)?;
-        self.process_borrowed_at(frame, observed_at, now)
+        self.process_borrowed_at(frame, observed_at, now, face)
     }
 
     fn process_borrowed(
@@ -323,7 +418,7 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         frame: BorrowedOakFrame<'_>,
     ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
         let now = self.clock.now().map_err(RgbExpressionBridgeError::Clock)?;
-        self.process_borrowed_at(frame, now, now)
+        self.process_borrowed_at(frame, now, now, None)
     }
 
     fn process_borrowed_at(
@@ -331,6 +426,7 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         frame: BorrowedOakFrame<'_>,
         observed_at: MonotonicTimestamp,
         now: MonotonicTimestamp,
+        face: Option<FaceTrackingUpdate>,
     ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
         let layout = parse_tight_bgr_layout(frame)?;
         let freshness = FreshnessWindow::from_ttl(observed_at, self.freshness)
@@ -340,10 +436,29 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
             layout,
             freshness,
         );
+        self.process_parsed_borrowed_at(frame, observation, now, face)
+    }
+
+    fn process_parsed_borrowed_at(
+        &mut self,
+        frame: BorrowedOakFrame<'_>,
+        observation: RgbObservation,
+        now: MonotonicTimestamp,
+        face: Option<FaceTrackingUpdate>,
+    ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
         let view = RgbFrameView::try_new(observation, frame.pixels)
             .map_err(RgbExpressionBridgeError::Layout)?;
 
         self.validate_device_capture_clock(frame.device_timestamp_ns)?;
+
+        if let Some(face) = face
+            && face.observation() != observation
+        {
+            return Err(RgbExpressionBridgeError::FaceObservationMismatch {
+                frame: observation,
+                face: face.observation(),
+            });
+        }
 
         let admitted = self
             .extractor
@@ -353,13 +468,19 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         self.last_device_timestamp_ns = Some(frame.device_timestamp_ns);
 
         let scene = analysis.observation();
+        let face_intent = face
+            .map(face_attention_intent)
+            .transpose()
+            .map_err(RgbExpressionBridgeError::FaceAttentionFreshness)?
+            .flatten();
+        let intents = face_intent.as_slice();
         let reaction = self.mixer.mix(
             now,
             ReactionInputs {
                 rgb: Some(&observation),
                 people: &[],
                 scene: Some(&scene),
-                intents: &[],
+                intents,
             },
         );
         let prepared = adapt_reaction_output(reaction, ExpressionKind::Curious, self.style, now)
@@ -399,6 +520,41 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         }
         Ok(())
     }
+}
+
+fn face_attention_intent(
+    update: FaceTrackingUpdate,
+) -> Result<Option<ExpressionIntent>, TimeError> {
+    let (target, freshness) = match update.state() {
+        FaceTargetState::Tracked(observation) => (observation, observation.freshness()),
+        FaceTargetState::Switched(switched) => {
+            let observation = switched.observation();
+            (observation, observation.freshness())
+        }
+        FaceTargetState::Coasting(coasting) => {
+            let observation = coasting.last_observation();
+            let current = update.observation().freshness();
+            let current_deadline = current.valid_until_exclusive();
+            let loss_deadline = coasting.loss_deadline();
+            let deadline = if current_deadline <= loss_deadline {
+                current_deadline
+            } else {
+                loss_deadline
+            };
+            let freshness = FreshnessWindow::try_new(current.observed_at(), deadline)?;
+            (observation, freshness)
+        }
+        FaceTargetState::NoTarget | FaceTargetState::Acquiring(_) | FaceTargetState::Lost(_) => {
+            return Ok(None);
+        }
+    };
+    Ok(Some(ExpressionIntent::new(
+        ExpressionKind::Attentive,
+        FACE_ATTENTION_STRENGTH,
+        ExpressionPriority::Important,
+        Some(GazeTarget::new(target.center())),
+        freshness,
+    )))
 }
 
 fn parse_tight_bgr_layout(
@@ -441,7 +597,10 @@ mod tests {
     };
 
     use kiko_expression_core::{MonotonicTimestamp, PositiveUnitAmount, UnitAmount};
-    use kiko_expression_runtime::{MotionThresholds, SamplingGeometry};
+    use kiko_expression_runtime::{
+        DetectorResultSequence, FaceDetection, FaceDetectionBatch, FaceDetectorSource, FaceTracker,
+        FaceTrackingConfig, MotionThresholds, SamplingGeometry,
+    };
     use kiko_eye_protocol::Expression;
 
     use super::*;
@@ -572,6 +731,44 @@ mod tests {
         )
     }
 
+    fn face_batch(
+        capture_sequence: u64,
+        detector_sequence: u64,
+        observed_at_ns: u64,
+        detection: Option<(u32, u32, u32, u32)>,
+    ) -> FaceDetectionBatch {
+        let layout = ImageLayout::try_new(2, 2, 6, ChannelOrder::Bgr).expect("face test layout");
+        let freshness = FreshnessWindow::from_ttl(
+            MonotonicTimestamp::from_nanos_since_epoch(observed_at_ns),
+            NonZeroDuration::try_from_nanos(100).expect("face test freshness"),
+        )
+        .expect("face test deadline");
+        let observation = RgbObservation::new(
+            FrameId::new(stream_epoch(), capture_sequence),
+            layout,
+            freshness,
+        );
+        let parsed = detection.map(|(left, top, width, height)| {
+            FaceDetection::try_new(
+                layout,
+                left,
+                top,
+                width,
+                height,
+                -3.0,
+                FaceDetectorSource::Frontal,
+            )
+            .expect("face test detection")
+        });
+        FaceDetectionBatch::try_new(
+            observation,
+            DetectorResultSequence::new(detector_sequence),
+            0,
+            parsed.as_slice(),
+        )
+        .expect("face test batch")
+    }
+
     #[test]
     fn cold_start_returns_only_styled_neutral_prepared_intent() {
         let clock = TestClock::new(10);
@@ -617,6 +814,112 @@ mod tests {
         let prepared = outcome.into_prepared();
         assert_eq!(prepared.generated_at().nanos_since_epoch(), 20);
         assert_eq!(prepared.intent().expression(), Expression::Curious);
+    }
+
+    #[test]
+    fn established_face_owns_important_gaze_without_using_haar_rank_as_confidence() {
+        assert_eq!(FACE_ATTENTION_STRENGTH, PositiveUnitAmount::ONE);
+        let clock = TestClock::new(10);
+        let mut bridge = bridge(clock.clone());
+        let mut tracker = FaceTracker::new(FaceTrackingConfig::default());
+
+        let first_batch = face_batch(4, 1, 10, Some((1, 0, 1, 1)));
+        let first_face = tracker
+            .update(&first_batch, MonotonicTimestamp::from_nanos_since_epoch(10))
+            .expect("acquisition result");
+        let first = bridge
+            .process_ingress_observed_borrowed_with_face(
+                queued_rgb(4, 1_000, 10, &[0; 12]),
+                Some(first_face),
+            )
+            .expect("acquiring face frame");
+        assert_eq!(
+            first.into_prepared().intent().expression(),
+            Expression::Neutral,
+            "one detector result is not an established target"
+        );
+
+        clock.set(20);
+        let second_batch = face_batch(5, 2, 20, Some((1, 0, 1, 1)));
+        let second_face = tracker
+            .update(
+                &second_batch,
+                MonotonicTimestamp::from_nanos_since_epoch(20),
+            )
+            .expect("tracked result");
+        let second = bridge
+            .process_ingress_observed_borrowed_with_face(
+                queued_rgb(5, 2_000, 20, &[0; 12]),
+                Some(second_face),
+            )
+            .expect("tracked face frame")
+            .into_prepared();
+        assert_eq!(second.intent().expression(), Expression::Curious);
+        assert_eq!(second.intent().gaze_x().get(), 500);
+        assert_eq!(second.intent().gaze_y().get(), 500);
+        assert_eq!(
+            second.valid_until_exclusive(),
+            Some(
+                second_batch
+                    .observation()
+                    .freshness()
+                    .valid_until_exclusive()
+            )
+        );
+    }
+
+    #[test]
+    fn coasted_face_uses_current_frame_freshness_capped_by_loss_deadline() {
+        let mut tracker = FaceTracker::new(FaceTrackingConfig::default());
+        for (camera, detector, observed) in [(4, 1, 10), (5, 2, 20)] {
+            tracker
+                .update(
+                    &face_batch(camera, detector, observed, Some((1, 0, 1, 1))),
+                    MonotonicTimestamp::from_nanos_since_epoch(observed),
+                )
+                .expect("establish face");
+        }
+        let empty = face_batch(6, 3, 30, None);
+        let coasted = tracker
+            .update(&empty, MonotonicTimestamp::from_nanos_since_epoch(30))
+            .expect("coasted result");
+        let intent = face_attention_intent(coasted)
+            .expect("valid coast freshness")
+            .expect("coasting retains attention");
+        assert_eq!(intent.kind(), ExpressionKind::Attentive);
+        assert_eq!(intent.strength(), FACE_ATTENTION_STRENGTH);
+        assert_eq!(intent.priority(), ExpressionPriority::Important);
+        assert_eq!(
+            intent.freshness(),
+            empty.observation().freshness(),
+            "the current RGB deadline is earlier than the two-second loss deadline"
+        );
+    }
+
+    #[test]
+    fn face_result_cannot_be_retagged_onto_another_rgb_frame() {
+        let clock = TestClock::new(10);
+        let mut bridge = bridge(clock);
+        let mut tracker = FaceTracker::new(FaceTrackingConfig::default());
+        let batch = face_batch(5, 1, 10, Some((1, 0, 1, 1)));
+        let face = tracker
+            .update(&batch, MonotonicTimestamp::from_nanos_since_epoch(10))
+            .expect("face update");
+        let mismatched_frame = queued_rgb(4, 1_000, 10, &[0; 12]);
+        assert_eq!(
+            bridge.process_ingress_observed_borrowed_with_face(mismatched_frame, Some(face)),
+            Err(RgbExpressionBridgeError::FaceObservationMismatch {
+                frame: face_batch(4, 99, 10, None).observation(),
+                face: batch.observation(),
+            })
+        );
+
+        assert!(matches!(
+            bridge
+                .process_ingress_observed_borrowed(queued_rgb(4, 1_000, 10, &[0; 12]))
+                .expect("mismatch did not advance scene or device-clock state"),
+            RgbExpressionBridgeOutcome::ColdStart(_)
+        ));
     }
 
     #[test]

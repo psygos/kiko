@@ -61,20 +61,24 @@ use robot_server::{
 
 use super::actuation::LiveActuationError;
 use super::mpc::{MpcConfigV1, PlantModelJsonParseError, PlantModelV1, WheelSide};
+use super::nano_accessory_worker::NanoFacePerceptionAssets;
 use super::{
     AdmittedOakSuperSpeedEvidence, ControlPeriodNs, ManifestBoundNanoAgentPolicyConfigV3,
     NanoAccessoryFaultWaitError, NanoAccessoryHealthPeriod, NanoAccessoryHealthPeriodError,
-    NanoAccessoryManifestBindingError, NanoAccessoryTerminalFault, NanoAccessoryWorker,
+    NanoAccessoryManifestBindingError, NanoAccessoryPerceptionReadyEvidence,
+    NanoAccessoryShutdownEvidence, NanoAccessoryTerminalFault, NanoAccessoryWorker,
     NanoAccessoryWorkerConfig, NanoAccessoryWorkerConfigError, NanoAccessoryWorkerExit,
     NanoAccessoryWorkerJoinError, NanoAccessoryWorkerStartError, NanoAgentLaunchLoadError,
-    NanoAgentLaunchV2, NanoAgentPolicyConfigParseError, NanoAgentPolicyConfigV3,
+    NanoAgentLaunchV3, NanoAgentPolicyConfigParseError, NanoAgentPolicyConfigV3,
     NanoCalibrationArtifactParseError, NanoCalibrationArtifactV1, NanoCalibrationBindingError,
-    NanoLaunchAssetRole, NanoLaunchBoundAssetLoadError, NanoObservedInventoryBuildError,
-    NanoObservedInventoryBuilder, NanoObservedInventoryEvidenceError, NanoProductionAdmissionError,
+    NanoFaceCascadeAssetRole, NanoFacePerceptionShutdownClass, NanoFacePerceptionShutdownEvidence,
+    NanoLaunchAssetRole, NanoLaunchBoundAssetLoadError, NanoLaunchFacePerception,
+    NanoObservedInventoryBuildError, NanoObservedInventoryBuilder,
+    NanoObservedInventoryEvidenceError, NanoProductionAdmissionError,
     NanoProductionAdmissionTimeline, NanoProductionAdmissionTimelineError,
     NavigationActuationConfigV1, NavigationClockEpoch, PendingLiveMpcControlDriver,
     PreparedNanoProductionRuntime, ShadowNavigationConfigParseError, ShadowNavigationConfigV1,
-    load_nano_agent_launch_v2,
+    load_nano_agent_launch_v3,
 };
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
@@ -687,25 +691,100 @@ pub struct LoadedNanoBootstrapAssets {
 impl LoadedNanoBootstrapAssets {
     fn load(
         deployment_root: &Path,
-        launch: &NanoAgentLaunchV2,
-    ) -> Result<Self, NanoBootstrapPrimaryError> {
+        launch: &NanoAgentLaunchV3,
+    ) -> Result<(Self, LoadedNanoBootstrapFacePerceptionAssets), NanoBootstrapPrimaryError> {
         let load = |role| {
             launch
                 .asset(role)
                 .load_exact(deployment_root)
                 .map_err(|source| NanoBootstrapPrimaryError::BoundAssetLoad { role, source })
         };
+        let face_perception = LoadedNanoBootstrapFacePerceptionAssets::load(
+            deployment_root,
+            launch.face_perception(),
+        )
+        .map_err(NanoBootstrapPrimaryError::FacePerceptionAssetLoad)?;
+        Ok((
+            Self {
+                agent_policy: load(NanoLaunchAssetRole::AgentPolicy)?,
+                navigation_shadow_config: load(NanoLaunchAssetRole::NavigationShadowConfig)?,
+                physical_actuation_config: load(NanoLaunchAssetRole::PhysicalActuationConfig)?,
+                controller_server_contract: load(NanoLaunchAssetRole::ControllerServerContract)?,
+                calibration_artifact: load(NanoLaunchAssetRole::CalibrationArtifact)?,
+                plant_artifact: load(NanoLaunchAssetRole::PlantArtifact)?,
+                onnx_runtime_library: load(NanoLaunchAssetRole::OnnxRuntimeLibrary)?,
+                superpoint_model: load(NanoLaunchAssetRole::SuperpointModel)?,
+                lightglue_model: load(NanoLaunchAssetRole::LightglueModel)?,
+            },
+            face_perception,
+        ))
+    }
+}
+
+/// Exact retained V3 face-cascade inputs.
+///
+/// `LoadedDeploymentAsset` proves that the retained bytes match the V3 launch
+/// binding and retains their canonical deployment-relative identity. Startup
+/// moves these byte vectors into the named face-perception thread and OpenCV
+/// parses them from an in-memory `FileStorage`; no pathname is reopened and no
+/// Rust-side duplicate vector is created. The native boundary makes one
+/// required owned `std::string` copy per cascade for the startup parse.
+#[derive(Debug)]
+struct LoadedNanoBootstrapFacePerceptionAssets {
+    frontal_face_cascade: LoadedDeploymentAsset,
+    profile_face_cascade: LoadedDeploymentAsset,
+}
+
+impl LoadedNanoBootstrapFacePerceptionAssets {
+    fn load(
+        deployment_root: &Path,
+        bindings: &NanoLaunchFacePerception,
+    ) -> Result<Self, NanoBootstrapFacePerceptionAssetLoadError> {
+        let load = |role| {
+            bindings
+                .asset(role)
+                .load_exact(deployment_root)
+                .map_err(
+                    |source| NanoBootstrapFacePerceptionAssetLoadError::BoundAssetLoad {
+                        role,
+                        source,
+                    },
+                )
+        };
         Ok(Self {
-            agent_policy: load(NanoLaunchAssetRole::AgentPolicy)?,
-            navigation_shadow_config: load(NanoLaunchAssetRole::NavigationShadowConfig)?,
-            physical_actuation_config: load(NanoLaunchAssetRole::PhysicalActuationConfig)?,
-            controller_server_contract: load(NanoLaunchAssetRole::ControllerServerContract)?,
-            calibration_artifact: load(NanoLaunchAssetRole::CalibrationArtifact)?,
-            plant_artifact: load(NanoLaunchAssetRole::PlantArtifact)?,
-            onnx_runtime_library: load(NanoLaunchAssetRole::OnnxRuntimeLibrary)?,
-            superpoint_model: load(NanoLaunchAssetRole::SuperpointModel)?,
-            lightglue_model: load(NanoLaunchAssetRole::LightglueModel)?,
+            frontal_face_cascade: load(NanoFaceCascadeAssetRole::FrontalFace)?,
+            profile_face_cascade: load(NanoFaceCascadeAssetRole::ProfileFace)?,
         })
+    }
+
+    fn into_parts(self) -> (LoadedDeploymentAsset, LoadedDeploymentAsset) {
+        (self.frontal_face_cascade, self.profile_face_cascade)
+    }
+}
+
+#[derive(Debug)]
+pub enum NanoBootstrapFacePerceptionAssetLoadError {
+    BoundAssetLoad {
+        role: NanoFaceCascadeAssetRole,
+        source: NanoLaunchBoundAssetLoadError,
+    },
+}
+
+impl fmt::Display for NanoBootstrapFacePerceptionAssetLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BoundAssetLoad { role, source } => {
+                write!(formatter, "{role:?} face-cascade load failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NanoBootstrapFacePerceptionAssetLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BoundAssetLoad { source, .. } => Some(source),
+        }
     }
 }
 
@@ -740,7 +819,7 @@ pub struct ParsedNanoLiveConfiguration {
 #[must_use = "the returned OAK and controller owners require explicit lifecycle handling"]
 pub struct PreparedNanoBootstrap {
     pub roots: NanoBootstrapRoots,
-    pub launch: super::LoadedNanoAgentLaunchV2,
+    pub launch: super::LoadedNanoAgentLaunchV3,
     pub assets: LoadedNanoBootstrapAssets,
     pub accessory_evidence: NanoBootstrapAccessoryEvidence,
     pub oak_connected_identity: ConnectedDeviceIdentity,
@@ -798,11 +877,12 @@ pub async fn bootstrap_nano_production(
     } = request;
 
     require_running(running).map_err(NanoBootstrapError::before_hardware)?;
-    let launch = load_nano_agent_launch_v2(roots.deployment_root(), launch_relative_path).map_err(
+    let launch = load_nano_agent_launch_v3(roots.deployment_root(), launch_relative_path).map_err(
         |source| NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::LaunchLoad(source)),
     )?;
-    let assets = LoadedNanoBootstrapAssets::load(roots.deployment_root(), launch.launch())
-        .map_err(NanoBootstrapError::before_hardware)?;
+    let (assets, face_perception_assets) =
+        LoadedNanoBootstrapAssets::load(roots.deployment_root(), launch.launch())
+            .map_err(NanoBootstrapError::before_hardware)?;
 
     let policy =
         NanoAgentPolicyConfigV3::parse_json(assets.agent_policy.bytes()).map_err(|source| {
@@ -935,9 +1015,23 @@ pub async fn bootstrap_nano_production(
     .map_err(|source| {
         NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::AccessoryConfig(source))
     })?;
-    let accessory = NanoAccessoryWorker::start(accessory_config).map_err(|source| {
-        NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::AccessoryStart(source))
-    })?;
+    let (frontal_face_cascade, profile_face_cascade) = face_perception_assets.into_parts();
+    let face_perception_assets =
+        NanoFacePerceptionAssets::from_v3_loaded_assets(frontal_face_cascade, profile_face_cascade);
+    let accessory =
+        NanoAccessoryWorker::start_with_face_perception(accessory_config, face_perception_assets)
+            .map_err(|source| {
+            NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::AccessoryStart(source))
+        })?;
+    if !matches!(
+        accessory.readiness().perception(),
+        NanoAccessoryPerceptionReadyEvidence::Face(_)
+    ) {
+        return Err(NanoBootstrapError::before_hardware(
+            NanoBootstrapPrimaryError::AccessoryFacePerceptionReadinessMissing,
+        )
+        .with_accessory_shutdown(accessory));
+    }
     if let Err(primary) = require_early_accessory_healthy(&accessory, running) {
         return Err(NanoBootstrapError::before_hardware(primary).with_accessory_shutdown(accessory));
     }
@@ -1276,7 +1370,7 @@ struct ConnectedOakPreparation {
 }
 
 struct ConnectedOakRequest<'a> {
-    launch: &'a NanoAgentLaunchV2,
+    launch: &'a NanoAgentLaunchV3,
     navigation_bytes: &'a [u8],
     actuation_bytes: &'a [u8],
     calibration: &'a NanoCalibrationArtifactV1,
@@ -1591,7 +1685,7 @@ struct SelectedPlantArtifact {
 
 fn bind_calibration_artifact(
     roots: &NanoBootstrapRoots,
-    launch: &NanoAgentLaunchV2,
+    launch: &NanoAgentLaunchV3,
     loaded: &LoadedDeploymentAsset,
     policy: &NanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -1748,7 +1842,7 @@ impl std::error::Error for NanoCalibrationArtifactSelectionError {
 
 fn select_plant_artifact(
     roots: &NanoBootstrapRoots,
-    launch: &NanoAgentLaunchV2,
+    launch: &NanoAgentLaunchV3,
     launch_plant: &LoadedDeploymentAsset,
     policy: &NanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -1845,7 +1939,7 @@ fn deployment_relative_artifact_path(
 }
 
 fn bind_controller_contract_to_manifest(
-    launch: &NanoAgentLaunchV2,
+    launch: &NanoAgentLaunchV3,
     server: &ControllerServerConfigV1,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
 ) -> Result<(), NanoBootstrapPrimaryError> {
@@ -1888,7 +1982,7 @@ fn bind_controller_contract_to_manifest(
 }
 
 fn bind_controller_contract_to_actuation(
-    launch: &NanoAgentLaunchV2,
+    launch: &NanoAgentLaunchV3,
     server: &ControllerServerConfigV1,
     actuation: &NavigationActuationConfigV1,
     mpc: MpcConfigV1,
@@ -2173,7 +2267,12 @@ impl NanoBootstrapError {
             self.accessory,
             NanoBootstrapAccessoryDisposition::NotStarted
         ));
-        self.accessory = NanoBootstrapAccessoryDisposition::shutdown(accessory);
+        let primary_terminal_fault = match self.primary.as_ref() {
+            NanoBootstrapPrimaryError::AccessoryTerminalFault(fault) => Some(fault),
+            _ => None,
+        };
+        self.accessory =
+            NanoBootstrapAccessoryDisposition::shutdown(accessory, primary_terminal_fault);
         self
     }
 
@@ -2222,28 +2321,215 @@ impl std::error::Error for NanoBootstrapError {
 
 pub enum NanoBootstrapAccessoryDisposition {
     NotStarted,
+    /// The accessory actor and face lane both reached an internally
+    /// consistent terminal state. This does not imply healthy execution:
+    /// `terminal_fault` identifies whether the sole first-fault value is
+    /// retained here or was already moved into the primary bootstrap error.
     ShutdownCompleted {
-        terminal_fault: Option<NanoAccessoryTerminalFault>,
-        eye_release_verified: bool,
-        head_hold_preserving_release_completed: bool,
+        terminal_fault: NanoBootstrapAccessoryTerminalFaultDisposition,
+        evidence: Box<NanoAccessoryShutdownEvidence>,
+    },
+    /// Eye/head cleanup joined, but the bounded face join detached at its
+    /// deadline. The raw typed join evidence is retained and no cancellation
+    /// or completed face shutdown is claimed.
+    FacePerceptionShutdownUncertain {
+        terminal_fault: NanoBootstrapAccessoryTerminalFaultDisposition,
+        evidence: Box<NanoAccessoryShutdownEvidence>,
+    },
+    /// Eye/head cleanup joined, but the face exit and retained first terminal
+    /// fault are not an internally consistent pair.
+    FacePerceptionShutdownUnexpected {
+        terminal_fault: NanoBootstrapAccessoryTerminalFaultDisposition,
+        evidence: Box<NanoAccessoryShutdownEvidence>,
     },
     UnexpectedExit(Box<NanoAccessoryWorkerExit>),
     JoinUncertain(NanoAccessoryWorkerJoinError),
 }
 
+/// Where the accessory actor's retained first terminal fault is owned.
+///
+/// The worker publishes a clone of its stored first terminal fault to the sole
+/// bootstrap observer. If that observer already moved the value into
+/// [`NanoBootstrapPrimaryError::AccessoryTerminalFault`], shutdown records
+/// only `AlreadyOwnedByPrimary`; it does not retain or print the worker's
+/// equivalent clone a second time. Missing or conflicting shutdown evidence
+/// remains explicit rather than being guessed equivalent.
+#[derive(Debug)]
+pub enum NanoBootstrapAccessoryTerminalFaultDisposition {
+    NotObserved,
+    RetainedByShutdown(NanoAccessoryTerminalFault),
+    AlreadyOwnedByPrimary,
+    MissingFromShutdownAfterPrimaryObservation,
+    ConflictsWithPrimary(NanoAccessoryTerminalFault),
+}
+
+impl fmt::Display for NanoBootstrapAccessoryTerminalFaultDisposition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotObserved => formatter.write_str("no accessory terminal fault was observed"),
+            Self::RetainedByShutdown(fault) => {
+                write!(formatter, "accessory shutdown retained terminal fault: {fault}")
+            }
+            Self::AlreadyOwnedByPrimary => formatter.write_str(
+                "accessory first terminal fault is already owned by the primary bootstrap error",
+            ),
+            Self::MissingFromShutdownAfterPrimaryObservation => formatter.write_str(
+                "primary bootstrap error owns an accessory terminal fault which shutdown did not retain",
+            ),
+            Self::ConflictsWithPrimary(fault) => write!(
+                formatter,
+                "accessory shutdown retained a terminal fault which conflicts with the primary bootstrap error: {fault}"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NanoBootstrapFaceShutdownDispositionKind {
+    Completed,
+    Uncertain,
+    Unexpected,
+}
+
+fn classify_bootstrap_face_shutdown(
+    face_perception: &NanoFacePerceptionShutdownEvidence,
+    terminal_fault: Option<&NanoAccessoryTerminalFault>,
+) -> NanoBootstrapFaceShutdownDispositionKind {
+    match face_perception.classify(terminal_fault) {
+        NanoFacePerceptionShutdownClass::Disabled
+        | NanoFacePerceptionShutdownClass::CoordinatedShutdown
+        | NanoFacePerceptionShutdownClass::PublishedRuntimeFault { .. }
+        | NanoFacePerceptionShutdownClass::AccessoryFaultFollower { .. } => {
+            NanoBootstrapFaceShutdownDispositionKind::Completed
+        }
+        NanoFacePerceptionShutdownClass::DetachedAfterTimeout { .. } => {
+            NanoBootstrapFaceShutdownDispositionKind::Uncertain
+        }
+        NanoFacePerceptionShutdownClass::UnexpectedDisabledFaceFault { .. }
+        | NanoFacePerceptionShutdownClass::UnexpectedJoined { .. } => {
+            NanoBootstrapFaceShutdownDispositionKind::Unexpected
+        }
+    }
+}
+
+fn accessory_terminal_faults_are_equivalent(
+    primary: &NanoAccessoryTerminalFault,
+    shutdown: &NanoAccessoryTerminalFault,
+) -> bool {
+    match (primary, shutdown) {
+        (
+            NanoAccessoryTerminalFault::HeadHealth(primary),
+            NanoAccessoryTerminalFault::HeadHealth(shutdown),
+        ) => primary == shutdown,
+        (
+            NanoAccessoryTerminalFault::HeadHealthStatusPoisoned,
+            NanoAccessoryTerminalFault::HeadHealthStatusPoisoned,
+        )
+        | (
+            NanoAccessoryTerminalFault::RgbHealthStatusPoisoned,
+            NanoAccessoryTerminalFault::RgbHealthStatusPoisoned,
+        )
+        | (
+            NanoAccessoryTerminalFault::RgbIngressDisconnected,
+            NanoAccessoryTerminalFault::RgbIngressDisconnected,
+        )
+        | (
+            NanoAccessoryTerminalFault::RgbChannelPoisoned,
+            NanoAccessoryTerminalFault::RgbChannelPoisoned,
+        )
+        | (
+            NanoAccessoryTerminalFault::ReadinessObserverDropped,
+            NanoAccessoryTerminalFault::ReadinessObserverDropped,
+        ) => true,
+        (
+            NanoAccessoryTerminalFault::ExpressionBridge(primary),
+            NanoAccessoryTerminalFault::ExpressionBridge(shutdown),
+        ) => primary == shutdown,
+        (
+            NanoAccessoryTerminalFault::FacePerception(primary),
+            NanoAccessoryTerminalFault::FacePerception(shutdown),
+        ) => primary == shutdown,
+        (
+            NanoAccessoryTerminalFault::EyeApply(primary),
+            NanoAccessoryTerminalFault::EyeApply(shutdown),
+        ) => primary == shutdown,
+        _ => false,
+    }
+}
+
+fn reconcile_accessory_terminal_fault(
+    primary: Option<&NanoAccessoryTerminalFault>,
+    shutdown: Option<NanoAccessoryTerminalFault>,
+) -> (NanoBootstrapAccessoryTerminalFaultDisposition, bool) {
+    match (primary, shutdown) {
+        (None, None) => (
+            NanoBootstrapAccessoryTerminalFaultDisposition::NotObserved,
+            true,
+        ),
+        (None, Some(fault)) => (
+            NanoBootstrapAccessoryTerminalFaultDisposition::RetainedByShutdown(fault),
+            true,
+        ),
+        (Some(_), None) => (
+            NanoBootstrapAccessoryTerminalFaultDisposition::
+                MissingFromShutdownAfterPrimaryObservation,
+            false,
+        ),
+        (Some(primary), Some(shutdown))
+            if accessory_terminal_faults_are_equivalent(primary, &shutdown) =>
+        {
+            (
+                NanoBootstrapAccessoryTerminalFaultDisposition::AlreadyOwnedByPrimary,
+                true,
+            )
+        }
+        (Some(_), Some(shutdown)) => (
+            NanoBootstrapAccessoryTerminalFaultDisposition::ConflictsWithPrimary(shutdown),
+            false,
+        ),
+    }
+}
+
 impl NanoBootstrapAccessoryDisposition {
-    fn shutdown(accessory: NanoAccessoryWorker) -> Self {
+    fn shutdown(
+        accessory: NanoAccessoryWorker,
+        primary_terminal_fault: Option<&NanoAccessoryTerminalFault>,
+    ) -> Self {
         match accessory.shutdown() {
             Ok(NanoAccessoryWorkerExit::Shutdown {
                 terminal_fault,
                 evidence,
-            }) => Self::ShutdownCompleted {
-                terminal_fault,
-                eye_release_verified: evidence.eye().release_verified(),
-                head_hold_preserving_release_completed: evidence
-                    .head()
-                    .hold_preserving_release_completed(),
-            },
+            }) => {
+                let mut kind = classify_bootstrap_face_shutdown(
+                    evidence.face_perception(),
+                    terminal_fault.as_ref(),
+                );
+                let (terminal_fault, terminal_fault_is_consistent) =
+                    reconcile_accessory_terminal_fault(primary_terminal_fault, terminal_fault);
+                if !terminal_fault_is_consistent {
+                    kind = NanoBootstrapFaceShutdownDispositionKind::Unexpected;
+                }
+                match kind {
+                    NanoBootstrapFaceShutdownDispositionKind::Completed => {
+                        Self::ShutdownCompleted {
+                            terminal_fault,
+                            evidence,
+                        }
+                    }
+                    NanoBootstrapFaceShutdownDispositionKind::Uncertain => {
+                        Self::FacePerceptionShutdownUncertain {
+                            terminal_fault,
+                            evidence,
+                        }
+                    }
+                    NanoBootstrapFaceShutdownDispositionKind::Unexpected => {
+                        Self::FacePerceptionShutdownUnexpected {
+                            terminal_fault,
+                            evidence,
+                        }
+                    }
+                }
+            }
             Ok(exit) => Self::UnexpectedExit(Box::new(exit)),
             Err(source) => Self::JoinUncertain(source),
         }
@@ -2262,11 +2548,36 @@ impl fmt::Display for NanoBootstrapAccessoryDisposition {
             Self::NotStarted => formatter.write_str("accessory owner was not started"),
             Self::ShutdownCompleted {
                 terminal_fault,
-                eye_release_verified,
-                head_hold_preserving_release_completed,
+                evidence,
             } => write!(
                 formatter,
-                "accessory owner shutdown completed (terminal_fault={terminal_fault:?}, eye_release_verified={eye_release_verified}, head_hold_preserving_release_completed={head_hold_preserving_release_completed})"
+                "accessory owner shutdown joined with internally consistent face evidence (terminal_fault={terminal_fault}, eye_release_verified={}, head_hold_preserving_release_completed={}, face_perception_classification={:?}, face_perception_evidence={:?})",
+                evidence.eye().release_verified(),
+                evidence.head().hold_preserving_release_completed(),
+                NanoBootstrapFaceShutdownDispositionKind::Completed,
+                evidence.face_perception(),
+            ),
+            Self::FacePerceptionShutdownUncertain {
+                terminal_fault,
+                evidence,
+            } => write!(
+                formatter,
+                "accessory eye/head shutdown joined but face-perception shutdown is uncertain (terminal_fault={terminal_fault}, eye_release_verified={}, head_hold_preserving_release_completed={}, face_perception_classification={:?}, face_perception_evidence={:?})",
+                evidence.eye().release_verified(),
+                evidence.head().hold_preserving_release_completed(),
+                NanoBootstrapFaceShutdownDispositionKind::Uncertain,
+                evidence.face_perception(),
+            ),
+            Self::FacePerceptionShutdownUnexpected {
+                terminal_fault,
+                evidence,
+            } => write!(
+                formatter,
+                "accessory eye/head shutdown joined but face-perception shutdown evidence is unexpected (terminal_fault={terminal_fault}, eye_release_verified={}, head_hold_preserving_release_completed={}, face_perception_classification={:?}, face_perception_evidence={:?})",
+                evidence.eye().release_verified(),
+                evidence.head().hold_preserving_release_completed(),
+                NanoBootstrapFaceShutdownDispositionKind::Unexpected,
+                evidence.face_perception(),
             ),
             Self::UnexpectedExit(exit) => {
                 write!(
@@ -2373,6 +2684,7 @@ pub enum NanoBootstrapPrimaryError {
         role: NanoLaunchAssetRole,
         source: NanoLaunchBoundAssetLoadError,
     },
+    FacePerceptionAssetLoad(NanoBootstrapFacePerceptionAssetLoadError),
     AgentPolicy(NanoAgentPolicyConfigParseError),
     PolicyPathOutsideDeployment {
         kind: NanoBootstrapDeploymentPathKind,
@@ -2445,6 +2757,7 @@ pub enum NanoBootstrapPrimaryError {
     AccessoryHealthPeriod(NanoAccessoryHealthPeriodError),
     AccessoryConfig(NanoAccessoryWorkerConfigError),
     AccessoryStart(NanoAccessoryWorkerStartError),
+    AccessoryFacePerceptionReadinessMissing,
     AccessoryTerminalFault(NanoAccessoryTerminalFault),
     AccessoryFaultMonitor(NanoAccessoryFaultWaitError),
     OakConnect(oak_sys::ConnectionError),
@@ -2529,6 +2842,7 @@ impl std::error::Error for NanoBootstrapPrimaryError {
         match self {
             Self::LaunchLoad(source) => Some(source),
             Self::BoundAssetLoad { source, .. } => Some(source),
+            Self::FacePerceptionAssetLoad(source) => Some(source),
             Self::AgentPolicy(source) => Some(source),
             Self::Manifest(source) => Some(source),
             Self::AccessoryManifestBinding(source) => Some(source),
@@ -2581,6 +2895,7 @@ impl std::error::Error for NanoBootstrapPrimaryError {
             | Self::ControllerFirmwareBuildMismatch { .. }
             | Self::ControllerFingerprintMismatch
             | Self::ControllerEndpointMismatch { .. }
+            | Self::AccessoryFacePerceptionReadinessMissing
             | Self::AccessoryTerminalFault(_)
             | Self::EmptyOpenedOakMxid
             | Self::StereoTimedOut { .. }
@@ -2606,6 +2921,11 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::rc::Rc;
     use std::sync::atomic::AtomicU64;
+
+    use crate::navigation::{
+        NanoFacePerceptionJoinEvidence, NanoFacePerceptionRuntimeError,
+        NanoFacePerceptionThreadExit,
+    };
 
     use super::*;
 
@@ -3306,5 +3626,167 @@ mod tests {
                     && required_exclusive_lower_bound == Duration::from_millis(15)
             ));
         }
+    }
+
+    #[test]
+    fn bootstrap_face_shutdown_never_calls_a_detached_join_completed() {
+        for terminal_fault in [
+            None,
+            Some(NanoAccessoryTerminalFault::RgbIngressDisconnected),
+            Some(NanoAccessoryTerminalFault::FacePerception(
+                NanoFacePerceptionRuntimeError::RgbIngressDisconnected,
+            )),
+        ] {
+            let evidence = NanoFacePerceptionShutdownEvidence::Join(
+                NanoFacePerceptionJoinEvidence::DetachedAfterTimeout {
+                    configured_timeout: Duration::from_secs(2),
+                    active_join_budget: Duration::from_millis(375),
+                },
+            );
+            assert_eq!(
+                classify_bootstrap_face_shutdown(&evidence, terminal_fault.as_ref()),
+                NanoBootstrapFaceShutdownDispositionKind::Uncertain
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_face_shutdown_preserves_coordinated_first_fault_semantics() {
+        let disabled = NanoFacePerceptionShutdownEvidence::Disabled;
+        assert_eq!(
+            classify_bootstrap_face_shutdown(&disabled, None),
+            NanoBootstrapFaceShutdownDispositionKind::Completed
+        );
+
+        let coordinated = NanoFacePerceptionShutdownEvidence::Join(
+            NanoFacePerceptionJoinEvidence::Joined(NanoFacePerceptionThreadExit::Shutdown),
+        );
+        assert_eq!(
+            classify_bootstrap_face_shutdown(&coordinated, None),
+            NanoBootstrapFaceShutdownDispositionKind::Completed
+        );
+
+        let published = NanoFacePerceptionShutdownEvidence::Join(
+            NanoFacePerceptionJoinEvidence::Joined(NanoFacePerceptionThreadExit::RuntimeFault {
+                source: NanoFacePerceptionRuntimeError::RgbIngressDisconnected,
+                published_to_accessory: true,
+            }),
+        );
+        let published_fault = NanoAccessoryTerminalFault::FacePerception(
+            NanoFacePerceptionRuntimeError::RgbIngressDisconnected,
+        );
+        assert_eq!(
+            classify_bootstrap_face_shutdown(&published, Some(&published_fault)),
+            NanoBootstrapFaceShutdownDispositionKind::Completed
+        );
+
+        for follower in [
+            NanoFacePerceptionThreadExit::AccessoryFaultPendingPublication,
+            NanoFacePerceptionThreadExit::AccessoryFaultLatched,
+        ] {
+            let evidence = NanoFacePerceptionShutdownEvidence::Join(
+                NanoFacePerceptionJoinEvidence::Joined(follower),
+            );
+            let retained_first_fault = NanoAccessoryTerminalFault::RgbIngressDisconnected;
+            assert_eq!(
+                classify_bootstrap_face_shutdown(&evidence, Some(&retained_first_fault)),
+                NanoBootstrapFaceShutdownDispositionKind::Completed
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_face_shutdown_separates_inconsistent_evidence_from_uncertainty() {
+        let disabled = NanoFacePerceptionShutdownEvidence::Disabled;
+        let impossible_face_fault = NanoAccessoryTerminalFault::FacePerception(
+            NanoFacePerceptionRuntimeError::RgbIngressDisconnected,
+        );
+        assert_eq!(
+            classify_bootstrap_face_shutdown(&disabled, Some(&impossible_face_fault)),
+            NanoBootstrapFaceShutdownDispositionKind::Unexpected
+        );
+
+        let unpublished = NanoFacePerceptionShutdownEvidence::Join(
+            NanoFacePerceptionJoinEvidence::Joined(NanoFacePerceptionThreadExit::RuntimeFault {
+                source: NanoFacePerceptionRuntimeError::RgbIngressDisconnected,
+                published_to_accessory: false,
+            }),
+        );
+        assert_eq!(
+            classify_bootstrap_face_shutdown(&unpublished, None),
+            NanoBootstrapFaceShutdownDispositionKind::Unexpected
+        );
+
+        let impossible_shutdown = NanoFacePerceptionShutdownEvidence::Join(
+            NanoFacePerceptionJoinEvidence::Joined(NanoFacePerceptionThreadExit::Shutdown),
+        );
+        let retained_first_fault = NanoAccessoryTerminalFault::RgbIngressDisconnected;
+        assert_eq!(
+            classify_bootstrap_face_shutdown(&impossible_shutdown, Some(&retained_first_fault)),
+            NanoBootstrapFaceShutdownDispositionKind::Unexpected
+        );
+    }
+
+    #[test]
+    fn bootstrap_shutdown_does_not_retain_a_terminal_fault_already_owned_by_primary() {
+        let primary = NanoAccessoryTerminalFault::FacePerception(
+            NanoFacePerceptionRuntimeError::RgbIngressDisconnected,
+        );
+        let shutdown = NanoAccessoryTerminalFault::FacePerception(
+            NanoFacePerceptionRuntimeError::RgbIngressDisconnected,
+        );
+        let (disposition, consistent) =
+            reconcile_accessory_terminal_fault(Some(&primary), Some(shutdown));
+
+        assert!(consistent);
+        assert!(matches!(
+            disposition,
+            NanoBootstrapAccessoryTerminalFaultDisposition::AlreadyOwnedByPrimary
+        ));
+        assert_eq!(
+            disposition.to_string(),
+            "accessory first terminal fault is already owned by the primary bootstrap error"
+        );
+    }
+
+    #[test]
+    fn bootstrap_shutdown_retains_distinct_or_missing_terminal_evidence_as_inconsistent() {
+        let primary = NanoAccessoryTerminalFault::FacePerception(
+            NanoFacePerceptionRuntimeError::RgbIngressDisconnected,
+        );
+        let conflicting_shutdown = NanoAccessoryTerminalFault::FacePerception(
+            NanoFacePerceptionRuntimeError::RgbChannelPoisoned,
+        );
+        let (conflict, conflict_is_consistent) =
+            reconcile_accessory_terminal_fault(Some(&primary), Some(conflicting_shutdown));
+        assert!(!conflict_is_consistent);
+        assert!(matches!(
+            conflict,
+            NanoBootstrapAccessoryTerminalFaultDisposition::ConflictsWithPrimary(
+                NanoAccessoryTerminalFault::FacePerception(
+                    NanoFacePerceptionRuntimeError::RgbChannelPoisoned
+                )
+            )
+        ));
+
+        let (missing, missing_is_consistent) =
+            reconcile_accessory_terminal_fault(Some(&primary), None);
+        assert!(!missing_is_consistent);
+        assert!(matches!(
+            missing,
+            NanoBootstrapAccessoryTerminalFaultDisposition::
+                MissingFromShutdownAfterPrimaryObservation
+        ));
+
+        let shutdown_only = NanoAccessoryTerminalFault::RgbIngressDisconnected;
+        let (retained, retained_is_consistent) =
+            reconcile_accessory_terminal_fault(None, Some(shutdown_only));
+        assert!(retained_is_consistent);
+        assert!(matches!(
+            retained,
+            NanoBootstrapAccessoryTerminalFaultDisposition::RetainedByShutdown(
+                NanoAccessoryTerminalFault::RgbIngressDisconnected
+            )
+        ));
     }
 }

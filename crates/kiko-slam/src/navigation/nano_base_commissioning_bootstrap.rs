@@ -64,9 +64,10 @@ use super::nano_base_commissioning::{
 use super::{
     MAX_NANO_AGENT_LAUNCH_JSON_BYTES, MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES,
     ManifestBoundNanoAgentPolicyConfigV3, NanoAccessoryManifestBindingError,
-    NanoAgentLaunchParseError, NanoAgentLaunchV2, NanoAgentPolicyConfigParseError,
+    NanoAgentLaunchParseError, NanoAgentLaunchV3, NanoAgentPolicyConfigParseError,
     NanoAgentPolicyConfigV3, NanoCalibrationArtifactParseError, NanoCalibrationArtifactV1,
-    NanoCalibrationBindingError, NanoLaunchAssetRole, NanoLaunchBoundAssetLoadError,
+    NanoCalibrationBindingError, NanoFaceCascadeAssetRole, NanoLaunchAssetRole,
+    NanoLaunchBoundAssetLoadError,
 };
 use crate::dataset::Calibration;
 
@@ -811,6 +812,8 @@ pub struct LoadedNanoBaseCommissioningInputs {
     pub onnx_runtime_library: LoadedDeploymentAsset,
     pub superpoint_model: LoadedDeploymentAsset,
     pub lightglue_model: LoadedDeploymentAsset,
+    pub frontal_face_cascade: LoadedDeploymentAsset,
+    pub profile_face_cascade: LoadedDeploymentAsset,
 }
 
 /// Read-only, fully parsed commissioning admission. Constructing this value
@@ -823,7 +826,7 @@ pub struct PreparedNanoBaseCommissioning {
     profile: NanoBaseCommissioningControllerProfileV1,
     server: ControllerServerConfigV3,
     calibration: NanoCalibrationArtifactV1,
-    live_graph: NanoAgentLaunchV2,
+    live_graph: NanoAgentLaunchV3,
     accessory_policy: ManifestBoundNanoAgentPolicyConfigV3,
     inputs: LoadedNanoBaseCommissioningInputs,
 }
@@ -1081,7 +1084,7 @@ impl PreparedNanoBaseCommissioning {
         &self.calibration
     }
 
-    pub const fn live_graph(&self) -> &NanoAgentLaunchV2 {
+    pub const fn live_graph(&self) -> &NanoAgentLaunchV3 {
         &self.live_graph
     }
 
@@ -2343,7 +2346,7 @@ pub fn prepare_nano_base_commissioning(
     let manifest = loaded_manifest.into_manifest();
     let calibration = NanoCalibrationArtifactV1::parse_json(calibration_source.bytes())
         .map_err(NanoBaseCommissioningPreparationError::Calibration)?;
-    let live_graph = NanoAgentLaunchV2::parse_json(live_graph_launch_source.bytes())
+    let live_graph = NanoAgentLaunchV3::parse_json(live_graph_launch_source.bytes())
         .map_err(NanoBaseCommissioningPreparationError::LiveGraphLaunch)?;
     bind_prepared_inputs(
         &launch,
@@ -2374,6 +2377,19 @@ pub fn prepare_nano_base_commissioning(
     let onnx_runtime_library = load_live_graph_asset(NanoLaunchAssetRole::OnnxRuntimeLibrary)?;
     let superpoint_model = load_live_graph_asset(NanoLaunchAssetRole::SuperpointModel)?;
     let lightglue_model = load_live_graph_asset(NanoLaunchAssetRole::LightglueModel)?;
+    let load_face_asset = |role| {
+        let binding = live_graph.face_perception().asset(role);
+        if binding.relative_path() == live_graph_launch_source.relative_path() {
+            return Err(
+                NanoBaseCommissioningPreparationError::LiveGraphFaceAssetAliasesLaunch { role },
+            );
+        }
+        binding.load_exact(deployment_root).map_err(|source| {
+            NanoBaseCommissioningPreparationError::LiveGraphFaceAssetLoad { role, source }
+        })
+    };
+    let frontal_face_cascade = load_face_asset(NanoFaceCascadeAssetRole::FrontalFace)?;
+    let profile_face_cascade = load_face_asset(NanoFaceCascadeAssetRole::ProfileFace)?;
 
     Ok(PreparedNanoBaseCommissioning {
         state_root,
@@ -2396,6 +2412,8 @@ pub fn prepare_nano_base_commissioning(
             onnx_runtime_library,
             superpoint_model,
             lightglue_model,
+            frontal_face_cascade,
+            profile_face_cascade,
         },
     })
 }
@@ -2407,7 +2425,7 @@ fn bind_prepared_inputs(
     server: &ControllerServerConfigV3,
     manifest: &DeviceInventoryManifestV3,
     calibration: &NanoCalibrationArtifactV1,
-    live_graph: &NanoAgentLaunchV2,
+    live_graph: &NanoAgentLaunchV3,
 ) -> Result<(), NanoBaseCommissioningPreparationError> {
     if launch.session_id() != profile.session_id() {
         return Err(NanoBaseCommissioningPreparationError::SessionIdMismatch);
@@ -2573,6 +2591,13 @@ pub enum NanoBaseCommissioningPreparationError {
         role: NanoLaunchAssetRole,
         source: NanoLaunchBoundAssetLoadError,
     },
+    LiveGraphFaceAssetAliasesLaunch {
+        role: NanoFaceCascadeAssetRole,
+    },
+    LiveGraphFaceAssetLoad {
+        role: NanoFaceCascadeAssetRole,
+        source: NanoLaunchBoundAssetLoadError,
+    },
     AccessoryPolicy(NanoAgentPolicyConfigParseError),
     AccessoryManifestBinding(NanoAccessoryManifestBindingError),
     SessionIdMismatch,
@@ -2643,7 +2668,8 @@ impl std::error::Error for NanoBaseCommissioningPreparationError {
             Self::Manifest(source) => Some(source),
             Self::Calibration(source) => Some(source),
             Self::LiveGraphLaunch(source) => Some(source),
-            Self::LiveGraphAssetLoad { source, .. } => Some(source),
+            Self::LiveGraphAssetLoad { source, .. }
+            | Self::LiveGraphFaceAssetLoad { source, .. } => Some(source),
             Self::AccessoryPolicy(source) => Some(source),
             Self::AccessoryManifestBinding(source) => Some(source),
             Self::CalibrationBinding(source) => Some(source),
@@ -3115,7 +3141,7 @@ mod tests {
             "controller_server_contract_asset": asset("commissioning/controller-v3.json"),
             "device_manifest_asset": asset("commissioning/inventory-v3.json"),
             "calibration_artifact_asset": asset("calibration/oak-base-v1.json"),
-            "live_graph_launch_asset": asset("launch/nano-agent-v2.json")
+            "live_graph_launch_asset": asset("nano-agent-launch-v3.json")
         })
     }
 

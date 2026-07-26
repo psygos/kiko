@@ -20,6 +20,8 @@ use oak_sys::{
     StreamId as OakStreamId,
 };
 
+#[cfg(feature = "nano-agent")]
+use super::NanoFacePerceptionShutdownClass;
 use super::nano_base_commissioning::CommissioningExternalSignal;
 use super::nano_base_commissioning_bootstrap::{
     AdmittedCommissioningObservationStream, CommissioningAlignedObservation,
@@ -27,11 +29,12 @@ use super::nano_base_commissioning_bootstrap::{
     PreparedNanoBaseCommissioning,
 };
 use super::{
-    NanoAccessoryComponentHealth, NanoAccessoryFaultWaitError, NanoAccessoryFrameStats,
-    NanoAccessoryFrameSubmitOutcome, NanoAccessoryHealthPeriod, NanoAccessoryHealthPeriodError,
-    NanoAccessoryHealthStatusError, NanoAccessoryTerminalFault, NanoAccessoryWorker,
-    NanoAccessoryWorkerConfig, NanoAccessoryWorkerConfigError, NanoAccessoryWorkerExit,
-    NanoAccessoryWorkerJoinError, NanoAccessoryWorkerStartError,
+    NANO_ACCESSORY_TERMINAL_PUBLICATION_TIMEOUT, NanoAccessoryComponentHealth,
+    NanoAccessoryFaultWaitError, NanoAccessoryFrameStats, NanoAccessoryFrameSubmitOutcome,
+    NanoAccessoryHealthPeriod, NanoAccessoryHealthPeriodError, NanoAccessoryHealthStatusError,
+    NanoAccessoryTerminalFault, NanoAccessoryWorker, NanoAccessoryWorkerConfig,
+    NanoAccessoryWorkerConfigError, NanoAccessoryWorkerExit, NanoAccessoryWorkerJoinError,
+    NanoAccessoryWorkerStartError,
 };
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::{
@@ -109,7 +112,7 @@ pub fn prepare_commissioning_live_observation(
     )
     .map_err(CommissioningLiveOpenPrimaryError::AccessoryConfig)
     .map_err(CommissioningLiveOpenError::before_oak)?;
-    let accessory = NanoAccessoryWorker::start(accessory_config)
+    let accessory = NanoAccessoryWorker::start_scene_motion_only(accessory_config)
         .map_err(CommissioningLiveOpenPrimaryError::AccessoryStart)
         .map_err(CommissioningLiveOpenError::before_oak)?;
     let mut accessory_guard = Some(accessory);
@@ -121,9 +124,9 @@ pub fn prepare_commissioning_live_observation(
     ) {
         Ok(device) => device,
         Err(source) => {
-            let accessory_shutdown = accessory_guard
-                .take()
-                .and_then(|worker| shutdown_accessory(worker).err());
+            let accessory_shutdown = accessory_guard.take().and_then(|worker| {
+                shutdown_accessory(worker, AccessoryTerminalReport::NotReported).err()
+            });
             return Err(CommissioningLiveOpenError {
                 primary: Box::new(CommissioningLiveOpenPrimaryError::OakConnect(source)),
                 oak_close: None,
@@ -218,6 +221,7 @@ pub fn prepare_commissioning_live_observation(
             sample_timeout,
             minimum_sample_period,
             last_emitted_visual_observed_at_ns: None,
+            accessory_terminal_report: AccessoryTerminalReport::NotReported,
             accessory: accessory_guard.take(),
         };
         if let Err(source) = engine.next_observation_with_timeout(TRACKER_WARMUP_TIMEOUT) {
@@ -251,9 +255,9 @@ pub fn prepare_commissioning_live_observation(
         }),
         Err(primary) => {
             let oak_close = device_guard.and_then(|device| device.close().err());
-            let accessory_shutdown = accessory_guard
-                .take()
-                .and_then(|worker| shutdown_accessory(worker).err());
+            let accessory_shutdown = accessory_guard.take().and_then(|worker| {
+                shutdown_accessory(worker, AccessoryTerminalReport::NotReported).err()
+            });
             Err(CommissioningLiveOpenError {
                 primary: Box::new(primary),
                 oak_close,
@@ -422,7 +426,14 @@ struct LiveObservationEngine {
     sample_timeout: Duration,
     minimum_sample_period: Duration,
     last_emitted_visual_observed_at_ns: Option<u64>,
+    accessory_terminal_report: AccessoryTerminalReport,
     accessory: Option<NanoAccessoryWorker>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessoryTerminalReport {
+    NotReported,
+    ReportedToCaller,
 }
 
 #[derive(Clone, Copy)]
@@ -453,7 +464,7 @@ impl LiveObservationEngine {
         let accessory_shutdown = self
             .accessory
             .take()
-            .and_then(|worker| shutdown_accessory(worker).err());
+            .and_then(|worker| shutdown_accessory(worker, self.accessory_terminal_report).err());
         if oak_close.is_none() && accessory_shutdown.is_none() {
             Ok(())
         } else {
@@ -601,6 +612,7 @@ impl LiveObservationEngine {
             .try_terminal_fault()
             .map_err(CommissioningLiveSourceError::AccessoryFaultMonitor)?
         {
+            self.accessory_terminal_report = AccessoryTerminalReport::ReportedToCaller;
             return Err(CommissioningLiveSourceError::AccessoryTerminalFault(
                 Box::new(fault),
             ));
@@ -626,6 +638,22 @@ impl LiveObservationEngine {
         match self.accessory_mut()?.submit_rgb(frame) {
             NanoAccessoryFrameSubmitOutcome::Enqueued
             | NanoAccessoryFrameSubmitOutcome::ReplacedOlderFrame => Ok(()),
+            outcome @ (NanoAccessoryFrameSubmitOutcome::TerminalFaultPendingPublication
+            | NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched) => {
+                debug_assert!(commissioning_submission_requires_exact_fault_wait(outcome));
+                let running = Arc::clone(&self.running);
+                let accessory = self.accessory_ref()?;
+                let fault =
+                    cancel_commissioning_before_terminal_fault_wait(running.as_ref(), || {
+                        accessory
+                            .wait_for_terminal_fault(NANO_ACCESSORY_TERMINAL_PUBLICATION_TIMEOUT)
+                    })
+                    .map_err(CommissioningLiveSourceError::AccessoryFaultMonitor)?;
+                self.accessory_terminal_report = AccessoryTerminalReport::ReportedToCaller;
+                Err(CommissioningLiveSourceError::AccessoryTerminalFault(
+                    Box::new(fault),
+                ))
+            }
             outcome => Err(CommissioningLiveSourceError::AccessoryRgbRejected(outcome)),
         }
     }
@@ -714,6 +742,31 @@ impl LiveObservationEngine {
             .as_mut()
             .ok_or(CommissioningLiveSourceError::AccessoryAlreadyClosed)
     }
+}
+
+/// Withdraw commissioning motion authority before a bounded diagnostic wait.
+///
+/// This cancellation flag is shared with the commissioning runtime. It makes
+/// the stop request observable before this thread can block waiting for the
+/// accessory actor to publish the exact typed fault. The normal commissioning
+/// terminal path still owns the receipt-backed exact-zero request and owner
+/// shutdown; this store alone does not claim applied-zero evidence.
+fn cancel_commissioning_before_terminal_fault_wait<T>(
+    running: &AtomicBool,
+    wait: impl FnOnce() -> T,
+) -> T {
+    running.store(false, Ordering::SeqCst);
+    wait()
+}
+
+const fn commissioning_submission_requires_exact_fault_wait(
+    outcome: NanoAccessoryFrameSubmitOutcome,
+) -> bool {
+    matches!(
+        outcome,
+        NanoAccessoryFrameSubmitOutcome::TerminalFaultPendingPublication
+            | NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched
+    )
 }
 
 /// Same-owner live source consumed directly by the commissioning runtime.
@@ -830,14 +883,17 @@ impl std::error::Error for CommissioningLiveCloseError {}
 #[derive(Debug)]
 pub enum CommissioningAccessoryShutdownError {
     Join(NanoAccessoryWorkerJoinError),
-    UnverifiedExit(Box<NanoAccessoryWorkerExit>),
+    UnverifiedActuatorRelease(Box<NanoAccessoryWorkerExit>),
+    UnreportedTerminalFault(Box<NanoAccessoryWorkerExit>),
+    FacePerceptionUncertainOrUnexpected(Box<NanoAccessoryWorkerExit>),
+    UnexpectedExit(Box<NanoAccessoryWorkerExit>),
 }
 
 impl fmt::Display for CommissioningAccessoryShutdownError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "commissioning accessory owner did not prove eye release and hold-preserving head release: {self:?}"
+            "commissioning accessory owner did not complete verified, coordinated cleanup: {self:?}"
         )
     }
 }
@@ -846,29 +902,99 @@ impl std::error::Error for CommissioningAccessoryShutdownError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Join(source) => Some(source),
-            Self::UnverifiedExit(_) => None,
+            Self::UnverifiedActuatorRelease(exit)
+            | Self::UnreportedTerminalFault(exit)
+            | Self::FacePerceptionUncertainOrUnexpected(exit)
+            | Self::UnexpectedExit(exit) => Some(exit.as_ref()),
         }
     }
 }
 
 fn shutdown_accessory(
     worker: NanoAccessoryWorker,
+    terminal_report: AccessoryTerminalReport,
 ) -> Result<(), CommissioningAccessoryShutdownError> {
     let exit = worker
         .shutdown()
         .map_err(CommissioningAccessoryShutdownError::Join)?;
     match &exit {
         NanoAccessoryWorkerExit::Shutdown {
-            terminal_fault: None,
+            terminal_fault,
             evidence,
-        } if evidence.eye().release_verified()
-            && evidence.head().hold_preserving_release_completed() =>
-        {
-            Ok(())
+        } => {
+            if !evidence.eye().release_verified()
+                || !evidence.head().hold_preserving_release_completed()
+            {
+                return Err(
+                    CommissioningAccessoryShutdownError::UnverifiedActuatorRelease(Box::new(exit)),
+                );
+            }
+            #[cfg(feature = "nano-agent")]
+            {
+                let face = evidence.face_perception().classify(terminal_fault.as_ref());
+                match classify_commissioning_face_cleanup(
+                    &face,
+                    terminal_fault.is_some(),
+                    terminal_report,
+                ) {
+                    CommissioningFaceCleanupClass::Healthy
+                    | CommissioningFaceCleanupClass::ReportedCoordinatedFault => Ok(()),
+                    CommissioningFaceCleanupClass::UnreportedTerminalFault => Err(
+                        CommissioningAccessoryShutdownError::UnreportedTerminalFault(Box::new(
+                            exit,
+                        )),
+                    ),
+                    CommissioningFaceCleanupClass::UncertainOrUnexpected => Err(
+                        CommissioningAccessoryShutdownError::FacePerceptionUncertainOrUnexpected(
+                            Box::new(exit),
+                        ),
+                    ),
+                }
+            }
+            #[cfg(not(feature = "nano-agent"))]
+            if terminal_fault.is_none()
+                || terminal_report == AccessoryTerminalReport::ReportedToCaller
+            {
+                Ok(())
+            } else {
+                Err(CommissioningAccessoryShutdownError::UnreportedTerminalFault(Box::new(exit)))
+            }
         }
-        _ => Err(CommissioningAccessoryShutdownError::UnverifiedExit(
+        _ => Err(CommissioningAccessoryShutdownError::UnexpectedExit(
             Box::new(exit),
         )),
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommissioningFaceCleanupClass {
+    Healthy,
+    ReportedCoordinatedFault,
+    UnreportedTerminalFault,
+    UncertainOrUnexpected,
+}
+
+#[cfg(feature = "nano-agent")]
+fn classify_commissioning_face_cleanup(
+    face: &NanoFacePerceptionShutdownClass<'_>,
+    terminal_fault_retained: bool,
+    terminal_report: AccessoryTerminalReport,
+) -> CommissioningFaceCleanupClass {
+    if face.is_uncertain_or_unexpected() {
+        return CommissioningFaceCleanupClass::UncertainOrUnexpected;
+    }
+    if terminal_fault_retained {
+        return if terminal_report == AccessoryTerminalReport::ReportedToCaller {
+            CommissioningFaceCleanupClass::ReportedCoordinatedFault
+        } else {
+            CommissioningFaceCleanupClass::UnreportedTerminalFault
+        };
+    }
+    if face.is_healthy() {
+        CommissioningFaceCleanupClass::Healthy
+    } else {
+        CommissioningFaceCleanupClass::UncertainOrUnexpected
     }
 }
 
@@ -1133,6 +1259,8 @@ impl std::error::Error for CommissioningLiveSourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "nano-agent")]
+    use crate::navigation::NanoFacePerceptionThreadExit;
 
     const IDENTITY: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
@@ -1158,5 +1286,70 @@ mod tests {
             body_velocity_from_camera_increment(Pose64::identity(), Pose64::identity(), 0,),
             Err(CommissioningLiveSourceError::ZeroVisualDuration)
         ));
+    }
+
+    #[test]
+    fn pending_or_latched_commissioning_fault_cancels_before_exact_fault_wait() {
+        for outcome in [
+            NanoAccessoryFrameSubmitOutcome::TerminalFaultPendingPublication,
+            NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched,
+        ] {
+            assert!(commissioning_submission_requires_exact_fault_wait(outcome));
+            let running = AtomicBool::new(true);
+            let observed_running =
+                cancel_commissioning_before_terminal_fault_wait(&running, || {
+                    running.load(Ordering::SeqCst)
+                });
+            assert!(
+                !observed_running,
+                "{outcome:?} wait began before cancellation"
+            );
+            assert!(!running.load(Ordering::SeqCst));
+        }
+        assert!(!commissioning_submission_requires_exact_fault_wait(
+            NanoAccessoryFrameSubmitOutcome::Enqueued
+        ));
+    }
+
+    #[cfg(feature = "nano-agent")]
+    #[test]
+    fn coordinated_face_fault_requires_the_terminal_to_have_been_reported() {
+        let exit = NanoFacePerceptionThreadExit::AccessoryFaultLatched;
+        let terminal = NanoAccessoryTerminalFault::RgbIngressDisconnected;
+        let face = NanoFacePerceptionShutdownClass::AccessoryFaultFollower {
+            exit: &exit,
+            terminal_fault: &terminal,
+        };
+        assert_eq!(
+            classify_commissioning_face_cleanup(&face, true, AccessoryTerminalReport::NotReported,),
+            CommissioningFaceCleanupClass::UnreportedTerminalFault
+        );
+        assert_eq!(
+            classify_commissioning_face_cleanup(
+                &face,
+                true,
+                AccessoryTerminalReport::ReportedToCaller,
+            ),
+            CommissioningFaceCleanupClass::ReportedCoordinatedFault
+        );
+    }
+
+    #[cfg(feature = "nano-agent")]
+    #[test]
+    fn detached_face_owner_fails_cleanup_even_after_a_reported_terminal() {
+        let terminal = NanoAccessoryTerminalFault::RgbIngressDisconnected;
+        let face = NanoFacePerceptionShutdownClass::DetachedAfterTimeout {
+            configured_timeout: Duration::from_secs(2),
+            active_join_budget: Duration::from_millis(5),
+            terminal_fault: Some(&terminal),
+        };
+        assert_eq!(
+            classify_commissioning_face_cleanup(
+                &face,
+                true,
+                AccessoryTerminalReport::ReportedToCaller,
+            ),
+            CommissioningFaceCleanupClass::UncertainOrUnexpected
+        );
     }
 }

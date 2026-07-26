@@ -8,7 +8,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::io::{BufRead, IsTerminal, Write};
 
 #[cfg(all(feature = "nano-agent", unix))]
-use kiko_expression_core::StreamEpochId;
+use kiko_expression_core::{ChannelOrder, ImagePoint, StreamEpochId};
+#[cfg(all(feature = "nano-agent", unix))]
+use kiko_expression_runtime::{
+    FaceDetection, FaceDetectorSource, FaceResultAdmission, FaceTargetState, FaceTrackingUpdate,
+};
 use kiko_slam::dataset::{
     DatasetDepthCursor, DatasetError, DatasetReader, DepthOpticalFrame, DepthProjectionContract,
 };
@@ -139,14 +143,17 @@ use kiko_slam::navigation::{
 };
 #[cfg(all(feature = "nano-agent", unix))]
 use kiko_slam::navigation::{
-    MAX_NANO_WARM_SELECTION_BYTES, NanoAccessoryFaultWaitError, NanoAccessoryFrameSubmitOutcome,
+    MAX_NANO_WARM_SELECTION_BYTES, NANO_ACCESSORY_TERMINAL_PUBLICATION_TIMEOUT,
+    NanoAccessoryFaultWaitError, NanoAccessoryFrameSubmitOutcome, NanoAccessoryShutdownEvidence,
     NanoAccessoryTerminalFault, NanoAccessoryWorker, NanoAccessoryWorkerExit,
     NanoAccessoryWorkerJoinError, NanoBootstrapRequest, NanoBootstrapRoots,
-    NanoBootstrapStereoEvidence, NanoDatasetReplayRequired, NanoFinalizedJournalMapIdentity,
-    NanoLaunchInference, NanoLaunchOccupancy, NanoLaunchRerun, NanoLaunchStorage,
-    NanoMapPersistenceConfig, NanoMapPersistenceOwner, NanoMapPersistencePathError,
-    NanoMapSaveCommandError, NanoMapSnapshotRetentionError, NanoMapWarmStartLoad,
-    NanoOakStreamGraph, NanoStateQuotaAdmissionError, NanoStateQuotaOwner,
+    NanoBootstrapStereoEvidence, NanoDatasetReplayRequired, NanoFaceDiagnosticFrame,
+    NanoFaceDiagnosticReceiver, NanoFaceDiagnosticStatsHandle, NanoFacePerceptionShutdownClass,
+    NanoFacePerceptionShutdownEvidence, NanoFacePerceptionStageStatsHandle,
+    NanoFinalizedJournalMapIdentity, NanoLaunchInference, NanoLaunchOccupancy, NanoLaunchRerun,
+    NanoLaunchStorage, NanoMapPersistenceConfig, NanoMapPersistenceOwner,
+    NanoMapPersistencePathError, NanoMapSaveCommandError, NanoMapSnapshotRetentionError,
+    NanoMapWarmStartLoad, NanoOakStreamGraph, NanoStateQuotaAdmissionError, NanoStateQuotaOwner,
     NanoWarmCheckpointCommandError, NanoWarmStartRelocalizationError,
     NanoWarmStartRelocalizationTransition, NanoWarmStartReplayConfig, ParsedNanoLiveConfiguration,
     PreparedNanoBootstrap, bootstrap_nano_production, replay_nano_warm_start,
@@ -167,7 +174,7 @@ use kiko_slam::{
 };
 #[cfg(feature = "record")]
 use oak_sys::{
-    CalibrationError as OakCalibrationError, CloseError as OakCloseError,
+    CalibrationError as OakCalibrationError, CameraTimestampReference, CloseError as OakCloseError,
     ConnectedDeviceIdentityError, DepthAiBuildMetadataError, DepthAlignment, DepthConfig,
     DepthError, DepthFrame as OakDepthFrame, Device, DeviceConfig, ImageError,
     ImageFrame as OakImageFrame, ImuConfig, ImuError, Intrinsics as OakIntrinsics, MonoConfig,
@@ -3660,16 +3667,32 @@ struct LiveVizMsg {
 #[derive(Debug)]
 struct LiveRgbVizMsg {
     device_capture_sequence: i64,
+    host_delivery_sequence: i64,
     device_timestamp_ns: i64,
+    timestamp_reference: CameraTimestampReference,
+    stream_epoch: u64,
     width: u32,
     height: u32,
     pixels_bgr8: Vec<u8>,
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveRgbFrameKey {
+    device_capture_sequence: i64,
+    host_delivery_sequence: i64,
+    device_timestamp_ns: i64,
+    timestamp_reference: CameraTimestampReference,
+    stream_epoch: u64,
+    width: u32,
+    height: u32,
 }
 
 #[cfg(all(feature = "record", feature = "nano-agent", unix))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LiveRgbVizBuildError {
     WrongStream { actual: OakStreamId },
+    HostDeliverySequenceUnrepresentable { actual: u64 },
     RowBytesOverflow { width: u32 },
     PixelBytesOverflow { width: u32, height: u32 },
     StrideMismatch { expected: u32, actual: u32 },
@@ -3681,7 +3704,7 @@ impl std::fmt::Display for LiveRgbVizBuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "live RGB diagnostic frame violates the admitted BGR8 layout: {self:?}"
+            "live RGB frame cannot be represented as an exact diagnostic: {self:?}"
         )
     }
 }
@@ -3722,7 +3745,10 @@ fn validate_live_rgb_viz_layout(
 
 #[cfg(all(feature = "record", feature = "nano-agent", unix))]
 impl LiveRgbVizMsg {
-    fn try_from_oak(frame: &OakImageFrame) -> Result<Self, LiveRgbVizBuildError> {
+    fn try_from_oak(
+        frame: &OakImageFrame,
+        stream_epoch: StreamEpochId,
+    ) -> Result<Self, LiveRgbVizBuildError> {
         if frame.stream != OakStreamId::Rgb {
             return Err(LiveRgbVizBuildError::WrongStream {
                 actual: frame.stream,
@@ -3734,13 +3760,277 @@ impl LiveRgbVizMsg {
             frame.stride_bytes,
             frame.pixels().len(),
         )?;
+        let host_delivery_sequence =
+            i64::try_from(frame.host_delivery_sequence.as_u64()).map_err(|_| {
+                LiveRgbVizBuildError::HostDeliverySequenceUnrepresentable {
+                    actual: frame.host_delivery_sequence.as_u64(),
+                }
+            })?;
         Ok(Self {
             device_capture_sequence: frame.device_capture_sequence.as_i64(),
+            host_delivery_sequence,
             device_timestamp_ns: frame.timestamp.as_nanos(),
+            timestamp_reference: frame.timestamp_reference,
+            stream_epoch: stream_epoch.get(),
             width: frame.width,
             height: frame.height,
             pixels_bgr8: frame.pixels().to_vec(),
         })
+    }
+}
+
+#[cfg(feature = "record")]
+impl LiveRgbVizMsg {
+    const fn frame_key(&self) -> LiveRgbFrameKey {
+        LiveRgbFrameKey {
+            device_capture_sequence: self.device_capture_sequence,
+            host_delivery_sequence: self.host_delivery_sequence,
+            device_timestamp_ns: self.device_timestamp_ns,
+            timestamp_reference: self.timestamp_reference,
+            stream_epoch: self.stream_epoch,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveFaceVizBuildError {
+    WrongStream {
+        actual: OakStreamId,
+    },
+    ObservationMismatch,
+    ResultSequenceMismatch {
+        batch: u64,
+        tracking: u64,
+    },
+    TruncatedCountMismatch {
+        batch: u32,
+        tracking: u32,
+    },
+    CaptureSequenceMismatch {
+        observation: u64,
+        oak: u64,
+    },
+    DimensionsMismatch {
+        observation: [u32; 2],
+        oak: [u32; 2],
+    },
+    LayoutSizeOverflow,
+    LayoutNotTightlyPackedBgr8 {
+        channel_order: ChannelOrder,
+        stride_bytes: u32,
+        byte_len: usize,
+    },
+    HostDeliverySequenceUnrepresentable {
+        actual: u64,
+    },
+    DetectorResultSequenceUnrepresentable {
+        actual: u64,
+    },
+    PixelCoordinateUnrepresentable {
+        field: &'static str,
+        value: u32,
+    },
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+impl std::fmt::Display for LiveFaceVizBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "face metadata cannot be represented as an exact live diagnostic: {self:?}"
+        )
+    }
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ValidatedLiveFaceViz {
+    frame_key: LiveRgbFrameKey,
+    detector_result_sequence: i64,
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn exact_u32_as_f32(field: &'static str, value: u32) -> Result<f32, LiveFaceVizBuildError> {
+    let converted = value as f32;
+    if f64::from(converted) == f64::from(value) {
+        Ok(converted)
+    } else {
+        Err(LiveFaceVizBuildError::PixelCoordinateUnrepresentable { field, value })
+    }
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn validate_live_face_viz(
+    message: NanoFaceDiagnosticFrame,
+) -> Result<ValidatedLiveFaceViz, LiveFaceVizBuildError> {
+    let provenance = message.provenance();
+    if provenance.stream() != OakStreamId::Rgb {
+        return Err(LiveFaceVizBuildError::WrongStream {
+            actual: provenance.stream(),
+        });
+    }
+    let output = message.output();
+    let batch = output.batch();
+    let tracking = output.tracking();
+    let observation = batch.observation();
+    if observation != tracking.observation() {
+        return Err(LiveFaceVizBuildError::ObservationMismatch);
+    }
+    let batch_result_sequence = batch.detector_result_sequence().get();
+    let tracking_result_sequence = tracking.detector_result_sequence().get();
+    if batch_result_sequence != tracking_result_sequence {
+        return Err(LiveFaceVizBuildError::ResultSequenceMismatch {
+            batch: batch_result_sequence,
+            tracking: tracking_result_sequence,
+        });
+    }
+    if batch.detector_truncated_count() != tracking.detector_truncated_count() {
+        return Err(LiveFaceVizBuildError::TruncatedCountMismatch {
+            batch: batch.detector_truncated_count(),
+            tracking: tracking.detector_truncated_count(),
+        });
+    }
+    let frame_id = observation.frame_id();
+    let oak_capture_sequence = provenance.device_capture_sequence().as_u64();
+    if frame_id.sequence() != oak_capture_sequence {
+        return Err(LiveFaceVizBuildError::CaptureSequenceMismatch {
+            observation: frame_id.sequence(),
+            oak: oak_capture_sequence,
+        });
+    }
+    let layout = observation.layout();
+    if layout.width_px() != provenance.width_px() || layout.height_px() != provenance.height_px() {
+        return Err(LiveFaceVizBuildError::DimensionsMismatch {
+            observation: [layout.width_px(), layout.height_px()],
+            oak: [provenance.width_px(), provenance.height_px()],
+        });
+    }
+    let expected_stride = layout
+        .width_px()
+        .checked_mul(3)
+        .ok_or(LiveFaceVizBuildError::LayoutSizeOverflow)?;
+    let expected_byte_len = usize::try_from(
+        u64::from(expected_stride)
+            .checked_mul(u64::from(layout.height_px()))
+            .ok_or(LiveFaceVizBuildError::LayoutSizeOverflow)?,
+    )
+    .map_err(|_| LiveFaceVizBuildError::LayoutSizeOverflow)?;
+    if layout.channel_order() != ChannelOrder::Bgr
+        || layout.stride_bytes() != expected_stride
+        || layout.byte_len() != expected_byte_len
+    {
+        return Err(LiveFaceVizBuildError::LayoutNotTightlyPackedBgr8 {
+            channel_order: layout.channel_order(),
+            stride_bytes: layout.stride_bytes(),
+            byte_len: layout.byte_len(),
+        });
+    }
+    // Rerun's 2D geometry is f32. Reject dimensions that cannot be converted
+    // exactly instead of silently shifting integer detector rectangles.
+    let _ = exact_u32_as_f32("frame width", layout.width_px())?;
+    let _ = exact_u32_as_f32("frame height", layout.height_px())?;
+    for detection in batch.iter() {
+        let rectangle = detection.rectangle();
+        let _ = exact_u32_as_f32("face left", rectangle.left_px())?;
+        let _ = exact_u32_as_f32("face top", rectangle.top_px())?;
+        let _ = exact_u32_as_f32("face width", rectangle.width_px())?;
+        let _ = exact_u32_as_f32("face height", rectangle.height_px())?;
+    }
+    let host_delivery_sequence = i64::try_from(provenance.host_delivery_sequence().as_u64())
+        .map_err(
+            |_| LiveFaceVizBuildError::HostDeliverySequenceUnrepresentable {
+                actual: provenance.host_delivery_sequence().as_u64(),
+            },
+        )?;
+    let detector_result_sequence = i64::try_from(batch_result_sequence).map_err(|_| {
+        LiveFaceVizBuildError::DetectorResultSequenceUnrepresentable {
+            actual: batch_result_sequence,
+        }
+    })?;
+    Ok(ValidatedLiveFaceViz {
+        frame_key: LiveRgbFrameKey {
+            device_capture_sequence: provenance.device_capture_sequence().as_i64(),
+            host_delivery_sequence,
+            device_timestamp_ns: provenance.timestamp().as_nanos(),
+            timestamp_reference: provenance.timestamp_reference(),
+            stream_epoch: frame_id.stream_epoch().get(),
+            width: provenance.width_px(),
+            height: provenance.height_px(),
+        },
+        detector_result_sequence,
+    })
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LiveFaceVizStats {
+    received: u64,
+    logged: u64,
+    overlay_matched: u64,
+    overlay_unmatched: u64,
+    invalid: u64,
+    consumer_cancelled: u64,
+    pending_abandoned: u64,
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+#[derive(Debug, Default)]
+struct LiveFaceVizCounters {
+    received: std::sync::atomic::AtomicU64,
+    logged: std::sync::atomic::AtomicU64,
+    overlay_matched: std::sync::atomic::AtomicU64,
+    overlay_unmatched: std::sync::atomic::AtomicU64,
+    invalid: std::sync::atomic::AtomicU64,
+    consumer_cancelled: std::sync::atomic::AtomicU64,
+    pending_abandoned: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn increment_live_face_counter(counter: &std::sync::atomic::AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        value.checked_add(1)
+    });
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+impl LiveFaceVizCounters {
+    fn record_received(&self) {
+        increment_live_face_counter(&self.received);
+    }
+
+    fn record_logged(&self, overlay_matched: bool) {
+        increment_live_face_counter(&self.logged);
+        if overlay_matched {
+            increment_live_face_counter(&self.overlay_matched);
+        } else {
+            increment_live_face_counter(&self.overlay_unmatched);
+        }
+    }
+
+    fn record_invalid(&self) {
+        increment_live_face_counter(&self.invalid);
+    }
+
+    fn record_cancelled(&self, pending_abandoned: bool) {
+        increment_live_face_counter(&self.consumer_cancelled);
+        if pending_abandoned {
+            increment_live_face_counter(&self.pending_abandoned);
+        }
+    }
+
+    fn snapshot(&self) -> LiveFaceVizStats {
+        LiveFaceVizStats {
+            received: self.received.load(Ordering::Relaxed),
+            logged: self.logged.load(Ordering::Relaxed),
+            overlay_matched: self.overlay_matched.load(Ordering::Relaxed),
+            overlay_unmatched: self.overlay_unmatched.load(Ordering::Relaxed),
+            invalid: self.invalid.load(Ordering::Relaxed),
+            consumer_cancelled: self.consumer_cancelled.load(Ordering::Relaxed),
+            pending_abandoned: self.pending_abandoned.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -4448,20 +4738,16 @@ fn log_live_navigation_viz_message(
     message: LiveNavigationVizMsg,
     context_logged: &mut bool,
 ) -> Result<(), VizLogError> {
-    recording.disable_timeline("capture_ns");
-    recording.disable_timeline("oak_rgb_capture_sequence");
-    recording.set_time_sequence("navigation_tick", message.tick_sequence);
-    if let Some(host_timestamp_ns) = message
+    let host_timestamp_ns = message
         .host_timestamp_ns
-        .and_then(|value| i64::try_from(value).ok())
-    {
-        recording.set_time(
-            "navigation_host_ns",
-            rerun::TimeCell::from_duration_nanos(host_timestamp_ns),
-        );
-    } else {
-        recording.disable_timeline("navigation_host_ns");
-    }
+        .and_then(|value| i64::try_from(value).ok());
+    apply_live_rerun_timeline_domain(
+        recording,
+        LiveRerunTimelineDomain::Navigation {
+            tick_sequence: message.tick_sequence,
+            host_timestamp_ns,
+        },
+    )?;
     if let Some(timing) = message.kind.control_tick_timing() {
         recording.log(
             "navigation/control_loop/tick_lateness_ns",
@@ -4801,30 +5087,444 @@ fn log_live_navigation_viz_message(
 fn log_live_rgb_viz_message(
     recording: &rerun::RecordingStream,
     message: LiveRgbVizMsg,
-) -> Result<(), VizLogError> {
-    recording.disable_timeline("navigation_tick");
-    recording.disable_timeline("navigation_host_ns");
-    let time = rerun::TimeCell::from_duration_nanos(message.device_timestamp_ns);
-    if time.as_i64() != message.device_timestamp_ns {
-        return Err(VizLogError::TimestampUnrepresentable {
-            timestamp_ns: message.device_timestamp_ns,
-            encoded_ns: time.as_i64(),
-        });
-    }
-    recording.set_time("capture_ns", time);
-    recording.set_time_sequence("oak_rgb_capture_sequence", message.device_capture_sequence);
+) -> Result<LiveRgbFrameKey, VizLogError> {
+    let frame_key = message.frame_key();
+    apply_live_rerun_timeline_domain(
+        recording,
+        LiveRerunTimelineDomain::Rgb {
+            capture_timestamp_ns: message.device_timestamp_ns,
+            device_capture_sequence: message.device_capture_sequence,
+            host_delivery_sequence: message.host_delivery_sequence,
+        },
+    )?;
     let image = rerun::Image::from_color_model_and_bytes(
         message.pixels_bgr8,
         [message.width, message.height],
         rerun::ColorModel::BGR,
         rerun::ChannelDatatype::U8,
     );
+    // A face overlay is valid only for one exact RGB key. Clear the prior
+    // subtree before replacing the image so a dropped/disconnected face
+    // diagnostic cannot remain painted over a newer capture.
+    recording.log("view/rgb/face", &rerun::Clear::recursive())?;
     recording.log("view/rgb", &image)?;
-    Ok(())
+    let timestamp_reference = match message.timestamp_reference {
+        CameraTimestampReference::ExposureMidpoint => "exposure_midpoint",
+    };
+    recording.log(
+        "view/rgb/provenance",
+        &rerun::TextLog::new(format!(
+            "stream=rgb stream_epoch={} device_capture_sequence={} host_delivery_sequence={} capture_timestamp_ns={} timestamp_reference={} width_px={} height_px={} layout=tightly_packed_bgr8",
+            message.stream_epoch,
+            message.device_capture_sequence,
+            message.host_delivery_sequence,
+            message.device_timestamp_ns,
+            timestamp_reference,
+            message.width,
+            message.height,
+        )),
+    )?;
+    Ok(frame_key)
 }
 
 #[cfg(feature = "record")]
-fn log_live_viz_message(sink: &mut RerunSink, msg: LiveVizMsg) -> Result<(), VizLogError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveRerunTimelineDomain {
+    Capture,
+    Rgb {
+        capture_timestamp_ns: i64,
+        device_capture_sequence: i64,
+        host_delivery_sequence: i64,
+    },
+    Navigation {
+        tick_sequence: i64,
+        host_timestamp_ns: Option<i64>,
+    },
+    #[cfg(all(feature = "nano-agent", unix))]
+    Face {
+        capture_timestamp_ns: i64,
+        device_capture_sequence: i64,
+        host_delivery_sequence: i64,
+        detector_result_sequence: i64,
+    },
+}
+
+#[cfg(feature = "record")]
+trait LiveRerunTimelineTarget {
+    fn reset_live_time(&self);
+    fn set_live_time(&self, timeline: &'static str, time: rerun::TimeCell);
+    fn set_live_sequence(&self, timeline: &'static str, sequence: i64);
+}
+
+#[cfg(feature = "record")]
+impl LiveRerunTimelineTarget for rerun::RecordingStream {
+    fn reset_live_time(&self) {
+        self.reset_time();
+    }
+
+    fn set_live_time(&self, timeline: &'static str, time: rerun::TimeCell) {
+        self.set_time(timeline, time);
+    }
+
+    fn set_live_sequence(&self, timeline: &'static str, sequence: i64) {
+        self.set_time_sequence(timeline, sequence);
+    }
+}
+
+#[cfg(feature = "record")]
+fn checked_live_rerun_time(timestamp_ns: i64) -> Result<rerun::TimeCell, VizLogError> {
+    let time = rerun::TimeCell::from_duration_nanos(timestamp_ns);
+    if time.as_i64() != timestamp_ns {
+        return Err(VizLogError::TimestampUnrepresentable {
+            timestamp_ns,
+            encoded_ns: time.as_i64(),
+        });
+    }
+    Ok(time)
+}
+
+/// Selects one live diagnostic clock domain without retaining time columns
+/// from the preceding message handled by the shared Rerun thread.
+///
+/// Rerun timeline state is sticky and thread-local. Every live message family
+/// therefore resets the complete thread-local timepoint before setting exactly
+/// the clocks that describe its own evidence.
+#[cfg(feature = "record")]
+fn apply_live_rerun_timeline_domain(
+    target: &impl LiveRerunTimelineTarget,
+    domain: LiveRerunTimelineDomain,
+) -> Result<(), VizLogError> {
+    let capture_time = match domain {
+        LiveRerunTimelineDomain::Rgb {
+            capture_timestamp_ns,
+            ..
+        } => Some(checked_live_rerun_time(capture_timestamp_ns)?),
+        #[cfg(all(feature = "nano-agent", unix))]
+        LiveRerunTimelineDomain::Face {
+            capture_timestamp_ns,
+            ..
+        } => Some(checked_live_rerun_time(capture_timestamp_ns)?),
+        LiveRerunTimelineDomain::Navigation {
+            host_timestamp_ns: Some(host_timestamp_ns),
+            ..
+        } => Some(checked_live_rerun_time(host_timestamp_ns)?),
+        LiveRerunTimelineDomain::Capture
+        | LiveRerunTimelineDomain::Navigation {
+            host_timestamp_ns: None,
+            ..
+        } => None,
+    };
+
+    target.reset_live_time();
+    match domain {
+        LiveRerunTimelineDomain::Capture => {}
+        LiveRerunTimelineDomain::Rgb {
+            device_capture_sequence,
+            host_delivery_sequence,
+            ..
+        } => {
+            target.set_live_time(
+                "capture_ns",
+                capture_time.expect("RGB domain validates one capture timestamp"),
+            );
+            target.set_live_sequence("oak_rgb_capture_sequence", device_capture_sequence);
+            target.set_live_sequence("oak_rgb_host_delivery_sequence", host_delivery_sequence);
+        }
+        LiveRerunTimelineDomain::Navigation {
+            tick_sequence,
+            host_timestamp_ns,
+        } => {
+            target.set_live_sequence("navigation_tick", tick_sequence);
+            if host_timestamp_ns.is_some() {
+                target.set_live_time(
+                    "navigation_host_ns",
+                    capture_time.expect("present navigation timestamp was validated"),
+                );
+            }
+        }
+        #[cfg(all(feature = "nano-agent", unix))]
+        LiveRerunTimelineDomain::Face {
+            device_capture_sequence,
+            host_delivery_sequence,
+            detector_result_sequence,
+            ..
+        } => {
+            target.set_live_time(
+                "capture_ns",
+                capture_time.expect("face domain validates one capture timestamp"),
+            );
+            target.set_live_sequence("oak_rgb_capture_sequence", device_capture_sequence);
+            target.set_live_sequence("oak_rgb_host_delivery_sequence", host_delivery_sequence);
+            target.set_live_sequence("face_detector_result_sequence", detector_result_sequence);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn live_face_source_name(source: FaceDetectorSource) -> &'static str {
+    match source {
+        FaceDetectorSource::Frontal => "frontal",
+        FaceDetectorSource::Profile => "profile",
+        FaceDetectorSource::MirroredProfile => "mirrored_profile",
+    }
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn live_face_source_color(source: FaceDetectorSource) -> rerun::Color {
+    match source {
+        FaceDetectorSource::Frontal => rerun::Color::from_rgb(46, 196, 182),
+        FaceDetectorSource::Profile => rerun::Color::from_rgb(255, 159, 28),
+        FaceDetectorSource::MirroredProfile => rerun::Color::from_rgb(131, 56, 236),
+    }
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn live_face_admission_text(admission: FaceResultAdmission) -> String {
+    match admission {
+        FaceResultAdmission::ColdStart => "ColdStart".to_owned(),
+        FaceResultAdmission::Consecutive { previous, actual } => format!(
+            "Consecutive(previous={},actual={})",
+            previous.get(),
+            actual.get()
+        ),
+        FaceResultAdmission::ForwardGap {
+            previous,
+            actual,
+            skipped_result_count,
+        } => format!(
+            "ForwardGap(previous={},actual={},skipped_detector_results={})",
+            previous.get(),
+            actual.get(),
+            skipped_result_count.get()
+        ),
+    }
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn live_face_state_text(state: FaceTargetState) -> String {
+    match state {
+        FaceTargetState::NoTarget => "NoTarget".to_owned(),
+        FaceTargetState::Acquiring(target) => format!(
+            "Acquiring(frame_epoch=0x{:016x},frame_sequence={},consecutive_results={},required_results={})",
+            target.frame_id().stream_epoch().get(),
+            target.frame_id().sequence(),
+            target.consecutive_results().get(),
+            target.required_results().get(),
+        ),
+        FaceTargetState::Tracked(observation) => format!(
+            "Tracked(track_id=0x{:016x},frame_epoch=0x{:016x},frame_sequence={})",
+            observation.track_id().get(),
+            observation.frame_id().stream_epoch().get(),
+            observation.frame_id().sequence(),
+        ),
+        FaceTargetState::Coasting(target) => {
+            let last = target.last_observation();
+            format!(
+                "Coasting(track_id=0x{:016x},last_frame_epoch=0x{:016x},last_frame_sequence={},evaluated_frame_epoch=0x{:016x},evaluated_frame_sequence={},loss_deadline_accessory_ns={})",
+                last.track_id().get(),
+                last.frame_id().stream_epoch().get(),
+                last.frame_id().sequence(),
+                target.evaluated_frame_id().stream_epoch().get(),
+                target.evaluated_frame_id().sequence(),
+                target.loss_deadline().timestamp().nanos_since_epoch(),
+            )
+        }
+        FaceTargetState::Lost(target) => {
+            let last = target.last_observation();
+            format!(
+                "Lost(track_id=0x{:016x},last_frame_epoch=0x{:016x},last_frame_sequence={},evaluated_frame_epoch=0x{:016x},evaluated_frame_sequence={},loss_deadline_accessory_ns={})",
+                last.track_id().get(),
+                last.frame_id().stream_epoch().get(),
+                last.frame_id().sequence(),
+                target.evaluated_frame_id().stream_epoch().get(),
+                target.evaluated_frame_id().sequence(),
+                target.loss_deadline().timestamp().nanos_since_epoch(),
+            )
+        }
+        FaceTargetState::Switched(target) => {
+            let observation = target.observation();
+            format!(
+                "Switched(previous_track_id=0x{:016x},track_id=0x{:016x},frame_epoch=0x{:016x},frame_sequence={})",
+                target.previous_track_id().get(),
+                observation.track_id().get(),
+                observation.frame_id().stream_epoch().get(),
+                observation.frame_id().sequence(),
+            )
+        }
+    }
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn live_face_current_target(
+    update: FaceTrackingUpdate,
+) -> Option<(ImagePoint, &'static str, rerun::Color)> {
+    match update.state() {
+        FaceTargetState::NoTarget | FaceTargetState::Coasting(_) | FaceTargetState::Lost(_) => None,
+        FaceTargetState::Acquiring(target) => Some((
+            target.detection().center(),
+            "acquiring",
+            rerun::Color::from_rgb(255, 214, 10),
+        )),
+        FaceTargetState::Tracked(observation) => Some((
+            observation.center(),
+            "tracked",
+            rerun::Color::from_rgb(42, 157, 143),
+        )),
+        FaceTargetState::Switched(target) => Some((
+            target.observation().center(),
+            "switched",
+            rerun::Color::from_rgb(0, 180, 216),
+        )),
+    }
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn live_face_point_pixels(point: ImagePoint, frame_key: LiveRgbFrameKey) -> [f32; 2] {
+    let width = frame_key.width as f32;
+    let height = frame_key.height as f32;
+    [
+        f32::from(point.x_right().basis_points()) * width / 10_000.0,
+        f32::from(point.y_down().basis_points()) * height / 10_000.0,
+    ]
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn live_face_detection_label(detection: FaceDetection) -> String {
+    format!(
+        "{} opaque_rank_bits=0x{:016x}",
+        live_face_source_name(detection.source()),
+        detection.detector_level_weight().to_bits(),
+    )
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn log_live_face_viz_message(
+    recording: &rerun::RecordingStream,
+    message: NanoFaceDiagnosticFrame,
+    last_logged_rgb: Option<LiveRgbFrameKey>,
+    context_logged: &mut bool,
+) -> Result<Result<bool, LiveFaceVizBuildError>, VizLogError> {
+    let validated = match validate_live_face_viz(message) {
+        Ok(validated) => validated,
+        Err(source) => return Ok(Err(source)),
+    };
+    apply_live_rerun_timeline_domain(
+        recording,
+        LiveRerunTimelineDomain::Face {
+            capture_timestamp_ns: validated.frame_key.device_timestamp_ns,
+            device_capture_sequence: validated.frame_key.device_capture_sequence,
+            host_delivery_sequence: validated.frame_key.host_delivery_sequence,
+            detector_result_sequence: validated.detector_result_sequence,
+        },
+    )?;
+    if !*context_logged {
+        recording.log_static(
+            "diagnostics/face/contract",
+            &rerun::TextLog::new(
+                "Face rectangles are best-effort expression/gaze diagnostics from a classical Haar detector. opaque_rank is not confidence, probability, identity, range, occupancy, collision evidence, or navigation authority. Accessory monotonic timestamps use a distinct process-local clock origin and are never subtracted from OAK or navigation clocks.",
+            ),
+        )?;
+        *context_logged = true;
+    }
+
+    let output = message.output();
+    let batch = output.batch();
+    let tracking = output.tracking();
+    let timestamp_reference = match validated.frame_key.timestamp_reference {
+        CameraTimestampReference::ExposureMidpoint => "exposure_midpoint",
+    };
+    recording.log(
+        "diagnostics/face/status",
+        &rerun::TextLog::new(format!(
+            "stream=rgb stream_epoch=0x{:016x} device_capture_sequence={} host_delivery_sequence={} capture_timestamp_ns={} timestamp_reference={} layout=tightly_packed_bgr8 width_px={} height_px={} detector_result_sequence={} retained_count={} detector_truncated_count={} admission={} state={} accessory_clock_domain=tokio_process_local_monotonic accessory_observed_at_ns={} accessory_source_deadline_exclusive_ns={}",
+            validated.frame_key.stream_epoch,
+            validated.frame_key.device_capture_sequence,
+            validated.frame_key.host_delivery_sequence,
+            validated.frame_key.device_timestamp_ns,
+            timestamp_reference,
+            validated.frame_key.width,
+            validated.frame_key.height,
+            validated.detector_result_sequence,
+            batch.retained_count(),
+            batch.detector_truncated_count(),
+            live_face_admission_text(tracking.admission()),
+            live_face_state_text(tracking.state()),
+            message
+                .accessory_observed_at()
+                .nanos_since_epoch(),
+            message
+                .accessory_source_deadline()
+                .timestamp()
+                .nanos_since_epoch(),
+        )),
+    )?;
+    recording.log(
+        "diagnostics/face/retained_count",
+        &rerun::Scalars::single(batch.retained_count() as f64),
+    )?;
+    recording.log(
+        "diagnostics/face/detector_truncated_count",
+        &rerun::Scalars::single(f64::from(batch.detector_truncated_count())),
+    )?;
+
+    let overlay_matched = last_logged_rgb == Some(validated.frame_key);
+    recording.log(
+        "diagnostics/face/overlay_exact_rgb_match",
+        &rerun::Scalars::single(if overlay_matched { 1.0 } else { 0.0 }),
+    )?;
+    if overlay_matched {
+        if batch.is_empty() {
+            recording.log("view/rgb/face/detections", &rerun::Clear::flat())?;
+        } else {
+            let mut minimums = Vec::with_capacity(batch.retained_count());
+            let mut sizes = Vec::with_capacity(batch.retained_count());
+            let mut colors = Vec::with_capacity(batch.retained_count());
+            let mut labels = Vec::with_capacity(batch.retained_count());
+            for detection in batch.iter() {
+                let rectangle = detection.rectangle();
+                minimums.push([rectangle.left_px() as f32, rectangle.top_px() as f32]);
+                sizes.push([rectangle.width_px() as f32, rectangle.height_px() as f32]);
+                colors.push(live_face_source_color(detection.source()));
+                labels.push(live_face_detection_label(detection));
+            }
+            recording.log(
+                "view/rgb/face/detections",
+                &rerun::Boxes2D::from_mins_and_sizes(minimums, sizes)
+                    .with_colors(colors)
+                    .with_labels(labels)
+                    .with_draw_order(10.0),
+            )?;
+        }
+        if let Some((point, label, color)) = live_face_current_target(tracking) {
+            recording.log(
+                "view/rgb/face/current_target",
+                &rerun::Points2D::new([live_face_point_pixels(point, validated.frame_key)])
+                    .with_colors([color])
+                    .with_labels([label])
+                    .with_radii([5.0])
+                    .with_draw_order(11.0),
+            )?;
+        } else {
+            // Coasting and Lost refer to prior-frame evidence and must not be
+            // drawn as a target on the current frame.
+            recording.log("view/rgb/face/current_target", &rerun::Clear::flat())?;
+        }
+    } else {
+        // Rerun images are decimated and independently queued. Never draw a
+        // face batch over the most recently displayed but different capture.
+        recording.log("view/rgb/face", &rerun::Clear::recursive())?;
+    }
+    Ok(Ok(overlay_matched))
+}
+
+#[cfg(feature = "record")]
+fn log_live_viz_message(
+    recording: &rerun::RecordingStream,
+    sink: &mut RerunSink,
+    msg: LiveVizMsg,
+) -> Result<(), VizLogError> {
+    apply_live_rerun_timeline_domain(recording, LiveRerunTimelineDomain::Capture)?;
     if let Some(packet) = msg.packet.as_ref() {
         sink.log_with_points(packet, msg.points.as_deref())?;
     } else {
@@ -9946,6 +10646,72 @@ impl From<LiveDenseRouteError> for LiveThreadError {
 }
 
 #[cfg(all(feature = "nano-agent", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NanoFaceShutdownProblemKind {
+    UnexpectedEvidence,
+    DetachedUncertain,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+#[derive(Debug)]
+struct NanoAccessoryShutdownSummary {
+    terminal_fault: Option<NanoAccessoryTerminalFault>,
+    eye_release_verified: bool,
+    head_hold_preserving_release_completed: bool,
+    face_perception: NanoFacePerceptionShutdownEvidence,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl NanoAccessoryShutdownSummary {
+    fn from_evidence(
+        terminal_fault: Option<NanoAccessoryTerminalFault>,
+        evidence: NanoAccessoryShutdownEvidence,
+    ) -> Self {
+        let (eye, head, face_perception) = evidence.into_parts();
+        Self {
+            terminal_fault,
+            eye_release_verified: eye.release_verified(),
+            head_hold_preserving_release_completed: head.hold_preserving_release_completed(),
+            face_perception,
+        }
+    }
+
+    fn face_classification(&self) -> NanoFacePerceptionShutdownClass<'_> {
+        self.face_perception.classify(self.terminal_fault.as_ref())
+    }
+
+    fn face_problem_kind(&self) -> Option<NanoFaceShutdownProblemKind> {
+        match self.face_classification() {
+            NanoFacePerceptionShutdownClass::Disabled
+            | NanoFacePerceptionShutdownClass::CoordinatedShutdown
+            | NanoFacePerceptionShutdownClass::PublishedRuntimeFault { .. }
+            | NanoFacePerceptionShutdownClass::AccessoryFaultFollower { .. } => None,
+            NanoFacePerceptionShutdownClass::UnexpectedDisabledFaceFault { .. }
+            | NanoFacePerceptionShutdownClass::UnexpectedJoined { .. } => {
+                Some(NanoFaceShutdownProblemKind::UnexpectedEvidence)
+            }
+            NanoFacePerceptionShutdownClass::DetachedAfterTimeout { .. } => {
+                Some(NanoFaceShutdownProblemKind::DetachedUncertain)
+            }
+        }
+    }
+
+    fn face_stage_stats_are_final(&self) -> bool {
+        !matches!(
+            self.face_classification(),
+            NanoFacePerceptionShutdownClass::DetachedAfterTimeout { .. }
+        )
+    }
+
+    fn is_fully_healthy(&self) -> bool {
+        self.terminal_fault.is_none()
+            && self.eye_release_verified
+            && self.head_hold_preserving_release_completed
+            && self.face_classification().is_healthy()
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
 #[derive(Debug)]
 enum LiveAccessoryError {
     PreparationInterrupted(NanoLivePreparationInterrupted),
@@ -9958,6 +10724,30 @@ enum LiveAccessoryError {
     UnexpectedExit(Box<NanoAccessoryWorkerExit>),
     EyeReleaseUnverified,
     HeadHoldPreservingReleaseUnverified,
+    FaceShutdown {
+        kind: NanoFaceShutdownProblemKind,
+        evidence: NanoFacePerceptionShutdownEvidence,
+    },
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+fn stop_live_before_waiting_for_accessory_fault<T>(
+    running: &AtomicBool,
+    wait: impl FnOnce() -> T,
+) -> T {
+    running.store(false, Ordering::SeqCst);
+    wait()
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+const fn accessory_submission_requires_exact_fault_wait(
+    outcome: NanoAccessoryFrameSubmitOutcome,
+) -> bool {
+    matches!(
+        outcome,
+        NanoAccessoryFrameSubmitOutcome::TerminalFaultPendingPublication
+            | NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched
+    )
 }
 
 #[cfg(all(feature = "nano-agent", unix))]
@@ -9986,6 +10776,10 @@ impl std::fmt::Display for LiveAccessoryError {
             Self::HeadHoldPreservingReleaseUnverified => formatter.write_str(
                 "the head hold-preserving ownership release could not be verified during accessory shutdown",
             ),
+            Self::FaceShutdown { kind, evidence } => write!(
+                formatter,
+                "face-perception shutdown was {kind:?}; retained evidence: {evidence:?}"
+            ),
         }
     }
 }
@@ -10003,7 +10797,8 @@ impl std::error::Error for LiveAccessoryError {
             Self::FrameIngress(_)
             | Self::UnexpectedExit(_)
             | Self::EyeReleaseUnverified
-            | Self::HeadHoldPreservingReleaseUnverified => None,
+            | Self::HeadHoldPreservingReleaseUnverified
+            | Self::FaceShutdown { .. } => None,
         }
     }
 }
@@ -10704,6 +11499,7 @@ struct NanoLiveSetupGuard {
     motion: Option<PreparedLiveMotionSelection>,
     accessory: Option<NanoAccessoryWorker>,
     production_state: Option<NanoProductionStateOwners>,
+    accessory_terminal_fault_reported: bool,
 }
 
 #[cfg(all(feature = "nano-agent", unix))]
@@ -10717,6 +11513,7 @@ impl NanoLiveSetupGuard {
             motion: Some(motion),
             accessory,
             production_state,
+            accessory_terminal_fault_reported: false,
         }
     }
 
@@ -10734,8 +11531,22 @@ impl NanoLiveSetupGuard {
         self.accessory.take()
     }
 
+    fn take_face_diagnostics(
+        &mut self,
+    ) -> Option<(NanoFaceDiagnosticReceiver, NanoFaceDiagnosticStatsHandle)> {
+        self.accessory
+            .as_mut()
+            .and_then(NanoAccessoryWorker::take_face_diagnostics)
+    }
+
+    fn face_perception_stage_stats_handle(&self) -> Option<NanoFacePerceptionStageStatsHandle> {
+        self.accessory
+            .as_ref()
+            .and_then(NanoAccessoryWorker::face_perception_stage_stats_handle)
+    }
+
     fn require_accessory_healthy_if_present(
-        &self,
+        &mut self,
         running: &AtomicBool,
     ) -> Result<(), LiveAccessoryError> {
         if !running.load(Ordering::Acquire) {
@@ -10748,7 +11559,10 @@ impl NanoLiveSetupGuard {
         };
         match accessory.try_terminal_fault() {
             Ok(None) => Ok(()),
-            Ok(Some(fault)) => Err(LiveAccessoryError::TerminalFault(fault)),
+            Ok(Some(fault)) => {
+                self.accessory_terminal_fault_reported = true;
+                Err(LiveAccessoryError::TerminalFault(fault))
+            }
             Err(source) => Err(LiveAccessoryError::FaultMonitor(source)),
         }
     }
@@ -10780,15 +11594,25 @@ impl Drop for NanoLiveSetupGuard {
                 terminal_fault,
                 evidence,
             }) => {
-                if terminal_fault.is_some()
-                    || !evidence.eye().release_verified()
-                    || !evidence.head().hold_preserving_release_completed()
-                {
-                    eprintln!(
-                        "early live setup accessory shutdown was not fully healthy: terminal_fault={terminal_fault:?} eye_release_verified={} head_hold_preserving_release_completed={}",
-                        evidence.eye().release_verified(),
-                        evidence.head().hold_preserving_release_completed()
-                    );
+                let summary =
+                    NanoAccessoryShutdownSummary::from_evidence(terminal_fault, *evidence);
+                if !summary.is_fully_healthy() {
+                    if self.accessory_terminal_fault_reported && summary.terminal_fault.is_some() {
+                        eprintln!(
+                            "early live setup accessory shutdown was not fully healthy: terminal_fault=retained_for_consistency_and_already_reported_by_primary eye_release_verified={} head_hold_preserving_release_completed={} face_perception={}",
+                            summary.eye_release_verified,
+                            summary.head_hold_preserving_release_completed,
+                            summary.face_classification(),
+                        );
+                    } else {
+                        eprintln!(
+                            "early live setup accessory shutdown was not fully healthy: terminal_fault={:?} eye_release_verified={} head_hold_preserving_release_completed={} face_perception={}",
+                            summary.terminal_fault,
+                            summary.eye_release_verified,
+                            summary.head_hold_preserving_release_completed,
+                            summary.face_classification(),
+                        );
+                    }
                 }
             }
             Ok(exit) => {
@@ -10865,14 +11689,15 @@ impl Drop for NanoPostNavigationSetupGuard {
                 terminal_fault,
                 evidence,
             }) => {
-                if terminal_fault.is_some()
-                    || !evidence.eye().release_verified()
-                    || !evidence.head().hold_preserving_release_completed()
-                {
+                let summary =
+                    NanoAccessoryShutdownSummary::from_evidence(terminal_fault, *evidence);
+                if !summary.is_fully_healthy() {
                     eprintln!(
-                        "post-navigation setup accessory shutdown was not fully healthy: terminal_fault={terminal_fault:?} eye_release_verified={} head_hold_preserving_release_completed={}",
-                        evidence.eye().release_verified(),
-                        evidence.head().hold_preserving_release_completed()
+                        "post-navigation setup accessory shutdown was not fully healthy: terminal_fault={:?} eye_release_verified={} head_hold_preserving_release_completed={} face_perception={}",
+                        summary.terminal_fault,
+                        summary.eye_release_verified,
+                        summary.head_hold_preserving_release_completed,
+                        summary.face_classification(),
                     );
                 }
             }
@@ -10904,13 +11729,79 @@ enum NanoPreOwnerOakClose {
 #[derive(Debug)]
 enum NanoPreOwnerAccessoryShutdown {
     NotStarted,
-    Completed {
-        terminal_fault: Option<NanoAccessoryTerminalFault>,
-        eye_release_verified: bool,
-        head_hold_preserving_release_completed: bool,
+    Evidence {
+        summary: NanoAccessoryShutdownSummary,
+        terminal_fault_already_reported: bool,
     },
     UnexpectedExit(Box<NanoAccessoryWorkerExit>),
     JoinUncertain(NanoAccessoryWorkerJoinError),
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+impl std::fmt::Display for NanoPreOwnerAccessoryShutdown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStarted => formatter.write_str("accessory shutdown not started"),
+            Self::Evidence {
+                summary,
+                terminal_fault_already_reported,
+            } => {
+                if *terminal_fault_already_reported && summary.terminal_fault.is_some() {
+                    write!(
+                        formatter,
+                        "accessory shutdown evidence (terminal_fault=retained_for_consistency_and_already_reported_by_primary, eye_release_verified={}, head_hold_preserving_release_completed={}, face_perception={})",
+                        summary.eye_release_verified,
+                        summary.head_hold_preserving_release_completed,
+                        summary.face_classification(),
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "accessory shutdown evidence (terminal_fault={:?}, eye_release_verified={}, head_hold_preserving_release_completed={}, face_perception={})",
+                        summary.terminal_fault,
+                        summary.eye_release_verified,
+                        summary.head_hold_preserving_release_completed,
+                        summary.face_classification(),
+                    )
+                }
+            }
+            Self::UnexpectedExit(exit) => {
+                write!(
+                    formatter,
+                    "accessory shutdown returned unexpected exit: {exit:?}"
+                )
+            }
+            Self::JoinUncertain(source) => {
+                write!(formatter, "accessory shutdown join uncertain: {source}")
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+fn shutdown_nano_pre_owner_accessory(
+    accessory: NanoAccessoryWorker,
+    terminal_fault_already_reported: bool,
+) -> NanoPreOwnerAccessoryShutdown {
+    match accessory.shutdown() {
+        Ok(NanoAccessoryWorkerExit::Shutdown {
+            terminal_fault,
+            evidence,
+        }) => NanoPreOwnerAccessoryShutdown::Evidence {
+            summary: NanoAccessoryShutdownSummary::from_evidence(terminal_fault, *evidence),
+            terminal_fault_already_reported,
+        },
+        Ok(exit) => NanoPreOwnerAccessoryShutdown::UnexpectedExit(Box::new(exit)),
+        Err(source) => NanoPreOwnerAccessoryShutdown::JoinUncertain(source),
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+fn live_accessory_error_reports_terminal(source: &(dyn std::error::Error + 'static)) -> bool {
+    matches!(
+        source.downcast_ref::<LiveAccessoryError>(),
+        Some(LiveAccessoryError::TerminalFault(_))
+    )
 }
 
 #[cfg(all(feature = "nano-agent", unix))]
@@ -10938,21 +11829,7 @@ impl std::fmt::Display for NanoLivePreparationError {
         }
         match &self.accessory_shutdown {
             NanoPreOwnerAccessoryShutdown::NotStarted => {}
-            NanoPreOwnerAccessoryShutdown::Completed {
-                terminal_fault,
-                eye_release_verified,
-                head_hold_preserving_release_completed,
-            } => write!(
-                formatter,
-                "; accessory shutdown completed (terminal_fault={terminal_fault:?}, eye_release_verified={eye_release_verified}, head_hold_preserving_release_completed={head_hold_preserving_release_completed})"
-            )?,
-            NanoPreOwnerAccessoryShutdown::UnexpectedExit(exit) => write!(
-                formatter,
-                "; accessory shutdown returned unexpected exit: {exit:?}"
-            )?,
-            NanoPreOwnerAccessoryShutdown::JoinUncertain(source) => {
-                write!(formatter, "; accessory shutdown join uncertain: {source}")?
-            }
+            shutdown => write!(formatter, "; {shutdown}")?,
         }
         match &self.oak_close {
             NanoPreOwnerOakClose::Confirmed => formatter.write_str("; OAK close confirmed"),
@@ -10993,6 +11870,7 @@ impl NanoPreOwnerResources {
 
     fn cleanup(
         &mut self,
+        terminal_fault_already_reported: bool,
     ) -> (
         NanoPreOwnerControllerStop,
         NanoPreOwnerAccessoryShutdown,
@@ -11009,20 +11887,9 @@ impl NanoPreOwnerResources {
         };
         let accessory_shutdown = match self.accessory.take() {
             None => NanoPreOwnerAccessoryShutdown::NotStarted,
-            Some(accessory) => match accessory.shutdown() {
-                Ok(NanoAccessoryWorkerExit::Shutdown {
-                    terminal_fault,
-                    evidence,
-                }) => NanoPreOwnerAccessoryShutdown::Completed {
-                    terminal_fault,
-                    eye_release_verified: evidence.eye().release_verified(),
-                    head_hold_preserving_release_completed: evidence
-                        .head()
-                        .hold_preserving_release_completed(),
-                },
-                Ok(exit) => NanoPreOwnerAccessoryShutdown::UnexpectedExit(Box::new(exit)),
-                Err(source) => NanoPreOwnerAccessoryShutdown::JoinUncertain(source),
-            },
+            Some(accessory) => {
+                shutdown_nano_pre_owner_accessory(accessory, terminal_fault_already_reported)
+            }
         };
         let oak_close = match self
             .oak
@@ -11040,7 +11907,10 @@ impl NanoPreOwnerResources {
         mut self,
         primary: Box<dyn std::error::Error>,
     ) -> Result<T, Box<dyn std::error::Error>> {
-        let (controller_stop, accessory_shutdown, oak_close) = self.cleanup();
+        let terminal_fault_already_reported =
+            live_accessory_error_reports_terminal(primary.as_ref());
+        let (controller_stop, accessory_shutdown, oak_close) =
+            self.cleanup(terminal_fault_already_reported);
         Err(Box::new(NanoLivePreparationError {
             primary,
             controller_stop,
@@ -11072,7 +11942,7 @@ impl Drop for NanoPreOwnerResources {
         if self.runtime.is_none() && self.accessory.is_none() && self.oak.is_none() {
             return;
         }
-        let (controller_stop, accessory_shutdown, oak_close) = self.cleanup();
+        let (controller_stop, accessory_shutdown, oak_close) = self.cleanup(false);
         eprintln!(
             "Nano pre-owner resources unwound: controller_stop={controller_stop:?} accessory_shutdown={accessory_shutdown:?} oak_close={oak_close:?}"
         );
@@ -11126,22 +11996,13 @@ impl NanoQualificationPreOwnerResources {
             .expect("qualification bootstrap stop receipt is consumed once");
         let _ = self.initial_zero.take();
         drop(self.stopped_controller.take());
+        let terminal_fault_already_reported =
+            live_accessory_error_reports_terminal(primary.as_ref());
         let accessory_shutdown = match self.accessory.take() {
             None => NanoPreOwnerAccessoryShutdown::NotStarted,
-            Some(accessory) => match accessory.shutdown() {
-                Ok(NanoAccessoryWorkerExit::Shutdown {
-                    terminal_fault,
-                    evidence,
-                }) => NanoPreOwnerAccessoryShutdown::Completed {
-                    terminal_fault,
-                    eye_release_verified: evidence.eye().release_verified(),
-                    head_hold_preserving_release_completed: evidence
-                        .head()
-                        .hold_preserving_release_completed(),
-                },
-                Ok(exit) => NanoPreOwnerAccessoryShutdown::UnexpectedExit(Box::new(exit)),
-                Err(source) => NanoPreOwnerAccessoryShutdown::JoinUncertain(source),
-            },
+            Some(accessory) => {
+                shutdown_nano_pre_owner_accessory(accessory, terminal_fault_already_reported)
+            }
         };
         let oak_close = match self
             .oak
@@ -11208,7 +12069,10 @@ impl Drop for NanoQualificationPreOwnerResources {
         let initial_stop = self.initial_stop.take();
         let _ = self.initial_zero.take();
         drop(self.stopped_controller.take());
-        let accessory_shutdown = self.accessory.take().map(NanoAccessoryWorker::shutdown);
+        let accessory_shutdown = self
+            .accessory
+            .take()
+            .map(|accessory| shutdown_nano_pre_owner_accessory(accessory, false));
         let oak_close = self.oak.take().map(Device::close);
         eprintln!(
             "qualification pre-owner resources unwound from an exact bootstrap stop: stop_request_id={:?} accessory_shutdown={accessory_shutdown:?} oak_close={oak_close:?}",
@@ -11240,7 +12104,7 @@ impl std::fmt::Display for NanoQualificationLivePreparationError {
         )?;
         write!(
             formatter,
-            "; accessory shutdown: {:?}; OAK close: {:?}",
+            "; {}; OAK close: {:?}",
             self.accessory_shutdown, self.oak_close,
         )
     }
@@ -11893,7 +12757,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
         Ok(config) => config,
         Err(primary) => return resources.fail_box(primary),
     };
-    resources.accessory = match NanoAccessoryWorker::start(accessory_config) {
+    resources.accessory = match NanoAccessoryWorker::start_scene_motion_only(accessory_config) {
         Ok(accessory) => Some(accessory),
         Err(source) => {
             return resources.fail_box(Box::new(LiveAccessoryError::Start(source)));
@@ -12541,6 +13405,17 @@ fn run_prepared_live_session(
     let operation = (|| -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(all(feature = "nano-agent", unix))]
         let mut nano_setup_guard = NanoLiveSetupGuard::new(motion, accessory, production_state);
+        #[cfg(all(feature = "nano-agent", unix))]
+        let face_stage_stats_handle = nano_setup_guard.face_perception_stage_stats_handle();
+        #[cfg(all(feature = "nano-agent", unix))]
+        let (face_viz_rx, face_viz_channel_stats) = match nano_setup_guard.take_face_diagnostics() {
+            Some((receiver, stats)) => (Some(receiver), Some(stats)),
+            None => (None, None),
+        };
+        #[cfg(all(feature = "nano-agent", unix))]
+        let (face_viz_cancel_tx, face_viz_cancel_rx) = crossbeam_channel::bounded::<()>(0);
+        #[cfg(all(feature = "nano-agent", unix))]
+        let face_viz_counters = Arc::new(LiveFaceVizCounters::default());
         let rectified = RectifiedStereo::from_calibration(&calibration)?;
         let navigation_enabled = prepared_navigation_runtime.is_some();
         let pair_capacity = ChannelCapacity::try_from(pair_queue_depth)?;
@@ -13271,6 +14146,8 @@ fn run_prepared_live_session(
         )?;
 
         let decimation = rerun_decimation;
+        #[cfg(all(feature = "nano-agent", unix))]
+        let face_viz_thread_counters = Arc::clone(&face_viz_counters);
         let viz_handle = spawn_live_thread(
             "kiko-rerun",
             move || -> Result<(), LiveThreadError> {
@@ -13319,15 +14196,19 @@ fn run_prepared_live_session(
                     }
                 };
                 let mut logging_error = None;
-                let never_frames = crossbeam_channel::never::<LiveVizMsg>();
-                let never_rgb = crossbeam_channel::never::<LiveRgbVizMsg>();
-                let never_occupancy = crossbeam_channel::never::<TimedOccupancySnapshot>();
-                let never_navigation = crossbeam_channel::never::<LiveNavigationVizMsg>();
                 let mut frame_rx = Some(viz_rx);
                 let mut rgb_rx = Some(rgb_viz_rx);
                 let mut map_rx = occupancy_snapshot_rx;
                 let mut navigation_rx = navigation_viz_rx;
                 let mut navigation_context_logged = false;
+                #[cfg(all(feature = "nano-agent", unix))]
+                let mut face_rx = face_viz_rx;
+                #[cfg(all(feature = "nano-agent", unix))]
+                let mut face_cancel_rx = Some(face_viz_cancel_rx);
+                #[cfg(all(feature = "nano-agent", unix))]
+                let mut last_logged_rgb = None;
+                #[cfg(all(feature = "nano-agent", unix))]
+                let mut face_context_logged = false;
                 if initialization_error.is_some() {
                     // Stop upstream visualization work immediately. Tracking and
                     // occupancy remain authoritative and shut down through their own
@@ -13337,35 +14218,73 @@ fn run_prepared_live_session(
                     rgb_rx = None;
                     map_rx = None;
                     navigation_rx = None;
+                    #[cfg(all(feature = "nano-agent", unix))]
+                    {
+                        face_rx = None;
+                        face_cancel_rx = None;
+                    }
                 }
                 while frame_rx.is_some()
                     || rgb_rx.is_some()
                     || map_rx.is_some()
                     || navigation_rx.is_some()
+                    || {
+                        #[cfg(all(feature = "nano-agent", unix))]
+                        {
+                            face_rx.is_some()
+                        }
+                        #[cfg(not(all(feature = "nano-agent", unix)))]
+                        {
+                            false
+                        }
+                    }
                 {
                     let mut close_frames = false;
                     let mut close_rgb = false;
                     let mut close_maps = false;
                     let mut close_navigation = false;
+                    #[cfg(all(feature = "nano-agent", unix))]
+                    let mut close_face = false;
                     {
-                        let frame_receiver = frame_rx
+                        let mut selector = crossbeam_channel::Select::new();
+                        let frame_operation = frame_rx
                             .as_ref()
-                            .map_or(&never_frames, kiko_slam::DropReceiver::as_receiver);
-                        let rgb_receiver = rgb_rx
+                            .map(|receiver| selector.recv(receiver.as_receiver()));
+                        let rgb_operation = rgb_rx
                             .as_ref()
-                            .map_or(&never_rgb, kiko_slam::DropReceiver::as_receiver);
-                        let map_receiver = map_rx
+                            .map(|receiver| selector.recv(receiver.as_receiver()));
+                        let map_operation = map_rx
                             .as_ref()
-                            .map_or(&never_occupancy, kiko_slam::DropReceiver::as_receiver);
-                        let navigation_receiver = navigation_rx
+                            .map(|receiver| selector.recv(receiver.as_receiver()));
+                        let navigation_operation = navigation_rx
                             .as_ref()
-                            .map_or(&never_navigation, kiko_slam::DropReceiver::as_receiver);
-                        crossbeam_channel::select! {
-                            recv(frame_receiver) -> message => match message {
+                            .map(|receiver| selector.recv(receiver.as_receiver()));
+                        #[cfg(all(feature = "nano-agent", unix))]
+                        let face_operation = face_rx
+                            .as_ref()
+                            .map(|receiver| selector.recv(receiver.as_receiver()));
+                        #[cfg(all(feature = "nano-agent", unix))]
+                        let face_cancel_operation = if face_rx.is_some() {
+                            face_cancel_rx
+                                .as_ref()
+                                .map(|receiver| selector.recv(receiver))
+                        } else {
+                            None
+                        };
+                        let selected = selector.select();
+                        let selected_index = selected.index();
+                        if frame_operation == Some(selected_index) {
+                            let receiver = frame_rx
+                                .as_ref()
+                                .expect("registered frame receiver")
+                                .as_receiver();
+                            match selected.recv(receiver) {
                                 Ok(message) => {
                                     if logging_error.is_none()
                                         && let Some(sink) = sink.as_mut()
-                                        && let Err(error) = log_live_viz_message(sink, message)
+                                        && let Some(recording) = navigation_recording.as_ref()
+                                        && let Err(error) =
+                                            log_live_viz_message(recording, sink, message)
                                     {
                                         eprintln!(
                                             "live Rerun logging failed; disconnecting visualization producers: {error}"
@@ -13375,35 +14294,72 @@ fn run_prepared_live_session(
                                         close_rgb = true;
                                         close_maps = true;
                                         close_navigation = true;
+                                        #[cfg(all(feature = "nano-agent", unix))]
+                                        {
+                                            close_face = true;
+                                        }
                                     }
                                 }
                                 Err(_) => close_frames = true,
-                            },
-                            recv(rgb_receiver) -> message => match message {
+                            }
+                        } else if rgb_operation == Some(selected_index) {
+                            let receiver = rgb_rx
+                                .as_ref()
+                                .expect("registered RGB receiver")
+                                .as_receiver();
+                            match selected.recv(receiver) {
                                 Ok(message) => {
                                     if logging_error.is_none()
                                         && let Some(recording) = navigation_recording.as_ref()
-                                        && let Err(error) = log_live_rgb_viz_message(recording, message)
                                     {
-                                        eprintln!(
-                                            "live Rerun RGB logging failed; disconnecting visualization producers: {error}"
-                                        );
-                                        logging_error = Some(error);
-                                        close_frames = true;
-                                        close_rgb = true;
-                                        close_maps = true;
-                                        close_navigation = true;
+                                        match log_live_rgb_viz_message(recording, message) {
+                                            Ok(frame_key) => {
+                                                #[cfg(all(feature = "nano-agent", unix))]
+                                                {
+                                                    last_logged_rgb = Some(frame_key);
+                                                }
+                                                #[cfg(not(all(feature = "nano-agent", unix)))]
+                                                {
+                                                    let _ = frame_key;
+                                                }
+                                            }
+                                            Err(error) => {
+                                                eprintln!(
+                                                    "live Rerun RGB logging failed; disconnecting visualization producers: {error}"
+                                                );
+                                                logging_error = Some(error);
+                                                close_frames = true;
+                                                close_rgb = true;
+                                                close_maps = true;
+                                                close_navigation = true;
+                                                #[cfg(all(feature = "nano-agent", unix))]
+                                                {
+                                                    close_face = true;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 Err(_) => close_rgb = true,
-                            },
-                            recv(map_receiver) -> snapshot => match snapshot {
+                            }
+                        } else if map_operation == Some(selected_index) {
+                            let receiver = map_rx
+                                .as_ref()
+                                .expect("registered occupancy receiver")
+                                .as_receiver();
+                            match selected.recv(receiver) {
                                 Ok(snapshot) => {
                                     if logging_error.is_none()
                                         && let Some(sink) = sink.as_mut()
+                                        && let Some(recording) = navigation_recording.as_ref()
                                     {
                                         let (timestamp, snapshot) = snapshot.into_parts();
-                                        if let Err(error) = sink.log_occupancy(timestamp, snapshot) {
+                                        let result = apply_live_rerun_timeline_domain(
+                                            recording,
+                                            LiveRerunTimelineDomain::Capture,
+                                        )
+                                        .and_then(|()| sink.log_occupancy(timestamp, snapshot));
+                                        if let Err(error) = result {
                                             eprintln!(
                                                 "live Rerun occupancy logging failed; disconnecting visualization producers: {error}"
                                             );
@@ -13412,12 +14368,21 @@ fn run_prepared_live_session(
                                             close_rgb = true;
                                             close_maps = true;
                                             close_navigation = true;
+                                            #[cfg(all(feature = "nano-agent", unix))]
+                                            {
+                                                close_face = true;
+                                            }
                                         }
                                     }
                                 }
                                 Err(_) => close_maps = true,
-                            },
-                            recv(navigation_receiver) -> message => match message {
+                            }
+                        } else if navigation_operation == Some(selected_index) {
+                            let receiver = navigation_rx
+                                .as_ref()
+                                .expect("registered navigation receiver")
+                                .as_receiver();
+                            match selected.recv(receiver) {
                                 Ok(message) => {
                                     if logging_error.is_none()
                                         && let Some(recording) = navigation_recording.as_ref()
@@ -13435,10 +14400,75 @@ fn run_prepared_live_session(
                                         close_rgb = true;
                                         close_maps = true;
                                         close_navigation = true;
+                                        #[cfg(all(feature = "nano-agent", unix))]
+                                        {
+                                            close_face = true;
+                                        }
                                     }
                                 }
                                 Err(_) => close_navigation = true,
-                            },
+                            }
+                        } else {
+                            #[cfg(all(feature = "nano-agent", unix))]
+                            if face_operation == Some(selected_index) {
+                                let receiver = face_rx
+                                    .as_ref()
+                                    .expect("registered face receiver")
+                                    .as_receiver();
+                                match selected.recv(receiver) {
+                                    Ok(message) => {
+                                        face_viz_thread_counters.record_received();
+                                        if logging_error.is_none()
+                                            && let Some(recording) = navigation_recording.as_ref()
+                                        {
+                                            match log_live_face_viz_message(
+                                                recording,
+                                                message,
+                                                last_logged_rgb,
+                                                &mut face_context_logged,
+                                            ) {
+                                                Ok(Ok(overlay_matched)) => {
+                                                    face_viz_thread_counters
+                                                        .record_logged(overlay_matched);
+                                                }
+                                                Ok(Err(source)) => {
+                                                    face_viz_thread_counters.record_invalid();
+                                                    eprintln!(
+                                                        "live face Rerun diagnostics disabled after invalid provenance: {source}"
+                                                    );
+                                                    close_face = true;
+                                                }
+                                                Err(error) => {
+                                                    eprintln!(
+                                                        "live face Rerun logging failed; disconnecting visualization producers: {error}"
+                                                    );
+                                                    logging_error = Some(error);
+                                                    close_frames = true;
+                                                    close_rgb = true;
+                                                    close_maps = true;
+                                                    close_navigation = true;
+                                                    close_face = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(_) => close_face = true,
+                                }
+                            } else if face_cancel_operation == Some(selected_index) {
+                                let receiver = face_cancel_rx
+                                    .as_ref()
+                                    .expect("registered face cancellation receiver");
+                                let _ = selected.recv(receiver);
+                                let pending_abandoned = face_rx
+                                    .as_ref()
+                                    .is_some_and(|receiver| receiver.try_recv().is_ok());
+                                face_viz_thread_counters.record_cancelled(pending_abandoned);
+                                close_face = true;
+                            } else {
+                                unreachable!("selected one registered live Rerun operation");
+                            }
+                            #[cfg(not(all(feature = "nano-agent", unix)))]
+                            unreachable!("selected one registered live Rerun operation");
                         }
                     }
                     if close_frames {
@@ -13452,6 +14482,11 @@ fn run_prepared_live_session(
                     }
                     if close_navigation {
                         navigation_rx = None;
+                    }
+                    #[cfg(all(feature = "nano-agent", unix))]
+                    if close_face {
+                        face_rx = None;
+                        face_cancel_rx = None;
                     }
                 }
                 drop(navigation_recording);
@@ -13481,6 +14516,8 @@ fn run_prepared_live_session(
         let mut accessory_failures = Vec::new();
         #[cfg(all(feature = "nano-agent", unix))]
         let mut accessory_terminal_fault_recorded = false;
+        #[cfg(all(feature = "nano-agent", unix))]
+        let mut face_stage_stats_final = None;
         #[cfg(all(feature = "nano-agent", unix))]
         let mut accessory_worker = accessory;
         let mut capture_error = None;
@@ -13528,6 +14565,7 @@ fn run_prepared_live_session(
             if let Some(worker) = accessory_worker.as_mut() {
                 match device.rgb(0) {
                     Ok(frame) => {
+                        let accessory_stream_epoch = worker.readiness().stream_epoch();
                         let publish_rgb_viz =
                             rgb_viz_frame_index.is_multiple_of(rerun_decimation.get());
                         rgb_viz_frame_index = match rgb_viz_frame_index.checked_add(1) {
@@ -13540,41 +14578,63 @@ fn run_prepared_live_session(
                                 0
                             }
                         };
-                        if publish_rgb_viz && let Some(sender) = rgb_viz_tx.as_ref() {
-                            match LiveRgbVizMsg::try_from_oak(&frame) {
-                                Ok(message) => {
-                                    if matches!(sender.try_send(message), SendOutcome::Disconnected)
-                                    {
-                                        rgb_viz_tx = None;
+                        let submit_outcome =
+                            worker.submit_rgb_after_observation(frame, |frame| {
+                                if publish_rgb_viz && let Some(sender) = rgb_viz_tx.as_ref() {
+                                    match LiveRgbVizMsg::try_from_oak(
+                                        frame,
+                                        accessory_stream_epoch,
+                                    ) {
+                                        Ok(message) => {
+                                            if matches!(
+                                                sender.try_send(message),
+                                                SendOutcome::Disconnected
+                                            ) {
+                                                rgb_viz_tx = None;
+                                            }
+                                        }
+                                        Err(source) => {
+                                            eprintln!(
+                                                "live RGB Rerun diagnostic disabled after an invalid frame: {source}"
+                                            );
+                                            rgb_viz_tx = None;
+                                        }
                                     }
                                 }
-                                Err(source) => {
-                                    eprintln!(
-                                        "live RGB Rerun diagnostic disabled after an invalid frame: {source}"
-                                    );
-                                    rgb_viz_tx = None;
-                                }
-                            }
-                        }
-                        match worker.submit_rgb(frame) {
+                            });
+                        match submit_outcome {
                             NanoAccessoryFrameSubmitOutcome::Enqueued
                             | NanoAccessoryFrameSubmitOutcome::ReplacedOlderFrame => {}
-                            NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched => {
-                                match worker.try_terminal_fault() {
-                                    Ok(Some(fault)) => {
+                            outcome @ (NanoAccessoryFrameSubmitOutcome::TerminalFaultPendingPublication
+                            | NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched) => {
+                                debug_assert!(
+                                    accessory_submission_requires_exact_fault_wait(outcome)
+                                );
+                                // Both outcomes can precede publication to the
+                                // sole fault receiver: the face lane commits
+                                // its terminal output and closes raw admission
+                                // before the accessory actor consumes that
+                                // output. Stop every controller/navigation
+                                // owner, then wait boundedly for the exact first
+                                // cause instead of inventing a generic ingress
+                                // failure. The accessory stays alive during the
+                                // wait, but prior base authority cannot.
+                                match stop_live_before_waiting_for_accessory_fault(
+                                    running.as_ref(),
+                                    || {
+                                        worker.wait_for_terminal_fault(
+                                            NANO_ACCESSORY_TERMINAL_PUBLICATION_TIMEOUT,
+                                        )
+                                    },
+                                ) {
+                                    Ok(fault) => {
                                         accessory_terminal_fault_recorded = true;
                                         accessory_failures
                                             .push(LiveAccessoryError::TerminalFault(fault));
                                     }
-                                    Ok(None) => {
-                                        accessory_failures.push(LiveAccessoryError::FrameIngress(
-                                            NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched,
-                                        ))
-                                    }
                                     Err(source) => accessory_failures
                                         .push(LiveAccessoryError::FaultMonitor(source)),
                                 }
-                                running.store(false, Ordering::SeqCst);
                                 break 'capture;
                             }
                             outcome @ (NanoAccessoryFrameSubmitOutcome::IngressDisconnected
@@ -13786,6 +14846,8 @@ fn run_prepared_live_session(
         drop(depth_tx);
         drop(imu_tx);
         drop(rgb_viz_tx);
+        #[cfg(all(feature = "nano-agent", unix))]
+        drop(face_viz_cancel_tx);
         drop(navigation_dataset_writer);
         let mut live_failures = capture_error
             .into_iter()
@@ -13829,6 +14891,16 @@ fn run_prepared_live_session(
                     terminal_fault,
                     evidence,
                 }) => {
+                    let summary =
+                        NanoAccessoryShutdownSummary::from_evidence(terminal_fault, *evidence);
+                    face_stage_stats_final = Some(summary.face_stage_stats_are_final());
+                    let face_problem_kind = summary.face_problem_kind();
+                    let NanoAccessoryShutdownSummary {
+                        terminal_fault,
+                        eye_release_verified,
+                        head_hold_preserving_release_completed,
+                        face_perception,
+                    } = summary;
                     if let Some(fault) = terminal_fault
                         && !accessory_terminal_fault_recorded
                     {
@@ -13836,23 +14908,37 @@ fn run_prepared_live_session(
                             LiveAccessoryError::TerminalFault(fault),
                         ));
                     }
-                    if !evidence.eye().release_verified() {
+                    if !eye_release_verified {
                         live_failures.push(LiveWorkerFailure::Accessory(
                             LiveAccessoryError::EyeReleaseUnverified,
                         ));
                     }
-                    if !evidence.head().hold_preserving_release_completed() {
+                    if !head_hold_preserving_release_completed {
                         live_failures.push(LiveWorkerFailure::Accessory(
                             LiveAccessoryError::HeadHoldPreservingReleaseUnverified,
                         ));
                     }
+                    if let Some(kind) = face_problem_kind {
+                        live_failures.push(LiveWorkerFailure::Accessory(
+                            LiveAccessoryError::FaceShutdown {
+                                kind,
+                                evidence: face_perception,
+                            },
+                        ));
+                    }
                 }
-                Ok(exit) => live_failures.push(LiveWorkerFailure::Accessory(
-                    LiveAccessoryError::UnexpectedExit(Box::new(exit)),
-                )),
-                Err(source) => live_failures.push(LiveWorkerFailure::Accessory(
-                    LiveAccessoryError::ShutdownJoin(source),
-                )),
+                Ok(exit) => {
+                    face_stage_stats_final = Some(false);
+                    live_failures.push(LiveWorkerFailure::Accessory(
+                        LiveAccessoryError::UnexpectedExit(Box::new(exit)),
+                    ));
+                }
+                Err(source) => {
+                    face_stage_stats_final = Some(false);
+                    live_failures.push(LiveWorkerFailure::Accessory(
+                        LiveAccessoryError::ShutdownJoin(source),
+                    ));
+                }
             }
         }
 
@@ -14012,6 +15098,40 @@ fn run_prepared_live_session(
             rgb_viz_snapshot.dropped_newest,
             rgb_viz_snapshot.disconnected
         );
+        #[cfg(all(feature = "nano-agent", unix))]
+        if let Some(stats) = face_viz_channel_stats.as_ref() {
+            let channel = stats.snapshot();
+            let rerun = face_viz_counters.snapshot();
+            eprintln!(
+                "face viz stats: channel_enqueued={} channel_dropped_oldest={} channel_dropped_newest={} channel_disconnected={} rerun_received={} rerun_logged={} overlay_matched={} overlay_unmatched={} invalid={} consumer_cancelled={} pending_abandoned={}",
+                channel.enqueued,
+                channel.dropped_oldest,
+                channel.dropped_newest,
+                channel.disconnected,
+                rerun.received,
+                rerun.logged,
+                rerun.overlay_matched,
+                rerun.overlay_unmatched,
+                rerun.invalid,
+                rerun.consumer_cancelled,
+                rerun.pending_abandoned,
+            );
+        }
+        #[cfg(all(feature = "nano-agent", unix))]
+        if let Some(handle) = face_stage_stats_handle.as_ref() {
+            let stats = handle.snapshot();
+            eprintln!(
+                "face perception stage stats: final={} results_produced={} handoff_enqueued={} handoff_replaced_older={} handoff_terminal_pending={} handoff_terminal_fault_latched={} handoff_disconnected={} handoff_channel_poisoned={}",
+                face_stage_stats_final.unwrap_or(false),
+                stats.results_produced,
+                stats.handoff_enqueued,
+                stats.handoff_replaced_older,
+                stats.handoff_terminal_pending,
+                stats.handoff_terminal_fault_latched,
+                stats.handoff_disconnected,
+                stats.handoff_channel_poisoned,
+            );
+        }
         if let Some(depth_stats_handle) = depth_stats_handle {
             let depth_snapshot = depth_stats_handle.snapshot();
             eprintln!(
@@ -14422,6 +15542,92 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[test]
+    fn pending_or_latched_accessory_fault_stops_before_waiting_for_exact_publication() {
+        for outcome in [
+            kiko_slam::navigation::NanoAccessoryFrameSubmitOutcome::TerminalFaultPendingPublication,
+            kiko_slam::navigation::NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched,
+        ] {
+            assert!(super::accessory_submission_requires_exact_fault_wait(
+                outcome
+            ));
+            let running = AtomicBool::new(true);
+            let observed = super::stop_live_before_waiting_for_accessory_fault(&running, || {
+                running.load(Ordering::SeqCst)
+            });
+            assert!(
+                !observed,
+                "{outcome:?} publication wait must observe live authority stopped"
+            );
+            assert!(!running.load(Ordering::SeqCst));
+        }
+        assert!(!super::accessory_submission_requires_exact_fault_wait(
+            kiko_slam::navigation::NanoAccessoryFrameSubmitOutcome::Enqueued
+        ));
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[test]
+    fn pre_owner_cleanup_marks_a_terminal_already_reported_by_the_primary_error() {
+        let terminal = super::LiveAccessoryError::TerminalFault(
+            kiko_slam::navigation::NanoAccessoryTerminalFault::ReadinessObserverDropped,
+        );
+        assert!(super::live_accessory_error_reports_terminal(&terminal));
+
+        let ingress = super::LiveAccessoryError::FrameIngress(
+            kiko_slam::navigation::NanoAccessoryFrameSubmitOutcome::IngressDisconnected,
+        );
+        assert!(!super::live_accessory_error_reports_terminal(&ingress));
+
+        let shutdown = super::NanoPreOwnerAccessoryShutdown::Evidence {
+            summary: super::NanoAccessoryShutdownSummary {
+                terminal_fault: Some(
+                    kiko_slam::navigation::NanoAccessoryTerminalFault::ReadinessObserverDropped,
+                ),
+                eye_release_verified: true,
+                head_hold_preserving_release_completed: true,
+                face_perception: super::NanoFacePerceptionShutdownEvidence::Disabled,
+            },
+            terminal_fault_already_reported: true,
+        };
+        let displayed = shutdown.to_string();
+        assert!(displayed.contains("already_reported_by_primary"));
+        assert!(!displayed.contains("ReadinessObserverDropped"));
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[test]
+    fn live_face_stage_stats_are_final_only_after_disabled_or_joined_shutdown() {
+        let disabled = super::NanoAccessoryShutdownSummary {
+            terminal_fault: None,
+            eye_release_verified: true,
+            head_hold_preserving_release_completed: true,
+            face_perception: super::NanoFacePerceptionShutdownEvidence::Disabled,
+        };
+        assert!(disabled.is_fully_healthy());
+        assert_eq!(disabled.face_problem_kind(), None);
+        assert!(disabled.face_stage_stats_are_final());
+
+        let detached = super::NanoAccessoryShutdownSummary {
+            terminal_fault: None,
+            eye_release_verified: true,
+            head_hold_preserving_release_completed: true,
+            face_perception: super::NanoFacePerceptionShutdownEvidence::Join(
+                kiko_slam::navigation::NanoFacePerceptionJoinEvidence::DetachedAfterTimeout {
+                    configured_timeout: std::time::Duration::from_secs(2),
+                    active_join_budget: std::time::Duration::from_millis(250),
+                },
+            ),
+        };
+        assert!(!detached.is_fully_healthy());
+        assert_eq!(
+            detached.face_problem_kind(),
+            Some(super::NanoFaceShutdownProblemKind::DetachedUncertain)
+        );
+        assert!(!detached.face_stage_stats_are_final());
+    }
+
     #[cfg(all(feature = "record", feature = "nano-agent", unix))]
     #[test]
     fn live_rgb_diagnostics_require_exact_tightly_packed_bgr8() {
@@ -14446,6 +15652,202 @@ mod tests {
         assert_eq!(
             super::validate_live_rgb_viz_layout(u32::MAX, 1, u32::MAX, 0),
             Err(super::LiveRgbVizBuildError::RowBytesOverflow { width: u32::MAX })
+        );
+    }
+
+    #[cfg(all(feature = "record", feature = "nano-agent", unix))]
+    #[test]
+    fn live_face_geometry_rejects_every_inexact_u32_to_f32_boundary() {
+        assert_eq!(
+            super::exact_u32_as_f32("coordinate", (1_u32 << 24) - 1),
+            Ok(((1_u32 << 24) - 1) as f32)
+        );
+        assert_eq!(
+            super::exact_u32_as_f32("coordinate", 1_u32 << 24),
+            Ok((1_u32 << 24) as f32)
+        );
+        assert_eq!(
+            super::exact_u32_as_f32("coordinate", (1_u32 << 24) + 1),
+            Err(
+                super::LiveFaceVizBuildError::PixelCoordinateUnrepresentable {
+                    field: "coordinate",
+                    value: (1_u32 << 24) + 1,
+                }
+            )
+        );
+        assert_eq!(
+            super::exact_u32_as_f32("coordinate", u32::MAX),
+            Err(
+                super::LiveFaceVizBuildError::PixelCoordinateUnrepresentable {
+                    field: "coordinate",
+                    value: u32::MAX,
+                }
+            )
+        );
+    }
+
+    #[cfg(all(feature = "record", feature = "nano-agent", unix))]
+    #[test]
+    fn live_face_overlay_join_requires_the_complete_rgb_provenance_key() {
+        let expected = super::LiveRgbFrameKey {
+            device_capture_sequence: 11,
+            host_delivery_sequence: 13,
+            device_timestamp_ns: 17,
+            timestamp_reference: super::CameraTimestampReference::ExposureMidpoint,
+            stream_epoch: 19,
+            width: 640,
+            height: 400,
+        };
+        assert_eq!(Some(expected), Some(expected));
+
+        let distinct = [
+            super::LiveRgbFrameKey {
+                device_capture_sequence: 12,
+                ..expected
+            },
+            super::LiveRgbFrameKey {
+                host_delivery_sequence: 14,
+                ..expected
+            },
+            super::LiveRgbFrameKey {
+                device_timestamp_ns: 18,
+                ..expected
+            },
+            super::LiveRgbFrameKey {
+                stream_epoch: 20,
+                ..expected
+            },
+            super::LiveRgbFrameKey {
+                width: 641,
+                ..expected
+            },
+            super::LiveRgbFrameKey {
+                height: 401,
+                ..expected
+            },
+        ];
+        for actual in distinct {
+            assert_ne!(
+                Some(expected),
+                Some(actual),
+                "a face result must never overlay a different RGB provenance key"
+            );
+        }
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn live_rerun_domain_switches_remove_every_sticky_foreign_timeline() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Value {
+            Time(i64),
+            Sequence(i64),
+        }
+
+        #[derive(Default)]
+        struct FakeTimelineTarget {
+            active: std::cell::RefCell<std::collections::BTreeMap<&'static str, Value>>,
+        }
+
+        impl super::LiveRerunTimelineTarget for FakeTimelineTarget {
+            fn reset_live_time(&self) {
+                self.active.borrow_mut().clear();
+            }
+
+            fn set_live_time(&self, timeline: &'static str, time: rerun::TimeCell) {
+                self.active
+                    .borrow_mut()
+                    .insert(timeline, Value::Time(time.as_i64()));
+            }
+
+            fn set_live_sequence(&self, timeline: &'static str, sequence: i64) {
+                self.active
+                    .borrow_mut()
+                    .insert(timeline, Value::Sequence(sequence));
+            }
+        }
+
+        fn active(target: &FakeTimelineTarget) -> std::collections::BTreeMap<&'static str, Value> {
+            target.active.borrow().clone()
+        }
+
+        let target = FakeTimelineTarget::default();
+        target
+            .active
+            .borrow_mut()
+            .insert("future_timeline", Value::Sequence(1));
+        super::apply_live_rerun_timeline_domain(
+            &target,
+            super::LiveRerunTimelineDomain::Navigation {
+                tick_sequence: 7,
+                host_timestamp_ns: Some(11),
+            },
+        )
+        .expect("navigation timeline is representable");
+        assert_eq!(
+            active(&target),
+            std::collections::BTreeMap::from([
+                ("navigation_host_ns", Value::Time(11)),
+                ("navigation_tick", Value::Sequence(7)),
+            ])
+        );
+
+        super::apply_live_rerun_timeline_domain(&target, super::LiveRerunTimelineDomain::Capture)
+            .expect("capture domain has no additional weak fields");
+        assert!(active(&target).is_empty());
+
+        super::apply_live_rerun_timeline_domain(
+            &target,
+            super::LiveRerunTimelineDomain::Rgb {
+                capture_timestamp_ns: 13,
+                device_capture_sequence: 17,
+                host_delivery_sequence: 19,
+            },
+        )
+        .expect("RGB timeline is representable");
+        assert_eq!(
+            active(&target),
+            std::collections::BTreeMap::from([
+                ("capture_ns", Value::Time(13)),
+                ("oak_rgb_capture_sequence", Value::Sequence(17)),
+                ("oak_rgb_host_delivery_sequence", Value::Sequence(19),),
+            ])
+        );
+
+        #[cfg(all(feature = "nano-agent", unix))]
+        {
+            super::apply_live_rerun_timeline_domain(
+                &target,
+                super::LiveRerunTimelineDomain::Face {
+                    capture_timestamp_ns: 19,
+                    device_capture_sequence: 23,
+                    host_delivery_sequence: 29,
+                    detector_result_sequence: 31,
+                },
+            )
+            .expect("face timeline is representable");
+            assert_eq!(
+                active(&target),
+                std::collections::BTreeMap::from([
+                    ("capture_ns", Value::Time(19)),
+                    ("face_detector_result_sequence", Value::Sequence(31),),
+                    ("oak_rgb_capture_sequence", Value::Sequence(23),),
+                    ("oak_rgb_host_delivery_sequence", Value::Sequence(29),),
+                ])
+            );
+        }
+
+        super::apply_live_rerun_timeline_domain(
+            &target,
+            super::LiveRerunTimelineDomain::Navigation {
+                tick_sequence: 37,
+                host_timestamp_ns: None,
+            },
+        )
+        .expect("navigation sequence alone is valid");
+        assert_eq!(
+            active(&target),
+            std::collections::BTreeMap::from([("navigation_tick", Value::Sequence(37),)])
         );
     }
 
@@ -16138,7 +17540,7 @@ mod tests {
             "--deployment-root",
             "/opt/kiko/deployment",
             "--launch-config",
-            "nano-agent-launch-v2.json",
+            "nano-agent-launch-v3.json",
             "--state-root",
             "/var/lib/kiko-nano-agent",
         ])
@@ -16147,7 +17549,7 @@ mod tests {
             panic!("expected Nano agent command");
         };
         assert_eq!(args.deployment_root, Path::new("/opt/kiko/deployment"));
-        assert_eq!(args.launch_config, "nano-agent-launch-v2.json");
+        assert_eq!(args.launch_config, "nano-agent-launch-v3.json");
         assert_eq!(args.state_root, Path::new("/var/lib/kiko-nano-agent"));
     }
 

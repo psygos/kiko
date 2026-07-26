@@ -24,9 +24,17 @@ nano-agent = [
     "actuation",
     "operator-console",
     "record",
+    "nano-face-perception",
     "dep:kiko-nano-deployment-gate",
     "dep:robot-server",
     "dep:rustix",
+]
+# Host-side OpenCV perception seam. Production `nano-agent` includes this
+# feature; it remains independently selectable for hardware-free/check-only
+# boundary tests.
+nano-face-perception = [
+    "agent-runtime",
+    "oak-sys/opencv-face-detector",
 ]
 # Manually invoked, wheels-off-only qualification surface. The production
 # deployment is built with `nano-agent` alone, so its exact binary contains no
