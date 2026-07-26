@@ -515,10 +515,12 @@ fn main() {
             println!("cargo:rustc-link-search=native={}", library.display());
         }
     }
+    // `cc` emits the static bridge link directive here. Its dynamic
+    // dependencies must follow it for one-pass GNU ld with `--as-needed`.
+    build.compile("oak_bridge");
     for directive in link_directives(inputs.target_os, inputs.opencv_face_detector) {
         println!("{directive}");
     }
-    build.compile("oak_bridge");
 }
 
 #[cfg(test)]
