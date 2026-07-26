@@ -109,6 +109,32 @@ ownership, head health, SLAM, or motion. The canonical handoff therefore still
 requires a fresh endpoint-by-endpoint owner check, a canonical SuperSpeed
 attempt, and exact live admission.
 
+### 2026-07-27 native and motor-inert refresh
+
+Exact source revision `9c9f3a9b92d7f610a2153129849e12863a2646c8`
+passed a real native Linux-aarch64 `nano-agent` all-target check, a
+native OpenCV 4.5.4 cascade construction/detection smoke test that opened no
+camera, and a release
+`nano-wheels-off-qualification` executable build. The 28,119,992-byte release
+ELF has SHA-256
+`0b58ca0f07392ff65af516c7d82fade87c770ab3e0845ea4f996da2d4ee8d2c4`;
+its target loader trace had no unresolved dependency under the audited build
+environment. The exact details and limitations are recorded in
+`docs/nano-integration-acceptance-2026-07-24.md`.
+
+A fresh byte-read-only STM32 identity probe found the motion-disabled KRP2
+image at ABI `2`, build `131074`, fingerprint `KIKO-NO-ACT-V1!!`,
+capabilities `319`, maximum PWM zero, and output disabled. Fresh schema-3
+transport runs passed 200/200 probes at 20 Hz and 500/500 at 50 Hz, with zero
+missing, duplicate, reordered, scheduler-skipped, queue-skipped, or
+period-late probes. This does not qualify the four-PWM candidate or any
+physical behavior.
+
+At the same refresh, the stale Fable guardian/child process family remained
+present and the child still held the head endpoint. The OAK remained on the
+480M USB2 tree while the 10000M USB3 tree had no OAK below it. No process was
+stopped and no camera was opened. Gate A therefore remains closed.
+
 ## Gate A: required before asking to attach wheels
 
 Passing this gate authorizes physical wheel attachment for an attended
@@ -119,8 +145,9 @@ remain disarmed.
 
 - [ ] Freeze an immutable, reviewable source revision and
       wheels-off/commissioning bundle.
-- [ ] Build that exact source natively on the Nano with its pinned native
-      dependencies; record source and binary identities.
+- [x] Build that exact source natively on the Nano with its pinned native
+      dependencies; record source and binary identities. Revision `9c9f3a9`
+      and the release ELF identity are recorded in the acceptance report.
 - [ ] Perform a coordinated handoff from every existing Fable device owner.
       Never start a second OAK, head, or eye owner and never use a broad
       process kill.

@@ -203,6 +203,100 @@ and the new startup logic executes on that Nano CPU/OS. It does not prove a
 native DepthAI link, device ownership, camera capture, serial traffic, timing,
 temperature, deployment, or actuation.
 
+### Native face, release-link, and inert-transport refresh — 2026-07-27
+
+The clean `/home/makerspace/kiko` checkout was advanced only by fast-forward
+on `codex/nano-expression-integration-stage`. A first real native
+`nano-agent` all-target check exposed that locked `cxx-build 1.0.194` silently
+omitted face declarations guarded by the hyphenated Cargo feature
+`opencv-face-detector`: Cargo exported
+`CARGO_FEATURE_OPENCV_FACE_DETECTOR`, while the CXX cfg evaluator compared the
+literal hyphenated spelling without normalizing hyphens to underscores. Host
+`OAK_SYS_CHECK_ONLY=1` runs could not expose the missing generated C++ types.
+
+Revision `98e75eed48860a45b590260acdab1fbbb346e1a4` split the detector into a
+feature-selected CXX bridge generated from the already parsed build input. On
+Linux aarch64, the exact native
+
+```text
+cargo check --locked -p kiko-slam --no-default-features \
+  --features nano-agent --all-targets
+```
+
+then completed in 1 minute 45 seconds against the installed DepthAI source
+and OpenCV 4.5.4 headers. The generated detector header contained the
+configuration, source enum, detection, batch, and opaque detector types; its
+generated source contained both constructor and detection call wrappers.
+
+The follow-up native smoke test linked the test executable, which exposed a
+second boundary that `cargo check` cannot test: `cc` had emitted the static
+bridge after its dynamic dependencies, so GNU ld with `--as-needed` discarded
+OpenCV before later bridge references appeared. Final revision
+`9c9f3a9b92d7f610a2153129849e12863a2646c8` emits the static bridge first and
+DepthAI, USB, and OpenCV dependencies afterward.
+
+At that exact revision, the explicit ignored native test
+`native_haar_detector_loads_cascades_and_detects_a_blank_frame` passed. It
+read, bounded, and parsed these exact installed payloads into C++-owned
+classifiers, then processed one blank 160 by 120 tightly packed BGR frame:
+
+| Cascade | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `haarcascade_frontalface_default.xml` | 930,127 | `0f7d4527844eb514d4a4948e822da90fbb16a34a0bbbbc6adc6498747a5aafb0` |
+| `haarcascade_profileface.xml` | 828,514 | `b39a4a3be45539db146a7fc1d3e761a292c196eb88421185e6a615b3055e612d` |
+
+The native detector call itself returned successfully in 0.06 seconds with
+zero detections on the blank image. That is a functional constructor,
+linkage, and call-boundary smoke test. It is not a detector latency
+measurement, an accuracy result, evidence about a real RGB frame, or a
+performance claim. It opened no OAK device.
+
+The exact release wheels-off executable was then built natively with the
+lockfile and
+`--features nano-wheels-off-qualification --bin kiko-slam`. The build
+completed in 7 minutes 10 seconds. The resulting aarch64 PIE was 28,119,992
+bytes with SHA-256
+`0b58ca0f07392ff65af516c7d82fade87c770ab3e0845ea4f996da2d4ee8d2c4`.
+Its direct non-system `DT_NEEDED` entries included
+`libdepthai-core.so`, `libusb-1.0.so.0`,
+`libopencv_objdetect.so.4.5d`, `libopencv_imgproc.so.4.5d`, and
+`libopencv_core.so.4.5d`. A target `ldd` run with the audited DepthAI build
+directory first in `LD_LIBRARY_PATH` reported no unresolved entry. This
+qualifies the observed build-tree link, not an immutable `/opt/kiko`
+installation or the larger transitive OS ABI closure.
+
+The same refresh found the exact STM32 endpoint unowned and performed one
+byte-read-only identity observation. It reported UID
+`2c0018001750314242353320`, boot ID `12638770094519703627`, ABI `2`, build
+`131074`, fingerprint `KIKO-NO-ACT-V1!!`, capability bits `319`, maximum PWM
+zero, output disabled, and unverified physical-stop semantics. It grants no
+motion authority.
+
+Fresh schema-3 motor-inert qualification then passed at both baseline rates:
+
+| Rate | Reports | Missing/duplicate/reordered/skipped/late | Maximum diagnostic RTT |
+| ---: | ---: | --- | ---: |
+| 20 Hz | 200/200 | all zero | 19.348572 ms |
+| 50 Hz | 500/500 | all zero | 18.550369 ms |
+
+Both runs admitted the exact identity through a nonce-bound freshness
+challenge, retained final idle-safe heartbeat evidence, and reported maximum
+host writer in-flight count one. They measure only this diagnostic traffic;
+they do not prove motion-capable streaming, motor current, a physical stop,
+or a performance improvement. The mode-`0700` Nano evidence root is
+`/home/makerspace/kiko-hardware-evidence/20260727T034913IST-9c9f3a9-native-refresh`.
+The identity, 20 Hz, and 50 Hz JSON SHA-256 values are respectively
+`ec5a135a726ce53b852928f963ebc28948fa3a4ba2e8ed89b95ec60fe12c22ab`,
+`600bb59010ea1a792656ada772f9707f01c85d7c4876ef394ac14ebff62a2be9`,
+and
+`8f4fd2eae085ece5ffdfa745b125f92fb6d64c7477e9ef9c9b5c65382c50a2ad`.
+
+These results close the source-native-build, detector-boundary, release-link,
+and refreshed motor-inert transport portions of Gate A. They do not close the
+coordinated Fable handoff, OAK SuperSpeed/live-stream admission, head thermal
+and hold evidence, candidate firmware/zero/sign/fault matrix, immutable
+qualification bundle, live SLAM/occupancy/Rerun, or console checks.
+
 ## Live Nano evidence preserved
 
 The July 24 read-only Nano audit found:
