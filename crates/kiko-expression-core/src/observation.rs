@@ -235,8 +235,14 @@ impl fmt::Display for ImageLayoutError {
 
 impl core::error::Error for ImageLayoutError {}
 
-/// A normalized image coordinate: `x=0` is left, `x=1` is right, `y=0` is
-/// top, and `y=1` is bottom.
+/// A normalized continuous image-plane coordinate.
+///
+/// `x=0` and `x=1` are the left and right image edges; `y=0` and `y=1` are
+/// the top and bottom edges. Therefore the centre of integer pixel `(x, y)`
+/// in a `width` by `height` image is `((x + 0.5) / width,
+/// (y + 0.5) / height)`. Producers must not instead divide integer pixel
+/// indices by `extent - 1`, because that gives the same type a different
+/// geometric meaning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ImagePoint {
     x_right: UnitAmount,

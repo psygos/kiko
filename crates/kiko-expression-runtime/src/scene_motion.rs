@@ -660,12 +660,12 @@ fn minimum_active_samples(sample_count: usize, fraction: PositiveUnitAmount) -> 
 }
 
 fn normalized_centroid(weighted: u128, weight_sum: u64, extent: u32) -> UnitAmount {
-    if extent == 1 {
-        return UnitAmount::try_from_basis_points(5_000).expect("image centre is in range");
-    }
-    let denominator = u128::from(weight_sum) * u128::from(extent - 1);
-    let basis_points = rounded_ratio_u128(weighted * u128::from(CORE_UNIT_SCALE), denominator)
-        .min(CORE_UNIT_SCALE);
+    // `weighted` contains integer pixel indices. ImagePoint uses continuous
+    // image-edge coordinates, so add half a pixel before dividing by the full
+    // extent. Keeping the factor of two makes the half-pixel exact.
+    let numerator = (weighted * 2 + u128::from(weight_sum)) * u128::from(CORE_UNIT_SCALE);
+    let denominator = u128::from(weight_sum) * u128::from(extent) * 2;
+    let basis_points = rounded_ratio_u128(numerator, denominator).min(CORE_UNIT_SCALE);
     UnitAmount::try_from_basis_points(
         u16::try_from(basis_points).expect("normalized centroid fits u16"),
     )
@@ -922,9 +922,17 @@ mod tests {
             panic!("localized delta must be motion");
         };
         let motion = observation.motion().expect("motion value");
-        assert_eq!(motion.center().x_right().basis_points(), 10_000);
-        assert_eq!(motion.center().y_down().basis_points(), 0);
+        assert_eq!(motion.center().x_right().basis_points(), 8_333);
+        assert_eq!(motion.center().y_down().basis_points(), 1_667);
         assert!(motion.strength().basis_points() > 0);
+    }
+
+    #[test]
+    fn normalized_centroid_uses_continuous_pixel_centres() {
+        assert_eq!(normalized_centroid(0, 1, 1).basis_points(), 5_000);
+        assert_eq!(normalized_centroid(0, 1, 4).basis_points(), 1_250);
+        assert_eq!(normalized_centroid(3, 1, 4).basis_points(), 8_750);
+        assert_eq!(normalized_centroid(3, 2, 4).basis_points(), 5_000);
     }
 
     #[test]

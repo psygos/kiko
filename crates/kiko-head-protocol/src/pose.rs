@@ -127,6 +127,20 @@ pub struct ExactHeadTargetPose {
 }
 
 impl ExactHeadTargetPose {
+    /// Construct an exact target from positions that have already crossed the
+    /// protocol tick boundary. Naming every joint avoids an implicit array
+    /// order while preserving the `0..=4095` invariant of [`PositionTicks`].
+    pub const fn from_positions(
+        bow: PositionTicks,
+        curl: PositionTicks,
+        yaw: PositionTicks,
+        roll: PositionTicks,
+    ) -> Self {
+        Self {
+            positions: [bow, curl, yaw, roll],
+        }
+    }
+
     pub fn try_from_ticks(ticks: [u16; 4]) -> Result<Self, ExactHeadTargetPoseError> {
         let mut positions = [PositionTicks::MIN; 4];
         for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {

@@ -4,6 +4,7 @@
 mod actor;
 mod config;
 mod framing;
+pub mod gaze_control;
 mod motion;
 mod probe;
 mod transport;

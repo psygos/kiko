@@ -1,9 +1,11 @@
 //! Transport-independent host boundary for Kiko's expression pipeline.
 //!
-//! This crate owns four narrow responsibilities:
+//! This crate owns five narrow responsibilities:
 //!
 //! - deterministic scene-motion extraction from an already checked, borrowed
 //!   RGB frame;
+//! - bounded, confidence-free face-target association from typed detector
+//!   results;
 //! - typed, transport-free OAK-camera to neutral-head gaze geometry;
 //! - an exact semantic and numeric mapping from expression-core eye values to
 //!   the KEP2 eye protocol; and
@@ -17,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod face_tracking;
 mod gaze_geometry;
 mod scene_motion;
 mod session;
@@ -24,6 +27,18 @@ mod session;
 pub use adapter::{
     AdaptError, EyeRenderStyle, PreparedEyeIntent, adapt_eye_intention, adapt_reaction_output,
     map_expression,
+};
+pub use face_tracking::{
+    AcquiringFaceTarget, CloserFaceWidthRatio, CoastingFaceTarget, ConsecutiveFaceResults,
+    DEFAULT_FACE_ACQUISITION_DISTANCE_PX, DEFAULT_FACE_ACQUISITION_RESULTS,
+    DEFAULT_FACE_ASSOCIATION_DISTANCE_PX, DEFAULT_FACE_COASTING_DURATION_NS,
+    DEFAULT_FACE_SMOOTHING_ALPHA_BASIS_POINTS, DEFAULT_FACE_SWITCH_RESULTS, DetectorLevelWeight,
+    DetectorResultSequence, FaceCoastingDuration, FaceDetection, FaceDetectionBatch,
+    FaceDetectionBatchError, FaceDetectionError, FaceDetectorSource, FacePixelDistance,
+    FaceRectangle, FaceResultAdmission, FaceTargetState, FaceTracker, FaceTrackingConfig,
+    FaceTrackingConfigError, FaceTrackingError, FaceTrackingUpdate, LostFaceTarget,
+    MAX_CLOSER_FACE_WIDTH_RATIO, MAX_FACE_COASTING_DURATION_NS, MAX_FACE_CONSECUTIVE_RESULTS,
+    MAX_FACE_DETECTIONS, MAX_FACE_PIXEL_DISTANCE_PX, SwitchedFaceTarget, TrackedFaceObservation,
 };
 pub use gaze_geometry::{
     CameraForwardDepthMeters, CameraGazeTargetError, CameraToHeadGazeExtrinsics,
