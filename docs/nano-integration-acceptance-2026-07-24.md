@@ -8,19 +8,21 @@ head/eye behavior, live SLAM and geometric occupancy, a unified browser/agent
 control plane, bounded map and dataset persistence, attended wheels-off
 qualification, and attended wheel-on identification.
 
-The wheel-attach handoff remains **closed**. This is not a test failure hidden
-behind a warning. Under the currently evidenced PA0/PA1 plus PB4/PB5 four-PWM
-wiring, the repository has no known default-off external driver-enable line
-and no driver-fault/E-stop feedback input. The production controller contract
-therefore cannot truthfully advertise
-`production_external_interlocks`. The checked-in STM32 images intentionally
-remain motor-inert, wheels-off candidate, or attended wheel-on commissioning
-images.
+The attended calibration-only wheel-attach handoff remains **closed** until
+Gate A in `docs/nano-wheel-attach-gate-2026-07-23.md` has fresh Nano evidence.
+That gate requires the coordinated device handoff, canonical SuperSpeed OAK
+graph, exact-zero candidate, accessories, live SLAM/occupancy/Rerun, unified
+console, wheels-off commands/faults, and an independently tested reachable
+motor-power cut. Passing it authorizes attachment and the separate attended
+commissioning executable only.
 
-The repository must not claim production MPC motion, a physical emergency
-stop, or permission to attach the wheels until the physical interlock wiring
-and independent power cut are reviewed and implemented. Host code does not
-replace those facts with a boolean, prompt, or manifest claim.
+Production motion is a second, stricter gate. Under the evidenced PA0/PA1 plus
+PB4/PB5 four-PWM wiring, the repository has no known default-off external
+driver-enable line and no driver-fault/E-stop feedback input. The production
+controller contract therefore cannot truthfully advertise
+`production_external_interlocks`. Host code does not replace physical wiring,
+reviewed commissioning evidence, or an independent cut with a boolean, prompt,
+or manifest claim.
 
 ## Delivered software
 
@@ -50,8 +52,9 @@ replace those facts with a boolean, prompt, or manifest claim.
 - The STM32 KRP2 path has bounded UART work, record-preserving transmit queues,
   reserved stop/applied-result capacity, priority/coalesced host stop, exact
   acknowledgements, deadline/watchdog enforcement, and measured-evidence
-  fields. The intended 50 Hz rate is a declared software schedule, not a
-  measured Nano/STM32 performance claim.
+  fields. The motor-inert diagnostic transport was measured at 20 Hz and
+  50 Hz on the Nano; the motion-capable production command path and end-to-end
+  MPC loop were not measured.
 - Map finalization is a terminal, causal drain. The selected manifest and
   occupancy bytes are descriptor-bound, checksummed, quota-bounded, and
   replayed only as an exact warm-start candidate. A loaded map never claims
@@ -67,8 +70,9 @@ replace those facts with a boolean, prompt, or manifest claim.
 
 ## Verification evidence
 
-The broad frozen-tree matrix completed before the final sensor-freshness
-hardening:
+The following historical frozen-tree matrix completed before the final
+sensor-freshness hardening and before mandatory launch-V3 face perception.
+Its counts are retained as provenance; they are not current V3-tree evidence:
 
 | Graph | Evidence |
 | --- | --- |
@@ -102,6 +106,78 @@ After the final freshness hardening:
   and `git diff --check` passed;
 - the complete offline cold-boot/fault acceptance script passed again.
 
+At transport-evidence closure on exact pre-V3 revision `35adc90`:
+
+- the exact production `nano-agent` graph passed 1,331 library tests, 6
+  deployment-qualifier binary tests, 69 production binary tests, and 1
+  compile-fail doctest;
+- the complete production, wheels-off, and wheel-on attended feature union
+  passed 1,392 library tests, 3 base-commission binary tests, 6 deployment
+  qualifier tests, 71 Kiko binary tests, and 1 compile-fail doctest;
+- strict all-target Clippy passed for that complete feature union with
+  `-D warnings`;
+- the operator-console JavaScript syntax and view-model test passed; and
+- the complete offline cold-boot/fault acceptance script again returned
+  `acceptance_result=pass`.
+
+### Post-V3 host validation — 2026-07-27
+
+The mandatory face/head/lifecycle tree was frozen for host validation at exact
+source revision
+`de6c8626e0e69fbcfadd2b1db7ec68635d3c0bb2`. The following are separate
+results; they are not added into a synthetic aggregate:
+
+- `OAK_SYS_CHECK_ONLY=1 cargo test --locked -p kiko-slam
+  --no-default-features --features nano-agent --lib` passed 1,387/1,387;
+- the same production graph with `--bin kiko-slam` passed 75/75;
+- the complete
+  `nano-agent,nano-base-commissioning,nano-wheels-off-qualification` union,
+  filtered to `navigation::nano_base_commissioning_live::tests`, passed 5/5;
+- `OAK_SYS_CHECK_ONLY=1 cargo test --locked -p oak-sys
+  --features opencv-face-detector` passed 33/33;
+- expression core passed 15/15, expression runtime 61/61, head protocol
+  17/17, head runtime 72/72, the head commissioning binary 9/9, bundle
+  renderer 16/16, and deployment gate 6/6;
+- focused lifecycle reruns passed 45/45 accessory-worker tests and 24/24
+  Nano-bootstrap tests; these are subsets of the production library result,
+  not additional tests; and
+- formatting, `git diff --check`, locked metadata, and the final independent
+  lifecycle/scope/documentation audits passed.
+
+Strict all-target Clippy with `-D warnings` passed separately for:
+
+1. standalone `nano-face-perception`;
+2. `nano-base-commissioning`;
+3. production `nano-agent`; and
+4. the complete attended feature union above.
+
+Every host OAK run used `OAK_SYS_CHECK_ONLY=1`. This proves the Rust/C++ build
+boundary, typed parsing, deterministic face/tracker logic, supervised
+lifecycle, and launch/deployment contracts on the macOS host. It does not
+prove native OpenCV cascade construction on the Nano, OAK frame delivery,
+detector accuracy or latency, USB SuperSpeed, head motion, STM32 motion, SLAM
+accuracy, MPC tracking, or a performance improvement.
+
+The exact candidate and attended wheel-on STM32 feature sets also passed
+strict target Clippy and release compilation for
+`thumbv7em-none-eabihf`. With the source root remapped to `/kiko-source`, the
+local release ELF SHA-256 values were:
+
+| Firmware class | Feature identity | ELF SHA-256 |
+| --- | --- | --- |
+| wheels-off candidate | `firmware,flash-boot-journal,operator-supervised-four-pwm-candidate` | `5670fb523a1221b6d3d73856d26798f2087345b0c7be56ecff3c1b3cb57f0adb` |
+| attended wheel-on commissioning | `firmware,flash-boot-journal,attended-wheel-on-commissioning` | `7404673b9cf65539f58afe6f718113a29567ab9db6b1b8726c04fa3573a8db24` |
+
+These are local compile identities, not independently reproduced Nano builds,
+flash images, installed identities, or physical qualification.
+
+The first production test invocation ran inside a restricted filesystem
+sandbox and its 23 real-socket tests failed only because local bind returned
+`Operation not permitted`. The exact graph was rerun with ordinary
+loopback/Unix-socket permission and passed completely. All OAK host checks used
+`OAK_SYS_CHECK_ONLY=1`; this is source and host-runtime evidence, not native
+camera evidence.
+
 The offline acceptance script exercised strict launch and marker admission,
 map/session identity replacement, bounded storage and exact quota boundaries,
 terminal map publication order, private per-boot console capability handling,
@@ -129,7 +205,7 @@ temperature, deployment, or actuation.
 
 ## Live Nano evidence preserved
 
-The read-only Nano audit found:
+The July 24 read-only Nano audit found:
 
 - the Fable guardian still running and owning the head/eye/OAK lifecycle;
 - the Fable dirty worktree preserved on
@@ -138,8 +214,8 @@ The read-only Nano audit found:
   detached at the exact pushed integration revision above;
 - the STM32 serial endpoint present but emitting legacy ASCII `ODO,...`
   telemetry rather than KRP2;
-- the OAK currently opened by Fable in forced USB High-Speed mode, so its
-  observed 480 Mbit/s link is not a valid SuperSpeed failure diagnosis;
+- the OAK then opened by Fable in forced USB High-Speed mode, so its observed
+  480 Mbit/s link was not a valid SuperSpeed failure diagnosis;
 - no installed canonical Kiko service or immutable `/opt/kiko` deployment.
 
 At `2026-07-24T07:15:10+05:30`, while the compile-only build was running, the
@@ -158,6 +234,46 @@ means the first fault must not be explained away as build-resource pressure.
 It still does not identify the physical or electrical cause. The head remains
 unqualified and requires attended support, independent power control, and
 read-only thermal/electrical diagnosis before any ownership handoff.
+
+At `2026-07-24T21:28:07+05:30`, a later read-only audit counted 35
+`bow overtemp` reports in `/tmp/follow-track.log` and 38 guardian respawns
+since `19:40` in `/tmp/engine-guardian.log`. Recent raw fault values included
+`84`, `150`, `98`, `150`, `142`, `68`, `93`, and `74`; each was followed by an
+OAK `X_LINK_ERROR` and a guardian restart. Fresh admissions repeatedly
+reported raw temperatures around `35` to `38`. The then-current child,
+PID `8797`, had run for about 21 minutes and was reporting normal
+`head=TRACKING eyes=SLEEPY person=False` state. That stable interval does not
+clear the recurrent fault. The temperature register read checks servo ID,
+length, and checksum, but this evidence still cannot distinguish physical
+heating from an electrical, telemetry, or servo fault. No owner was disturbed
+to collect it.
+
+A still later read-only audit on `2026-07-26` superseded any inference that
+the standalone Fable child remained healthy. Guardian PIDs `1062` and `1081`
+still supervised child PID `14807`
+(`python3 kiko_face_follow.py --duration-s 864000`), but the last child log
+entry was from `2026-07-24T23:00:08+05:30`: admission reported bow raw
+temperature `33`, the next sample reported `bow overtemp 82`, and the log then
+stopped after `park_begin` and an OAK `X_LINK_ERROR`, without a completed park
+or shutdown receipt. The child still held `/dev/ttyACM1` for the head adapter,
+but held neither the eye endpoint nor a visible OAK descriptor. Its main
+thread was waiting on a futex while an XLink thread remained present. That
+evidence proves neither the exact blocking call nor the physical meaning of
+the raw temperature value; it does prove that process liveness and the
+guardian's `pgrep` check were not sufficient health evidence. No process or
+device owner was stopped, restarted, or displaced during this audit.
+
+A `2026-07-27` read-only refresh found the same guardian/child process family
+active and the child still holding the head endpoint. It did not establish a
+then-current OAK or eye process owner. OAK MXID `19443010F1B43A2E00`
+enumerated at `480M` on the USB2 tree; the separate `10000M` USB3 tree had no
+OAK beneath it. `/opt/kiko` and `kiko-nano-agent.service` were absent.
+`/home/makerspace/kiko` was clean at
+`482023e0fa69c381cb5d5946c445234a0ae88105` on
+`codex/jetson-hardware-validation`. No process, device, firmware, service, or
+file was changed by that refresh. These facts require a fresh
+endpoint-by-endpoint ownership check and a canonical SuperSpeed attempt; they
+do not requalify the stale Fable child, camera, accessories, STM32, or SLAM.
 
 No process was killed, no live device owner was deliberately displaced, and no
 firmware, installed service, or deployment file was changed. The only Nano
@@ -546,13 +662,13 @@ freshness-boundary defect demonstrated by that revision, and no ST-Link
 firmware update was attempted. The exact offline-analysis artifact hash is
 `1d401a71b552a19f750428ff756aa0e9bf32bbabd394aba5947740334a363331`.
 
-The current worktree now implements this host-side correction, but it has not
-yet been qualified on the Nano. After the one-time host input clear, the
-qualifier accounts for and raw-discards every byte delivered during a fixed
-1,000 ms quarantine, discards through one subsequent zero delimiter, and
-starts strict decoding at that known record boundary. The exact motor-inert
-Hello and idle-safe Heartbeat observed next are candidate-selection evidence
-only; they do not establish freshness or permit a control session or PWM.
+Commits `6b02fe7`, `b0f0022`, `5f19954`, and `35adc90` implement and harden
+the host-side correction. After the one-time host input clear, the qualifier
+accounts for and raw-discards every byte delivered during a fixed 1,000 ms
+quarantine, discards through one subsequent zero delimiter, and starts strict
+decoding at that known record boundary. The exact motor-inert Hello and
+idle-safe Heartbeat observed next are candidate-selection evidence only; they
+do not establish freshness or permit a control session or PWM.
 
 Before any measured diagnostic probe, the qualifier generates a fresh
 entropy-derived run ID and writes at most three motor-inert challenges,
@@ -570,37 +686,117 @@ buffer is empty.
 Strict post-boundary decode failures remain terminal. Successfully written
 challenge tuples are included in success evidence and in typed strict-decode
 failure evidence, but the process does not durably journal a tuple before its
-serial write. The next evidence step is therefore a fresh
-motor-power-disconnected Nano build and 20/50 Hz qualification under the
-explicitly recorded Fable coexistence load. A remaining post-boundary
-corruption would justify direct STM32 USART2 TX or equivalent halted-RAM
-accepted-byte evidence.
+serial write.
 
-## Exact remaining gate
+## Successful motor-inert transport qualification
 
-Before the wheel-attach sentence is allowed:
+The correction was built natively on the Nano from exact source revision
+`35adc901e50d0ccb893c66582238bea438e86f97`. The release
+`v2_transport_qualify` binary had SHA-256
+`eef7f4feb7ae2ec67e4a6ad067b61b12fefef92546043e03dcc45332dd3485c5`.
+All 40 focused qualifier tests passed on Linux aarch64 before the live runs.
 
-1. review the motor-driver wiring and select real default-off enable,
-   driver-fault/E-stop-feedback pins, voltage levels, and active polarities;
-2. ensure an independent physical emergency cut removes motor power outside
-   Jetson and STM32 control;
-3. add and review the uniquely identified production four-PWM firmware
-   profile, sampling real fault-clear state rather than deriving it from a
-   capability class;
-4. add the explicit promotion boundary that consumes completed commissioning
-   evidence, repeated-run consistency, wiring/stop qualification, approver
-   identity, and the flashed production STM32 identity before emitting the
-   active plant/controller bundle;
-5. coordinate the exact Fable handoff with the head supported; never use broad
-   process killing;
-6. flash and admit KRP2, prove exact zero, run motor-inert 20/50 Hz transport
-   qualification, then complete the attended wheels-off fault matrix;
-7. prove canonical SuperSpeed OAK, RGB expression, natural head hold, live
-   SLAM/occupancy/Rerun, console ownership, and cleanup on the Nano.
+Before the successful runs, the controller reported a latched
+`SERIAL_INTEGRITY` fault. An exact-target OpenOCD invocation selected ST-Link
+serial `066EFF313946303143221230`, connected under reset, issued `reset run`,
+and exited zero. It did not write flash. The reset evidence is retained at
+`/home/makerspace/kiko-hardware-evidence/20260724T210706IST-5f19954-reset-schema3-fable-load`.
+The reset stderr and status SHA-256 values are respectively
+`27e7b9beed726b30648644a34cc18ee6063c461e590e940173bfe54bcf0a4785`
+and
+`9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa`.
+The following schema-3 freshness admission, rather than a passive identity
+read, is the evidence that the controller was live and fault-clear.
 
-Only then may wheel-on commissioning measure visual forward velocity and
-calibrated IMU yaw, fit the encoderless left/right plants, qualify stopping
-behavior, bind the approved plant, and tune MPC inside measured support.
+Two fresh, separate qualifier processes then passed:
+
+| Rate | Evidence directory | Run ID | Reports | Maximum diagnostic RTT | Maximum host Heartbeat gap |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 20 Hz | `/home/makerspace/kiko-hardware-evidence/20260724T211051IST-35adc90-schema3-20hz-fable-load` | `6951038622635299946` | 200/200 | 17.939749 ms | 255.004196 ms |
+| 50 Hz | `/home/makerspace/kiko-hardware-evidence/20260724T211135IST-35adc90-schema3-50hz-fable-load` | `6814291295675353613` | 500/500 | 17.937019 ms | 258.822044 ms |
+
+Both runs used one challenge attempt after discarding 563 quarantine bytes and
+59 boundary-alignment bytes. Both had zero missing, duplicate, reordered,
+scheduler-skipped, in-flight-skipped, writer-queue-skipped, or period-late
+probes. Maximum observed in-flight work was one. Controller receive queue
+depth was always zero; maximum pre-response transmit queue depth was 45 bytes.
+Maximum decoded controller service time was 1 ms. The final idle-safe
+Heartbeat was observed after the last write. The checked-in schema-3 verifier
+returned `qualified` for both JSON files.
+
+The 20 Hz JSON, empty stderr, and zero-status SHA-256 values are
+`93ae596a2828263961b87f877adc7ae40f3b05a66dce57b89aedf6b0b2124d4e`,
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+and
+`9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa`.
+The corresponding 50 Hz values are
+`ad50a66153b51e19808abc78e43828e512ff940ed60d05b143f93a0584843134`,
+the same empty-file hash, and the same zero-status hash.
+
+Fable remained running throughout. Its before/after process snapshots were
+byte-identical at SHA-256
+`2ec644b1d0c25a85f635a549873a34b05d772596a13045ce31725d55e0bd7a3a`;
+the serial-owner snapshots were byte-identical at
+`63c07d03922575aea5d104ede88026c9f0ddc9b83fdc7f37b32524cde4356e82`.
+Fable owned the head and eye endpoints while the qualifier exclusively opened
+the otherwise unowned STM32 VCP. This proves coexistence for this
+motor-inert diagnostic workload, not shared OAK ownership or production
+runtime coexistence.
+
+Motor power was operator-reported, not independently instrumented, to remain
+disconnected. The successful runs created no control session and sent no PWM.
+They qualify the invocation-bound diagnostic transport at the measured rates;
+they do not prove motor output, candidate/production command handling, a
+performance improvement, or any physical stop behavior.
+
+## Exact remaining gates
+
+The wheel-attachment gate and production-motion gate are deliberately
+separate. Requiring an approved production plant before attaching wheels would
+be circular because the encoderless plant must be measured with the wheels on
+the floor.
+
+Before the attended calibration-only wheel-attachment sentence is allowed:
+
+1. ensure an independent, immediately reachable physical cut removes motor
+   power outside Jetson and STM32 control, and keep it open while the wheels
+   are attached;
+2. diagnose the recurrent historical Fable `bow overtemp` reports, then
+   coordinate an endpoint-by-endpoint Fable handoff with the head supported;
+   never use broad process killing or start a second OAK/head/eye owner;
+3. provision and read back the boot journal, flash and admit the exact
+   operator-supervised wheels-off candidate, prove exact applied zero, and
+   complete its attended command/fault matrix. The separate motor-inert 20/50
+   Hz diagnostic transport gate is already complete;
+4. capture and bind the exact live OAK calibration and the shadow-only inputs
+   required for the immutable wheels-off/commissioning bundle. A historically
+   prepared boot-journal image is not evidence that it was provisioned or read
+   back;
+5. prove canonical SuperSpeed OAK, natural head hold, RGB eye behavior, live
+   SLAM/occupancy/Rerun, single console ownership, and coordinated cleanup on
+   the Nano; and
+6. with wheels still absent, prove the bounded shaft-sign commands and
+   re-confirm disarmed applied zero immediately before the handoff.
+
+After those items, wheel attachment authorizes only the separately invoked,
+attended `kiko-nano-base-commission` schedule. It may measure visual forward
+velocity, calibrated IMU yaw, unequal left/right plants, wheelbase, and
+low-speed stopping, then emit a non-activatable proposal.
+
+Production motion remains closed until a distinct promotion review:
+
+1. reviews motor-driver wiring and real default-off enable,
+   driver-fault/E-stop-feedback pins, voltage levels, active polarities,
+   reset/brownout behavior, and physical stop semantics;
+2. admits a uniquely identified production four-PWM firmware profile that
+   samples real fault-clear state;
+3. consumes accepted commissioning evidence, repeated-run consistency,
+   wiring/stop qualification, approver identity, exact plant bytes, and the
+   flashed production STM32 identity;
+4. emits and verifies the immutable active plant/controller bundle and
+   qualified-only service enablement; and
+5. qualifies production deadman, fault stops, obstacle stops, and MPC only
+   inside the measured support envelope.
 
 ## Residual software limits
 

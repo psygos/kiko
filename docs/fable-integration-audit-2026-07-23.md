@@ -33,6 +33,44 @@ The most recent read-only copies of the Nano prototype had these identities:
 The current face-follow hash differs from some historical report copies. The
 hash above is authoritative only for the file inspected during this audit.
 
+At `2026-07-26T20:27:26+05:30`, a fresh read-only Nano check established the
+prototype's exact classifier inputs. Python OpenCV `4.13.0` resolved
+`cv2.data.haarcascades` to
+`/home/makerspace/.local/lib/python3.10/site-packages/cv2/data/`; the two
+user-owned mode-`0664` files were:
+
+| Classifier | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `haarcascade_frontalface_default.xml` | 930,127 | `0f7d4527844eb514d4a4948e822da90fbb16a34a0bbbbc6adc6498747a5aafb0` |
+| `haarcascade_profileface.xml` | 828,514 | `b39a4a3be45539db146a7fc1d3e761a292c196eb88421185e6a615b3055e612d` |
+
+The Nano's native C++ OpenCV development package reported `4.5.4` with
+`/usr/include/opencv4`. A C++17 probe read the two exact files above into
+memory, opened each with `FileStorage(READ | MEMORY)`, selected the first
+top-level `cascade` node, and obtained `read=true` with a nonempty classifier
+for both. This proves native parser acceptance of those exact current bytes,
+not detector-output equivalence, full `oak-sys` linkage, camera behavior, or
+runtime latency. Production must copy exact reviewed classifier bytes into the
+deployment, bind their sizes and digests, retain those verified bytes, and
+pass the retained buffers directly to the in-memory native constructor; the
+mutable per-user files are not production assets.
+
+A second read-only source inspection on `2026-07-26` retained the prototype's
+exact search policy instead of inferring it from the classifier names:
+
+- convert BGR to grayscale and equalize the histogram once;
+- search frontal faces first with `scaleFactor=1.15`,
+  `minNeighbors=6`, and `minSize=(30,30)`;
+- only when that result is empty, search profile faces with the same scale and
+  size but `minNeighbors=4`;
+- only when that is also empty, run the same profile search on a horizontal
+  mirror and map each rectangle back into the original image grid.
+
+Those are algorithm inputs, not a detector-quality or latency claim. The
+prototype used Python's `detectMultiScale` rectangle output and selected by
+apparent width. OpenCV's optional cascade level weight is an arbitrary finite
+ranking value, not a calibrated probability or person-confidence value.
+
 ## Evidence retained
 
 Artifact-backed or bounded historical evidence includes:
@@ -68,8 +106,8 @@ and positive Z is forward, so the configured translation
 
 The following remain heuristics or proposals:
 
-- Haar frontal/profile face detection and range inferred from an assumed
-  0.16 m face width;
+- Haar frontal/profile face detection;
+- range inferred from an assumed 0.16 m face width;
 - prototype servo gains, signs, offsets, and permissive windows;
 - ALIVENESS, DIRECTOR, and MIND CPU, timing, ODE, person-pipeline, residual
   network, and dynamics numbers;
@@ -90,7 +128,7 @@ The following remain heuristics or proposals:
 | Person attention | product intent and graceful loss behavior | typed frame/freshness/depth/association observations | assumed-face-width ranging as navigation or safety evidence |
 | Guardian | start expressions with the robot and preserve tension continuity | one least-privilege systemd lifecycle with readiness and coordinated handoff | `pgrep`, blind respawn, long-duration shell loops |
 | Dashboard | arrow/WASD UX, 150 ms browser lease, stop on release/blur/hide/disconnect, receipt visibility | a local adapter to the typed control socket | raw/legacy PWM, public unauthenticated binding, HTTP 202 as applied evidence |
-| Motor owner | exclusive owner intent, finite messages, monotonic receipt sequence, disconnect stop | KRP2 V2 `robot-server` and exact applied receipts | ASCII `CMD`/`PWM`, swallowed stop errors, inconsistent 10/20 percent claims |
+| Motor owner | exclusive owner intent, finite messages, monotonic receipt sequence, disconnect stop | canonical in-process KRP2 V2 STM32 owner and exact applied receipts | standalone production motor service, ASCII `CMD`/`PWM`, swallowed stop errors, inconsistent 10/20 percent claims |
 | Layering | one mixer and “director proposes; safety engine disposes” | versioned typed policy and deterministic engine layers | DWA/pure-pursuit bypasses, guessed dynamics, unsupported CPU/latency claims |
 | Recovery/flashing | provenance and operator procedure history | reproducible source-controlled build/install procedure | auto-flash, servo-ID assignment, `pkill -9`, or reset actions in the runtime |
 | Copied build/media trees | no runtime content | pinned canonical dependencies and selected reviewed assets | `target`, `node_modules`, browser `dist`, copied UF2, or CAD/media as code authority |
@@ -116,10 +154,15 @@ production owner, composed from the existing canonical modules:
    angular ratio, bounds, backlash, stop behavior, and raw telemetry policy
    have separate evidence.
 
-The scene-motion bridge currently supplies no people observations. Porting the
-character does not mean claiming person tracking. A future person boundary
-must carry exact frame identity, freshness, metric depth or explicit unknown
-depth, association confidence, and loss behavior.
+The production V3 bridge now adds bounded face attention to scene motion. Its
+native detector and Fable-derived association policy carry exact frame
+identity, freshness, loss/coast state, and an opaque detector rank; they do
+not manufacture a `PersonObservation`, identity, calibrated confidence,
+metric range, or navigation obstacle. Porting face-directed eye behavior
+therefore still does not mean claiming semantic person tracking. A future
+person boundary used by navigation must additionally carry metric depth or
+explicit unknown depth, calibrated association evidence, and reviewed loss
+behavior.
 
 ## Wheel-attachment gate
 

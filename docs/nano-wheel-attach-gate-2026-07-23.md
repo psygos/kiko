@@ -10,7 +10,7 @@ current evidence. Historical demonstrations, host-only tests, device
 enumeration, and a process that merely remains alive do not satisfy a physical
 gate.
 
-## Current read-only Nano snapshot
+## Historical read-only Nano snapshots
 
 Observed on `makerspace@192.168.50.2` at
 `2026-07-23T14:18:06+05:30`, without stopping or opening any owned device:
@@ -60,98 +60,155 @@ A subsequent read-only check during the same boot, at
   and a 16-byte option-byte read with SHA-256
   `d292558017cf9ca0a2e40e262a5c1daa4b305ccf084ce06128133d282f905115`.
 
-These observations prove current presence and observed ownership only. They do
-not prove current servo temperature, head torque state, STM32 control identity,
-camera-frame correctness, SLAM, occupancy, motion safety, or service restart
-behavior.
+These timestamped observations prove presence and observed ownership only at
+those instants. They do not prove later servo temperature, head torque state,
+STM32 control identity, camera-frame correctness, SLAM, occupancy, motion
+safety, or service restart behavior.
 
-## Required before asking for wheels
+### 2026-07-24 motor-inert transport update
 
-- [ ] Complete the attended, manual-only candidate run in
-      `docs/nano-wheels-off-qualification.md` from an immutable rendered
-      bundle. That run qualifies only the lifted raw-PWM streaming path and
-      common live stack; it does not satisfy wheel-ground plant, sign,
-      velocity, braking, or production external-interlock evidence.
-- [ ] Freeze an immutable, reviewable source revision and deployment bundle.
-- [ ] Build the exact source natively on the Nano with the pinned DepthAI and
-      ONNX Runtime libraries; record source and binary identities.
+At the time of this update, the STM32 ran the exact motion-disabled KRP2 image
+at build `131074`, fingerprint `KIKO-NO-ACT-V1!!`, capability bits `319`, and
+maximum PWM zero. Fresh schema-3 runs from source
+`35adc901e50d0ccb893c66582238bea438e86f97` passed at 20 Hz
+(200/200 reports) and 50 Hz (500/500 reports). Both had zero missing,
+duplicate, reordered, skipped, queue-skipped, or period-late probes. Their
+maximum diagnostic RTTs were 17.939749 ms and 17.937019 ms respectively.
+
+The exact evidence directories and hashes are recorded in
+`docs/nano-integration-acceptance-2026-07-24.md`. Fable's process and
+head/eye serial ownership snapshots remained byte-identical across both runs;
+the STM32 VCP was separately available to the qualifier. Motor power was
+operator-reported, not independently instrumented, to remain disconnected.
+The runs created no control session and sent no PWM. This closes only the
+motor-inert 20/50 Hz diagnostic transport item below.
+
+During those measurements Fable remained the OAK/head/eye owner. That did not
+prevent the separate STM32 transport measurement, but it prevented canonical
+`kiko-slam nano-agent` startup. DepthAI and both accessory transports are
+exclusive owners, not shareable process resources.
+
+### 2026-07-27 read-only status refresh
+
+A later read-only check, without stopping a process or opening a device, found:
+
+- the Fable guardian and `kiko_face_follow.py` child still running;
+- the Fable child holding the head serial endpoint. That check did not
+  establish the then-current OAK or eye process owner, so the attended handoff
+  must re-check every endpoint rather than inheriting the July 23 ownership
+  result;
+- OAK MXID `19443010F1B43A2E00` enumerated at `480M` on the USB2 tree, while a
+  separate `10000M` USB3 tree existed without the OAK beneath it;
+- no `/opt/kiko` installation and no `kiko-nano-agent.service`;
+- `/home/makerspace/kiko` clean at
+  `482023e0fa69c381cb5d5946c445234a0ae88105` on
+  `codex/jetson-hardware-validation`.
+
+This refresh did not re-probe STM32 firmware identity, camera frames, eye
+ownership, head health, SLAM, or motion. The canonical handoff therefore still
+requires a fresh endpoint-by-endpoint owner check, a canonical SuperSpeed
+attempt, and exact live admission.
+
+## Gate A: required before asking to attach wheels
+
+Passing this gate authorizes physical wheel attachment for an attended
+calibration session only. It does not authorize production, autonomous,
+point-goal, frontier, or MPC-driven motion. At the moment the sentence is
+issued, motor power must remain independently cut and the controller must
+remain disarmed.
+
+- [ ] Freeze an immutable, reviewable source revision and
+      wheels-off/commissioning bundle.
+- [ ] Build that exact source natively on the Nano with its pinned native
+      dependencies; record source and binary identities.
+- [ ] Perform a coordinated handoff from every existing Fable device owner.
+      Never start a second OAK, head, or eye owner and never use a broad
+      process kill.
 - [ ] Have the canonical owner request SuperSpeed for the exact OAK, read back
       the negotiated transport, and admit RGB, stereo, rectified-left depth,
-      and IMU from the one graph. Request a physical port/cable move only if
-      that canonical SuperSpeed attempt fails; the Fable prototype's forced
-      High-Speed mode is not such a failure.
-- [ ] Perform a coordinated handoff from the Fable guardian. Never start a
-      second OAK, head, or eye owner and never use a broad process kill.
-- [ ] Start one least-privilege production lifecycle, including the sole typed
-      STM32 owner.
-- [ ] Restore and exactly identify a canonical KRP2 image. Do not treat the
-      present legacy ASCII controller or the checked-in motion-disabled
-      `KIKO-NO-ACT-V1!!` profile as production motion authority.
-- [ ] Before granting nonzero motion authority, bind a separately reviewed
-      hardware profile that proves the installed left/right channel signs,
-      maximum output, default-off external driver-enable gate, driver-fault
-      input, reset/brownout behavior, and physical stop semantics. The
-      historical finite 30 percent shaft pulses do not prove these properties.
-- [ ] Admit the exact manifest, artifacts, OAK, STM32 session, KEP2 eye
-      identity, head adapter, and servos 1 through 4.
-- [ ] Establish a confirmed applied base zero and remain explicitly disarmed.
+      and IMU from one graph. Request a physical port/cable move only if that
+      canonical attempt fails; Fable's forced High-Speed mode is not such an
+      attempt.
+- [ ] Provision and read back the boot journal, flash and exactly identify the
+      operator-supervised four-PWM candidate, and keep it distinct from both
+      the motion-disabled diagnostic image and any later production image.
+- [ ] Start one least-privilege qualification lifecycle with the sole typed
+      STM32 owner. Admit the exact manifest, artifacts, OAK, STM32 session,
+      KEP2 eye identity, head adapter, and servos 1 through 4.
+- [ ] Establish a confirmed applied base zero, remain explicitly disarmed, and
+      independently verify that the reachable physical cut removes motor
+      power outside Jetson and STM32 control.
 - [ ] Establish and continuously supervise the natural head hold. A reported
-      fault must stop base authority but must not silently drop the still-live
-      head hold; torque release is an explicit coordinated shutdown action.
+      fault must stop base authority without silently abandoning a still-live
+      hold; coordinated cleanup must explicitly report every attempted torque
+      release.
 - [ ] Produce current RGB-derived eye behavior through the same OAK owner.
 - [ ] Produce live stereo/IMU SLAM, localized rectified-left depth occupancy,
       and diagnostic Rerun/status output.
 - [ ] Serve one loopback-only operator/agent control gateway. It must own the
-      sole downstream request sequence, arbitrate manual and autonomous modes
-      through the same live owner, display only exact applied-controller
-      evidence, and expose live pose, occupancy, goal, path, MPC rollout, and
-      timing without opening a second camera or motor connection.
-- [ ] Prove the software safety-stop path is priority-latched across client
-      reconnects, produces or truthfully fails to produce an exact applied
-      zero, and cannot be confused with the still-required independent
-      physical emergency stop.
-- [ ] Prove typed arm/disarm and manual deadman command streaming against fake
-      and loopback transports, including exact applied receipts.
-- [ ] With the motion-disabled KRP2 profile, run the real STM32 transport
-      qualifier at and above the intended production command cadence. Record
-      exact sequence loss/reordering, host send lateness, round-trip and
-      controller-service timing, queue depth, wire rate, identity changes, and
-      safe output/fault state. Do not claim the rebuilt stream is faster until
-      this reproducible measurement exists.
-- [ ] With the wheels physically absent and the area/head supported, run the
-      bounded production fault matrix: camera loss, stale depth, localization
-      loss, controller reset/serial loss, client disconnect, command expiry,
-      clock fault, SIGTERM, and cold restart. Each motion-relevant path must
-      require or confirm zero.
+      sole downstream request sequence, keep production autonomous authority
+      disabled, display only exact applied-controller evidence, and expose
+      live pose, occupancy, goal, path, shadow MPC rollout, and timing without
+      opening a second camera or motor connection.
+- [ ] Prove typed arm/disarm, manual deadman streaming, priority-latched stop,
+      client-reconnect handling, and exact applied receipts first against fake
+      or loopback transports and then in the bounded wheels-off candidate run
+      described by `docs/nano-wheels-off-qualification.md`.
+- [x] With the motion-disabled KRP2 profile, run the real STM32 diagnostic
+      transport qualifier at 20 Hz and 50 Hz. The schema-3 results record exact
+      sequence, scheduling, round-trip, controller-service, queue, wire-rate,
+      identity, and idle-safe evidence. They do not qualify the
+      motion-capable command path or claim a performance improvement.
+- [ ] With the wheels absent and the robot/head supported, run the candidate
+      fault matrix: camera loss, stale depth, localization loss, controller
+      reset/serial loss, client disconnect, command expiry, clock fault,
+      SIGTERM, and cold restart. Each motion-relevant path must confirm zero or
+      report exact uncertainty.
 - [ ] With the wheels still absent and separate operator approval, establish
-      left/right body-sign conventions through bounded low-output production
-      commands. This is sign evidence, not a velocity model.
-- [ ] Before manual startup, install the exact enablement-only systemd
-      drop-in, mint and re-verify the offline install marker, and prove the
-      base unit refuses a missing or changed marker. After every live
-      wheels-off item above is reviewed, enable the already-gated unit and
-      repeat the cold-boot admission check. The marker binds installed bytes;
-      it is not a substitute for any live item in this checklist. Follow
-      `docs/nano-qualified-deployment.md`.
+      left/right shaft/body sign conventions through bounded low-output
+      candidate commands. This is sign evidence, not a velocity model.
+- [ ] Prepare a clear commissioning area, support/restrain the robot until
+      attachment is complete, station an operator at the independent power
+      cut, and re-confirm disarmed applied zero immediately before asking for
+      wheels.
 
-## Work after wheels are attached
+## After Gate A: attended calibration-only work
 
-Wheel attachment does not authorize unbounded manual driving. In a clear area
-with an immediately reachable independent power cut:
+Wheel attachment does not itself authorize power or motion. After the operator
+attaches the wheels, separately authorize the bounded
+`kiko-nano-base-commission` schedule in a clear area with the independent
+power cut continuously reachable:
 
-1. run the bounded encoderless commissioning schedule;
-2. record exact applied PWM, visual forward velocity, calibrated IMU yaw rate,
+1. record exact applied PWM, visual forward velocity, calibrated IMU yaw rate,
    controller/session identity, and common monotonic timing;
-3. fit unequal left/right first-order wheel plants and reject the result unless
-   coverage, conditioning, parameter-domain, and holdout residual gates pass;
-4. measure effective wheelbase evidence and low-speed stopping behavior;
-5. bind the accepted plant artifact into the exact manifest and re-admit the
-   production motion owner;
-6. tune MPC only inside the measured support envelope;
-7. qualify deadman, obstacle stop, continued online SLAM and mapping;
-8. drive a bounded map run, atomically save it, reload it with exact replay
-   binding, establish fresh live relocalization, then qualify frontier and
-   revision-bound point-goal navigation.
+2. fit unequal left/right first-order wheel plants and reject the result unless
+   coverage, conditioning, parameter-domain, repeated-run, and holdout
+   residual gates pass;
+3. measure effective wheelbase evidence and low-speed stopping behavior; and
+4. emit a non-activatable plant proposal and complete evidence set for review.
+
+## Gate B: required before production motion
+
+Calibration output cannot authorize itself. Production manual, MPC,
+autonomous, point-goal, and frontier motion remain disabled until all of the
+following are independently reviewed:
+
+1. installed left/right wiring, maximum output, voltage levels, active
+   polarities, default-off external driver enable, driver-fault input,
+   E-stop feedback, reset/brownout behavior, and physical stop semantics;
+2. a uniquely identified production four-PWM firmware profile that samples
+   real fault-clear inputs rather than inferring them from a capability class;
+3. an explicit promotion boundary binding accepted commissioning evidence,
+   repeated-run consistency, wiring/stop qualification, approver identity,
+   exact plant bytes, and flashed production STM32 identity;
+4. an immutable production bundle and qualified-only service enablement whose
+   offline marker, installed bytes, least-privilege unit, and cold-boot
+   admission all verify exactly;
+5. the production fault matrix, applied-zero behavior, deadman, obstacle stop,
+   and independent physical emergency cut; and
+6. MPC tuning only inside the measured plant envelope, followed by bounded
+   online-SLAM/map-save/reload/relocalization, frontier, and revision-bound
+   point-goal qualification.
 
 IMU yaw rate cannot identify translation or PWM-to-linear-velocity gain by
 itself. Visual forward velocity is required. Persisted occupancy alone cannot
