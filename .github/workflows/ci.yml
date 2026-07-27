@@ -56,6 +56,14 @@ jobs:
       - name: Clippy robot server
         run: cargo clippy --locked -p robot-server --all-targets -- -D warnings
 
+      - name: Clippy robot server qualification fault injection
+        run: >-
+          cargo clippy --locked -p robot-server
+          --no-default-features
+          --features qualification-fault-injection
+          --all-targets
+          -- -D warnings
+
       - name: Clippy embedded pure logic
         run: cargo clippy --locked -p embedded --lib --tests -- -D warnings
 
@@ -99,6 +107,7 @@ jobs:
           OAK_SYS_CHECK_ONLY: "1"
         run: >-
           cargo clippy --locked -p kiko-slam
+          --no-default-features
           --features nano-agent
           --all-targets
           -- -D warnings
@@ -108,6 +117,7 @@ jobs:
           OAK_SYS_CHECK_ONLY: "1"
         run: >-
           cargo clippy --locked -p kiko-slam
+          --no-default-features
           --features nano-wheels-off-qualification
           --all-targets
           -- -D warnings
@@ -153,6 +163,12 @@ jobs:
       - name: Test robot server
         run: cargo test --locked -p robot-server
 
+      - name: Test robot server qualification fault injection
+        run: >-
+          cargo test --locked -p robot-server
+          --no-default-features
+          --features qualification-fault-injection
+
       - name: Test embedded pure logic
         run: cargo test --locked -p embedded --lib
 
@@ -162,8 +178,11 @@ jobs:
           --features boot-journal-tool
           --bin kiko-boot-journal-image
 
-      - name: Test operator-console view model
-        run: node --test crates/kiko-slam/src/operator-console/view-model.test.js
+      - name: Test operator-console pure browser logic
+        run: >-
+          node --test
+          crates/kiko-slam/src/operator-console/view-model.test.js
+          crates/kiko-slam/src/operator-console/drive-safety.test.js
 
       - name: Test standalone KEP2 eye firmware host logic
         run: >-
@@ -186,6 +205,22 @@ jobs:
           -p kiko-nano-bundle-renderer
           -p kiko-nano-deployment-gate
           -p kiko-supervisor-core
+
+      - name: Test exact production Kiko Nano graph
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo test --locked -p kiko-slam
+          --no-default-features
+          --features nano-agent
+
+      - name: Test exact attended wheels-off qualification graph
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo test --locked -p kiko-slam
+          --no-default-features
+          --features nano-wheels-off-qualification
 
       - name: Verify exact production command surface
         env:
