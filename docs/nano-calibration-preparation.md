@@ -13,12 +13,16 @@ source claims and transformation values are retained for review.
 
 The recommended navigation input is
 `configs/nano-wheels-off-qualification-template/navigation-shadow-preparation-v1.json.template`.
-It covers the complete shadow-navigation schema, fixes only schema versions
-and the fail-closed `blocked` unknown-space policy, and leaves every
-configuration or physically identified value as an explicitly named
-`UNVALIDATED` token. Render every `NAV_SHADOW_UNVALIDATED_*` token from
-retained, reviewed evidence before invoking the assembler. Leave the two
-quoted `CALIBRATION_PREPARER_REPLACES_*` placeholders in place: the assembler
+It covers the complete shadow-navigation schema, fixes the schema versions,
+the fail-closed `blocked` unknown-space policy, and the exact checked-in
+qualification-only synthetic shadow plant. That plant is deliberately not
+physical identification; fixing it here avoids a circular demand for
+wheel-on measurements before Gate A permits wheel attachment. Every other
+configuration or physically identified value remains an explicitly named
+`UNVALIDATED` token. Render every remaining
+`NAV_SHADOW_UNVALIDATED_*` token from retained, reviewed evidence before
+invoking the assembler. Leave the two quoted
+`CALIBRATION_PREPARER_REPLACES_*` placeholders in place: the assembler
 replaces those complete values before the production parser sees the
 navigation document. They must be the exact complete string values at
 `coordinate_frames.tracking_camera_to_base` and
@@ -128,6 +132,73 @@ summary has SHA-256
 `e2d9e048508762f968810ca0eea0613a78344047e94ec22f9f4507937780f53a`.
 That tenfold disagreement is rejected by the assembler and the affected
 conversion summary must not be used as canonical baseline evidence.
+
+## Exact live-capture-to-preparer transaction
+
+Use one fresh `kiko-slam record` dataset to bind the connected OAK observation
+to the values selected for the V4 runtime graph. This is an observation and
+provenance transaction, not a camera- or IMU-calibration algorithm.
+
+Before capture:
+
+1. require the exact expected MXID and SuperSpeed connection with no competing
+   OAK owner;
+2. select the final V4 stereo width, height, FPS, and IMU rate; and
+3. choose a new absent dataset path. The recorder deliberately refuses to
+   reuse an existing dataset directory.
+
+Run the exact release executable selected for the candidate bundle. Substitute
+literal numeric values from the same V4 render input; do not rely on defaults
+or a second configuration file:
+
+```text
+KIKO_RECORD_DEPTH=1 \
+  /path/to/exact/kiko-slam record /new/evidence/dataset \
+  --oak-device-id EXACT_MXID \
+  --width EXACT_STEREO_WIDTH_PX \
+  --height EXACT_STEREO_HEIGHT_PX \
+  --fps EXACT_STEREO_FPS \
+  --rectified \
+  --imu-rate-hz EXACT_IMU_RATE_HZ
+```
+
+Stop with one normal shutdown signal only after paired stereo, rectified-left
+depth, and IMU records have been observed. Admit the capture only if the
+recorder reports successful finalization and device close. Retain the complete
+dataset, invocation, log, source revision, executable SHA-256, `meta.json`,
+`calibration.json`, and finalized dataset manifest. An interrupted, dropped,
+writer-failed, unfinalized, or device-close-failed capture is evidence of that
+failure, not calibration input.
+
+Map the retained `calibration.json` into `rectified_stereo` exactly once:
+
+- `left.{fx,fy,cx,cy,width,height}` becomes
+  `left.{fx_px,fy_px,cx_px,cy_px,width_px,height_px}`;
+- the right camera maps identically;
+- `rectified` and `baseline_m` retain their exact serialized values; and
+- the SHA-256 of those exact `calibration.json` bytes is
+  `rectified_stereo.provenance.source_sha256_hex`.
+
+The embedded `oak_eeprom` matrices remain raw vendor-API evidence. In
+particular, `imu_to_camera_b_m` is not a native-IMU-to-base rotation and the raw
+left-rectification matrix has no asserted transform direction. Neither may be
+silently relabelled into the two physical transforms required by the
+preparer.
+
+Create a second retained measurement record for the stereo baseline using a
+derivation independent of the OAK EEPROM/live calibration API, for example a
+documented physical optical-centre measurement. Its exact bytes, identifier,
+method, units, uncertainty, date, assembly identity, and SHA-256 populate the
+corroborating baseline fields. Re-exporting, reformatting, or renaming the live
+OAK value is not independent evidence.
+
+The current preparer retains caller-supplied provenance declarations but does
+not reopen the source files. Therefore the release review must recompute both
+source hashes from the retained bytes, compare every mapped stereo value to
+`calibration.json`, and retain that review beside the preparer output. Any
+mismatch closes the gate. The generated calibration and navigation documents
+are subsequently parsed and cross-bound by the assembler and qualification
+bootstrap; that later binding does not replace this source-byte review.
 
 ## Remaining physical inputs
 

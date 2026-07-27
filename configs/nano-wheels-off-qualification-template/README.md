@@ -71,11 +71,16 @@ and is parser-tested against this artifact. It is only an example: its
 identity camera/base transform and synthetic IMU calibration are not suitable
 for a rendered qualification bundle.
 
-Neither file is wired into the renderer or any production template. A future
-qualification render must supply a separately reviewed navigation document
-whose camera/base transform and IMU calibration bind to the canonical physical
-calibration artifact; qualification bootstrap will also require its embedded
-plant declaration to equal this separately content-addressed plant domain.
+The fixture is not automatically wired into the renderer or any production
+template. The recommended
+`navigation-shadow-preparation-v1.json.template` embeds this exact synthetic
+plant domain so Gate A does not circularly claim wheel-on physical
+identification before wheel attachment. A qualification render must still
+supply the separately content-addressed plant file and a reviewed navigation
+document whose camera/base transform and IMU calibration bind to the canonical
+physical calibration artifact. Bootstrap requires the embedded and separate
+plant domains to be exactly equal. Production admission rejects this synthetic
+evidence as physical plant identification.
 
 ## Fixed candidate contract
 
