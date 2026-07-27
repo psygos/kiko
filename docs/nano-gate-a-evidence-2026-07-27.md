@@ -4,6 +4,59 @@ This file records current, bounded evidence for the wheel-attachment gate. It
 does not declare Gate A passed and does not authorize wheel attachment,
 powered motion, deployment, or production use.
 
+## Current bd6987a native qualification build
+
+The clean Nano checkout at `/home/makerspace/kiko` was fast-forwarded to the
+exact pushed revision:
+
+```text
+bd6987a9def8d17b15b91683210739ce98387894
+```
+
+The retained 5d1b1bc native build inputs were reused without modification. A
+first non-login SSH launch omitted Cargo from `PATH` and exited with status 127
+before compilation began. The successful launch added the retained
+`/home/makerspace/.cargo/bin` path explicitly and ran the same bounded build:
+
+```text
+CARGO_BUILD_JOBS=2 nice -n 15 cargo build --locked --release \
+  -p kiko-slam --no-default-features \
+  --features nano-wheels-off-qualification --bin kiko-slam
+```
+
+The Linux aarch64 release build completed in 5m09s. This duration is completion
+context, not a benchmark or performance claim. The resulting executable is:
+
+```text
+path: /home/makerspace/kiko/target/release/kiko-slam
+size_bytes: 28994400
+sha256: b6269de500bd46d2fb312d0fd3063558627b296df2ade2cdd8665de4ed7b36be
+elf_machine: AArch64
+elf_type: PIE
+build_id_sha1: ac3e82ec6e3639927d0dc5e752657356793fb04f
+```
+
+`readelf -d` retained the direct DepthAI, OpenCV, C++, and system dependency
+set. `ldd` under the retained native library path resolved its complete
+closure with `not_found_count=0`. The artifact differs from the prior native
+build, but no source of the byte-level difference or reproducible-build claim
+is inferred from that observation.
+
+At `2026-07-28T02:37:11+05:30`, the owner-private evidence directory and its
+17-entry manifest verified:
+
+```text
+/home/makerspace/kiko-native-evidence/bd6987a-20260728T023552+0530
+```
+
+It retains the exact source and clean status, build inputs and command,
+toolchain identity, executable identity, ELF metadata, loader closure, and a
+read-only process/service snapshot. Both canonical services remained inactive.
+The standalone Kiko `engine-guardian.sh` and `kiko_face_follow.py` process
+family remained running; no Fable process was present. No process was stopped,
+signalled, paused, reconfigured, or replaced, and no camera, serial endpoint,
+STM32, or actuator was opened.
+
 ## Superseding native tracker-startup refresh
 
 The clean Nano checkout at `/home/makerspace/kiko` was fast-forwarded to the
@@ -109,6 +162,10 @@ STM32 flash. Every listed source was a regular file, not a symbolic link, and
 | OpenCV core | `/usr/lib/aarch64-linux-gnu/libopencv_core.so.4.5.4d` | 2,607,080 | `3abc549967c52f594b2b597db44b0013c55edb2198e11f9110d564277eb00beb` |
 | OpenCV image processing | `/usr/lib/aarch64-linux-gnu/libopencv_imgproc.so.4.5.4d` | 2,906,064 | `15b2448af215493a79f4638cad8eefcb9b43f15926724caffbdbd06a9c018261` |
 | OpenCV object detection | `/usr/lib/aarch64-linux-gnu/libopencv_objdetect.so.4.5.4d` | 366,632 | `94d3ddfb2111e72658d4bd005d22fd0ce402f8ae45ff8a79e9f7bdbd9b194b0b` |
+
+The qualification-executable row in this timestamped inventory is superseded
+by the bd6987a native artifact above. The other rows remain historical
+01:56:58 observations and were not silently promoted to a later revalidation.
 
 The same inspection read the OAK USB descriptor from sysfs without opening the
 device. It reported serial/MXID `19443010F1B43A2E00`, corroborating the
