@@ -5592,6 +5592,62 @@ mod tests {
     }
 
     #[test]
+    fn gate_a_lattice_can_leave_stop_under_the_five_percent_slew_limit() {
+        let mut fixture = runtime_fixture(10, 4);
+        fixture.model = PlantModelV1::parse_json(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../configs/nano-wheels-off-qualification-template/qualification-shadow-only-synthetic-unvalidated-plant-v2.json"
+        )))
+        .expect("Gate-A shadow plant");
+
+        // MpcConfigV1Dto intentionally is not a serde boundary: the complete
+        // checked-in preparation template is parsed authoritatively by the
+        // qualification integration test. Keep this internal solver fixture
+        // explicit rather than adding an unchecked second JSON parser.
+        let mut config = config_dto(0.05, 10, 4);
+        config.optimization_iterations = 2;
+        config.max_rollout_evaluations = 181;
+        config.initial_search_radius_percent = 5;
+        config.left_pwm_min_percent = -30;
+        config.left_pwm_max_percent = 30;
+        config.right_pwm_min_percent = -30;
+        config.right_pwm_max_percent = 30;
+        config.left_max_slew_percent_per_step = 5;
+        config.right_max_slew_percent_per_step = 5;
+        config.max_integration_tube_radius_m = 0.05;
+        config.position_cost_per_m2 = 100.0;
+        config.heading_cost_per_rad2 = 10.0;
+        config.forward_velocity_cost_s2_per_m2 = 100.0;
+        config.yaw_rate_cost_s2_per_rad2 = 4.0;
+        config.pwm_cost_per_percent2 = 0.001;
+        config.slew_cost_per_percent2 = 0.004;
+        config.terminal_state_cost_multiplier = 4.0;
+        fixture.config = MpcConfigV1::parse(config).expect("Gate-A shadow MPC");
+
+        let reference = reference(&fixture, 0.1);
+        let request = request(&fixture, &reference);
+        let mut solver = MpcSolver::new(fixture.model, fixture.config).expect("Gate-A solver");
+        let mut query = ScriptedQuery::clear(fixture.collision);
+        let mut clock = ConstantClock(HostMonotonicTimestamp::from_nanos(30));
+        let solution = solver
+            .solve(request, &mut query, &mut clock)
+            .expect("collision-free Gate-A shadow solution");
+
+        assert_ne!(
+            solution.requested_pwm(),
+            ShadowPwmPair::STOP,
+            "the cold-start search lattice must contain a nonzero slew-valid candidate"
+        );
+        assert!(percent_delta(solution.requested_pwm().left(), ShadowPwmPair::STOP.left()) <= 5);
+        assert!(
+            percent_delta(
+                solution.requested_pwm().right(),
+                ShadowPwmPair::STOP.right()
+            ) <= 5
+        );
+    }
+
+    #[test]
     fn canonical_costmap_adapter_blocks_exact_tangent_to_nonfree_cell() {
         let fixture = runtime_fixture(1, 1);
         let view = fixture

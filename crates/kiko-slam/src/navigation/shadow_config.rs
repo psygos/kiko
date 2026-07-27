@@ -1558,11 +1558,11 @@ mod tests {
             } => {
                 assert_eq!(
                     fixture_id.as_str(),
-                    "qualification-shadow-only-synthetic-unvalidated-fixture-v1"
+                    "qualification-shadow-only-synthetic-unvalidated-fixture-v2"
                 );
                 assert_eq!(
                     generator_id.as_str(),
-                    "synthetic-unvalidated-hand-authored-qualification-shadow-v1"
+                    "synthetic-unvalidated-hand-authored-qualification-shadow-v2"
                 );
             }
             PlantEvidenceV1::ClaimedPhysicalIdentification { .. } => {
@@ -1576,7 +1576,7 @@ mod tests {
         let navigation_bytes =
             include_bytes!("../../../../configs/navigation-shadow-v1.example.json");
         let plant_bytes = include_bytes!(
-            "../../../../configs/nano-wheels-off-qualification-template/qualification-shadow-only-synthetic-unvalidated-plant-v1.json"
+            "../../../../configs/nano-wheels-off-qualification-template/qualification-shadow-only-synthetic-unvalidated-plant-v2.json"
         );
         let plant =
             PlantModelV1::parse_json(plant_bytes).expect("checked-in synthetic plant artifact");
@@ -1588,11 +1588,11 @@ mod tests {
             } => {
                 assert_eq!(
                     fixture_id.as_str(),
-                    "qualification-shadow-only-synthetic-unvalidated-fixture-v1"
+                    "qualification-shadow-only-synthetic-unvalidated-fixture-v2"
                 );
                 assert_eq!(
                     generator_id.as_str(),
-                    "synthetic-unvalidated-hand-authored-qualification-shadow-v1"
+                    "synthetic-unvalidated-hand-authored-qualification-shadow-v2"
                 );
             }
             PlantEvidenceV1::ClaimedPhysicalIdentification { .. } => {

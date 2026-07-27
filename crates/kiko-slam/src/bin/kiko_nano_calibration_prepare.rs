@@ -1974,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-    fn deployable_navigation_preparation_template_is_sentinelized() {
+    fn qualification_navigation_preparation_template_is_sentinelized_and_shadow_only() {
         let template = include_str!(
             "../../../../configs/nano-wheels-off-qualification-template/navigation-shadow-preparation-v1.json.template"
         );
@@ -1982,23 +1982,20 @@ mod tests {
         assert!(template.contains("${CALIBRATION_PREPARER_REPLACES_TRACKING_CAMERA_TO_BASE}"));
         assert!(template.contains("${CALIBRATION_PREPARER_REPLACES_RAW_IMU_CALIBRATION}"));
         assert!(!template.contains("synthetic-host-shadow-example"));
-        assert!(!template.contains("qualification-shadow-only-synthetic"));
 
-        let mut fixture: Value =
+        let fixture: Value =
             serde_json::from_slice(synthetic_navigation_fixture()).expect("synthetic fixture JSON");
-        fixture["plant_model"]["evidence"] = json!({
-            "kind": "claimed_physical_identification",
-            "dataset_content_id": "test-only-identified-plant-dataset",
-            "identification_method_id": "test-only-fit-method",
-            "sample_count": 10,
-            "residuals": {
-                "left_velocity_rmse_mps": 0.01,
-                "right_velocity_rmse_mps": 0.01,
-                "yaw_rate_rmse_rad_s": 0.01,
-                "maximum_absolute_velocity_error_mps": 0.02
-            }
-        });
         let mut rendered = template_with_unquoted_tokens_replaced_by_null(template);
+        assert_eq!(
+            rendered["plant_model"]["model_id"],
+            "qualification-shadow-only-synthetic-unvalidated-v2"
+        );
+        assert_eq!(rendered["plant_model"]["model_version"], 2);
+        assert_eq!(rendered["plant_model"]["sample_period_s"], 0.05);
+        assert_eq!(
+            rendered["plant_model"]["evidence"]["kind"],
+            "synthetic_fixture"
+        );
         fill_navigation_sentinels_from_fixture(&mut rendered, &fixture);
         let rendered_bytes = serde_json::to_vec(&rendered).expect("rendered template JSON");
         assert_eq!(

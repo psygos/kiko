@@ -17,11 +17,17 @@ It covers the complete shadow-navigation schema, fixes the schema versions,
 the fail-closed `blocked` unknown-space policy, and the exact checked-in
 qualification-only synthetic shadow plant. That plant is deliberately not
 physical identification; fixing it here avoids a circular demand for
-wheel-on measurements before Gate A permits wheel attachment. Every other
-configuration or physically identified value remains an explicitly named
-`UNVALIDATED` token. Render every remaining
-`NAV_SHADOW_UNVALIDATED_*` token from retained, reviewed evidence before
-invoking the assembler. Leave the two quoted
+wheel-on measurements before Gate A permits wheel attachment. The template
+also fixes one conservative, shadow-only navigation policy: 50 ms
+plant/MPC/control periods, a 100 ms shadow lease, candidate-compatible
+±30%/5% PWM bounds, a search lattice that can leave STOP, bounded odometry and
+costmap freshness, and explicit solver/journal limits. Those values are
+software admission choices, not tuned navigation or performance evidence.
+
+Only five physically dependent `NAV_SHADOW_UNVALIDATED_*` leaves remain:
+world-to-occupancy rotation and translation, footprint radius, and the minimum
+and maximum obstacle heights. Render those five from retained physical
+evidence before invoking the assembler. Leave the two quoted
 `CALIBRATION_PREPARER_REPLACES_*` placeholders in place: the assembler
 replaces those complete values before the production parser sees the
 navigation document. They must be the exact complete string values at
