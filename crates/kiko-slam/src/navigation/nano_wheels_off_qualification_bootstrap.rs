@@ -2,7 +2,7 @@
 //! candidate controller.
 //!
 //! This is deliberately a library boundary rather than a second live-loop
-//! binary. It loads every launch-bound file once, binds the schema-V3
+//! binary. It loads every launch-bound file once, binds the schema-V4
 //! candidate contracts, probes the connected robot, acquires only an
 //! acknowledged zero, performs exact inner-V1 inventory comparison, and
 //! returns a linear stopped controller token for a later qualification owner.
@@ -40,24 +40,25 @@ use super::nano_bootstrap::{
 };
 use super::{
     AdmittedOakSuperSpeedEvidence, CandidateActuationSessionStartError, CandidateMpcBindingError,
-    CandidateRuntimeServiceIntervalError, LoadedNanoWheelsOffQualificationLaunchV3,
-    ManifestBoundNanoAgentPolicyConfigV3, NanoAccessoryManifestBindingError,
-    NanoAgentPolicyConfigParseError, NanoAgentPolicyConfigV3, NanoBootstrapAccessoryEvidence,
-    NanoBootstrapOakCloseDisposition, NanoBootstrapPrimaryError, NanoBootstrapRootError,
-    NanoBootstrapRoots, NanoBootstrapStereoEvidence, NanoCalibrationArtifactParseError,
-    NanoCalibrationArtifactV1, NanoCalibrationBindingError, NanoLaunchBoundAssetLoadError,
-    NanoObservedInventoryBuildError, NanoObservedInventoryBuilder,
-    NanoObservedInventoryEvidenceError, NanoWheelsOffMappedImageError,
-    NanoWheelsOffNativeRuntimeBindingError, NanoWheelsOffNativeRuntimeParseError,
-    NanoWheelsOffNativeRuntimeV1, NanoWheelsOffNativeRuntimeVerificationError,
-    NanoWheelsOffQualificationAssetRole, NanoWheelsOffQualificationLaunchLoadError,
-    NanoWheelsOffQualificationLaunchV3, ParsedNanoLiveConfiguration,
+    CandidateRuntimeServiceIntervalError, HeadGazePolicyParseError, HeadGazePolicyV1,
+    LoadedNanoWheelsOffQualificationLaunchV4, ManifestBoundNanoAgentPolicyConfigV3,
+    NanoAccessoryManifestBindingError, NanoAgentPolicyConfigParseError, NanoAgentPolicyConfigV3,
+    NanoBootstrapAccessoryEvidence, NanoBootstrapOakCloseDisposition, NanoBootstrapPrimaryError,
+    NanoBootstrapRootError, NanoBootstrapRoots, NanoBootstrapStereoEvidence,
+    NanoCalibrationArtifactParseError, NanoCalibrationArtifactV1, NanoCalibrationBindingError,
+    NanoFaceCascadeAssetRole, NanoLaunchBoundAssetLoadError, NanoObservedInventoryBuildError,
+    NanoObservedInventoryBuilder, NanoObservedInventoryEvidenceError,
+    NanoWheelsOffMappedImageError, NanoWheelsOffNativeRuntimeBindingError,
+    NanoWheelsOffNativeRuntimeParseError, NanoWheelsOffNativeRuntimeV1,
+    NanoWheelsOffNativeRuntimeVerificationError, NanoWheelsOffQualificationAssetRole,
+    NanoWheelsOffQualificationLaunchLoadError, NanoWheelsOffQualificationLaunchV4,
+    NanoWheelsOffQualificationV4AssetRole, ParsedNanoLiveConfiguration,
     ShadowNavigationConfigParseError, ShadowNavigationConfigV1,
     StoppedWheelsOffCandidateController, VerifiedNanoWheelsOffMappedImages,
     VerifiedNanoWheelsOffNativeRuntimeDependencies, WheelsOffCandidateActuationSession,
     WheelsOffCandidateControllerBinding, WheelsOffCandidateControllerBindingError,
     WheelsOffCandidateLimits, WheelsOffCandidatePolicyError,
-    WheelsOffCandidateRuntimeServiceInterval, load_nano_wheels_off_qualification_launch_v3,
+    WheelsOffCandidateRuntimeServiceInterval, load_nano_wheels_off_qualification_launch_v4,
     verify_linux_mapped_qualification_images,
 };
 use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
@@ -132,6 +133,9 @@ pub struct LoadedNanoWheelsOffQualificationAssets {
     pub native_runtime: NanoWheelsOffNativeRuntimeV1,
     pub native_runtime_dependency_identities: VerifiedNanoWheelsOffNativeRuntimeDependencies,
     pub agent_policy: LoadedDeploymentAsset,
+    pub head_gaze_policy: LoadedDeploymentAsset,
+    pub frontal_face_cascade: LoadedDeploymentAsset,
+    pub profile_face_cascade: LoadedDeploymentAsset,
     pub navigation_shadow_config: LoadedDeploymentAsset,
     pub candidate_inventory_manifest: LoadedDeploymentAsset,
     pub candidate_controller_policy: LoadedDeploymentAsset,
@@ -148,7 +152,7 @@ pub struct LoadedNanoWheelsOffQualificationAssets {
 impl LoadedNanoWheelsOffQualificationAssets {
     fn load(
         deployment_root: &Path,
-        launch: &NanoWheelsOffQualificationLaunchV3,
+        launch: &NanoWheelsOffQualificationLaunchV4,
     ) -> Result<Self, QualificationBootstrapPrimaryError> {
         let load = |role| {
             launch
@@ -156,6 +160,26 @@ impl LoadedNanoWheelsOffQualificationAssets {
                 .load_exact(deployment_root)
                 .map_err(
                     |source| QualificationBootstrapPrimaryError::BoundAssetLoad { role, source },
+                )
+        };
+        let load_v4 = |role| {
+            launch
+                .v4_asset(role)
+                .load_exact(deployment_root)
+                .map_err(
+                    |source| QualificationBootstrapPrimaryError::V4BoundAssetLoad { role, source },
+                )
+        };
+        let load_face = |role| {
+            launch
+                .face_perception()
+                .asset(role)
+                .load_exact(deployment_root)
+                .map_err(
+                    |source| QualificationBootstrapPrimaryError::FaceBoundAssetLoad {
+                        role,
+                        source,
+                    },
                 )
         };
         let qualification_executable = launch
@@ -192,7 +216,17 @@ impl LoadedNanoWheelsOffQualificationAssets {
                 NanoWheelsOffQualificationAssetRole::ALL
                     .into_iter()
                     .filter(|role| *role != NanoWheelsOffQualificationAssetRole::OnnxRuntimeLibrary)
-                    .map(|role| launch.asset(role).relative_path()),
+                    .map(|role| launch.asset(role).relative_path())
+                    .chain(
+                        NanoWheelsOffQualificationV4AssetRole::ALL
+                            .into_iter()
+                            .map(|role| launch.v4_asset(role).relative_path()),
+                    )
+                    .chain(
+                        NanoFaceCascadeAssetRole::ALL
+                            .into_iter()
+                            .map(|role| launch.face_perception().asset(role).relative_path()),
+                    ),
             )
             .map_err(QualificationBootstrapPrimaryError::NativeRuntimeBinding)?;
         let native_runtime_dependency_identities = native_runtime
@@ -215,6 +249,9 @@ impl LoadedNanoWheelsOffQualificationAssets {
             native_runtime,
             native_runtime_dependency_identities,
             agent_policy: load(NanoWheelsOffQualificationAssetRole::AgentPolicy)?,
+            head_gaze_policy: load_v4(NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy)?,
+            frontal_face_cascade: load_face(NanoFaceCascadeAssetRole::FrontalFace)?,
+            profile_face_cascade: load_face(NanoFaceCascadeAssetRole::ProfileFace)?,
             navigation_shadow_config: load(
                 NanoWheelsOffQualificationAssetRole::NavigationShadowConfig,
             )?,
@@ -396,8 +433,9 @@ impl QualificationPlantEvidence {
 #[must_use = "the OAK and stopped candidate-controller token need explicit lifecycle ownership"]
 pub struct PreparedNanoWheelsOffQualificationBootstrap {
     pub roots: NanoBootstrapRoots,
-    pub launch: LoadedNanoWheelsOffQualificationLaunchV3,
+    pub launch: LoadedNanoWheelsOffQualificationLaunchV4,
     pub assets: LoadedNanoWheelsOffQualificationAssets,
+    pub head_gaze_policy: HeadGazePolicyV1,
     pub manifest: LoadedExpectedManifestV2,
     pub policy: ManifestBoundNanoAgentPolicyConfigV3,
     pub calibration: NanoCalibrationArtifactV1,
@@ -461,12 +499,15 @@ pub async fn bootstrap_nano_wheels_off_qualification(
         .map_err(QualificationBootstrapPrimaryError::common)
         .map_err(QualificationBootstrapError::before_hardware)?;
     let launch =
-        load_nano_wheels_off_qualification_launch_v3(roots.deployment_root(), launch_relative_path)
+        load_nano_wheels_off_qualification_launch_v4(roots.deployment_root(), launch_relative_path)
             .map_err(QualificationBootstrapPrimaryError::LaunchLoad)
             .map_err(QualificationBootstrapError::before_hardware)?;
     let assets =
         LoadedNanoWheelsOffQualificationAssets::load(roots.deployment_root(), launch.launch())
             .map_err(QualificationBootstrapError::before_hardware)?;
+    let head_gaze_policy = HeadGazePolicyV1::parse_json(assets.head_gaze_policy.bytes())
+        .map_err(QualificationBootstrapPrimaryError::HeadGazePolicy)
+        .map_err(QualificationBootstrapError::before_hardware)?;
 
     let parsed_policy = NanoAgentPolicyConfigV3::parse_json(assets.agent_policy.bytes())
         .map_err(QualificationBootstrapPrimaryError::AgentPolicy)
@@ -830,6 +871,7 @@ pub async fn bootstrap_nano_wheels_off_qualification(
             roots,
             launch,
             assets,
+            head_gaze_policy,
             manifest,
             policy,
             calibration,
@@ -886,7 +928,7 @@ struct ConnectedQualificationOak {
 
 fn prepare_oak(
     oak: &mut Device,
-    launch: &NanoWheelsOffQualificationLaunchV3,
+    launch: &NanoWheelsOffQualificationLaunchV4,
     calibration: &NanoCalibrationArtifactV1,
     navigation: ShadowNavigationConfigV1,
     candidate_runtime_service_interval: WheelsOffCandidateRuntimeServiceInterval,
@@ -930,7 +972,7 @@ fn prepare_oak(
 
 fn bind_policy_paths(
     roots: &NanoBootstrapRoots,
-    launch: &NanoWheelsOffQualificationLaunchV3,
+    launch: &NanoWheelsOffQualificationLaunchV4,
     configured_manifest: &Path,
     artifact_root: &Path,
 ) -> Result<(), QualificationBootstrapPrimaryError> {
@@ -967,7 +1009,7 @@ fn require_exact_manifest_path(
 
 fn bind_calibration(
     roots: &NanoBootstrapRoots,
-    launch: &NanoWheelsOffQualificationLaunchV3,
+    launch: &NanoWheelsOffQualificationLaunchV4,
     loaded: &LoadedDeploymentAsset,
     policy: &ManifestBoundNanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -1070,7 +1112,7 @@ fn calibration_deployment_relative_artifact_path(
 
 fn select_plant(
     roots: &NanoBootstrapRoots,
-    launch: &NanoWheelsOffQualificationLaunchV3,
+    launch: &NanoWheelsOffQualificationLaunchV4,
     loaded: &LoadedDeploymentAsset,
     policy: &ManifestBoundNanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -1449,6 +1491,14 @@ pub enum QualificationBootstrapPrimaryError {
         role: NanoWheelsOffQualificationAssetRole,
         source: NanoLaunchBoundAssetLoadError,
     },
+    V4BoundAssetLoad {
+        role: NanoWheelsOffQualificationV4AssetRole,
+        source: NanoLaunchBoundAssetLoadError,
+    },
+    FaceBoundAssetLoad {
+        role: NanoFaceCascadeAssetRole,
+        source: NanoLaunchBoundAssetLoadError,
+    },
     QualificationExecutable(QualificationExecutableIdentityError),
     NativeRuntimeManifest(NanoWheelsOffNativeRuntimeParseError),
     NativeRuntimeBinding(NanoWheelsOffNativeRuntimeBindingError),
@@ -1456,6 +1506,7 @@ pub enum QualificationBootstrapPrimaryError {
     OnnxRuntimeInitialization(crate::InferenceError),
     MappedImages(NanoWheelsOffMappedImageError),
     AgentPolicy(NanoAgentPolicyConfigParseError),
+    HeadGazePolicy(HeadGazePolicyParseError),
     ManifestPathMismatch {
         launch: PathBuf,
         policy: PathBuf,
@@ -1573,7 +1624,9 @@ impl std::error::Error for QualificationBootstrapPrimaryError {
         match self {
             Self::CommonBootstrap(source) => Some(source),
             Self::LaunchLoad(source) => Some(source),
-            Self::BoundAssetLoad { source, .. } => Some(source),
+            Self::BoundAssetLoad { source, .. }
+            | Self::V4BoundAssetLoad { source, .. }
+            | Self::FaceBoundAssetLoad { source, .. } => Some(source),
             Self::QualificationExecutable(source) => Some(source),
             Self::NativeRuntimeManifest(source) => Some(source),
             Self::NativeRuntimeBinding(source) => Some(source),
@@ -1581,6 +1634,7 @@ impl std::error::Error for QualificationBootstrapPrimaryError {
             Self::OnnxRuntimeInitialization(source) => Some(source),
             Self::MappedImages(source) => Some(source),
             Self::AgentPolicy(source) => Some(source),
+            Self::HeadGazePolicy(source) => Some(source),
             Self::Manifest(source) => Some(source),
             Self::AccessoryManifestBinding(source) => Some(source),
             Self::ArtifactHash(source) => Some(source),

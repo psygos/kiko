@@ -12773,6 +12773,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
         assets,
         manifest: _,
         policy,
+        head_gaze_policy: _,
         calibration: _,
         plant: _,
         artifact_hashes: _,
@@ -12814,7 +12815,11 @@ fn prepare_nano_wheels_off_qualification_live_session(
         Ok(config) => config,
         Err(primary) => return resources.fail_box(primary),
     };
-    resources.accessory = match NanoAccessoryWorker::start_scene_motion_only(accessory_config) {
+    resources.accessory = match NanoAccessoryWorker::start_with_loaded_face_perception(
+        accessory_config,
+        assets.frontal_face_cascade,
+        assets.profile_face_cascade,
+    ) {
         Ok(accessory) => Some(accessory),
         Err(source) => {
             return resources.fail_box(Box::new(LiveAccessoryError::Start(source)));

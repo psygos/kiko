@@ -11,5 +11,6 @@ mod input;
 mod renderer;
 
 pub use renderer::{
-    BundleFileEvidence, BundlePlanEvidence, RenderError, RenderMode, render_bundle,
+    BundleFileEvidence, BundlePlanEvidence, QualificationFaceCascadeRole, RenderError, RenderMode,
+    render_bundle,
 };

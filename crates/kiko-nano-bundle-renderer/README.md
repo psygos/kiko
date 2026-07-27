@@ -17,6 +17,11 @@ dataset replay. Dataset replay emits the canonical persisted snapshot/dataset
 paths, but it does not claim that replay or live relocalization succeeded.
 Qualification bundles reject persisted warm start.
 
+Qualification render-input V4 additionally requires distinct exact frontal
+and profile cascades plus one exact qualification-only head-gaze policy. They
+are retained, size/hash bound into launch V4, and rejected on path/content
+aliasing. Production render-input V1 and launch V3 remain unchanged.
+
 The storage input requires independent nonzero ceilings for cumulative dataset
 logical bytes, regular files, and navigation-ingress records, plus a
 descriptor-relative post-write free-space floor and terminal reserve. The

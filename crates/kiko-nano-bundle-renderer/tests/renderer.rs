@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 use kiko_device_inventory::{
     load_expected_manifest_v1_from_slice, load_expected_manifest_v2_from_slice,
 };
-use kiko_nano_bundle_renderer::{RenderMode, render_bundle};
+use kiko_nano_bundle_renderer::{
+    QualificationFaceCascadeRole, RenderError, RenderMode, render_bundle,
+};
 use kiko_slam::navigation::{
     NanoAgentLaunchV3, NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1,
-    NanoWheelsOffNativeRuntimeV1, NanoWheelsOffQualificationLaunchV3,
+    NanoWheelsOffNativeRuntimeV1, NanoWheelsOffQualificationLaunchV4,
     WheelsOffCandidateControllerBinding,
 };
 use robot_server::config::{ControllerServerConfig, ControllerServerConfigV1};
@@ -28,8 +30,7 @@ fn canonical_root(temporary: &TempDir) -> PathBuf {
     fs::canonicalize(temporary.path()).expect("canonical temporary root")
 }
 
-fn add_production_face_assets(root: &Path, input: &mut Value) {
-    input["schema_version"] = json!(1);
+fn add_face_assets(root: &Path, input: &mut Value) {
     let frontal = write_source(root, "frontal.xml", b"frontal-cascade-exact");
     let profile = write_source(root, "profile.xml", b"profile-cascade-exact");
     input["assets"]["face_perception"] = json!({
@@ -44,6 +45,15 @@ fn add_production_face_assets(root: &Path, input: &mut Value) {
                 "models/opencv/haarcascade_profileface.xml"
         }
     });
+}
+
+fn add_production_face_assets(root: &Path, input: &mut Value) {
+    input["schema_version"] = json!(1);
+    add_face_assets(root, input);
+    input["assets"]
+        .as_object_mut()
+        .expect("assets object")
+        .remove("head_gaze_policy_source_path");
 }
 
 fn source_fixture() -> (TempDir, Value) {
@@ -116,8 +126,13 @@ fn source_fixture() -> (TempDir, Value) {
         "kiko-nano-wheels-off-qualification",
         b"qualification-executable-exact",
     );
-    let input = json!({
-        "schema_version": 3,
+    let head_gaze_policy = write_source(
+        &root,
+        "head-gaze-policy.json",
+        br#"{"schema_version":1,"policy":"exact"}"#,
+    );
+    let mut input = json!({
+        "schema_version": 4,
         "bundle": {
             "kind": "wheels_off_qualification",
             "qualification_executable_path": qualification_executable
@@ -176,7 +191,8 @@ fn source_fixture() -> (TempDir, Value) {
             "lightglue_model": {
                 "source_path": lightglue,
                 "destination_relative_path": "models/lightglue.onnx"
-            }
+            },
+            "head_gaze_policy_source_path": head_gaze_policy
         },
         "native_libraries": [
             {
@@ -289,6 +305,7 @@ fn source_fixture() -> (TempDir, Value) {
             "neutral_head_from_camera_quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]
         }
     });
+    add_face_assets(&root, &mut input);
     (temporary, input)
 }
 
@@ -416,7 +433,7 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
     assert_eq!(plan.bundle_kind, "wheels_off_qualification");
     assert_eq!(
         plan.files.last().expect("last file").relative_path,
-        "nano-wheels-off-qualification-launch-v3.json"
+        "nano-wheels-off-qualification-launch-v4.json"
     );
     assert_eq!(
         plan.files
@@ -468,7 +485,7 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
     assert_eq!(recorded_order, planned_order);
     assert_eq!(
         recorded_order.last().expect("last recorded write"),
-        "nano-wheels-off-qualification-launch-v3.json"
+        "nano-wheels-off-qualification-launch-v4.json"
     );
     let inventory_bytes = fs::read(destination.join("device-inventory-candidate-v2.json"))
         .expect("candidate inventory");
@@ -524,9 +541,9 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
         inventory["calibration_artifacts"][0]["sha256"],
         Value::Array(expected_digest)
     );
-    let launch_bytes = fs::read(destination.join("nano-wheels-off-qualification-launch-v3.json"))
+    let launch_bytes = fs::read(destination.join("nano-wheels-off-qualification-launch-v4.json"))
         .expect("qualification launch");
-    NanoWheelsOffQualificationLaunchV3::parse_json(&launch_bytes)
+    NanoWheelsOffQualificationLaunchV4::parse_json(&launch_bytes)
         .expect("typed qualification launch");
     let launch: Value = serde_json::from_slice(&launch_bytes).expect("qualification launch JSON");
     assert_eq!(
@@ -563,10 +580,48 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
         launch["native_runtime_manifest_asset"]["sha256_hex"],
         sha256_hex(&native_runtime_manifest)
     );
-    let input_evidence = destination.join("evidence/render-input-v3.json");
+    let head_gaze_policy =
+        fs::read(destination.join("head-gaze-policy-v1.json")).expect("head-gaze policy");
+    assert_eq!(
+        launch["head_gaze_policy_asset"]["relative_path"],
+        "head-gaze-policy-v1.json"
+    );
+    assert_eq!(
+        launch["head_gaze_policy_asset"]["sha256_hex"],
+        sha256_hex(&head_gaze_policy)
+    );
+    assert_eq!(
+        launch["head_gaze_policy_asset"]["maximum_bytes"],
+        u64::try_from(head_gaze_policy.len()).expect("head-gaze policy length")
+    );
+    for (field, relative_path) in [
+        (
+            "frontal_face_cascade_asset",
+            "models/opencv/haarcascade_frontalface_default.xml",
+        ),
+        (
+            "profile_face_cascade_asset",
+            "models/opencv/haarcascade_profileface.xml",
+        ),
+    ] {
+        let cascade = fs::read(destination.join(relative_path)).expect("face cascade");
+        assert_eq!(
+            launch["face_perception"][field]["relative_path"],
+            relative_path
+        );
+        assert_eq!(
+            launch["face_perception"][field]["sha256_hex"],
+            sha256_hex(&cascade)
+        );
+        assert_eq!(
+            launch["face_perception"][field]["maximum_bytes"],
+            u64::try_from(cascade.len()).expect("cascade length")
+        );
+    }
+    let input_evidence = destination.join("evidence/render-input-v4.json");
     assert!(
         input_evidence.exists(),
-        "qualification retains its schema-V3 render input under a versioned evidence name"
+        "qualification retains its schema-V4 render input under a versioned evidence name"
     );
     let executable_source = render_evidence["sources"]
         .as_array()
@@ -630,11 +685,11 @@ fn render_input_versions_are_bundle_specific_and_fail_closed() {
         &write_input(&root, &legacy_qualification),
         RenderMode::DryRun,
     )
-    .expect_err("published qualification V1 cannot be reinterpreted as V3");
+    .expect_err("published qualification V1 cannot be reinterpreted as V4");
     assert!(
         error
             .to_string()
-            .contains("unsupported wheels_off_qualification render-input schema 1; expected 3")
+            .contains("unsupported wheels_off_qualification render-input schema 1; expected 4")
     );
 
     let mut retired_qualification_v2 = input.clone();
@@ -643,11 +698,24 @@ fn render_input_versions_are_bundle_specific_and_fail_closed() {
         &write_input(&root, &retired_qualification_v2),
         RenderMode::DryRun,
     )
-    .expect_err("published qualification V2 cannot be reinterpreted as V3");
+    .expect_err("published qualification V2 cannot be reinterpreted as V4");
     assert!(
         error
             .to_string()
-            .contains("unsupported wheels_off_qualification render-input schema 2; expected 3")
+            .contains("unsupported wheels_off_qualification render-input schema 2; expected 4")
+    );
+
+    let mut retired_qualification_v3 = input.clone();
+    retired_qualification_v3["schema_version"] = json!(3);
+    let error = render_bundle(
+        &write_input(&root, &retired_qualification_v3),
+        RenderMode::DryRun,
+    )
+    .expect_err("published qualification V3 cannot be reinterpreted as V4");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported wheels_off_qualification render-input schema 3; expected 4")
     );
 
     let mut production = input;
@@ -672,6 +740,113 @@ fn render_input_versions_are_bundle_specific_and_fail_closed() {
         error
             .to_string()
             .contains("unsupported production render-input schema 2; expected 1")
+    );
+}
+
+#[test]
+fn qualification_v4_requires_exact_face_and_head_gaze_assets() {
+    let (temporary, input) = source_fixture();
+    let root = canonical_root(&temporary);
+
+    let mut missing_face = input.clone();
+    missing_face["assets"]
+        .as_object_mut()
+        .expect("fixture assets")
+        .remove("face_perception");
+    let error = render_bundle(&write_input(&root, &missing_face), RenderMode::DryRun)
+        .expect_err("V4 face assets are mandatory");
+    assert!(
+        error
+            .to_string()
+            .contains("requires exact frontal and profile face-cascade")
+    );
+
+    let mut missing_head_gaze = input;
+    missing_head_gaze["assets"]
+        .as_object_mut()
+        .expect("fixture assets")
+        .remove("head_gaze_policy_source_path");
+    let error = render_bundle(&write_input(&root, &missing_head_gaze), RenderMode::DryRun)
+        .expect_err("V4 head-gaze policy is mandatory");
+    assert!(
+        error
+            .to_string()
+            .contains("requires an exact head-gaze policy source")
+    );
+}
+
+#[test]
+fn qualification_v4_rejects_face_and_head_gaze_aliases() {
+    let (temporary, input) = source_fixture();
+    let root = canonical_root(&temporary);
+
+    let mut same_face_content = input.clone();
+    same_face_content["assets"]["face_perception"]["profile_face_cascade"]["source_path"] =
+        same_face_content["assets"]["face_perception"]["frontal_face_cascade"]["source_path"]
+            .clone();
+    let error = render_bundle(&write_input(&root, &same_face_content), RenderMode::DryRun)
+        .expect_err("frontal and profile content must be distinct");
+    assert!(matches!(
+        error,
+        RenderError::QualificationFaceAssetContentAlias {
+            face: QualificationFaceCascadeRole::Frontal,
+            ref aliased_role,
+        } if aliased_role == "profile_face_cascade"
+    ));
+
+    let mut face_aliases_common = input.clone();
+    face_aliases_common["assets"]["face_perception"]["frontal_face_cascade"]["source_path"] =
+        face_aliases_common["assets"]["navigation_shadow_source_path"].clone();
+    let error = render_bundle(
+        &write_input(&root, &face_aliases_common),
+        RenderMode::DryRun,
+    );
+    assert!(matches!(
+        error,
+        Err(RenderError::QualificationFaceAssetContentAlias {
+            face: QualificationFaceCascadeRole::Frontal,
+            ref aliased_role,
+        }) if aliased_role == "navigation_shadow"
+    ));
+
+    let mut face_aliases_head = input.clone();
+    face_aliases_head["assets"]["face_perception"]["profile_face_cascade"]["source_path"] =
+        face_aliases_head["assets"]["head_gaze_policy_source_path"].clone();
+    let error = render_bundle(&write_input(&root, &face_aliases_head), RenderMode::DryRun);
+    assert!(matches!(
+        error,
+        Err(RenderError::QualificationFaceAssetContentAlias {
+            face: QualificationFaceCascadeRole::Profile,
+            ref aliased_role,
+        }) if aliased_role == "head_gaze_policy"
+    ));
+
+    let mut aliased_head_content = input.clone();
+    aliased_head_content["assets"]["head_gaze_policy_source_path"] =
+        aliased_head_content["assets"]["navigation_shadow_source_path"].clone();
+    let error = render_bundle(
+        &write_input(&root, &aliased_head_content),
+        RenderMode::DryRun,
+    )
+    .expect_err("head-gaze policy content cannot alias another role");
+    assert!(
+        error
+            .to_string()
+            .contains("head-gaze policy content aliases staged role navigation_shadow")
+    );
+
+    let mut aliased_face_destination = input;
+    aliased_face_destination["assets"]["face_perception"]["frontal_face_cascade"]["destination_relative_path"] =
+        aliased_face_destination["assets"]["superpoint_model"]["destination_relative_path"].clone();
+    let error = render_bundle(
+        &write_input(&root, &aliased_face_destination),
+        RenderMode::DryRun,
+    )
+    .expect_err("face destination cannot alias another asset");
+    assert!(
+        error
+            .to_string()
+            .contains("multiple assets target models/superpoint.onnx")
     );
 }
 
@@ -718,6 +893,9 @@ fn production_without_separate_profile_is_fail_closed() {
 fn production_without_exact_face_assets_is_fail_closed() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
+    let assets = input["assets"].as_object_mut().expect("fixture assets");
+    assets.remove("face_perception");
+    assets.remove("head_gaze_policy_source_path");
     input["bundle"] = json!({
         "kind": "production",
         "production_controller_profile_path": null
@@ -730,6 +908,26 @@ fn production_without_exact_face_assets_is_fail_closed() {
         error
             .to_string()
             .contains("requires exact frontal and profile face-cascade")
+    );
+}
+
+#[test]
+fn production_v1_rejects_the_qualification_only_head_gaze_input() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    let head_gaze_policy = input["assets"]["head_gaze_policy_source_path"].clone();
+    add_production_face_assets(&root, &mut input);
+    input["assets"]["head_gaze_policy_source_path"] = head_gaze_policy;
+    input["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": null
+    });
+    let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
+        .expect_err("production must reject the qualification-only policy input");
+    assert!(
+        error
+            .to_string()
+            .contains("qualification-only head-gaze policy input is forbidden")
     );
 }
 
@@ -788,7 +986,7 @@ fn production_derives_navigation_digest_and_loopback_port() {
     .expect("production render");
     assert_eq!(plan.bundle_kind, "production");
     assert!(destination.join("evidence/render-input-v1.json").exists());
-    assert!(!destination.join("evidence/render-input-v3.json").exists());
+    assert!(!destination.join("evidence/render-input-v4.json").exists());
     let production_input_permissions =
         fs::metadata(destination.join("evidence/render-input-v1.json"))
             .expect("production render-input evidence metadata")

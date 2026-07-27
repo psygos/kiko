@@ -6,10 +6,10 @@ configuration, or permission to attach the wheels.
 
 The qualification contracts are deliberately different from production:
 
-- `bundle-render-input-v3.json.template` is the qualification-only renderer
-  boundary with its bundle kind, null face assets, warm-start policy, and all
-  seven exact native-runtime SONAMEs fixed;
-- `nano-wheels-off-qualification-launch-v3.json.template` is launch schema V3;
+- `bundle-render-input-v4.json.template` is the qualification-only renderer
+  boundary with its bundle kind, exact face-cascade and head-gaze-policy
+  sources, warm-start policy, and all seven exact native-runtime SONAMEs fixed;
+- `nano-wheels-off-qualification-launch-v4.json.template` is launch schema V4;
 - `device-inventory-candidate-v2.json.template` is candidate inventory schema
   V2;
 - `candidate-controller-policy-v1.json` is candidate host-policy schema V1;
@@ -68,11 +68,14 @@ production manual velocity actuation remain disabled.
 
 Render into a staging directory, never directly into the live deployment:
 
-1. prepare `bundle-render-input-v3.json.template`, setting
+1. prepare `bundle-render-input-v4.json.template`, setting
    `bundle.qualification_executable_path` to the absolute path of the reviewed
-   Linux-aarch64 qualification executable; its qualification bundle kind,
-   null face assets, schema version, and cold-start selection are fixed rather
-   than caller placeholders;
+   Linux-aarch64 qualification executable and supplying the distinct exact
+   frontal/profile cascades plus the exact head-gaze policy bytes; renderer
+   binding proves their path, size, and digest only, while the typed consumer
+   must separately prove policy semantics and any physical review claim; its
+   qualification bundle kind, schema version, and cold-start selection are
+   fixed rather than caller placeholders;
 2. install the exact canonical calibration artifact, shadow-only plant,
    navigation-shadow configuration, model bytes, and all seven required roles
    in the closed qualification native-runtime manifest under their reviewed
@@ -95,9 +98,9 @@ Render into a staging directory, never directly into the live deployment:
 7. copy the candidate controller policy without editing it;
 8. compute the byte count and lowercase SHA-256 of every rendered JSON input;
 9. render the evidence manifest and launch document last from those exact
-   values, including exact bindings for the executable and native-runtime
-   manifest. Retain the qualification render input as
-   `evidence/render-input-v3.json`; and
+   values, including exact bindings for the executable, native-runtime
+   manifest, two cascades, and head-gaze policy. Retain the qualification
+   render input as `evidence/render-input-v4.json`; and
 10. reject the staging tree if any `${` token remains or any rendered JSON
    fails `jq -e .`.
 
@@ -106,10 +109,17 @@ hexadecimal digest used by launch bindings and the exact 32-element decimal
 byte array used by inventory artifact entries from the same digest. Do not
 transcribe either representation manually.
 
-Qualification render-input/launch V1 and V2 were already published contracts.
-They must not be relabelled: V2 incorrectly selected the system ABI name
-`libusb-1.0.so.0` for the pinned DepthAI libusb role. The current renderer
-therefore rejects qualification render-input V1 and V2 and emits launch V3.
+The two cascade leaves are independently bounded to 4 MiB and must have
+distinct destinations and exact content. The qualification-only head-gaze
+policy is bounded to 256 KiB, parsed as exact JSON, retained at
+`head-gaze-policy-v1.json`, and rejected if its path or content aliases another
+launch-bound input.
+
+Qualification render-input/launch V1, V2, and V3 were already published
+contracts. They must not be relabelled: V2 incorrectly selected the system ABI
+name `libusb-1.0.so.0` for the pinned DepthAI libusb role, while V3 had no
+face-cascade or head-gaze-policy bindings. The current renderer therefore
+rejects qualification render-input V1 through V3 and emits launch V4.
 Production render-input schema V1 and production launch V3 remain unchanged.
 
 The pinned DepthAI v3.4.0 `libdepthai-core.so` directly needs

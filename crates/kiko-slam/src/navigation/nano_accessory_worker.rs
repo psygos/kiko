@@ -206,7 +206,7 @@ pub(super) struct NanoFacePerceptionAssets {
 
 #[cfg(feature = "nano-agent")]
 impl NanoFacePerceptionAssets {
-    pub(super) fn from_v3_loaded_assets(
+    fn from_loaded_assets(
         frontal_face_cascade: LoadedDeploymentAsset,
         profile_face_cascade: LoadedDeploymentAsset,
     ) -> Self {
@@ -214,6 +214,13 @@ impl NanoFacePerceptionAssets {
             frontal_face_cascade,
             profile_face_cascade,
         }
+    }
+
+    pub(super) fn from_v3_loaded_assets(
+        frontal_face_cascade: LoadedDeploymentAsset,
+        profile_face_cascade: LoadedDeploymentAsset,
+    ) -> Self {
+        Self::from_loaded_assets(frontal_face_cascade, profile_face_cascade)
     }
 
     fn evidence(&self) -> NanoFacePerceptionAssetEvidence {
@@ -2322,8 +2329,30 @@ impl NanoAccessoryWorker {
         }
     }
 
-    /// Start the production V3 face-perception lane and only then start the
-    /// head/eye owner.
+    /// Start face perception from already loaded cascade assets and only then
+    /// start the head/eye owner.
+    ///
+    /// This boundary does not infer cascade roles or trust file paths. The
+    /// caller must pass assets which its launch/bootstrap boundary has already
+    /// bound to the frontal and profile roles respectively. The retained bytes
+    /// move once into the private face-perception asset wrapper; neither path
+    /// is reopened.
+    #[cfg(feature = "nano-agent")]
+    pub fn start_with_loaded_face_perception(
+        config: NanoAccessoryWorkerConfig,
+        frontal_face_cascade: LoadedDeploymentAsset,
+        profile_face_cascade: LoadedDeploymentAsset,
+    ) -> Result<Self, NanoAccessoryWorkerStartError> {
+        Self::start_with_face_perception(
+            config,
+            NanoFacePerceptionAssets::from_loaded_assets(
+                frontal_face_cascade,
+                profile_face_cascade,
+            ),
+        )
+    }
+
+    /// Start the face-perception lane and only then start the head/eye owner.
     ///
     /// The exact retained cascade byte vectors move into the named perception
     /// thread. `NanoFacePerception` is constructed and retained there, so its

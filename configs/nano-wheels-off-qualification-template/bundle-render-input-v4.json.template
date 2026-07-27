@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "bundle": {
     "kind": "wheels_off_qualification",
     "qualification_executable_path": "${QUALIFICATION_EXECUTABLE_SOURCE_ABSOLUTE_PATH}"
@@ -59,7 +59,17 @@
       "source_path": "${LIGHTGLUE_MODEL_SOURCE_ABSOLUTE_PATH}",
       "destination_relative_path": "${LIGHTGLUE_MODEL_RELATIVE_PATH}"
     },
-    "face_perception": null
+    "face_perception": {
+      "frontal_face_cascade": {
+        "source_path": "${FRONTAL_FACE_CASCADE_SOURCE_ABSOLUTE_PATH}",
+        "destination_relative_path": "models/opencv/haarcascade_frontalface_default.xml"
+      },
+      "profile_face_cascade": {
+        "source_path": "${PROFILE_FACE_CASCADE_SOURCE_ABSOLUTE_PATH}",
+        "destination_relative_path": "models/opencv/haarcascade_profileface.xml"
+      }
+    },
+    "head_gaze_policy_source_path": "${HEAD_GAZE_POLICY_SOURCE_ABSOLUTE_PATH}"
   },
   "native_libraries": [
     {

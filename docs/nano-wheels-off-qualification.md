@@ -55,12 +55,12 @@ surface. The raw-PWM qualification modules are compiled out of an ordinary
 production-only `--features nano-agent` build.
 
 The exact resulting executable is a mandatory renderer input. Start from
-`configs/nano-wheels-off-qualification-template/bundle-render-input-v3.json.template`.
+`configs/nano-wheels-off-qualification-template/bundle-render-input-v4.json.template`.
 The prepared qualification render-input boundary includes:
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "bundle": {
     "kind": "wheels_off_qualification",
     "qualification_executable_path": "/absolute/path/to/target/release/kiko-slam"
@@ -68,11 +68,12 @@ The prepared qualification render-input boundary includes:
 }
 ```
 
-Qualification render-input/launch V1 and V2 were already published. Do not
-relabel either old document: V2 incorrectly selected the system ABI name
-`libusb-1.0.so.0` for the pinned DepthAI libusb role. The current renderer
-requires qualification input V3 and emits qualification launch V3. Production
-input V1 and launch V3 are unchanged.
+Qualification render-input/launch V1 through V3 were already published. Do
+not relabel an old document: V2 incorrectly selected the system ABI name
+`libusb-1.0.so.0` for the pinned DepthAI libusb role, and V3 had no exact
+face-cascade or head-gaze-policy binding. The current renderer requires
+qualification input V4 and emits qualification launch V4. Production input V1
+and launch V3 are unchanged.
 
 Do not install a qualification systemd unit. Do not add qualification to the
 production unit, qualified-boot drop-in, cron, Fable guardian, or any other
@@ -104,14 +105,15 @@ staging root. The canonical installed layout is:
 ├── candidate-controller-policy-v1.json
 ├── controller-server-candidate-v2.json
 ├── device-inventory-candidate-v2.json
-├── nano-wheels-off-qualification-launch-v3.json
+├── head-gaze-policy-v1.json
+├── nano-wheels-off-qualification-launch-v4.json
 ├── navigation-shadow-v1.json
 ├── native-runtime-v1.json
 ├── artifacts/
 │   ├── calibration/<exact calibration asset>
 │   └── plant/<exact shadow-only plant asset>
 ├── evidence/
-│   ├── render-input-v3.json
+│   ├── render-input-v4.json
 │   └── render-evidence-v1.json
 ├── lib/
 │   ├── libdepthai-core.so
@@ -121,7 +123,11 @@ staging root. The canonical installed layout is:
 │   ├── libopencv_core.so.4.5d
 │   ├── libopencv_imgproc.so.4.5d
 │   └── libopencv_objdetect.so.4.5d
-└── models/<exact SuperPoint and LightGlue models>
+└── models/
+│   ├── opencv/
+│   │   ├── haarcascade_frontalface_default.xml
+│   │   └── haarcascade_profileface.xml
+│   └── <exact SuperPoint and LightGlue model paths>
 ```
 
 The deployment tool must discover and render the following instead of
@@ -151,7 +157,7 @@ configuration. Production separately cross-binds the artifact's three
 calibration IDs to the physical-actuation approval.
 
 Render the leaf assets and documents first. Render
-`nano-wheels-off-qualification-launch-v3.json` last. On the Nano, inspect the
+`nano-wheels-off-qualification-launch-v4.json` last. On the Nano, inspect the
 result before installation:
 
 ```bash
@@ -231,7 +237,7 @@ sudo /usr/bin/env LD_LIBRARY_PATH=/opt/kiko/qualification/lib \
   /opt/kiko/qualification/bin/kiko-nano-wheels-off-qualification \
   nano-wheels-off-qualification \
   --deployment-root /opt/kiko/qualification \
-  --launch-config nano-wheels-off-qualification-launch-v3.json \
+  --launch-config nano-wheels-off-qualification-launch-v4.json \
   --state-root /var/lib/kiko-nano-qualification
 ```
 

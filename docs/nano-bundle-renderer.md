@@ -23,22 +23,22 @@ anything.
 The schema version is selected with the bundle kind. Production remains
 render-input schema V1 and its illustrative source template is
 `configs/nano-agent-template/bundle-render-input-v1.json.template`.
-Wheels-off qualification requires render-input schema V3. Its field layout
+Wheels-off qualification requires render-input schema V4. Its field layout
 is the exact
-`configs/nano-wheels-off-qualification-template/bundle-render-input-v3.json.template`;
-it fixes the qualification bundle kind, null face assets, cold-start
-selection, and reviewed SONAMEs while requiring the canonical absolute
-`qualification_executable_path`. Production instead requires the complete
-two-cascade object and has no executable-path field. Unresolved `${...}`
-fields make either prepared file non-deployable. The strict renderer rejects
-cross-version and bundle/asset mismatches.
+`configs/nano-wheels-off-qualification-template/bundle-render-input-v4.json.template`;
+it fixes the qualification bundle kind, cold-start selection, cascade
+destinations, head-gaze-policy destination, and reviewed SONAMEs while
+requiring canonical absolute source paths. Production keeps its complete
+two-cascade object and has no qualification executable or head-gaze-policy
+field. Unresolved `${...}` fields make either prepared file non-deployable.
+The strict renderer rejects cross-version and bundle/asset mismatches.
 
-Qualification render-input/launch V1 and V2 were already published. V2
+Qualification render-input/launch V1 through V3 were already published. V2
 incorrectly selected the system ABI name `libusb-1.0.so.0` for the pinned
 DepthAI libusb role, so it is retired rather than silently reinterpreted.
-Qualification render-input V3 emits
-`nano-wheels-off-qualification-launch-v3.json`. Production render-input V1
-and launch V3 are unchanged.
+V3 did not bind face cascades or a head-gaze policy. Qualification
+render-input V4 emits `nano-wheels-off-qualification-launch-v4.json`.
+Production render-input V1 and launch V3 are unchanged.
 
 Prepare the JSON input from one retained discovery record and reviewed source
 files. The strict parser:
@@ -55,8 +55,7 @@ files. The strict parser:
   libusb 1.0, and ONNX Runtime—plus `opencv_core`, `opencv_imgproc`, and
   `opencv_objdetect` roles for both bundle kinds. The attended wheels-off
   binary includes the production dispatch under `nano-agent`, so its ELF
-  required native-runtime manifest cannot omit the detector libraries even
-  though its qualification path rejects and never loads face-cascade assets.
+  required native-runtime manifest cannot omit the detector libraries.
   Qualification pins all seven reviewed native-role SONAMEs exactly:
   `libdepthai-core.so`, `libdynamic_calibration.so`, `libusb-1.0.so`,
   `libonnxruntime.so.1`, `libopencv_core.so.4.5d`,
@@ -79,11 +78,14 @@ rendering does not prove those devices remain connected. The renderer never
 resolves a by-id path to a transient `ttyACM*` name.
 
 The qualification executable, navigation-shadow document, canonical
-calibration artifact, plant artifact, models, production frontal/profile face
-cascades, and native libraries are exact leaf sources. The renderer retains
-their exact bytes.
-Production requires both cascade sources as one typed set; wheels-off
-qualification rejects that unused set. The calibration input key is deliberately
+calibration artifact, plant artifact, models, frontal/profile face cascades,
+qualification head-gaze policy, and native libraries are exact leaf sources.
+The renderer retains their exact bytes. Both bundle variants require the two
+cascade sources as one typed set. Qualification additionally requires one
+JSON head-gaze policy, caps it at 256 KiB, fixes its retained path to
+`head-gaze-policy-v1.json`, and rejects path or content aliasing. Each cascade
+is independently capped at 4 MiB and the two exact contents must differ.
+The calibration input key is deliberately
 `assets.calibration`, not `camera_calibration`: the one artifact owns the
 exact OAK MXID, rectified stereo intrinsics/dimensions/baseline, raw IMU
 calibration, tracking-camera-to-base transform, and three approval calibration
@@ -112,13 +114,13 @@ production installation.
 
 The renderer constructs and writes:
 
-1. the exact qualification executable when selected, plus calibration, plant,
-   navigation-shadow, model, production face-cascade, and native-library
-   leaves;
+1. the exact qualification executable and head-gaze policy when selected,
+   plus calibration, plant, navigation-shadow, model, face-cascade, and
+   native-library leaves;
 2. the native-runtime manifest, inventory, controller contract, motion
    contract when applicable, candidate policy when applicable, and agent
    policy;
-3. the exact render-input evidence copy—V3 for qualification and V1 for
+3. the exact render-input evidence copy—V4 for qualification and V1 for
    production—and the production-profile evidence copy when applicable;
 4. `evidence/render-evidence-v1.json`; and
 5. the bundle launch document, always last.

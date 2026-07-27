@@ -122,14 +122,14 @@ render-input schema-V1 source. Replace its whole-value
 canonical absolute source paths. The strict renderer rejects production
 without both distinct assets.
 
-The wheels-off renderer uses the separate exact schema-V3 source at
-`configs/nano-wheels-off-qualification-template/bundle-render-input-v3.json.template`.
-It fixes the qualification bundle kind, null face assets, cold-start
-selection, and reviewed SONAMEs while requiring
-`qualification_executable_path`, the canonical absolute path of the exact
-Linux-aarch64 executable retained into the qualification bundle. The strict
-renderer rejects cross-version or bundle-specific fields instead of silently
-reinterpreting them.
+The wheels-off renderer uses the separate exact schema-V4 source at
+`configs/nano-wheels-off-qualification-template/bundle-render-input-v4.json.template`.
+It fixes the qualification bundle kind, exact face-cascade and
+head-gaze-policy inputs, cold-start selection, and reviewed SONAMEs while
+requiring `qualification_executable_path`, the canonical absolute path of the
+exact Linux-aarch64 executable retained into the qualification bundle. The
+strict renderer rejects cross-version or bundle-specific fields instead of
+silently reinterpreting them.
 
 ```json
 {

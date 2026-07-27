@@ -2,10 +2,12 @@
 //! qualifier.
 //!
 //! This schema deliberately has no production physical-actuation document.
-//! The V3 launch binds the common OAK/SLAM/occupancy/inference graph to a
-//! schema-V2 candidate inventory, a candidate-only controller contract, and
-//! a candidate-only host policy. Production and qualification documents are
-//! different Rust types and reject each other's schemas.
+//! V3 binds the common OAK/SLAM/occupancy/inference graph to a schema-V2
+//! candidate inventory, a candidate-only controller contract, and a
+//! candidate-only host policy. V4 adds exact frontal/profile face-cascade and
+//! head-gaze-policy bindings without reinterpreting V3. Production and
+//! qualification documents are different Rust types and reject each other's
+//! schemas.
 
 use std::fmt;
 use std::path::Path;
@@ -19,10 +21,11 @@ use kiko_device_inventory::{
 use serde::Deserialize;
 
 use super::nano_agent_launch::{
-    NanoAgentLaunchParseError, NanoLaunchAssetBinding, NanoLaunchAssetBindingDto,
-    NanoLaunchAssetRole, NanoLaunchCalibrationArtifact, NanoLaunchCalibrationArtifactDto,
-    NanoLaunchControllerServer, NanoLaunchControllerServerDto, NanoLaunchInference,
-    NanoLaunchInferenceDto, NanoLaunchOccupancy, NanoLaunchOccupancyDto, NanoLaunchPlantArtifact,
+    MAX_OPENCV_HAAR_CASCADE_BYTES, NanoAgentLaunchParseError, NanoFaceCascadeAssetRole,
+    NanoLaunchAssetBinding, NanoLaunchAssetBindingDto, NanoLaunchAssetRole,
+    NanoLaunchCalibrationArtifact, NanoLaunchCalibrationArtifactDto, NanoLaunchControllerServer,
+    NanoLaunchControllerServerDto, NanoLaunchInference, NanoLaunchInferenceDto,
+    NanoLaunchOccupancy, NanoLaunchOccupancyDto, NanoLaunchPlantArtifact,
     NanoLaunchPlantArtifactDto, NanoLaunchRerun, NanoLaunchRerunDto, NanoLaunchSha256Error,
     NanoLaunchStorage, NanoLaunchStorageDto, NanoOakStreamGraph, NanoOakStreamGraphDto,
     parse_asset, parse_calibration_artifact, parse_controller_server, parse_inference, parse_oak,
@@ -35,7 +38,24 @@ use super::{
 };
 
 pub const NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_V3: u32 = 3;
+pub const NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_V4: u32 = 4;
 pub const MAX_NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_JSON_BYTES: usize = 64 * 1_024;
+pub const MAX_NANO_HEAD_GAZE_POLICY_JSON_BYTES: u64 = 256 * 1_024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NanoWheelsOffQualificationV4AssetRole {
+    HeadGazePolicy,
+}
+
+impl NanoWheelsOffQualificationV4AssetRole {
+    pub const ALL: [Self; 1] = [Self::HeadGazePolicy];
+
+    const fn maximum_bytes(self) -> u64 {
+        match self {
+            Self::HeadGazePolicy => MAX_NANO_HEAD_GAZE_POLICY_JSON_BYTES,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NanoWheelsOffQualificationAssetRole {
@@ -158,7 +178,12 @@ impl NanoWheelsOffQualificationLaunchV3 {
                 },
             );
         }
+        Self::from_dto(dto)
+    }
 
+    fn from_dto(
+        dto: NanoWheelsOffQualificationLaunchV3Dto,
+    ) -> Result<Self, NanoWheelsOffQualificationLaunchParseError> {
         let launch = Self {
             robot_id: QualificationRobotId::parse(dto.robot_id)?,
             qualification_executable: parse_candidate_asset(
@@ -308,6 +333,177 @@ impl NanoWheelsOffQualificationLaunchV3 {
     }
 }
 
+/// Exact face-cascade bindings added by qualification launch V4.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NanoWheelsOffQualificationFacePerception {
+    frontal_face_cascade: NanoLaunchAssetBinding,
+    profile_face_cascade: NanoLaunchAssetBinding,
+}
+
+impl NanoWheelsOffQualificationFacePerception {
+    pub const fn frontal_face_cascade(&self) -> &NanoLaunchAssetBinding {
+        &self.frontal_face_cascade
+    }
+
+    pub const fn profile_face_cascade(&self) -> &NanoLaunchAssetBinding {
+        &self.profile_face_cascade
+    }
+
+    pub const fn asset(&self, role: NanoFaceCascadeAssetRole) -> &NanoLaunchAssetBinding {
+        match role {
+            NanoFaceCascadeAssetRole::FrontalFace => &self.frontal_face_cascade,
+            NanoFaceCascadeAssetRole::ProfileFace => &self.profile_face_cascade,
+        }
+    }
+}
+
+/// Qualification V4 retains the complete V3 graph, exact face cascades, and
+/// one exact head-gaze-policy binding.
+///
+/// This is a separate type so a V3 document can never silently gain face
+/// semantics. Runtime wiring must explicitly select and load V4.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NanoWheelsOffQualificationLaunchV4 {
+    common: NanoWheelsOffQualificationLaunchV3,
+    head_gaze_policy: NanoLaunchAssetBinding,
+    face_perception: NanoWheelsOffQualificationFacePerception,
+}
+
+impl NanoWheelsOffQualificationLaunchV4 {
+    pub fn parse_json(json: &[u8]) -> Result<Self, NanoWheelsOffQualificationLaunchParseError> {
+        if json.len() > MAX_NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_JSON_BYTES {
+            return Err(NanoWheelsOffQualificationLaunchParseError::InputTooLarge {
+                actual_bytes: json.len(),
+                maximum_bytes: MAX_NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_JSON_BYTES,
+            });
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(json);
+        let dto = NanoWheelsOffQualificationLaunchV4Dto::deserialize(&mut deserializer)
+            .map_err(NanoWheelsOffQualificationLaunchParseError::JsonDecode)?;
+        deserializer
+            .end()
+            .map_err(NanoWheelsOffQualificationLaunchParseError::JsonTrailingData)?;
+        if dto.schema_version != NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_V4 {
+            return Err(
+                NanoWheelsOffQualificationLaunchParseError::UnsupportedSchema {
+                    actual: dto.schema_version,
+                    supported: NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_V4,
+                },
+            );
+        }
+
+        let (common_dto, head_gaze_policy_dto, face_perception_dto) = dto.into_parts();
+        let face_perception = parse_qualification_face_perception(
+            face_perception_dto
+                .ok_or(NanoWheelsOffQualificationLaunchParseError::MissingFacePerception)?,
+        )?;
+        let launch = Self {
+            common: NanoWheelsOffQualificationLaunchV3::from_dto(common_dto)?,
+            head_gaze_policy: parse_v4_asset(
+                NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy,
+                head_gaze_policy_dto.ok_or(
+                    NanoWheelsOffQualificationLaunchParseError::MissingV4RequiredAsset {
+                        role: NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy,
+                    },
+                )?,
+            )?,
+            face_perception,
+        };
+        ensure_distinct_v4_assets(&launch)?;
+        Ok(launch)
+    }
+
+    pub const fn robot_id(&self) -> &QualificationRobotId {
+        self.common.robot_id()
+    }
+
+    /// The complete, already parsed V3-compatible portion retained by V4.
+    ///
+    /// This accessor does not reinterpret V4 as V3; callers still own the V4
+    /// type and must separately consume every V4-only asset before runtime
+    /// construction.
+    pub const fn common(&self) -> &NanoWheelsOffQualificationLaunchV3 {
+        &self.common
+    }
+
+    pub const fn qualification_executable(&self) -> &NanoLaunchAssetBinding {
+        self.common.qualification_executable()
+    }
+
+    pub const fn native_runtime_manifest(&self) -> &NanoLaunchAssetBinding {
+        self.common.native_runtime_manifest()
+    }
+
+    pub const fn agent_policy(&self) -> &NanoLaunchAssetBinding {
+        self.common.agent_policy()
+    }
+
+    pub const fn navigation_shadow_config(&self) -> &NanoLaunchAssetBinding {
+        self.common.navigation_shadow_config()
+    }
+
+    pub const fn candidate_inventory_manifest(&self) -> &NanoLaunchAssetBinding {
+        self.common.candidate_inventory_manifest()
+    }
+
+    pub const fn candidate_controller_policy(&self) -> &NanoLaunchAssetBinding {
+        self.common.candidate_controller_policy()
+    }
+
+    pub const fn controller_server(&self) -> &NanoLaunchControllerServer {
+        self.common.controller_server()
+    }
+
+    pub const fn plant_artifact(&self) -> &NanoLaunchPlantArtifact {
+        self.common.plant_artifact()
+    }
+
+    pub const fn calibration_artifact(&self) -> &NanoLaunchCalibrationArtifact {
+        self.common.calibration_artifact()
+    }
+
+    pub const fn oak(&self) -> &NanoOakStreamGraph {
+        self.common.oak()
+    }
+
+    pub const fn occupancy(&self) -> &NanoLaunchOccupancy {
+        self.common.occupancy()
+    }
+
+    pub const fn inference(&self) -> &NanoLaunchInference {
+        self.common.inference()
+    }
+
+    pub const fn rerun(&self) -> NanoLaunchRerun {
+        self.common.rerun()
+    }
+
+    pub const fn storage(&self) -> &NanoLaunchStorage {
+        self.common.storage()
+    }
+
+    pub fn asset(&self, role: NanoWheelsOffQualificationAssetRole) -> &NanoLaunchAssetBinding {
+        self.common.asset(role)
+    }
+
+    pub const fn head_gaze_policy(&self) -> &NanoLaunchAssetBinding {
+        &self.head_gaze_policy
+    }
+
+    pub const fn v4_asset(
+        &self,
+        role: NanoWheelsOffQualificationV4AssetRole,
+    ) -> &NanoLaunchAssetBinding {
+        match role {
+            NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy => &self.head_gaze_policy,
+        }
+    }
+
+    pub const fn face_perception(&self) -> &NanoWheelsOffQualificationFacePerception {
+        &self.face_perception
+    }
+}
+
 #[derive(Debug)]
 pub struct LoadedNanoWheelsOffQualificationLaunchV3 {
     launch: NanoWheelsOffQualificationLaunchV3,
@@ -359,11 +555,89 @@ pub fn load_nano_wheels_off_qualification_launch_v3(
 }
 
 #[derive(Debug)]
+pub struct LoadedNanoWheelsOffQualificationLaunchV4 {
+    launch: NanoWheelsOffQualificationLaunchV4,
+    source: LoadedDeploymentAsset,
+}
+
+impl LoadedNanoWheelsOffQualificationLaunchV4 {
+    pub const fn launch(&self) -> &NanoWheelsOffQualificationLaunchV4 {
+        &self.launch
+    }
+
+    pub const fn source(&self) -> &LoadedDeploymentAsset {
+        &self.source
+    }
+
+    pub const fn content_sha256(&self) -> DeploymentAssetContentSha256 {
+        self.source.content_sha256()
+    }
+
+    pub fn into_parts(self) -> (NanoWheelsOffQualificationLaunchV4, LoadedDeploymentAsset) {
+        (self.launch, self.source)
+    }
+}
+
+pub fn load_nano_wheels_off_qualification_launch_v4(
+    deployment_root: &Path,
+    launch_relative_path: ArtifactRelativePath,
+) -> Result<LoadedNanoWheelsOffQualificationLaunchV4, NanoWheelsOffQualificationLaunchLoadError> {
+    let byte_limit = DeploymentAssetByteLimit::try_new(
+        u64::try_from(MAX_NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_JSON_BYTES)
+            .expect("launch JSON bound fits every supported host"),
+    )
+    .expect("launch JSON bound is within the deployment-asset domain");
+    let source = load_deployment_asset(deployment_root, launch_relative_path, byte_limit)
+        .map_err(NanoWheelsOffQualificationLaunchLoadError::Load)?;
+    let launch = NanoWheelsOffQualificationLaunchV4::parse_json(source.bytes())
+        .map_err(NanoWheelsOffQualificationLaunchLoadError::Parse)?;
+    for role in NanoWheelsOffQualificationAssetRole::ALL {
+        if launch.asset(role).relative_path() == source.relative_path() {
+            return Err(
+                NanoWheelsOffQualificationLaunchLoadError::InputAliasesLaunchDocument {
+                    role,
+                    relative_path: source.relative_path().clone(),
+                },
+            );
+        }
+    }
+    for role in NanoWheelsOffQualificationV4AssetRole::ALL {
+        if launch.v4_asset(role).relative_path() == source.relative_path() {
+            return Err(
+                NanoWheelsOffQualificationLaunchLoadError::V4InputAliasesLaunchDocument {
+                    role,
+                    relative_path: source.relative_path().clone(),
+                },
+            );
+        }
+    }
+    for role in NanoFaceCascadeAssetRole::ALL {
+        if launch.face_perception().asset(role).relative_path() == source.relative_path() {
+            return Err(
+                NanoWheelsOffQualificationLaunchLoadError::FaceInputAliasesLaunchDocument {
+                    role,
+                    relative_path: source.relative_path().clone(),
+                },
+            );
+        }
+    }
+    Ok(LoadedNanoWheelsOffQualificationLaunchV4 { launch, source })
+}
+
+#[derive(Debug)]
 pub enum NanoWheelsOffQualificationLaunchLoadError {
     Load(DeploymentAssetLoadError),
     Parse(NanoWheelsOffQualificationLaunchParseError),
     InputAliasesLaunchDocument {
         role: NanoWheelsOffQualificationAssetRole,
+        relative_path: ArtifactRelativePath,
+    },
+    FaceInputAliasesLaunchDocument {
+        role: NanoFaceCascadeAssetRole,
+        relative_path: ArtifactRelativePath,
+    },
+    V4InputAliasesLaunchDocument {
+        role: NanoWheelsOffQualificationV4AssetRole,
         relative_path: ArtifactRelativePath,
     },
 }
@@ -382,7 +656,9 @@ impl std::error::Error for NanoWheelsOffQualificationLaunchLoadError {
         match self {
             Self::Load(source) => Some(source),
             Self::Parse(source) => Some(source),
-            Self::InputAliasesLaunchDocument { .. } => None,
+            Self::InputAliasesLaunchDocument { .. }
+            | Self::FaceInputAliasesLaunchDocument { .. }
+            | Self::V4InputAliasesLaunchDocument { .. } => None,
         }
     }
 }
@@ -428,6 +704,85 @@ pub enum NanoWheelsOffQualificationLaunchParseError {
         second: NanoWheelsOffQualificationAssetRole,
         relative_path: ArtifactRelativePath,
     },
+    MissingFacePerception,
+    InvalidFaceAssetPath {
+        role: NanoFaceCascadeAssetRole,
+        source: ArtifactRelativePathError,
+    },
+    InvalidFaceAssetByteLimit {
+        role: NanoFaceCascadeAssetRole,
+        source: DeploymentAssetByteLimitError,
+    },
+    FaceAssetByteLimitAboveMaximum {
+        role: NanoFaceCascadeAssetRole,
+        actual_bytes: u64,
+        maximum_bytes: u64,
+    },
+    InvalidFaceAssetSha256 {
+        role: NanoFaceCascadeAssetRole,
+        source: NanoLaunchSha256Error,
+    },
+    DuplicateFaceAssetPath {
+        relative_path: ArtifactRelativePath,
+    },
+    DuplicateFaceAssetContent {
+        expected_sha256: [u8; 32],
+    },
+    FaceAssetAliasesInputAsset {
+        face: NanoFaceCascadeAssetRole,
+        input: NanoWheelsOffQualificationAssetRole,
+        relative_path: ArtifactRelativePath,
+    },
+    FaceAssetAliasesInputContent {
+        face: NanoFaceCascadeAssetRole,
+        input: NanoWheelsOffQualificationAssetRole,
+        expected_sha256: [u8; 32],
+    },
+    FaceAssetAliasesV4Content {
+        face: NanoFaceCascadeAssetRole,
+        input: NanoWheelsOffQualificationV4AssetRole,
+        expected_sha256: [u8; 32],
+    },
+    MissingV4RequiredAsset {
+        role: NanoWheelsOffQualificationV4AssetRole,
+    },
+    InvalidV4AssetPath {
+        role: NanoWheelsOffQualificationV4AssetRole,
+        source: ArtifactRelativePathError,
+    },
+    InvalidV4AssetByteLimit {
+        role: NanoWheelsOffQualificationV4AssetRole,
+        source: DeploymentAssetByteLimitError,
+    },
+    V4AssetByteLimitAboveRoleMaximum {
+        role: NanoWheelsOffQualificationV4AssetRole,
+        actual_bytes: u64,
+        maximum_bytes: u64,
+    },
+    InvalidV4AssetSha256 {
+        role: NanoWheelsOffQualificationV4AssetRole,
+        source: NanoLaunchSha256Error,
+    },
+    V4AssetAliasesInputPath {
+        role: NanoWheelsOffQualificationV4AssetRole,
+        input: NanoWheelsOffQualificationAssetRole,
+        relative_path: ArtifactRelativePath,
+    },
+    V4AssetAliasesFacePath {
+        role: NanoWheelsOffQualificationV4AssetRole,
+        face: NanoFaceCascadeAssetRole,
+        relative_path: ArtifactRelativePath,
+    },
+    V4AssetAliasesInputContent {
+        role: NanoWheelsOffQualificationV4AssetRole,
+        input: NanoWheelsOffQualificationAssetRole,
+        expected_sha256: [u8; 32],
+    },
+    V4AssetAliasesFaceContent {
+        role: NanoWheelsOffQualificationV4AssetRole,
+        face: NanoFaceCascadeAssetRole,
+        expected_sha256: [u8; 32],
+    },
     Common(NanoAgentLaunchParseError),
 }
 
@@ -447,13 +802,32 @@ impl std::error::Error for NanoWheelsOffQualificationLaunchParseError {
             Self::InvalidAssetPath { source, .. } => Some(source),
             Self::InvalidAssetByteLimit { source, .. } => Some(source),
             Self::InvalidAssetSha256 { source, .. } => Some(source),
+            Self::InvalidFaceAssetPath { source, .. } => Some(source),
+            Self::InvalidFaceAssetByteLimit { source, .. } => Some(source),
+            Self::InvalidFaceAssetSha256 { source, .. } => Some(source),
+            Self::InvalidV4AssetPath { source, .. } => Some(source),
+            Self::InvalidV4AssetByteLimit { source, .. } => Some(source),
+            Self::InvalidV4AssetSha256 { source, .. } => Some(source),
             Self::Common(source) => Some(source),
             Self::InputTooLarge { .. }
             | Self::UnsupportedSchema { .. }
             | Self::InvalidRobotId { .. }
             | Self::MissingRequiredAsset { .. }
             | Self::AssetByteLimitAboveRoleMaximum { .. }
-            | Self::DuplicateInputAssetPath { .. } => None,
+            | Self::DuplicateInputAssetPath { .. }
+            | Self::MissingFacePerception
+            | Self::FaceAssetByteLimitAboveMaximum { .. }
+            | Self::DuplicateFaceAssetPath { .. }
+            | Self::DuplicateFaceAssetContent { .. }
+            | Self::FaceAssetAliasesInputAsset { .. }
+            | Self::FaceAssetAliasesInputContent { .. }
+            | Self::FaceAssetAliasesV4Content { .. }
+            | Self::MissingV4RequiredAsset { .. }
+            | Self::V4AssetByteLimitAboveRoleMaximum { .. }
+            | Self::V4AssetAliasesInputPath { .. }
+            | Self::V4AssetAliasesFacePath { .. }
+            | Self::V4AssetAliasesInputContent { .. }
+            | Self::V4AssetAliasesFaceContent { .. } => None,
         }
     }
 }
@@ -477,6 +851,77 @@ struct NanoWheelsOffQualificationLaunchV3Dto {
     inference: NanoLaunchInferenceDto,
     rerun: NanoLaunchRerunDto,
     storage: NanoLaunchStorageDto,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NanoWheelsOffQualificationLaunchV4Dto {
+    schema_version: u32,
+    robot_id: String,
+    qualification_executable_asset: Option<CandidateAssetBindingDto>,
+    native_runtime_manifest_asset: Option<CandidateAssetBindingDto>,
+    agent_policy_asset: NanoLaunchAssetBindingDto,
+    navigation_shadow_config_asset: NanoLaunchAssetBindingDto,
+    candidate_inventory_manifest_asset: CandidateAssetBindingDto,
+    candidate_controller_policy_asset: CandidateAssetBindingDto,
+    head_gaze_policy_asset: Option<CandidateAssetBindingDto>,
+    controller_server: NanoLaunchControllerServerDto,
+    calibration_artifact: NanoLaunchCalibrationArtifactDto,
+    plant_artifact: NanoLaunchPlantArtifactDto,
+    oak: NanoOakStreamGraphDto,
+    occupancy: NanoLaunchOccupancyDto,
+    inference: NanoLaunchInferenceDto,
+    face_perception: Option<QualificationFacePerceptionDto>,
+    rerun: NanoLaunchRerunDto,
+    storage: NanoLaunchStorageDto,
+}
+
+impl NanoWheelsOffQualificationLaunchV4Dto {
+    fn into_parts(
+        self,
+    ) -> (
+        NanoWheelsOffQualificationLaunchV3Dto,
+        Option<CandidateAssetBindingDto>,
+        Option<QualificationFacePerceptionDto>,
+    ) {
+        (
+            NanoWheelsOffQualificationLaunchV3Dto {
+                schema_version: NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_V3,
+                robot_id: self.robot_id,
+                qualification_executable_asset: self.qualification_executable_asset,
+                native_runtime_manifest_asset: self.native_runtime_manifest_asset,
+                agent_policy_asset: self.agent_policy_asset,
+                navigation_shadow_config_asset: self.navigation_shadow_config_asset,
+                candidate_inventory_manifest_asset: self.candidate_inventory_manifest_asset,
+                candidate_controller_policy_asset: self.candidate_controller_policy_asset,
+                controller_server: self.controller_server,
+                calibration_artifact: self.calibration_artifact,
+                plant_artifact: self.plant_artifact,
+                oak: self.oak,
+                occupancy: self.occupancy,
+                inference: self.inference,
+                rerun: self.rerun,
+                storage: self.storage,
+            },
+            self.head_gaze_policy_asset,
+            self.face_perception,
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationFacePerceptionDto {
+    frontal_face_cascade_asset: QualificationFaceAssetBindingDto,
+    profile_face_cascade_asset: QualificationFaceAssetBindingDto,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationFaceAssetBindingDto {
+    relative_path: String,
+    maximum_bytes: u64,
+    sha256_hex: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -517,6 +962,80 @@ fn parse_candidate_asset(
     ))
 }
 
+fn parse_v4_asset(
+    role: NanoWheelsOffQualificationV4AssetRole,
+    dto: CandidateAssetBindingDto,
+) -> Result<NanoLaunchAssetBinding, NanoWheelsOffQualificationLaunchParseError> {
+    let relative_path = ArtifactRelativePath::parse(dto.relative_path).map_err(|source| {
+        NanoWheelsOffQualificationLaunchParseError::InvalidV4AssetPath { role, source }
+    })?;
+    let byte_limit = DeploymentAssetByteLimit::try_new(dto.maximum_bytes).map_err(|source| {
+        NanoWheelsOffQualificationLaunchParseError::InvalidV4AssetByteLimit { role, source }
+    })?;
+    let maximum_bytes = role.maximum_bytes();
+    if byte_limit.get() > maximum_bytes {
+        return Err(
+            NanoWheelsOffQualificationLaunchParseError::V4AssetByteLimitAboveRoleMaximum {
+                role,
+                actual_bytes: byte_limit.get(),
+                maximum_bytes,
+            },
+        );
+    }
+    let expected_sha256 = parse_sha256(&dto.sha256_hex).map_err(|source| {
+        NanoWheelsOffQualificationLaunchParseError::InvalidV4AssetSha256 { role, source }
+    })?;
+    Ok(NanoLaunchAssetBinding::from_parsed_parts(
+        relative_path,
+        byte_limit,
+        expected_sha256,
+    ))
+}
+
+fn parse_qualification_face_perception(
+    dto: QualificationFacePerceptionDto,
+) -> Result<NanoWheelsOffQualificationFacePerception, NanoWheelsOffQualificationLaunchParseError> {
+    Ok(NanoWheelsOffQualificationFacePerception {
+        frontal_face_cascade: parse_qualification_face_asset(
+            NanoFaceCascadeAssetRole::FrontalFace,
+            dto.frontal_face_cascade_asset,
+        )?,
+        profile_face_cascade: parse_qualification_face_asset(
+            NanoFaceCascadeAssetRole::ProfileFace,
+            dto.profile_face_cascade_asset,
+        )?,
+    })
+}
+
+fn parse_qualification_face_asset(
+    role: NanoFaceCascadeAssetRole,
+    dto: QualificationFaceAssetBindingDto,
+) -> Result<NanoLaunchAssetBinding, NanoWheelsOffQualificationLaunchParseError> {
+    let relative_path = ArtifactRelativePath::parse(dto.relative_path).map_err(|source| {
+        NanoWheelsOffQualificationLaunchParseError::InvalidFaceAssetPath { role, source }
+    })?;
+    let byte_limit = DeploymentAssetByteLimit::try_new(dto.maximum_bytes).map_err(|source| {
+        NanoWheelsOffQualificationLaunchParseError::InvalidFaceAssetByteLimit { role, source }
+    })?;
+    if byte_limit.get() > MAX_OPENCV_HAAR_CASCADE_BYTES {
+        return Err(
+            NanoWheelsOffQualificationLaunchParseError::FaceAssetByteLimitAboveMaximum {
+                role,
+                actual_bytes: byte_limit.get(),
+                maximum_bytes: MAX_OPENCV_HAAR_CASCADE_BYTES,
+            },
+        );
+    }
+    let expected_sha256 = parse_sha256(&dto.sha256_hex).map_err(|source| {
+        NanoWheelsOffQualificationLaunchParseError::InvalidFaceAssetSha256 { role, source }
+    })?;
+    Ok(NanoLaunchAssetBinding::from_parsed_parts(
+        relative_path,
+        byte_limit,
+        expected_sha256,
+    ))
+}
+
 fn ensure_distinct_assets(
     launch: &NanoWheelsOffQualificationLaunchV3,
 ) -> Result<(), NanoWheelsOffQualificationLaunchParseError> {
@@ -535,6 +1054,113 @@ fn ensure_distinct_assets(
                         first,
                         second,
                         relative_path: first_path.clone(),
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_distinct_v4_assets(
+    launch: &NanoWheelsOffQualificationLaunchV4,
+) -> Result<(), NanoWheelsOffQualificationLaunchParseError> {
+    let frontal = launch
+        .face_perception()
+        .asset(NanoFaceCascadeAssetRole::FrontalFace);
+    let profile = launch
+        .face_perception()
+        .asset(NanoFaceCascadeAssetRole::ProfileFace);
+    if frontal.relative_path() == profile.relative_path() {
+        return Err(
+            NanoWheelsOffQualificationLaunchParseError::DuplicateFaceAssetPath {
+                relative_path: frontal.relative_path().clone(),
+            },
+        );
+    }
+    if frontal.expected_sha256() == profile.expected_sha256() {
+        return Err(
+            NanoWheelsOffQualificationLaunchParseError::DuplicateFaceAssetContent {
+                expected_sha256: *frontal.expected_sha256(),
+            },
+        );
+    }
+    for face in NanoFaceCascadeAssetRole::ALL {
+        let face_asset = launch.face_perception().asset(face);
+        for input in NanoWheelsOffQualificationAssetRole::ALL {
+            let existing = launch.asset(input);
+            if face_asset.relative_path() == existing.relative_path() {
+                return Err(
+                    NanoWheelsOffQualificationLaunchParseError::FaceAssetAliasesInputAsset {
+                        face,
+                        input,
+                        relative_path: face_asset.relative_path().clone(),
+                    },
+                );
+            }
+            if face_asset.expected_sha256() == existing.expected_sha256() {
+                return Err(
+                    NanoWheelsOffQualificationLaunchParseError::FaceAssetAliasesInputContent {
+                        face,
+                        input,
+                        expected_sha256: *face_asset.expected_sha256(),
+                    },
+                );
+            }
+        }
+        for input in NanoWheelsOffQualificationV4AssetRole::ALL {
+            let existing = launch.v4_asset(input);
+            if face_asset.expected_sha256() == existing.expected_sha256() {
+                return Err(
+                    NanoWheelsOffQualificationLaunchParseError::FaceAssetAliasesV4Content {
+                        face,
+                        input,
+                        expected_sha256: *face_asset.expected_sha256(),
+                    },
+                );
+            }
+        }
+    }
+    for role in NanoWheelsOffQualificationV4AssetRole::ALL {
+        let additional = launch.v4_asset(role);
+        for input in NanoWheelsOffQualificationAssetRole::ALL {
+            let existing = launch.asset(input);
+            if additional.relative_path() == existing.relative_path() {
+                return Err(
+                    NanoWheelsOffQualificationLaunchParseError::V4AssetAliasesInputPath {
+                        role,
+                        input,
+                        relative_path: additional.relative_path().clone(),
+                    },
+                );
+            }
+            if additional.expected_sha256() == existing.expected_sha256() {
+                return Err(
+                    NanoWheelsOffQualificationLaunchParseError::V4AssetAliasesInputContent {
+                        role,
+                        input,
+                        expected_sha256: *additional.expected_sha256(),
+                    },
+                );
+            }
+        }
+        for face in NanoFaceCascadeAssetRole::ALL {
+            let existing = launch.face_perception().asset(face);
+            if additional.relative_path() == existing.relative_path() {
+                return Err(
+                    NanoWheelsOffQualificationLaunchParseError::V4AssetAliasesFacePath {
+                        role,
+                        face,
+                        relative_path: additional.relative_path().clone(),
+                    },
+                );
+            }
+            if additional.expected_sha256() == existing.expected_sha256() {
+                return Err(
+                    NanoWheelsOffQualificationLaunchParseError::V4AssetAliasesFaceContent {
+                        role,
+                        face,
+                        expected_sha256: *additional.expected_sha256(),
                     },
                 );
             }
@@ -630,6 +1256,28 @@ mod tests {
             }
         }))
         .expect("qualification launch fixture")
+    }
+
+    fn face_asset(path: &str, digest_byte: &str) -> Value {
+        json!({
+            "relative_path": path,
+            "maximum_bytes": 1024,
+            "sha256_hex": digest_byte.repeat(32),
+        })
+    }
+
+    fn launch_v4_document() -> Vec<u8> {
+        let mut value: Value =
+            serde_json::from_slice(&launch_document()).expect("qualification V3 fixture");
+        value["schema_version"] = json!(4);
+        value["head_gaze_policy_asset"] = face_asset("head-gaze-policy-v1.json", "44");
+        value["face_perception"] = json!({
+            "frontal_face_cascade_asset":
+                face_asset("models/opencv/haarcascade_frontalface_default.xml", "22"),
+            "profile_face_cascade_asset":
+                face_asset("models/opencv/haarcascade_profileface.xml", "33"),
+        });
+        serde_json::to_vec(&value).expect("qualification V4 launch fixture")
     }
 
     #[test]
@@ -732,6 +1380,228 @@ mod tests {
         assert!(matches!(
             NanoWheelsOffQualificationLaunchV3::parse_json(&trailing),
             Err(NanoWheelsOffQualificationLaunchParseError::JsonTrailingData(_))
+        ));
+    }
+
+    #[test]
+    fn v4_adds_exact_face_assets_without_reinterpreting_v3() {
+        let v4 = launch_v4_document();
+        let launch = NanoWheelsOffQualificationLaunchV4::parse_json(&v4).expect("qualification V4");
+        assert_eq!(
+            launch
+                .face_perception()
+                .frontal_face_cascade()
+                .relative_path()
+                .as_str(),
+            "models/opencv/haarcascade_frontalface_default.xml"
+        );
+        assert_eq!(
+            launch
+                .face_perception()
+                .profile_face_cascade()
+                .relative_path()
+                .as_str(),
+            "models/opencv/haarcascade_profileface.xml"
+        );
+        assert_eq!(
+            launch.head_gaze_policy().relative_path().as_str(),
+            "head-gaze-policy-v1.json"
+        );
+        assert!(
+            NanoWheelsOffQualificationLaunchV3::parse_json(&v4).is_err(),
+            "V3 must not silently adopt V4 face semantics"
+        );
+        assert!(
+            NanoAgentLaunchV3::parse_json(&v4).is_err(),
+            "production launch remains a disjoint type"
+        );
+
+        for retired in [1_u32, 2, 3] {
+            let mut value: Value = serde_json::from_slice(&v4).expect("qualification V4 fixture");
+            value["schema_version"] = json!(retired);
+            assert!(matches!(
+                NanoWheelsOffQualificationLaunchV4::parse_json(
+                    &serde_json::to_vec(&value).expect("retired version fixture")
+                ),
+                Err(
+                    NanoWheelsOffQualificationLaunchParseError::UnsupportedSchema {
+                        actual,
+                        supported: 4
+                    }
+                ) if actual == retired
+            ));
+        }
+    }
+
+    #[test]
+    fn v4_requires_distinct_bounded_face_assets_that_alias_nothing() {
+        let original: Value =
+            serde_json::from_slice(&launch_v4_document()).expect("qualification V4 fixture");
+
+        let mut missing = original.clone();
+        missing
+            .as_object_mut()
+            .expect("V4 launch object")
+            .remove("face_perception");
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV4::parse_json(
+                &serde_json::to_vec(&missing).expect("missing face fixture")
+            ),
+            Err(NanoWheelsOffQualificationLaunchParseError::MissingFacePerception)
+        ));
+
+        let mut same_path = original.clone();
+        same_path["face_perception"]["profile_face_cascade_asset"]["relative_path"] =
+            same_path["face_perception"]["frontal_face_cascade_asset"]["relative_path"].clone();
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV4::parse_json(
+                &serde_json::to_vec(&same_path).expect("same face path fixture")
+            ),
+            Err(NanoWheelsOffQualificationLaunchParseError::DuplicateFaceAssetPath { .. })
+        ));
+
+        let mut same_content = original.clone();
+        same_content["face_perception"]["profile_face_cascade_asset"]["sha256_hex"] =
+            same_content["face_perception"]["frontal_face_cascade_asset"]["sha256_hex"].clone();
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV4::parse_json(
+                &serde_json::to_vec(&same_content).expect("same face content fixture")
+            ),
+            Err(NanoWheelsOffQualificationLaunchParseError::DuplicateFaceAssetContent { .. })
+        ));
+
+        let mut aliases_common_content = original.clone();
+        aliases_common_content["face_perception"]["frontal_face_cascade_asset"]["sha256_hex"] =
+            aliases_common_content["agent_policy_asset"]["sha256_hex"].clone();
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV4::parse_json(
+                &serde_json::to_vec(&aliases_common_content)
+                    .expect("face/common content alias fixture")
+            ),
+            Err(
+                NanoWheelsOffQualificationLaunchParseError::FaceAssetAliasesInputContent {
+                    face: NanoFaceCascadeAssetRole::FrontalFace,
+                    input: NanoWheelsOffQualificationAssetRole::QualificationExecutable,
+                    ..
+                }
+            )
+        ));
+
+        let mut aliases_head_content = original.clone();
+        aliases_head_content["face_perception"]["profile_face_cascade_asset"]["sha256_hex"] =
+            aliases_head_content["head_gaze_policy_asset"]["sha256_hex"].clone();
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV4::parse_json(
+                &serde_json::to_vec(&aliases_head_content)
+                    .expect("face/head content alias fixture")
+            ),
+            Err(
+                NanoWheelsOffQualificationLaunchParseError::FaceAssetAliasesV4Content {
+                    face: NanoFaceCascadeAssetRole::ProfileFace,
+                    input: NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy,
+                    ..
+                }
+            )
+        ));
+
+        let mut aliases_input = original.clone();
+        aliases_input["face_perception"]["frontal_face_cascade_asset"]["relative_path"] =
+            aliases_input["agent_policy_asset"]["relative_path"].clone();
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV4::parse_json(
+                &serde_json::to_vec(&aliases_input).expect("aliased face fixture")
+            ),
+            Err(
+                NanoWheelsOffQualificationLaunchParseError::FaceAssetAliasesInputAsset {
+                    face: NanoFaceCascadeAssetRole::FrontalFace,
+                    input: NanoWheelsOffQualificationAssetRole::AgentPolicy,
+                    ..
+                }
+            )
+        ));
+
+        let mut oversized = original;
+        oversized["face_perception"]["profile_face_cascade_asset"]["maximum_bytes"] =
+            json!(MAX_OPENCV_HAAR_CASCADE_BYTES + 1);
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV4::parse_json(
+                &serde_json::to_vec(&oversized).expect("oversized face fixture")
+            ),
+            Err(
+                NanoWheelsOffQualificationLaunchParseError::FaceAssetByteLimitAboveMaximum {
+                    role: NanoFaceCascadeAssetRole::ProfileFace,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn v4_requires_a_bounded_head_gaze_policy_that_aliases_nothing() {
+        let original: Value =
+            serde_json::from_slice(&launch_v4_document()).expect("qualification V4 fixture");
+
+        let mut missing = original.clone();
+        missing
+            .as_object_mut()
+            .expect("V4 launch object")
+            .remove("head_gaze_policy_asset");
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV4::parse_json(
+                &serde_json::to_vec(&missing).expect("missing head-gaze fixture")
+            ),
+            Err(
+                NanoWheelsOffQualificationLaunchParseError::MissingV4RequiredAsset {
+                    role: NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy
+                }
+            )
+        ));
+
+        let mut aliases_path = original.clone();
+        aliases_path["head_gaze_policy_asset"]["relative_path"] =
+            aliases_path["agent_policy_asset"]["relative_path"].clone();
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV4::parse_json(
+                &serde_json::to_vec(&aliases_path).expect("head-gaze path alias fixture")
+            ),
+            Err(
+                NanoWheelsOffQualificationLaunchParseError::V4AssetAliasesInputPath {
+                    role: NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy,
+                    input: NanoWheelsOffQualificationAssetRole::AgentPolicy,
+                    ..
+                }
+            )
+        ));
+
+        let mut aliases_content = original.clone();
+        aliases_content["head_gaze_policy_asset"]["sha256_hex"] =
+            aliases_content["face_perception"]["frontal_face_cascade_asset"]["sha256_hex"].clone();
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV4::parse_json(
+                &serde_json::to_vec(&aliases_content).expect("head-gaze content alias fixture")
+            ),
+            Err(
+                NanoWheelsOffQualificationLaunchParseError::FaceAssetAliasesV4Content {
+                    face: NanoFaceCascadeAssetRole::FrontalFace,
+                    input: NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy,
+                    ..
+                }
+            )
+        ));
+
+        let mut oversized = original;
+        oversized["head_gaze_policy_asset"]["maximum_bytes"] =
+            json!(MAX_NANO_HEAD_GAZE_POLICY_JSON_BYTES + 1);
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV4::parse_json(
+                &serde_json::to_vec(&oversized).expect("oversized head-gaze fixture")
+            ),
+            Err(
+                NanoWheelsOffQualificationLaunchParseError::V4AssetByteLimitAboveRoleMaximum {
+                    role: NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy,
+                    ..
+                }
+            )
         ));
     }
 }

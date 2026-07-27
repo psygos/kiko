@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "robot_id": "${ROBOT_ID}",
   "qualification_executable_asset": {
     "relative_path": "bin/kiko-nano-wheels-off-qualification",
@@ -30,6 +30,11 @@
     "relative_path": "candidate-controller-policy-v1.json",
     "maximum_bytes": ${CANDIDATE_CONTROLLER_POLICY_MAXIMUM_BYTES},
     "sha256_hex": "${CANDIDATE_CONTROLLER_POLICY_SHA256}"
+  },
+  "head_gaze_policy_asset": {
+    "relative_path": "head-gaze-policy-v1.json",
+    "maximum_bytes": ${HEAD_GAZE_POLICY_MAXIMUM_BYTES},
+    "sha256_hex": "${HEAD_GAZE_POLICY_SHA256}"
   },
   "controller_server": {
     "contract_asset": {
@@ -114,6 +119,18 @@
     "lightglue_backend": "${LIGHTGLUE_BACKEND}",
     "downscale_factor": ${INFERENCE_DOWNSCALE_FACTOR},
     "maximum_keypoints": ${INFERENCE_MAXIMUM_KEYPOINTS}
+  },
+  "face_perception": {
+    "frontal_face_cascade_asset": {
+      "relative_path": "models/opencv/haarcascade_frontalface_default.xml",
+      "maximum_bytes": ${FRONTAL_FACE_CASCADE_MAXIMUM_BYTES},
+      "sha256_hex": "${FRONTAL_FACE_CASCADE_SHA256}"
+    },
+    "profile_face_cascade_asset": {
+      "relative_path": "models/opencv/haarcascade_profileface.xml",
+      "maximum_bytes": ${PROFILE_FACE_CASCADE_MAXIMUM_BYTES},
+      "sha256_hex": "${PROFILE_FACE_CASCADE_SHA256}"
+    }
   },
   "rerun": {
     "kind": "serve_loopback",
