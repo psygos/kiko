@@ -180,7 +180,13 @@ guessing them:
 - exact byte counts and lowercase SHA-256 values for every file in the
   renderer's typed bundle plan, including the qualification executable, the
   seven required native-runtime roles, and `native-runtime-v1.json`; and
-- reviewed OAK, occupancy, inference, Rerun, and storage resource limits.
+- the source files for the fixed SuperPoint, LightGlue, face-cascade, and
+  native-library destinations.
+
+OAK stream geometry, occupancy, inference, Rerun, storage, head-return, and
+RGB-expression policy are fixed by the checked-in V4 render-input template.
+Changing them is a reviewed source change with tests, not a deployment-time
+substitution.
 
 The current physical connection assumptions may seed device discovery, but
 they are not evidence. The rendered server, inventory, and live acquisition

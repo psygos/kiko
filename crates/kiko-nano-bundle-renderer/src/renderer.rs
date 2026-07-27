@@ -6,7 +6,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use robot_server::config::{ControllerServerConfigV1, ControllerServerConfigV2, ServerConfigError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -31,6 +31,47 @@ const PRODUCTION_PROFILE_EVIDENCE_PATH: &str = "evidence/production-controller-p
 const RENDER_EVIDENCE_PATH: &str = "evidence/render-evidence-v1.json";
 const QUALIFICATION_EXECUTABLE_RELATIVE_PATH: &str = "bin/kiko-nano-wheels-off-qualification";
 const HEAD_GAZE_POLICY_RELATIVE_PATH: &str = "head-gaze-policy-v1.json";
+const QUALIFICATION_GATE_A_PLANT_ARTIFACT_ID: &str =
+    "qualification-shadow-only-synthetic-unvalidated-v2";
+const QUALIFICATION_GATE_A_PLANT_RELATIVE_PATH: &str =
+    "artifacts/plant/qualification-shadow-only-synthetic-unvalidated-plant-v2.json";
+const QUALIFICATION_GATE_A_PLANT_MODEL_ID: &str =
+    "qualification-shadow-only-synthetic-unvalidated-v2";
+const QUALIFICATION_GATE_A_PLANT_MODEL_VERSION: u32 = 2;
+const QUALIFICATION_GATE_A_PLANT_SAMPLE_PERIOD_S: f64 = 0.05;
+const QUALIFICATION_GATE_A_PLANT_FIXTURE_ID: &str =
+    "qualification-shadow-only-synthetic-unvalidated-fixture-v2";
+const QUALIFICATION_GATE_A_PLANT_GENERATOR_ID: &str =
+    "synthetic-unvalidated-hand-authored-qualification-shadow-v2";
+const QUALIFICATION_GATE_A_PLANT_SHA256_HEX: &str =
+    "aa96e9a3e75c540112d645a8dbefa54ba647574e90fc33e48b314b3c0094ded8";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationGateAPlantV2 {
+    schema_version: u32,
+    model_id: String,
+    model_version: u32,
+    sample_period_s: f64,
+    #[serde(rename = "wheelbase_m")]
+    _wheelbase_m: f64,
+    #[serde(rename = "left")]
+    _left: Value,
+    #[serde(rename = "right")]
+    _right: Value,
+    #[serde(rename = "validity")]
+    _validity: Value,
+    evidence: QualificationGateAPlantEvidenceV2,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum QualificationGateAPlantEvidenceV2 {
+    SyntheticFixture {
+        fixture_id: String,
+        generator_id: String,
+    },
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum RenderMode<'a> {
@@ -439,7 +480,11 @@ fn load_assets(input: &RenderInput) -> Result<LoadedAssets, RenderError> {
         input.assets.plant.source_path.as_path(),
         MAX_SOURCE_ASSET_BYTES,
     )?;
-    reject_tokens_if_json(&plant)?;
+    if matches!(input.bundle, BundleSelection::WheelsOffQualification { .. }) {
+        bind_qualification_gate_a_plant(input, &plant)?;
+    } else {
+        reject_tokens_if_json(&plant)?;
+    }
     let navigation_shadow = LoadedSource::read(
         "navigation_shadow",
         input.assets.navigation_shadow_source_path.as_path(),
@@ -499,6 +544,68 @@ fn load_assets(input: &RenderInput) -> Result<LoadedAssets, RenderError> {
         face_perception,
         native_libraries,
     })
+}
+
+fn bind_qualification_gate_a_plant(
+    input: &RenderInput,
+    plant: &LoadedSource,
+) -> Result<(), RenderError> {
+    for (field, matches) in [
+        (
+            "assets.plant.artifact_id",
+            input.assets.plant.artifact_id == QUALIFICATION_GATE_A_PLANT_ARTIFACT_ID,
+        ),
+        (
+            "assets.plant.destination_relative_path",
+            input.assets.plant.destination_relative_path.as_str()
+                == QUALIFICATION_GATE_A_PLANT_RELATIVE_PATH,
+        ),
+    ] {
+        if !matches {
+            return Err(RenderError::QualificationPlantBindingMismatch { field });
+        }
+    }
+
+    reject_unresolved_tokens("qualification Gate-A V2 plant", &plant.bytes)?;
+    let parsed: QualificationGateAPlantV2 = parse_exact_json(&plant.bytes, plant.path.as_path())?;
+    let QualificationGateAPlantEvidenceV2::SyntheticFixture {
+        fixture_id,
+        generator_id,
+    } = parsed.evidence;
+    for (field, matches) in [
+        ("schema_version", parsed.schema_version == 1),
+        (
+            "model_id",
+            parsed.model_id == QUALIFICATION_GATE_A_PLANT_MODEL_ID,
+        ),
+        (
+            "model_version",
+            parsed.model_version == QUALIFICATION_GATE_A_PLANT_MODEL_VERSION,
+        ),
+        (
+            "sample_period_s",
+            parsed.sample_period_s.to_bits()
+                == QUALIFICATION_GATE_A_PLANT_SAMPLE_PERIOD_S.to_bits(),
+        ),
+        (
+            "evidence.fixture_id",
+            fixture_id == QUALIFICATION_GATE_A_PLANT_FIXTURE_ID,
+        ),
+        (
+            "evidence.generator_id",
+            generator_id == QUALIFICATION_GATE_A_PLANT_GENERATOR_ID,
+        ),
+    ] {
+        if !matches {
+            return Err(RenderError::QualificationPlantBindingMismatch { field });
+        }
+    }
+
+    let actual_sha256_hex = encode_hex(&plant.sha256);
+    if actual_sha256_hex != QUALIFICATION_GATE_A_PLANT_SHA256_HEX {
+        return Err(RenderError::QualificationPlantContentMismatch { actual_sha256_hex });
+    }
+    Ok(())
 }
 
 fn render_non_launch_files(
@@ -1954,6 +2061,12 @@ pub enum RenderError {
     QualificationHeadGazeAssetContentAlias {
         aliased_role: String,
     },
+    QualificationPlantBindingMismatch {
+        field: &'static str,
+    },
+    QualificationPlantContentMismatch {
+        actual_sha256_hex: String,
+    },
     UnexpectedNativeLibraryRemainder,
     MissingOnnxRuntime,
     InternalJsonShape,
@@ -2091,6 +2204,14 @@ impl fmt::Display for RenderError {
             Self::QualificationHeadGazeAssetContentAlias { aliased_role } => write!(
                 formatter,
                 "wheels-off qualification head-gaze policy content aliases staged role {aliased_role}"
+            ),
+            Self::QualificationPlantBindingMismatch { field } => write!(
+                formatter,
+                "wheels-off qualification Gate-A V2 plant binding mismatch in {field}"
+            ),
+            Self::QualificationPlantContentMismatch { actual_sha256_hex } => write!(
+                formatter,
+                "wheels-off qualification Gate-A V2 plant retained digest {actual_sha256_hex}; expected {QUALIFICATION_GATE_A_PLANT_SHA256_HEX}"
             ),
             Self::UnexpectedNativeLibraryRemainder => {
                 formatter.write_str("unconsumed native libraries remain after deterministic render")

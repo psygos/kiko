@@ -46,18 +46,18 @@
       "destination_relative_path": "artifacts/${CALIBRATION_ARTIFACT_RELATIVE_PATH}"
     },
     "plant": {
-      "artifact_id": "${PLANT_ARTIFACT_ID}",
+      "artifact_id": "qualification-shadow-only-synthetic-unvalidated-v2",
       "source_path": "${PLANT_SOURCE_ABSOLUTE_PATH}",
-      "destination_relative_path": "artifacts/${PLANT_ARTIFACT_RELATIVE_PATH}"
+      "destination_relative_path": "artifacts/plant/qualification-shadow-only-synthetic-unvalidated-plant-v2.json"
     },
     "navigation_shadow_source_path": "${NAVIGATION_SHADOW_SOURCE_ABSOLUTE_PATH}",
     "superpoint_model": {
       "source_path": "${SUPERPOINT_MODEL_SOURCE_ABSOLUTE_PATH}",
-      "destination_relative_path": "${SUPERPOINT_MODEL_RELATIVE_PATH}"
+      "destination_relative_path": "models/sp.onnx"
     },
     "lightglue_model": {
       "source_path": "${LIGHTGLUE_MODEL_SOURCE_ABSOLUTE_PATH}",
-      "destination_relative_path": "${LIGHTGLUE_MODEL_RELATIVE_PATH}"
+      "destination_relative_path": "models/lg.onnx"
     },
     "face_perception": {
       "frontal_face_cascade": {
@@ -109,77 +109,77 @@
   ],
   "runtime": {
     "oak": {
-      "rgb_width_px": ${OAK_RGB_WIDTH_PX},
-      "rgb_height_px": ${OAK_RGB_HEIGHT_PX},
-      "rgb_fps": ${OAK_RGB_FPS},
-      "stereo_width_px": ${OAK_STEREO_WIDTH_PX},
-      "stereo_height_px": ${OAK_STEREO_HEIGHT_PX},
-      "stereo_fps": ${OAK_STEREO_FPS},
-      "imu_rate_hz": ${OAK_IMU_RATE_HZ},
-      "queue_size": ${OAK_QUEUE_SIZE}
+      "rgb_width_px": 640,
+      "rgb_height_px": 400,
+      "rgb_fps": 15,
+      "stereo_width_px": 640,
+      "stereo_height_px": 400,
+      "stereo_fps": 15,
+      "imu_rate_hz": 200,
+      "queue_size": 4
     },
     "occupancy": {
-      "resolution_m": ${OCCUPANCY_RESOLUTION_M},
-      "lower_x_m": ${OCCUPANCY_LOWER_X_M},
-      "lower_y_m": ${OCCUPANCY_LOWER_Y_M},
-      "width_cells": ${OCCUPANCY_WIDTH_CELLS},
-      "height_cells": ${OCCUPANCY_HEIGHT_CELLS},
-      "maximum_cells": ${OCCUPANCY_MAXIMUM_CELLS},
-      "maximum_keyframes": ${OCCUPANCY_MAXIMUM_KEYFRAMES},
-      "snapshot_every_keyframes": ${OCCUPANCY_SNAPSHOT_EVERY_KEYFRAMES}
+      "resolution_m": 0.05,
+      "lower_x_m": -10.0,
+      "lower_y_m": -10.0,
+      "width_cells": 400,
+      "height_cells": 400,
+      "maximum_cells": 160000,
+      "maximum_keyframes": 4096,
+      "snapshot_every_keyframes": 20
     },
     "inference": {
-      "superpoint_backend": "${SUPERPOINT_BACKEND}",
-      "lightglue_backend": "${LIGHTGLUE_BACKEND}",
-      "downscale_factor": ${INFERENCE_DOWNSCALE_FACTOR},
-      "maximum_keypoints": ${INFERENCE_MAXIMUM_KEYPOINTS}
+      "superpoint_backend": "cpu",
+      "lightglue_backend": "cpu",
+      "downscale_factor": 2,
+      "maximum_keypoints": 512
     },
     "rerun": {
-      "decimation": ${RERUN_DECIMATION},
-      "memory_limit_bytes": ${RERUN_MEMORY_LIMIT_BYTES},
-      "flush_timeout_ms": ${RERUN_FLUSH_TIMEOUT_MS}
+      "decimation": 2,
+      "memory_limit_bytes": 134217728,
+      "flush_timeout_ms": 2000
     },
     "storage": {
-      "maximum_map_snapshot_bytes": ${MAXIMUM_MAP_SNAPSHOT_BYTES},
-      "minimum_free_bytes_after_map_save": ${MINIMUM_FREE_BYTES_AFTER_MAP_SAVE},
-      "maximum_navigation_dataset_bytes": ${MAXIMUM_NAVIGATION_DATASET_BYTES},
-      "maximum_navigation_dataset_files": ${MAXIMUM_NAVIGATION_DATASET_FILES},
-      "maximum_navigation_ingress_records": ${MAXIMUM_NAVIGATION_INGRESS_RECORDS},
-      "minimum_free_bytes_after_navigation_dataset_write": ${MINIMUM_FREE_BYTES_AFTER_NAVIGATION_DATASET_WRITE},
-      "navigation_dataset_terminal_reserve_bytes": ${NAVIGATION_DATASET_TERMINAL_RESERVE_BYTES},
+      "maximum_map_snapshot_bytes": 67108864,
+      "minimum_free_bytes_after_map_save": 536870912,
+      "maximum_navigation_dataset_bytes": 4294967296,
+      "maximum_navigation_dataset_files": 8192,
+      "maximum_navigation_ingress_records": 100000,
+      "minimum_free_bytes_after_navigation_dataset_write": 1073741824,
+      "navigation_dataset_terminal_reserve_bytes": 268435456,
       "warm_start": {
         "kind": "none"
       }
     }
   },
   "head_policy": {
-    "response_timeout_ms": ${HEAD_RESPONSE_TIMEOUT_MS},
-    "write_timeout_ms": ${HEAD_WRITE_TIMEOUT_MS},
-    "arming_freshness_ms": ${HEAD_ARMING_FRESHNESS_MS},
-    "write_attempts": ${HEAD_WRITE_ATTEMPTS},
-    "noise_budget_bytes": ${HEAD_NOISE_BUDGET_BYTES},
-    "redundant_read_tolerance_ticks": ${HEAD_REDUNDANT_READ_TOLERANCE_TICKS},
-    "readback_tolerance_ticks": ${HEAD_READBACK_TOLERANCE_TICKS},
-    "final_target_tolerance_ticks": ${HEAD_FINAL_TARGET_TOLERANCE_TICKS},
-    "path_corridor_tolerance_ticks": ${HEAD_PATH_CORRIDOR_TOLERANCE_TICKS},
-    "direction_regression_tolerance_ticks": ${HEAD_DIRECTION_REGRESSION_TOLERANCE_TICKS},
-    "goal_speed_ticks_per_second": ${HEAD_GOAL_SPEED_TICKS_PER_SECOND},
-    "torque_limit_permille": [${HEAD_TORQUE_LIMIT_PERMILLE_U16_ARRAY}],
-    "minimum_start_ticks": [${HEAD_MINIMUM_START_TICKS_U16_ARRAY}],
-    "maximum_start_ticks": [${HEAD_MAXIMUM_START_TICKS_U16_ARRAY}],
-    "reviewed_natural_target_ticks": [${HEAD_REVIEWED_NATURAL_TARGET_TICKS_U16_ARRAY}],
-    "maximum_travel_ticks": [${HEAD_MAXIMUM_TRAVEL_TICKS_U16_ARRAY}]
+    "response_timeout_ms": 100,
+    "write_timeout_ms": 100,
+    "arming_freshness_ms": 250,
+    "write_attempts": 2,
+    "noise_budget_bytes": 32,
+    "redundant_read_tolerance_ticks": 10,
+    "readback_tolerance_ticks": 20,
+    "final_target_tolerance_ticks": 20,
+    "path_corridor_tolerance_ticks": 20,
+    "direction_regression_tolerance_ticks": 20,
+    "goal_speed_ticks_per_second": 50,
+    "torque_limit_permille": [600, 400, 400, 400],
+    "minimum_start_ticks": [2135, 2525, 2842, 2856],
+    "maximum_start_ticks": [2227, 2592, 2963, 2922],
+    "reviewed_natural_target_ticks": [2155, 2545, 2943, 2876],
+    "maximum_travel_ticks": [80, 64, 128, 64]
   },
   "rgb_expression_policy": {
-    "sampling_columns": ${RGB_SAMPLING_COLUMNS},
-    "sampling_rows": ${RGB_SAMPLING_ROWS},
-    "minimum_residual_luma": ${RGB_MINIMUM_RESIDUAL_LUMA},
-    "minimum_active_fraction_basis_points": ${RGB_MINIMUM_ACTIVE_FRACTION_BASIS_POINTS},
-    "frame_freshness_ms": ${RGB_FRAME_FRESHNESS_MS},
-    "brightness_basis_points": ${RGB_BRIGHTNESS_BASIS_POINTS},
-    "color_rgb": [${RGB_COLOR_U8_ARRAY}],
-    "blink": ${RGB_BLINK},
-    "head_origin_in_camera_m": [${HEAD_ORIGIN_IN_CAMERA_M_F64_ARRAY}],
-    "neutral_head_from_camera_quaternion_xyzw": [${NEUTRAL_HEAD_FROM_CAMERA_QUATERNION_XYZW_F64_ARRAY}]
+    "sampling_columns": 16,
+    "sampling_rows": 12,
+    "minimum_residual_luma": 24,
+    "minimum_active_fraction_basis_points": 500,
+    "frame_freshness_ms": 80,
+    "brightness_basis_points": 7000,
+    "color_rgb": [32, 128, 255],
+    "blink": false,
+    "head_origin_in_camera_m": [0.0, -0.25, -0.20],
+    "neutral_head_from_camera_quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]
   }
 }

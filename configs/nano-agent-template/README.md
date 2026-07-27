@@ -149,9 +149,10 @@ Both bundle kinds must provide the exact regular bytes for the current Nano's
 three directly linked OpenCV libraries as `opencv_core`, `opencv_imgproc`, and
 `opencv_objdetect`: the attended wheels-off binary also contains the
 production dispatch. Their accepted SONAMEs are pinned in the template and
-typed renderer. Face-cascade assets remain production-only. This direct
-closure does not make unstaged transitive OpenCV or OS libraries hermetic;
-complete the final-ELF loader-trace review in
+typed renderer. Both production and V4 wheels-off qualification require the
+two exact, distinct face-cascade leaves because both launch the common
+accessory graph. This direct closure does not make unstaged transitive OpenCV
+or OS libraries hermetic; complete the final-ELF loader-trace review in
 `docs/nano-qualified-deployment.md` before treating the runtime as ready.
 
 ## Native build and manual service installation

@@ -8,9 +8,8 @@ The qualification contracts are deliberately different from production:
 
 - `bundle-render-input-v4.json.template` is the qualification-only renderer
   boundary with its bundle kind, exact face-cascade sources, optional
-  head-gaze input disabled by absence, warm-start policy, and all seven exact
-  native-runtime SONAMEs fixed;
-- `nano-wheels-off-qualification-launch-v4.json.template` is launch schema V4;
+  head-gaze input disabled by absence, cold-start policy, conservative
+  software policy, and all seven exact native-runtime SONAMEs fixed;
 - `device-inventory-candidate-v2.json.template` is candidate inventory schema
   V2;
 - `candidate-controller-policy-v1.json` is candidate host-policy schema V1;
@@ -23,9 +22,43 @@ The qualification contracts are deliberately different from production:
   persistence, and loopback-console policy while leaving all production motion
   modes disabled.
 
-The unexpanded `${...}` tokens are intentional. In particular, every SHA-256
-is a deployment-tool output placeholder. No checked-in digest is presented as
+There is deliberately no checked-in launch-V4 template. The renderer derives
+`nano-wheels-off-qualification-launch-v4.json` from the one typed V4 render
+input and writes it last. Keeping a second tokenized launch template would make
+the fixed Gate-A software policy ambiguous.
+
+The remaining unexpanded `${...}` tokens are intentional deployment
+boundaries: exact observed device identities, source paths, generated
+calibration identity, and native build provenance. The V4 renderer computes
+every byte count and SHA-256 itself; no checked-in digest is presented as
 evidence about a future installed byte sequence.
+
+## Fixed Gate-A software policy
+
+The V4 render-input template now fixes one bounded Gate-A graph instead of
+asking deployment-time string replacement to make software-policy decisions:
+
+- RGB and rectified stereo/depth are `640x400@15`, IMU is `200 Hz`, and each
+  nonblocking OAK queue has capacity 4;
+- global occupancy is a 20 m square at 5 cm resolution with 160,000 cells,
+  4,096 retained keyframes, and a snapshot every 20 keyframes;
+- SuperPoint and LightGlue use the reviewed CPU boundary, downscale 2, and at
+  most 512 keypoints;
+- Rerun is decimated by 2 with a 128 MiB memory bound and 2 s flush timeout;
+- map/dataset storage has explicit 64 MiB, 4 GiB, file-count, ingress-count,
+  free-space, and terminal-reserve bounds; and
+- the previously reviewed natural-head and RGB-expression values are copied
+  exactly, including the operator-declared head origin
+  `[0.0,-0.25,-0.20] m` and parallel neutral axes.
+
+These are admission choices for an attended, wheels-off qualification. They
+are not frame-rate, latency, control-tick-jitter, solver-budget,
+mapping-duration, thermal, storage-throughput, gaze-calibration, or performance
+evidence. The fresh OAK calibration must have the exact selected stereo
+dimensions. Enforced solver, lease, freshness, quota, and live-contract
+failures remain qualification failures rather than reasons to change the
+running configuration implicitly. Control-tick lateness is retained as
+diagnostic evidence; this policy does not claim a fail-closed jitter threshold.
 
 ## Proposal-only head gaze
 
@@ -62,7 +95,7 @@ head-gaze activation is not part of the wheels-off attachment gate.
 
 ## Synthetic shadow plant
 
-`qualification-shadow-only-synthetic-unvalidated-plant-v1.json` is a
+`qualification-shadow-only-synthetic-unvalidated-plant-v2.json` is a
 checked-in, qualification-shadow-only synthetic fixture. Its numeric values
 are test inputs, not measurements, physical identification, performance
 evidence, or permission to actuate. The explicitly non-calibrated
@@ -71,16 +104,24 @@ and is parser-tested against this artifact. It is only an example: its
 identity camera/base transform and synthetic IMU calibration are not suitable
 for a rendered qualification bundle.
 
-The fixture is not automatically wired into the renderer or any production
-template. The recommended
-`navigation-shadow-preparation-v1.json.template` embeds this exact synthetic
+V2 uses a 50 ms sample period and the candidate's ±30% PWM envelope. The V1
+fixture's 100 ms sample period could never pass the candidate runtime's strict
+54,999,999 ns service-interval ceiling because plant, MPC, and control periods
+must match exactly. The version change is an input-contract correction, not a
+performance claim or physical plant identification.
+
+The fixture is never wired into production. The qualification renderer does
+not discover it by ambient path: deployment supplies one explicit source, and
+the renderer binds that source to the exact V2 artifact ID, destination,
+semantic identity, and checked-in SHA-256 before staging it. The recommended
+`navigation-shadow-preparation-v1.json.template` embeds the same synthetic
 plant domain so Gate A does not circularly claim wheel-on physical
 identification before wheel attachment. A qualification render must still
-supply the separately content-addressed plant file and a reviewed navigation
-document whose camera/base transform and IMU calibration bind to the canonical
-physical calibration artifact. Bootstrap requires the embedded and separate
-plant domains to be exactly equal. Production admission rejects this synthetic
-evidence as physical plant identification.
+supply a reviewed navigation document whose camera/base transform and IMU
+calibration bind to the canonical physical calibration artifact. Bootstrap
+requires the embedded and separate plant domains to be exactly equal.
+Production admission rejects this synthetic evidence as physical plant
+identification.
 
 ## Fixed candidate contract
 

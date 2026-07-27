@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,247 @@ use robot_server::config::{ControllerServerConfig, ControllerServerConfigV1};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+
+fn unresolved_tokens(input: &str) -> BTreeSet<&str> {
+    let mut tokens = BTreeSet::new();
+    let mut remaining = input;
+    while let Some(start) = remaining.find("${") {
+        remaining = &remaining[start..];
+        let end = remaining
+            .find('}')
+            .expect("every render-input token must close");
+        tokens.insert(&remaining[..=end]);
+        remaining = &remaining[end + 1..];
+    }
+    tokens
+}
+
+fn template_shape_with_unquoted_tokens_replaced_by_null(input: &str) -> Value {
+    let input = input.as_bytes();
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < input.len() {
+        let byte = input[index];
+        if !in_string && byte == b'$' && input.get(index + 1) == Some(&b'{') {
+            let relative_end = input[index + 2..]
+                .iter()
+                .position(|candidate| *candidate == b'}')
+                .expect("render-input token must close");
+            index += relative_end + 3;
+            output.extend_from_slice(b"null");
+            continue;
+        }
+
+        output.push(byte);
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        }
+        index += 1;
+    }
+    serde_json::from_slice(&output).expect("sentinelized V4 render-input shape must be JSON")
+}
+
+fn template_replacement(value: &Value) -> String {
+    let serialized = serde_json::to_string(value).expect("template replacement is JSON");
+    if value.is_string() {
+        serialized[1..serialized.len() - 1].to_owned()
+    } else {
+        serialized
+    }
+}
+
+fn materialize_v4_template(template: &str, fixture: &Value) -> Value {
+    let native_source = |role: &str| {
+        fixture["native_libraries"]
+            .as_array()
+            .expect("fixture native libraries")
+            .iter()
+            .find(|library| library["role"] == role)
+            .expect("fixture has every native role")["source_path"]
+            .clone()
+    };
+    let replacements = [
+        (
+            "${QUALIFICATION_EXECUTABLE_SOURCE_ABSOLUTE_PATH}",
+            fixture["bundle"]["qualification_executable_path"].clone(),
+        ),
+        ("${ROBOT_ID}", fixture["robot_id"].clone()),
+        ("${OAK_MXID}", fixture["discovery"]["oak"]["mxid"].clone()),
+        (
+            "${DEPTHAI_HEADER_SDK_VERSION}",
+            fixture["discovery"]["oak"]["compiled_depthai_header_sdk_version"].clone(),
+        ),
+        (
+            "${DEPTHAI_HEADER_SDK_COMMIT}",
+            fixture["discovery"]["oak"]["compiled_depthai_header_sdk_commit"].clone(),
+        ),
+        (
+            "${DEPTHAI_HEADER_DEVICE_ARTIFACT_VERSION}",
+            fixture["discovery"]["oak"]
+                ["compiled_depthai_header_embedded_device_artifact_version"]
+                .clone(),
+        ),
+        (
+            "${DEPTHAI_HEADER_BOOTLOADER_ARTIFACT_VERSION}",
+            fixture["discovery"]["oak"]
+                ["compiled_depthai_header_embedded_bootloader_artifact_version"]
+                .clone(),
+        ),
+        (
+            "${STM32_SERIAL_BY_ID_PATH}",
+            fixture["discovery"]["stm32"]["serial_by_id_path"].clone(),
+        ),
+        (
+            "${CONTROLLER_UID_HEX}",
+            fixture["discovery"]["stm32"]["controller_uid_hex"].clone(),
+        ),
+        (
+            "${FIRMWARE_ABI}",
+            fixture["discovery"]["stm32"]["firmware_abi"].clone(),
+        ),
+        (
+            "${FIRMWARE_BUILD_ID}",
+            fixture["discovery"]["stm32"]["firmware_build_id"].clone(),
+        ),
+        (
+            "${ACTUATOR_CONFIG_FINGERPRINT_HEX}",
+            fixture["discovery"]["stm32"]["hardware_profile_fingerprint_hex"].clone(),
+        ),
+        (
+            "${CONTROLLER_CAPABILITIES_BITS}",
+            fixture["discovery"]["stm32"]["capabilities_bits"].clone(),
+        ),
+        (
+            "${HEAD_SERIAL_BY_ID_PATH}",
+            fixture["discovery"]["head"]["adapter_serial_by_id_path"].clone(),
+        ),
+        (
+            "${HEAD_BOW_SERVO_ID}",
+            fixture["discovery"]["head"]["bow_servo_id"].clone(),
+        ),
+        (
+            "${HEAD_CURL_SERVO_ID}",
+            fixture["discovery"]["head"]["curl_servo_id"].clone(),
+        ),
+        (
+            "${HEAD_YAW_SERVO_ID}",
+            fixture["discovery"]["head"]["yaw_servo_id"].clone(),
+        ),
+        (
+            "${HEAD_ROLL_SERVO_ID}",
+            fixture["discovery"]["head"]["roll_servo_id"].clone(),
+        ),
+        (
+            "${HEAD_BAUD_RATE_BPS}",
+            fixture["discovery"]["head"]["baud_rate_bps"].clone(),
+        ),
+        (
+            "${HEAD_DTR_ASSERTED}",
+            fixture["discovery"]["head"]["dtr_asserted"].clone(),
+        ),
+        (
+            "${HEAD_RTS_ASSERTED}",
+            fixture["discovery"]["head"]["rts_asserted"].clone(),
+        ),
+        (
+            "${EYE_SERIAL_BY_ID_PATH}",
+            fixture["discovery"]["eye"]["serial_by_id_path"].clone(),
+        ),
+        (
+            "${EYE_KEP_PROTOCOL_VERSION}",
+            fixture["discovery"]["eye"]["kep_protocol_version"].clone(),
+        ),
+        (
+            "${EYE_DEVICE_UID_HEX}",
+            fixture["discovery"]["eye"]["device_uid_hex"].clone(),
+        ),
+        (
+            "${EYE_FIRMWARE_BUILD_ID_HEX}",
+            fixture["discovery"]["eye"]["firmware_build_id_hex"].clone(),
+        ),
+        (
+            "${EYE_CAPABILITIES_BITS}",
+            fixture["discovery"]["eye"]["capabilities_bits"].clone(),
+        ),
+        (
+            "${CALIBRATION_ARTIFACT_ID}",
+            fixture["assets"]["calibration"]["artifact_id"].clone(),
+        ),
+        (
+            "${CALIBRATION_SOURCE_ABSOLUTE_PATH}",
+            fixture["assets"]["calibration"]["source_path"].clone(),
+        ),
+        (
+            "${CALIBRATION_ARTIFACT_RELATIVE_PATH}",
+            json!("calibration/assembly-v1.json"),
+        ),
+        (
+            "${PLANT_SOURCE_ABSOLUTE_PATH}",
+            fixture["assets"]["plant"]["source_path"].clone(),
+        ),
+        (
+            "${NAVIGATION_SHADOW_SOURCE_ABSOLUTE_PATH}",
+            fixture["assets"]["navigation_shadow_source_path"].clone(),
+        ),
+        (
+            "${SUPERPOINT_MODEL_SOURCE_ABSOLUTE_PATH}",
+            fixture["assets"]["superpoint_model"]["source_path"].clone(),
+        ),
+        (
+            "${LIGHTGLUE_MODEL_SOURCE_ABSOLUTE_PATH}",
+            fixture["assets"]["lightglue_model"]["source_path"].clone(),
+        ),
+        (
+            "${FRONTAL_FACE_CASCADE_SOURCE_ABSOLUTE_PATH}",
+            fixture["assets"]["face_perception"]["frontal_face_cascade"]["source_path"].clone(),
+        ),
+        (
+            "${PROFILE_FACE_CASCADE_SOURCE_ABSOLUTE_PATH}",
+            fixture["assets"]["face_perception"]["profile_face_cascade"]["source_path"].clone(),
+        ),
+        ("${DEPTHAI_CORE_SOURCE_ABSOLUTE_PATH}", native_source("depthai_core")),
+        (
+            "${DYNAMIC_CALIBRATION_SOURCE_ABSOLUTE_PATH}",
+            native_source("dynamic_calibration"),
+        ),
+        ("${LIBUSB_1_0_SOURCE_ABSOLUTE_PATH}", native_source("libusb1_0")),
+        ("${ONNXRUNTIME_SOURCE_ABSOLUTE_PATH}", native_source("onnxruntime")),
+        ("${OPENCV_CORE_SOURCE_ABSOLUTE_PATH}", native_source("opencv_core")),
+        (
+            "${OPENCV_IMGPROC_SOURCE_ABSOLUTE_PATH}",
+            native_source("opencv_imgproc"),
+        ),
+        (
+            "${OPENCV_OBJDETECT_SOURCE_ABSOLUTE_PATH}",
+            native_source("opencv_objdetect"),
+        ),
+    ];
+
+    let mut rendered = template.to_owned();
+    for (token, value) in replacements {
+        assert_eq!(
+            rendered.matches(token).count(),
+            1,
+            "checked-in V4 template must contain exactly one {token}"
+        );
+        rendered = rendered.replace(token, &template_replacement(&value));
+    }
+    assert!(
+        unresolved_tokens(&rendered).is_empty(),
+        "fixture must replace every V4 evidence-boundary token"
+    );
+    serde_json::from_str(&rendered).expect("materialized checked-in V4 template is JSON")
+}
 
 fn write_source(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     let path = root.join(name);
@@ -106,7 +348,14 @@ fn source_fixture() -> (TempDir, Value) {
     }))
     .expect("serialize calibration fixture");
     let calibration = write_source(&root, "calibration.json", &calibration_bytes);
-    let plant = write_source(&root, "plant.json", br#"{"plant":"exact"}"#);
+    let plant = write_source(
+        &root,
+        "plant.json",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../configs/nano-wheels-off-qualification-template/qualification-shadow-only-synthetic-unvalidated-plant-v2.json"
+        )),
+    );
     let navigation = write_source(&root, "navigation.json", br#"{"navigation":"exact"}"#);
     let superpoint = write_source(&root, "superpoint.onnx", b"superpoint-exact");
     let lightglue = write_source(&root, "lightglue.onnx", b"lightglue-exact");
@@ -179,9 +428,9 @@ fn source_fixture() -> (TempDir, Value) {
                 "destination_relative_path": "artifacts/calibration/assembly-v1.json"
             },
             "plant": {
-                "artifact_id": "plant-exact-v1",
+                "artifact_id": "qualification-shadow-only-synthetic-unvalidated-v2",
                 "source_path": plant,
-                "destination_relative_path": "artifacts/plant/plant.json"
+                "destination_relative_path": "artifacts/plant/qualification-shadow-only-synthetic-unvalidated-plant-v2.json"
             },
             "navigation_shadow_source_path": navigation,
             "superpoint_model": {
@@ -815,6 +1064,32 @@ fn qualification_v4_rejects_explicit_null_head_gaze_policy() {
 }
 
 #[test]
+fn qualification_v4_rejects_valid_plant_bytes_under_the_fixed_gate_a_v2_label() {
+    let (temporary, input) = source_fixture();
+    let root = canonical_root(&temporary);
+    let plant_path = input["assets"]["plant"]["source_path"]
+        .as_str()
+        .expect("plant source path");
+    let mut mutated: Value = serde_json::from_slice(
+        &fs::read(plant_path).expect("read canonical Gate-A V2 plant fixture"),
+    )
+    .expect("parse canonical Gate-A V2 plant fixture");
+    mutated["wheelbase_m"] = json!(0.41);
+    fs::write(
+        plant_path,
+        serde_json::to_vec_pretty(&mutated).expect("serialize valid mutated plant"),
+    )
+    .expect("write valid mutated plant");
+
+    let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
+        .expect_err("fixed Gate-A V2 identity cannot label mutated valid plant bytes");
+    assert!(matches!(
+        error,
+        RenderError::QualificationPlantContentMismatch { .. }
+    ));
+}
+
+#[test]
 fn qualification_v4_rejects_face_and_head_gaze_aliases() {
     let (temporary, input) = source_fixture();
     let root = canonical_root(&temporary);
@@ -1072,7 +1347,12 @@ fn production_derives_navigation_digest_and_loopback_port() {
     assert_eq!(actuation["schema_version"], 2);
     assert_eq!(
         actuation["plant_artifact_sha256_hex"],
-        sha256_hex(&fs::read(destination.join("artifacts/plant/plant.json")).unwrap())
+        sha256_hex(
+            &fs::read(destination.join(
+                "artifacts/plant/qualification-shadow-only-synthetic-unvalidated-plant-v2.json",
+            ),)
+            .unwrap()
+        )
     );
     assert_eq!(
         actuation["operator_claimed_physical_approval"]["plant_dataset_content_id"],
@@ -1480,4 +1760,324 @@ fn symlinked_source_is_rejected() {
     let input_path = write_input(&root, &input);
     let error = render_bundle(&input_path, RenderMode::DryRun).expect_err("symlink");
     assert!(error.to_string().contains("symlink component rejected"));
+}
+
+#[test]
+fn qualification_v4_template_renders_exact_policy_and_leaves_only_evidence_boundaries() {
+    let template = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/nano-wheels-off-qualification-template/bundle-render-input-v4.json.template"
+    ));
+    assert_eq!(
+        unresolved_tokens(template),
+        BTreeSet::from([
+            "${ACTUATOR_CONFIG_FINGERPRINT_HEX}",
+            "${CALIBRATION_ARTIFACT_ID}",
+            "${CALIBRATION_ARTIFACT_RELATIVE_PATH}",
+            "${CALIBRATION_SOURCE_ABSOLUTE_PATH}",
+            "${CONTROLLER_CAPABILITIES_BITS}",
+            "${CONTROLLER_UID_HEX}",
+            "${DEPTHAI_CORE_SOURCE_ABSOLUTE_PATH}",
+            "${DEPTHAI_HEADER_BOOTLOADER_ARTIFACT_VERSION}",
+            "${DEPTHAI_HEADER_DEVICE_ARTIFACT_VERSION}",
+            "${DEPTHAI_HEADER_SDK_COMMIT}",
+            "${DEPTHAI_HEADER_SDK_VERSION}",
+            "${DYNAMIC_CALIBRATION_SOURCE_ABSOLUTE_PATH}",
+            "${EYE_CAPABILITIES_BITS}",
+            "${EYE_DEVICE_UID_HEX}",
+            "${EYE_FIRMWARE_BUILD_ID_HEX}",
+            "${EYE_KEP_PROTOCOL_VERSION}",
+            "${EYE_SERIAL_BY_ID_PATH}",
+            "${FIRMWARE_ABI}",
+            "${FIRMWARE_BUILD_ID}",
+            "${FRONTAL_FACE_CASCADE_SOURCE_ABSOLUTE_PATH}",
+            "${HEAD_BAUD_RATE_BPS}",
+            "${HEAD_BOW_SERVO_ID}",
+            "${HEAD_CURL_SERVO_ID}",
+            "${HEAD_DTR_ASSERTED}",
+            "${HEAD_ROLL_SERVO_ID}",
+            "${HEAD_RTS_ASSERTED}",
+            "${HEAD_SERIAL_BY_ID_PATH}",
+            "${HEAD_YAW_SERVO_ID}",
+            "${LIBUSB_1_0_SOURCE_ABSOLUTE_PATH}",
+            "${LIGHTGLUE_MODEL_SOURCE_ABSOLUTE_PATH}",
+            "${NAVIGATION_SHADOW_SOURCE_ABSOLUTE_PATH}",
+            "${OAK_MXID}",
+            "${ONNXRUNTIME_SOURCE_ABSOLUTE_PATH}",
+            "${OPENCV_CORE_SOURCE_ABSOLUTE_PATH}",
+            "${OPENCV_IMGPROC_SOURCE_ABSOLUTE_PATH}",
+            "${OPENCV_OBJDETECT_SOURCE_ABSOLUTE_PATH}",
+            "${PLANT_SOURCE_ABSOLUTE_PATH}",
+            "${PROFILE_FACE_CASCADE_SOURCE_ABSOLUTE_PATH}",
+            "${QUALIFICATION_EXECUTABLE_SOURCE_ABSOLUTE_PATH}",
+            "${ROBOT_ID}",
+            "${STM32_SERIAL_BY_ID_PATH}",
+            "${SUPERPOINT_MODEL_SOURCE_ABSOLUTE_PATH}",
+        ])
+    );
+
+    let shape = template_shape_with_unquoted_tokens_replaced_by_null(template);
+    assert_eq!(
+        shape["runtime"],
+        json!({
+            "oak": {
+                "rgb_width_px": 640,
+                "rgb_height_px": 400,
+                "rgb_fps": 15,
+                "stereo_width_px": 640,
+                "stereo_height_px": 400,
+                "stereo_fps": 15,
+                "imu_rate_hz": 200,
+                "queue_size": 4
+            },
+            "occupancy": {
+                "resolution_m": 0.05,
+                "lower_x_m": -10.0,
+                "lower_y_m": -10.0,
+                "width_cells": 400,
+                "height_cells": 400,
+                "maximum_cells": 160000,
+                "maximum_keyframes": 4096,
+                "snapshot_every_keyframes": 20
+            },
+            "inference": {
+                "superpoint_backend": "cpu",
+                "lightglue_backend": "cpu",
+                "downscale_factor": 2,
+                "maximum_keypoints": 512
+            },
+            "rerun": {
+                "decimation": 2,
+                "memory_limit_bytes": 134217728,
+                "flush_timeout_ms": 2000
+            },
+            "storage": {
+                "maximum_map_snapshot_bytes": 67108864,
+                "minimum_free_bytes_after_map_save": 536870912,
+                "maximum_navigation_dataset_bytes": 4294967296_u64,
+                "maximum_navigation_dataset_files": 8192,
+                "maximum_navigation_ingress_records": 100000,
+                "minimum_free_bytes_after_navigation_dataset_write": 1073741824,
+                "navigation_dataset_terminal_reserve_bytes": 268435456,
+                "warm_start": {"kind": "none"}
+            }
+        })
+    );
+    assert_eq!(
+        shape["head_policy"]["reviewed_natural_target_ticks"],
+        json!([2155, 2545, 2943, 2876])
+    );
+    assert_eq!(
+        shape["rgb_expression_policy"]["head_origin_in_camera_m"],
+        json!([0.0, -0.25, -0.20])
+    );
+    assert_eq!(
+        shape["assets"]["plant"]["artifact_id"],
+        "qualification-shadow-only-synthetic-unvalidated-v2"
+    );
+    assert_eq!(
+        shape["assets"]["plant"]["destination_relative_path"],
+        "artifacts/plant/qualification-shadow-only-synthetic-unvalidated-plant-v2.json"
+    );
+
+    let (temporary, fixture) = source_fixture();
+    let root = canonical_root(&temporary);
+    let materialized = materialize_v4_template(template, &fixture);
+    assert!(
+        materialized["assets"]
+            .as_object()
+            .expect("materialized assets")
+            .get("head_gaze_policy_source_path")
+            .is_none(),
+        "Gate A disables proposal-only head gaze by field absence"
+    );
+    let input_path = write_input(&root, &materialized);
+    let destination = root.join("checked-in-v4-template-bundle");
+    let plan = render_bundle(
+        &input_path,
+        RenderMode::Stage {
+            destination: &destination,
+        },
+    )
+    .expect("the materialized checked-in V4 template must render");
+    assert!(
+        plan.files
+            .iter()
+            .all(|file| file.relative_path != "head-gaze-policy-v1.json")
+    );
+
+    let retained_input: Value = serde_json::from_slice(
+        &fs::read(destination.join("evidence/render-input-v4.json"))
+            .expect("retained V4 render input"),
+    )
+    .expect("retained V4 render input JSON");
+    assert_eq!(retained_input, materialized);
+
+    let policy_bytes =
+        fs::read(destination.join("agent-policy-v3.json")).expect("rendered agent policy");
+    NanoAgentPolicyConfigV3::parse_json(&policy_bytes).expect("typed rendered agent policy");
+    let policy: Value = serde_json::from_slice(&policy_bytes).expect("rendered agent policy JSON");
+    assert_eq!(
+        policy["head"],
+        json!({
+            "mode": "return_to_natural_and_hold_continuously",
+            "device_path": fixture["discovery"]["head"]["adapter_serial_by_id_path"],
+            "response_timeout_ms": 100,
+            "write_timeout_ms": 100,
+            "arming_freshness_ms": 250,
+            "write_attempts": 2,
+            "noise_budget_bytes": 32,
+            "redundant_read_tolerance_ticks": 10,
+            "readback_tolerance_ticks": 20,
+            "final_target_tolerance_ticks": 20,
+            "path_corridor_tolerance_ticks": 20,
+            "direction_regression_tolerance_ticks": 20,
+            "goal_speed_ticks_per_second": 50,
+            "torque_limit_permille": [600, 400, 400, 400],
+            "minimum_start_ticks": [2135, 2525, 2842, 2856],
+            "maximum_start_ticks": [2227, 2592, 2963, 2922],
+            "reviewed_natural_target_ticks": [2155, 2545, 2943, 2876],
+            "maximum_travel_ticks": [80, 64, 128, 64],
+            "physical_torque_consent": "enable_for_reviewed_natural_return_and_hold",
+            "physical_motion_consent": "return_to_reviewed_natural_target"
+        })
+    );
+    assert_eq!(
+        policy["rgb_expression"],
+        json!({
+            "mode": "scene_motion",
+            "sampling_columns": 16,
+            "sampling_rows": 12,
+            "minimum_residual_luma": 24,
+            "minimum_active_fraction_basis_points": 500,
+            "frame_freshness_ms": 80,
+            "brightness_basis_points": 7000,
+            "color_rgb": [32, 128, 255],
+            "blink": false,
+            "gaze_geometry": {
+                "schema_version": 1,
+                "head_origin_in_camera_m": [0.0, -0.25, -0.20],
+                "neutral_head_from_camera_quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]
+            }
+        })
+    );
+    assert_eq!(
+        policy["live_mode_policy"],
+        json!({
+            "startup": "disarmed_map_only",
+            "manual": {"permission": "disabled"},
+            "point_goal": {"permission": "disabled"},
+            "frontier_explore": {"permission": "disabled"}
+        })
+    );
+
+    let launch_bytes = fs::read(destination.join("nano-wheels-off-qualification-launch-v4.json"))
+        .expect("rendered qualification launch");
+    NanoWheelsOffQualificationLaunchV4::parse_json(&launch_bytes)
+        .expect("typed rendered qualification launch");
+    let launch: Value =
+        serde_json::from_slice(&launch_bytes).expect("rendered qualification launch JSON");
+    assert!(launch.get("head_gaze_policy_asset").is_none());
+    assert_eq!(
+        launch["oak"],
+        json!({
+            "selector_source": "exact_inventory_oak_mxid",
+            "maximum_usb_speed": "SUPER",
+            "minimum_usb_speed": "SUPER",
+            "rgb": {"width_px": 640, "height_px": 400, "fps": 15},
+            "rectified_stereo": {
+                "width_px": 640,
+                "height_px": 400,
+                "fps": 15,
+                "rectified": true
+            },
+            "depth": {
+                "width_px": 640,
+                "height_px": 400,
+                "fps": 15,
+                "alignment": "rectified_left"
+            },
+            "imu": {"rate_hz": 200},
+            "queue": {"size": 4, "blocking": false}
+        })
+    );
+    assert_eq!(launch["occupancy"], shape["runtime"]["occupancy"]);
+    assert_eq!(
+        launch["rerun"],
+        json!({
+            "kind": "serve_loopback",
+            "bind": "127.0.0.1:9876",
+            "decimation": 2,
+            "memory_limit_bytes": 134217728,
+            "flush_timeout_ms": 2000
+        })
+    );
+    assert_eq!(
+        launch["storage"],
+        json!({
+            "map_snapshot_relative_path": "maps/current.kmap",
+            "navigation_dataset_directory_relative_path": "navigation",
+            "maximum_map_snapshot_bytes": 67108864,
+            "minimum_free_bytes_after_map_save": 536870912,
+            "maximum_navigation_dataset_bytes": 4294967296_u64,
+            "maximum_navigation_dataset_files": 8192,
+            "maximum_navigation_ingress_records": 100000,
+            "minimum_free_bytes_after_navigation_dataset_write": 1073741824,
+            "navigation_dataset_terminal_reserve_bytes": 268435456
+        })
+    );
+    assert_eq!(launch["inference"]["superpoint_backend"], "cpu");
+    assert_eq!(launch["inference"]["lightglue_backend"], "cpu");
+    assert_eq!(launch["inference"]["downscale_factor"], 2);
+    assert_eq!(launch["inference"]["maximum_keypoints"], 512);
+    assert_eq!(
+        launch["inference"]["superpoint_model_asset"]["relative_path"],
+        "models/sp.onnx"
+    );
+    assert_eq!(
+        launch["inference"]["lightglue_model_asset"]["relative_path"],
+        "models/lg.onnx"
+    );
+    assert_eq!(
+        launch["plant_artifact"]["artifact_id"],
+        "qualification-shadow-only-synthetic-unvalidated-v2"
+    );
+    assert_eq!(
+        launch["plant_artifact"]["asset"]["relative_path"],
+        "artifacts/plant/qualification-shadow-only-synthetic-unvalidated-plant-v2.json"
+    );
+    assert_eq!(
+        launch["face_perception"]["frontal_face_cascade_asset"]["relative_path"],
+        "models/opencv/haarcascade_frontalface_default.xml"
+    );
+    assert_eq!(
+        launch["face_perception"]["profile_face_cascade_asset"]["relative_path"],
+        "models/opencv/haarcascade_profileface.xml"
+    );
+
+    let native_bytes =
+        fs::read(destination.join("native-runtime-v1.json")).expect("rendered native manifest");
+    NanoWheelsOffNativeRuntimeV1::parse_json(&native_bytes)
+        .expect("typed rendered native manifest");
+    let native: Value =
+        serde_json::from_slice(&native_bytes).expect("rendered native manifest JSON");
+    for (role, soname) in [
+        ("depthai_core", "libdepthai-core.so"),
+        ("dynamic_calibration", "libdynamic_calibration.so"),
+        ("libusb_1_0", "libusb-1.0.so"),
+        ("onnxruntime", "libonnxruntime.so.1"),
+        ("opencv_core", "libopencv_core.so.4.5d"),
+        ("opencv_imgproc", "libopencv_imgproc.so.4.5d"),
+        ("opencv_objdetect", "libopencv_objdetect.so.4.5d"),
+    ] {
+        let library = native["libraries"]
+            .as_array()
+            .expect("native libraries")
+            .iter()
+            .find(|library| library["role"] == role)
+            .expect("fixed native role");
+        assert_eq!(library["soname"], soname);
+        assert_eq!(library["relative_path"], format!("lib/{soname}"));
+    }
+    restore_writable(&destination);
 }
