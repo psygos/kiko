@@ -4,6 +4,64 @@ This file records current, bounded evidence for the wheel-attachment gate. It
 does not declare Gate A passed and does not authorize wheel attachment,
 powered motion, deployment, or production use.
 
+## Current 9f1061d native qualification build
+
+The clean Nano checkout at `/home/makerspace/kiko` was fast-forwarded to the
+exact pushed revision:
+
+```text
+9f1061dcb5c72d7abbdaea3e1983d3cdfe2265ea
+```
+
+That revision contains the fresh full-telemetry head gate, authoritative
+offline deployment-graph binding, and challenged motor-power transition
+workflow. The retained native inputs from the prior `bd6987a` evidence were
+reused without modification. A first timing wrapper referenced unavailable
+`/usr/bin/time` and exited with status 127 before Cargo started. The successful
+command was:
+
+```text
+CARGO_BUILD_JOBS=2 nice -n 15 cargo build --locked --release \
+  -p kiko-slam --no-default-features \
+  --features nano-wheels-off-qualification --bin kiko-slam
+```
+
+The Linux aarch64 release build completed in 211.14 seconds. This is command
+completion context, not a benchmark or performance claim. The resulting
+executable identity is:
+
+```text
+path: /home/makerspace/kiko/target/release/kiko-slam
+size_bytes: 29155440
+sha256: b20dcab182823ce6ec9459118ea202d2206397c88b940bcd3cfcfd956bcb6a4e
+elf_machine: AArch64
+elf_type: PIE
+build_id_sha1: 89f5a273da03cec2299e5dc56342950c2e82888a
+```
+
+The complete loader closure resolved with `not_found_count=0`. The
+device-free `nano-wheels-off-qualification --help` boundary loaded
+successfully. The owner-private evidence directory has mode `0700`; its 22
+retained files have mode `0600`, and its SHA-256 manifest verifies:
+
+```text
+/home/makerspace/kiko-native-evidence/9f1061d-20260728T033436+0530
+```
+
+The evidence retains the source revision and clean status, exact build inputs
+and command, completion timing, toolchains, executable identity, ELF metadata,
+loader closure, CLI help, and read-only process/service/USB/serial snapshots.
+Both canonical Kiko services remained inactive. The Kiko-owned
+`engine-guardian.sh` process remained present and no Fable process was
+present. No process was stopped, signalled, paused, reconfigured, or replaced,
+and no camera, serial endpoint, STM32, head, eye, or actuator was opened.
+
+The retained post-build USB tree showed the `10000M` root and hub but no OAK
+child on either the USB3 or USB2 tree. All three persistent serial-by-id
+endpoints remained present. This snapshot therefore does not establish a
+connected OAK, and it does not infer a camera, cable, or hardware cause from
+the absence.
+
 ## Current bd6987a native qualification build
 
 The clean Nano checkout at `/home/makerspace/kiko` was fast-forwarded to the
@@ -396,11 +454,10 @@ after a conflict-free observation.
 
 ## Gate status after this refresh
 
-This is exact native build evidence for the final code-bearing revision
-`5d1b1bc`. A later evidence-only documentation commit does not change the
-executable inputs; any later executable change would supersede this evidence
-and require a new native build and identity. These physical/current items
-remain open:
+This is exact native build evidence for code-bearing revision `9f1061d`. A
+later evidence-only documentation commit does not change the executable
+inputs; any later executable change would supersede this evidence and require
+a new native build and identity. These physical/current items remain open:
 
 - fresh exclusive-endpoint proof followed by one canonical Kiko owner;
 - canonical OAK SuperSpeed negotiation and one-graph RGB/stereo/depth/IMU;
