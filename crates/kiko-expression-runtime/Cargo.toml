@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 kiko-expression-core = { path = "../kiko-expression-core" }
 kiko-eye-protocol = { path = "../kiko-eye-protocol" }
+kiko-head-protocol = { path = "../kiko-head-protocol" }
 libm = "0.2"
 
 [lints]

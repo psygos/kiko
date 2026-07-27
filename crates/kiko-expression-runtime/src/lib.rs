@@ -21,6 +21,7 @@
 mod adapter;
 mod face_tracking;
 mod gaze_geometry;
+mod head_gaze_calibration;
 mod scene_motion;
 mod session;
 
@@ -46,6 +47,16 @@ pub use gaze_geometry::{
     HeadGazeProjectionError, HeadRelativeGaze, MAX_CAMERA_FORWARD_DEPTH_M,
     MAX_CAMERA_TARGET_AXIS_ABS_M, MAX_HEAD_ORIGIN_DISTANCE_M, MIN_CAMERA_FORWARD_DEPTH_M,
     OakCameraTargetPoint, OakCameraTargetRay, QuaternionComponent, RayHeadGazeProjectionError,
+};
+pub use head_gaze_calibration::{
+    CameraRayHeadProposalError, DECLARED_HEAD_ORIGIN_IN_OAK_CAMERA_M,
+    DECLARED_NEUTRAL_HEAD_FROM_OAK_ROTATION_ROWS, HEAD_GAZE_FOCUS_PLANE_CAMERA_FORWARD_DEPTH_M,
+    HeadAssemblyId, HeadCalibrationProvenanceId, HeadGazeCoordinate, HeadGazeIdentifierError,
+    HeadGazeIdentifierField, HeadGazeMappingDeclaration, HeadGazeMappingDeclarationInput,
+    HeadGazeMappingDeclarationParseError, HeadGazeProposalMappingError, HeadGazeTargetProposal,
+    HeadGazeTickOffsetsPerRadianInput, HeadNaturalPoseDeclaration, HeadTickEnvelope,
+    HeadTickEnvelopeBound, HeadTickEnvelopeInput, MAX_HEAD_GAZE_IDENTIFIER_BYTES,
+    NamedHeadTickEnvelopesInput, NamedHeadTickOffsetsPerRadianInput, NamedNaturalHeadTicksInput,
 };
 pub use scene_motion::{
     MAX_SCENE_SAMPLES, MonotonicLatestAdmission, MonotonicLatestGap, MonotonicLatestSceneAnalysis,

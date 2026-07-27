@@ -18,6 +18,7 @@
 
 use core::fmt;
 
+use kiko_head_protocol::AngleRadians;
 use libm::{atan2, cos, fma, hypot, sin};
 
 /// Largest admitted camera-to-head origin distance, in metres.
@@ -430,13 +431,15 @@ impl CameraToHeadGazeExtrinsics {
             );
         }
 
-        let yaw_right_rad = atan2(head_m[0], head_m[2]);
-        let pitch_down_rad = atan2(head_m[1], hypot(head_m[0], head_m[2]));
-        ensure_open_forward_angle(HeadGazeAngle::YawRight, yaw_right_rad)?;
-        ensure_open_forward_angle(HeadGazeAngle::PitchDown, pitch_down_rad)?;
+        let yaw_right =
+            parse_open_forward_angle(HeadGazeAngle::YawRight, atan2(head_m[0], head_m[2]))?;
+        let pitch_down = parse_open_forward_angle(
+            HeadGazeAngle::PitchDown,
+            atan2(head_m[1], hypot(head_m[0], head_m[2])),
+        )?;
         Ok(HeadRelativeGaze {
-            yaw_right_rad,
-            pitch_down_rad,
+            yaw_right,
+            pitch_down,
         })
     }
 
@@ -461,13 +464,16 @@ fn dot3_fused(left: [f64; 3], right: [f64; 3]) -> f64 {
     )
 }
 
-fn ensure_open_forward_angle(
+fn parse_open_forward_angle(
     angle: HeadGazeAngle,
     angle_rad: f64,
-) -> Result<(), HeadGazeProjectionError> {
+) -> Result<AngleRadians, HeadGazeProjectionError> {
     use core::f64::consts::FRAC_PI_2;
 
-    if !angle_rad.is_finite() || angle_rad <= -FRAC_PI_2 || angle_rad >= FRAC_PI_2 {
+    let parsed = AngleRadians::try_new(angle_rad).map_err(|_| {
+        HeadGazeProjectionError::HeadAngleNotRepresentableInOpenForwardRange { angle, angle_rad }
+    })?;
+    if parsed.get() <= -FRAC_PI_2 || parsed.get() >= FRAC_PI_2 {
         return Err(
             HeadGazeProjectionError::HeadAngleNotRepresentableInOpenForwardRange {
                 angle,
@@ -475,7 +481,7 @@ fn ensure_open_forward_angle(
             },
         );
     }
-    Ok(())
+    Ok(parsed)
 }
 
 /// Head-relative neutral-axis angles in radians.
@@ -486,8 +492,8 @@ fn ensure_open_forward_angle(
 /// rejected.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HeadRelativeGaze {
-    yaw_right_rad: f64,
-    pitch_down_rad: f64,
+    yaw_right: AngleRadians,
+    pitch_down: AngleRadians,
 }
 
 // Construction is private and admits only finite angles strictly inside the
@@ -496,19 +502,27 @@ impl Eq for HeadRelativeGaze {}
 
 impl HeadRelativeGaze {
     pub const fn yaw_right_rad(self) -> f64 {
-        self.yaw_right_rad
+        self.yaw_right.get()
     }
 
     pub const fn pitch_down_rad(self) -> f64 {
-        self.pitch_down_rad
+        self.pitch_down.get()
+    }
+
+    pub(crate) const fn yaw_right_angle(self) -> AngleRadians {
+        self.yaw_right
+    }
+
+    pub(crate) const fn pitch_down_angle(self) -> AngleRadians {
+        self.pitch_down
     }
 
     /// Reconstruct the corresponding unit direction in the neutral-head frame.
     pub fn unit_direction_in_head(self) -> [f64; 3] {
-        let sin_yaw = sin(self.yaw_right_rad);
-        let cos_yaw = cos(self.yaw_right_rad);
-        let sin_pitch = sin(self.pitch_down_rad);
-        let cos_pitch = cos(self.pitch_down_rad);
+        let sin_yaw = sin(self.yaw_right.get());
+        let cos_yaw = cos(self.yaw_right.get());
+        let sin_pitch = sin(self.pitch_down.get());
+        let cos_pitch = cos(self.pitch_down.get());
         [cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw]
     }
 }
