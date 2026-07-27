@@ -55,12 +55,7 @@ pub mod nano_base_commissioning_bootstrap;
 pub mod nano_base_commissioning_live;
 #[cfg(all(feature = "nano-agent", unix))]
 mod nano_bootstrap;
-#[cfg(all(
-    feature = "agent-runtime",
-    feature = "actuation",
-    feature = "record",
-    unix
-))]
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
 mod nano_calibration_artifact;
 #[cfg(all(feature = "nano-face-perception", unix))]
 pub mod nano_face_perception;
@@ -328,12 +323,7 @@ pub use nano_accessory_worker::{
 pub use nano_agent_launch::*;
 #[cfg(all(feature = "nano-agent", unix))]
 pub use nano_bootstrap::*;
-#[cfg(all(
-    feature = "agent-runtime",
-    feature = "actuation",
-    feature = "record",
-    unix
-))]
+#[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
 pub use nano_calibration_artifact::{
     MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES, NANO_CALIBRATION_ARTIFACT_V1,
     NanoCalibrationArtifactParseError, NanoCalibrationArtifactV1, NanoCalibrationBindingError,

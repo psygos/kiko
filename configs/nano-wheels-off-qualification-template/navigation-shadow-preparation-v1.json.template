@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "coordinate_frames": {
+    "tracking_camera_to_base": "${CALIBRATION_PREPARER_REPLACES_TRACKING_CAMERA_TO_BASE}",
+    "world_to_occupancy": {
+      "rotation": ${NAV_SHADOW_UNVALIDATED_WORLD_TO_OCCUPANCY_ROTATION_F64_MATRIX},
+      "translation_m": ${NAV_SHADOW_UNVALIDATED_WORLD_TO_OCCUPANCY_TRANSLATION_M_F64_ARRAY}
+    }
+  },
+  "odometry": {
+    "raw_imu_calibration": "${CALIBRATION_PREPARER_REPLACES_RAW_IMU_CALIBRATION}",
+    "maximum_visual_interval_ns": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_VISUAL_INTERVAL_NS},
+    "maximum_visual_linear_speed_m_per_sec": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_VISUAL_LINEAR_SPEED_M_PER_SEC},
+    "maximum_visual_yaw_rate_rad_per_sec": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_VISUAL_YAW_RATE_RAD_PER_SEC},
+    "maximum_calibrated_yaw_rate_rad_per_sec": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_CALIBRATED_YAW_RATE_RAD_PER_SEC},
+    "minimum_gyro_accuracy": "${NAV_SHADOW_UNVALIDATED_MINIMUM_GYRO_ACCURACY}",
+    "maximum_vertical_increment_m": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_VERTICAL_INCREMENT_M},
+    "maximum_relative_roll_pitch_increment_rad": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_RELATIVE_ROLL_PITCH_INCREMENT_RAD},
+    "maximum_absolute_map_roll_pitch_rad": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_ABSOLUTE_MAP_ROLL_PITCH_RAD},
+    "maximum_imu_gap_ns": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_IMU_GAP_NS},
+    "maximum_prediction_age_ns": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_PREDICTION_AGE_NS},
+    "maximum_host_observation_age_ns": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_HOST_OBSERVATION_AGE_NS},
+    "maximum_history_bracket_gap_ns": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_HISTORY_BRACKET_GAP_NS},
+    "gyro_history_capacity": ${NAV_SHADOW_UNVALIDATED_GYRO_HISTORY_CAPACITY},
+    "pose_history_capacity": ${NAV_SHADOW_UNVALIDATED_POSE_HISTORY_CAPACITY}
+  },
+  "local_costmap": {
+    "resolution_m": ${NAV_SHADOW_UNVALIDATED_LOCAL_COSTMAP_RESOLUTION_M},
+    "lower_bound_m": ${NAV_SHADOW_UNVALIDATED_LOCAL_COSTMAP_LOWER_BOUND_M_F64_ARRAY},
+    "width_cells": ${NAV_SHADOW_UNVALIDATED_LOCAL_COSTMAP_WIDTH_CELLS},
+    "height_cells": ${NAV_SHADOW_UNVALIDATED_LOCAL_COSTMAP_HEIGHT_CELLS},
+    "maximum_cells": ${NAV_SHADOW_UNVALIDATED_LOCAL_COSTMAP_MAXIMUM_CELLS},
+    "obstacle_height_minimum_m": ${NAV_SHADOW_UNVALIDATED_OBSTACLE_HEIGHT_MINIMUM_M},
+    "obstacle_height_maximum_m": ${NAV_SHADOW_UNVALIDATED_OBSTACLE_HEIGHT_MAXIMUM_M},
+    "depth_minimum_m": ${NAV_SHADOW_UNVALIDATED_DEPTH_MINIMUM_M},
+    "depth_maximum_m": ${NAV_SHADOW_UNVALIDATED_DEPTH_MAXIMUM_M},
+    "sampling_block_pixels": ${NAV_SHADOW_UNVALIDATED_SAMPLING_BLOCK_PIXELS},
+    "footprint_radius_m": ${NAV_SHADOW_UNVALIDATED_FOOTPRINT_RADIUS_M},
+    "clearance_m": ${NAV_SHADOW_UNVALIDATED_CLEARANCE_M},
+    "maximum_observation_age_ns": ${NAV_SHADOW_UNVALIDATED_LOCAL_COSTMAP_MAXIMUM_OBSERVATION_AGE_NS}
+  },
+  "global_planner": {
+    "unknown_space_policy": "blocked"
+  },
+  "plant_model": {
+    "schema_version": 1,
+    "model_id": "${NAV_SHADOW_UNVALIDATED_PLANT_MODEL_ID}",
+    "model_version": ${NAV_SHADOW_UNVALIDATED_PLANT_MODEL_VERSION},
+    "sample_period_s": ${NAV_SHADOW_UNVALIDATED_PLANT_SAMPLE_PERIOD_S},
+    "wheelbase_m": ${NAV_SHADOW_UNVALIDATED_WHEELBASE_M},
+    "left": {
+      "velocity_gain_mps_per_pwm_percent": ${NAV_SHADOW_UNVALIDATED_LEFT_VELOCITY_GAIN_MPS_PER_PWM_PERCENT},
+      "time_constant_s": ${NAV_SHADOW_UNVALIDATED_LEFT_TIME_CONSTANT_S}
+    },
+    "right": {
+      "velocity_gain_mps_per_pwm_percent": ${NAV_SHADOW_UNVALIDATED_RIGHT_VELOCITY_GAIN_MPS_PER_PWM_PERCENT},
+      "time_constant_s": ${NAV_SHADOW_UNVALIDATED_RIGHT_TIME_CONSTANT_S}
+    },
+    "validity": {
+      "left_pwm_min_percent": ${NAV_SHADOW_UNVALIDATED_LEFT_PWM_MIN_PERCENT},
+      "left_pwm_max_percent": ${NAV_SHADOW_UNVALIDATED_LEFT_PWM_MAX_PERCENT},
+      "right_pwm_min_percent": ${NAV_SHADOW_UNVALIDATED_RIGHT_PWM_MIN_PERCENT},
+      "right_pwm_max_percent": ${NAV_SHADOW_UNVALIDATED_RIGHT_PWM_MAX_PERCENT},
+      "left_velocity_min_mps": ${NAV_SHADOW_UNVALIDATED_LEFT_VELOCITY_MIN_MPS},
+      "left_velocity_max_mps": ${NAV_SHADOW_UNVALIDATED_LEFT_VELOCITY_MAX_MPS},
+      "right_velocity_min_mps": ${NAV_SHADOW_UNVALIDATED_RIGHT_VELOCITY_MIN_MPS},
+      "right_velocity_max_mps": ${NAV_SHADOW_UNVALIDATED_RIGHT_VELOCITY_MAX_MPS},
+      "maximum_absolute_yaw_rate_rad_per_sec": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_ABSOLUTE_YAW_RATE_RAD_PER_SEC},
+      "maximum_absolute_lateral_velocity_m_per_sec": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_ABSOLUTE_LATERAL_VELOCITY_M_PER_SEC}
+    },
+    "evidence": {
+      "kind": "claimed_physical_identification",
+      "dataset_content_id": "${NAV_SHADOW_UNVALIDATED_PLANT_DATASET_CONTENT_ID}",
+      "identification_method_id": "${NAV_SHADOW_UNVALIDATED_PLANT_IDENTIFICATION_METHOD_ID}",
+      "sample_count": ${NAV_SHADOW_UNVALIDATED_PLANT_SAMPLE_COUNT},
+      "residuals": {
+        "left_velocity_rmse_mps": ${NAV_SHADOW_UNVALIDATED_LEFT_VELOCITY_RMSE_MPS},
+        "right_velocity_rmse_mps": ${NAV_SHADOW_UNVALIDATED_RIGHT_VELOCITY_RMSE_MPS},
+        "yaw_rate_rmse_rad_s": ${NAV_SHADOW_UNVALIDATED_YAW_RATE_RMSE_RAD_S},
+        "maximum_absolute_velocity_error_mps": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_ABSOLUTE_VELOCITY_ERROR_MPS}
+      }
+    }
+  },
+  "mpc": {
+    "schema_version": 1,
+    "horizon_steps": ${NAV_SHADOW_UNVALIDATED_MPC_HORIZON_STEPS},
+    "step_period_s": ${NAV_SHADOW_UNVALIDATED_MPC_STEP_PERIOD_S},
+    "integration_substeps": ${NAV_SHADOW_UNVALIDATED_MPC_INTEGRATION_SUBSTEPS},
+    "optimization_iterations": ${NAV_SHADOW_UNVALIDATED_MPC_OPTIMIZATION_ITERATIONS},
+    "candidates_per_wheel": ${NAV_SHADOW_UNVALIDATED_MPC_CANDIDATES_PER_WHEEL},
+    "maximum_rollout_evaluations": ${NAV_SHADOW_UNVALIDATED_MPC_MAXIMUM_ROLLOUT_EVALUATIONS},
+    "initial_search_radius_percent": ${NAV_SHADOW_UNVALIDATED_MPC_INITIAL_SEARCH_RADIUS_PERCENT},
+    "search_radius_decay_numerator": ${NAV_SHADOW_UNVALIDATED_MPC_SEARCH_RADIUS_DECAY_NUMERATOR},
+    "search_radius_decay_denominator": ${NAV_SHADOW_UNVALIDATED_MPC_SEARCH_RADIUS_DECAY_DENOMINATOR},
+    "left_pwm_min_percent": ${NAV_SHADOW_UNVALIDATED_MPC_LEFT_PWM_MIN_PERCENT},
+    "left_pwm_max_percent": ${NAV_SHADOW_UNVALIDATED_MPC_LEFT_PWM_MAX_PERCENT},
+    "right_pwm_min_percent": ${NAV_SHADOW_UNVALIDATED_MPC_RIGHT_PWM_MIN_PERCENT},
+    "right_pwm_max_percent": ${NAV_SHADOW_UNVALIDATED_MPC_RIGHT_PWM_MAX_PERCENT},
+    "left_maximum_slew_percent_per_step": ${NAV_SHADOW_UNVALIDATED_MPC_LEFT_MAXIMUM_SLEW_PERCENT_PER_STEP},
+    "right_maximum_slew_percent_per_step": ${NAV_SHADOW_UNVALIDATED_MPC_RIGHT_MAXIMUM_SLEW_PERCENT_PER_STEP},
+    "maximum_integration_tube_radius_m": ${NAV_SHADOW_UNVALIDATED_MPC_MAXIMUM_INTEGRATION_TUBE_RADIUS_M},
+    "position_cost_per_m2": ${NAV_SHADOW_UNVALIDATED_MPC_POSITION_COST_PER_M2},
+    "heading_cost_per_rad2": ${NAV_SHADOW_UNVALIDATED_MPC_HEADING_COST_PER_RAD2},
+    "forward_velocity_cost_s2_per_m2": ${NAV_SHADOW_UNVALIDATED_MPC_FORWARD_VELOCITY_COST_S2_PER_M2},
+    "yaw_rate_cost_s2_per_rad2": ${NAV_SHADOW_UNVALIDATED_MPC_YAW_RATE_COST_S2_PER_RAD2},
+    "pwm_cost_per_percent2": ${NAV_SHADOW_UNVALIDATED_MPC_PWM_COST_PER_PERCENT2},
+    "slew_cost_per_percent2": ${NAV_SHADOW_UNVALIDATED_MPC_SLEW_COST_PER_PERCENT2},
+    "terminal_state_cost_multiplier": ${NAV_SHADOW_UNVALIDATED_MPC_TERMINAL_STATE_COST_MULTIPLIER}
+  },
+  "path_reference": {
+    "schema_version": 1,
+    "maximum_path_points": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_PATH_POINTS},
+    "minimum_segment_length_m": ${NAV_SHADOW_UNVALIDATED_MINIMUM_SEGMENT_LENGTH_M},
+    "maximum_path_length_m": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_PATH_LENGTH_M},
+    "maximum_projection_distance_m": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_PROJECTION_DISTANCE_M},
+    "target_forward_speed_m_per_sec": ${NAV_SHADOW_UNVALIDATED_TARGET_FORWARD_SPEED_M_PER_SEC},
+    "goal_stop_distance_m": ${NAV_SHADOW_UNVALIDATED_GOAL_STOP_DISTANCE_M},
+    "maximum_absolute_yaw_rate_rad_per_sec": ${NAV_SHADOW_UNVALIDATED_PATH_MAXIMUM_ABSOLUTE_YAW_RATE_RAD_PER_SEC},
+    "nearest_segment_tie_policy": ${NAV_SHADOW_UNVALIDATED_NEAREST_SEGMENT_TIE_POLICY}
+  },
+  "control_loop": {
+    "control_period_ns": ${NAV_SHADOW_UNVALIDATED_CONTROL_PERIOD_NS},
+    "solver_budget_ns": ${NAV_SHADOW_UNVALIDATED_SOLVER_BUDGET_NS}
+  },
+  "shadow_command": {
+    "lease_ms": ${NAV_SHADOW_UNVALIDATED_SHADOW_COMMAND_LEASE_MS},
+    "retained_records": ${NAV_SHADOW_UNVALIDATED_SHADOW_COMMAND_RETAINED_RECORDS},
+    "initial_sequence": ${NAV_SHADOW_UNVALIDATED_SHADOW_COMMAND_INITIAL_SEQUENCE}
+  },
+  "ingress_journal": {
+    "maximum_ingress_records": ${NAV_SHADOW_UNVALIDATED_MAXIMUM_INGRESS_RECORDS}
+  }
+}

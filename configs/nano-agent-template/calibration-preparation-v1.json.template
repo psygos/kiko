@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "oak_mxid": "${OAK_MXID}",
+  "rectified_stereo": {
+    "provenance": {
+      "source_id": "${LIVE_RECTIFIED_STEREO_SOURCE_ID}",
+      "source_sha256_hex": "${LIVE_RECTIFIED_STEREO_SOURCE_SHA256_HEX}"
+    },
+    "corroborating_baseline_provenance": {
+      "source_id": "${CORROBORATING_BASELINE_SOURCE_ID}",
+      "source_sha256_hex": "${CORROBORATING_BASELINE_SOURCE_SHA256_HEX}"
+    },
+    "corroborating_baseline_relationship": "independently_derived",
+    "rectified": true,
+    "left": {
+      "fx_px": ${RECTIFIED_LEFT_FX_PX},
+      "fy_px": ${RECTIFIED_LEFT_FY_PX},
+      "cx_px": ${RECTIFIED_LEFT_CX_PX},
+      "cy_px": ${RECTIFIED_LEFT_CY_PX},
+      "width_px": ${RECTIFIED_STEREO_WIDTH_PX},
+      "height_px": ${RECTIFIED_STEREO_HEIGHT_PX}
+    },
+    "right": {
+      "fx_px": ${RECTIFIED_RIGHT_FX_PX},
+      "fy_px": ${RECTIFIED_RIGHT_FY_PX},
+      "cx_px": ${RECTIFIED_RIGHT_CX_PX},
+      "cy_px": ${RECTIFIED_RIGHT_CY_PX},
+      "width_px": ${RECTIFIED_STEREO_WIDTH_PX},
+      "height_px": ${RECTIFIED_STEREO_HEIGHT_PX}
+    },
+    "baseline_m": ${LIVE_RECTIFIED_STEREO_BASELINE_M},
+    "corroborating_baseline_m": ${CORROBORATING_BASELINE_M}
+  },
+  "basalt_imu_calibration": {
+    "provenance": {
+      "source_id": "${BASALT_IMU_CALIBRATION_SOURCE_ID}",
+      "source_sha256_hex": "${BASALT_IMU_CALIBRATION_SOURCE_SHA256_HEX}"
+    },
+    "calib_accel_bias_units": {
+      "bias": "metres_per_second_squared",
+      "scale": "dimensionless"
+    },
+    "calib_gyro_bias_units": {
+      "bias": "radians_per_second",
+      "scale": "dimensionless"
+    },
+    "calib_accel_bias": ${BASALT_CALIB_ACCEL_BIAS_F64_ARRAY_9},
+    "calib_gyro_bias": ${BASALT_CALIB_GYRO_BIAS_F64_ARRAY_12}
+  },
+  "native_imu_to_base": {
+    "provenance": {
+      "source_id": "${NATIVE_IMU_TO_BASE_SOURCE_ID}",
+      "source_sha256_hex": "${NATIVE_IMU_TO_BASE_SOURCE_SHA256_HEX}"
+    },
+    "rotation": ${NATIVE_IMU_TO_BASE_ROTATION_F64_MATRIX}
+  },
+  "tracking_camera_to_base": {
+    "provenance": {
+      "source_id": "${TRACKING_CAMERA_TO_BASE_SOURCE_ID}",
+      "source_sha256_hex": "${TRACKING_CAMERA_TO_BASE_SOURCE_SHA256_HEX}"
+    },
+    "rotation": ${TRACKING_CAMERA_TO_BASE_ROTATION_F32_MATRIX},
+    "translation_m": ${TRACKING_CAMERA_TO_BASE_TRANSLATION_M_F32_ARRAY}
+  }
+}

@@ -18,6 +18,9 @@ agent-runtime = [
     "dep:kiko-supervisor-core",
     "dep:tokio",
 ]
+# Offline calibration preparation only. Make its no-replace filesystem
+# primitive explicit without broadening generic agent-runtime/actuation builds.
+nano-calibration-prepare = ["agent-runtime", "actuation", "dep:rustix"]
 operator-console = ["dep:bytes", "dep:getrandom", "dep:rustix", "dep:tokio", "dep:warp"]
 nano-agent = [
     "agent-runtime",
@@ -103,6 +106,11 @@ required-features = ["nano-agent"]
 name = "kiko-nano-base-commission"
 path = "src/bin/kiko_nano_base_commission.rs"
 required-features = ["nano-base-commissioning"]
+
+[[bin]]
+name = "kiko-nano-calibration-prepare"
+path = "src/bin/kiko_nano_calibration_prepare.rs"
+required-features = ["nano-calibration-prepare"]
 
 [[bench]]
 name = "pose_graph_jacobians"
