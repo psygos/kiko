@@ -27,6 +27,8 @@ mod global_planner;
 mod goal_input;
 #[cfg(feature = "agent-runtime")]
 mod head_gaze_policy;
+#[cfg(feature = "agent-runtime")]
+mod head_gaze_proposal_adapter;
 mod ingress;
 #[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
 mod live_motion_owner;
@@ -232,6 +234,13 @@ pub use head_gaze_policy::{
     HeadGazeProposalClaimId, HeadGazeProposalOnlyClaim, HeadGazeReviewClaimId,
     HeadGazeReviewEvidenceId, HeadGazeTimingField, MAX_HEAD_GAZE_POLICY_JSON_BYTES,
     OperatorClaimedHeadGazePhysicalReview, REQUIRED_HEAD_GAZE_ACQUISITION_PROPOSALS,
+};
+#[cfg(feature = "agent-runtime")]
+pub use head_gaze_proposal_adapter::{
+    FreshCurrentFaceGazeTarget, FreshFaceGazeTransition, HeadGazeFaceProposal,
+    HeadGazeFaceProposalAdapter, HeadGazeFaceProposalAdapterError, HeadGazeFaceProposalError,
+    HeadGazeFaceProposalOutcome, HeadGazeFaceProposalWithheld, HeadGazeReturnTriggerBound,
+    MAXIMUM_HEAD_GAZE_RETURN_TRIGGER_DELAY, RgbFacePinholeProjection,
 };
 pub use ingress::{
     AcceptedDepthIngress, ControlTickIngress, CurrentMapEpochBinding, FinalizedNavigationIngress,
