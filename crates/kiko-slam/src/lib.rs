@@ -109,8 +109,9 @@ pub use tracker::{
     KeyframePolicy, KeyframePolicyError, KeyframePoseUpdate, LoopSubsystemConfig,
     MapCorrectionApplied, MapCorrectionId, MapCorrectionIdExhausted, MapCorrectionKind,
     MapLocalization, ParallaxPx, PoseStatus, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
-    SystemHealth, TrackerConfig, TrackerError, TrackerInitError, TrackerOutput, TrackerStatusParts,
-    TrackingHealth, VisualFrameStamp, VisualIncrement, VisualIncrementBasis, VisualIncrementError,
+    SystemHealth, TrackerConfig, TrackerError, TrackerInitError, TrackerOutput,
+    TrackerRuntimePolicy, TrackerStatusParts, TrackingHealth, VisualFrameStamp, VisualIncrement,
+    VisualIncrementBasis, VisualIncrementError,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, KeyframeLandmarkError, RectifiedStereo,

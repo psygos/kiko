@@ -124,6 +124,11 @@ cargo bench -p kiko-slam --bench occupancy_mapping
 - `--superpoint-model` / `KIKO_SUPERPOINT_MODEL` — custom SuperPoint ONNX path
 - `--lightglue-model` / `KIKO_LIGHTGLUE_MODEL` — custom LightGlue ONNX path
 - `KIKO_ORT_INTRA_THREADS` — ONNX intra-op threads; unset or `0` selects `max(2, available_parallelism / 2)` for CPU sessions and 2 for accelerator sessions, while an explicit count must be at least 2 because Kiko uses asynchronous inference
+- `KIKO_ORT_INTER_THREADS` — ONNX inter-op threads (default 1; values must fit ONNX Runtime's signed 32-bit count)
+- `KIKO_ORT_OPT_LEVEL` — graph optimization level: `0`/`disable`, `1`/`level1`/`basic`, `2`/`level2`/`extended`, or `3`/`level3`/`all` (default level 3)
+- `KIKO_ORT_MEM_PATTERN` — enable ONNX Runtime memory-pattern optimization (default true)
+- `KIKO_ORT_PARALLEL_EXEC` — enable ONNX Runtime parallel graph execution (default false)
+- `KIKO_ORT_CPU_ARENA` — enable the CPU execution provider's memory arena (default true); parsed only when the selected backend may configure a CPU provider
 - `KIKO_ORT_RUN_WARN_MS` — slow-inference warning threshold in milliseconds (default 200); `0` warns for every nonzero observed duration
 - `KIKO_ORT_RUN_TIMEOUT_MS` — strict inference deadline in milliseconds (default 5000, must be greater than zero and at least the warning threshold); successful completion observed at or after the deadline returns an error but leaves the session usable, while a run still pending at the deadline makes that session fail-stop because ONNX Runtime cancellation is nonblocking
 
@@ -192,9 +197,15 @@ Override with `--superpoint-model` / `--lightglue-model` or `KIKO_SUPERPOINT_MOD
 [tensor and coordinate profile](crates/kiko-slam/models/README.md); the path option does not infer
 or adapt alternate layouts, units, or axis orders.
 
-Learned place recognition resolves `eigenplaces.onnx` from the same directory. That model is not
-stored in this repository; provide it at that path or set `KIKO_EIGENPLACES_MODEL`. Learned
-descriptors are required when loop closure is enabled.
+The offline compatibility tracker's learned place-recognition mode resolves
+`eigenplaces.onnx` from the same directory. That model is not stored in this
+repository; provide it at that path or set `KIKO_EIGENPLACES_MODEL`. Learned
+descriptors are required when that compatibility mode enables loop closure.
+Canonical Nano production and wheels-off startup instead use deterministic
+descriptors aggregated from admitted SuperPoint features, so they do not open
+an EigenPlaces model. This bootstrap mode makes loop closure and relocalization
+available without the missing model; it does not claim EigenPlaces-equivalent
+place-recognition quality, which requires representative-map qualification.
 
 ## Roadmap
 

@@ -89,6 +89,16 @@ pub enum LoopSubsystemConfig {
         global_descriptor: GlobalDescriptorConfig,
         relocalization: Option<RelocalizationConfig>,
     },
+    /// Loop closure and relocalization using only deterministic descriptors
+    /// aggregated from the admitted local feature descriptors.
+    ///
+    /// This mode creates no learned-descriptor worker and resolves no model
+    /// path. Its place-recognition quality is not equivalent to EigenPlaces
+    /// and must be qualified separately on representative maps.
+    BootstrapDescriptors {
+        loop_closure: LoopClosureConfig,
+        relocalization: RelocalizationConfig,
+    },
 }
 
 impl LoopSubsystemConfig {
@@ -104,16 +114,27 @@ impl LoopSubsystemConfig {
         }
     }
 
+    pub const fn bootstrap_descriptors(
+        loop_closure: LoopClosureConfig,
+        relocalization: RelocalizationConfig,
+    ) -> Self {
+        Self::BootstrapDescriptors {
+            loop_closure,
+            relocalization,
+        }
+    }
+
     pub fn loop_closure(self) -> Option<LoopClosureConfig> {
         match self {
             Self::Disabled => None,
-            Self::Enabled { loop_closure, .. } => Some(loop_closure),
+            Self::Enabled { loop_closure, .. }
+            | Self::BootstrapDescriptors { loop_closure, .. } => Some(loop_closure),
         }
     }
 
     pub fn global_descriptor(self) -> Option<GlobalDescriptorConfig> {
         match self {
-            Self::Disabled => None,
+            Self::Disabled | Self::BootstrapDescriptors { .. } => None,
             Self::Enabled {
                 global_descriptor, ..
             } => Some(global_descriptor),
@@ -124,11 +145,16 @@ impl LoopSubsystemConfig {
         match self {
             Self::Disabled => None,
             Self::Enabled { relocalization, .. } => relocalization,
+            Self::BootstrapDescriptors { relocalization, .. } => Some(relocalization),
         }
     }
 
     pub fn is_enabled(self) -> bool {
-        matches!(self, Self::Enabled { .. })
+        !matches!(self, Self::Disabled)
+    }
+
+    pub const fn uses_bootstrap_descriptors_only(self) -> bool {
+        matches!(self, Self::BootstrapDescriptors { .. })
     }
 }
 
@@ -782,6 +808,21 @@ impl DescriptorSupervisor {
 
     fn has_worker(&self) -> bool {
         self.worker.is_some()
+    }
+}
+
+fn maybe_spawn_descriptor_supervisor(
+    loop_closure: Option<LoopClosureConfig>,
+    global_descriptor: Option<GlobalDescriptorConfig>,
+    max_respawns: u32,
+    spawn: impl FnOnce(GlobalDescriptorConfig, u32) -> Result<DescriptorSupervisor, TrackerInitError>,
+) -> Result<Option<DescriptorSupervisor>, TrackerInitError> {
+    match (loop_closure, global_descriptor) {
+        (Some(_), Some(config)) => spawn(config, max_respawns).map(Some),
+        (None, None) | (Some(_), None) => Ok(None),
+        (None, Some(_)) => unreachable!(
+            "LoopSubsystemConfig cannot expose learned descriptors without loop closure"
+        ),
     }
 }
 
@@ -2456,8 +2497,18 @@ struct PendingLoopCandidate {
     candidates: Vec<PlaceMatch>,
 }
 
+/// Explicit runtime policy for tracker worker supervision, landmark culling,
+/// and transition diagnostics.
+///
+/// [`SlamTracker::try_new`] retains the desktop/offline environment boundary.
+/// Canonical robot startup instead passes [`Self::canonical_nano`] to
+/// `SlamTracker::try_new_with_runtime_policy`, so the backend/descriptor
+/// respawn limits, landmark-culling threshold, and transition tracing do not
+/// come from ambient process variables. Learned-descriptor model selection is
+/// a separate boundary; canonical Nano startup uses bootstrap descriptors and
+/// therefore never enters it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TrackerEnvironment {
+pub struct TrackerRuntimePolicy {
     backend_max_respawns: u32,
     descriptor_max_respawns: u32,
     cull_min_observations: NonZeroUsize,
@@ -2476,8 +2527,22 @@ fn load_when_enabled<T, E>(
     }
 }
 
-impl TrackerEnvironment {
-    fn parse(backend_enabled: bool, descriptor_enabled: bool) -> Result<Self, TrackerInitError> {
+impl TrackerRuntimePolicy {
+    /// Fixed current Nano runtime policy. This function performs no I/O and
+    /// reads no process environment.
+    pub const fn canonical_nano() -> Self {
+        Self {
+            backend_max_respawns: DEFAULT_MAX_RESPAWNS,
+            descriptor_max_respawns: DEFAULT_MAX_RESPAWNS,
+            cull_min_observations: DEFAULT_CULL_MIN_OBSERVATIONS,
+            trace_transitions: false,
+        }
+    }
+
+    fn from_environment(
+        backend_enabled: bool,
+        descriptor_enabled: bool,
+    ) -> Result<Self, TrackerInitError> {
         let backend_max_respawns =
             load_when_enabled(backend_enabled, DEFAULT_MAX_RESPAWNS, || {
                 crate::env::env_u32(BACKEND_MAX_RESPAWNS_ENV)
@@ -2492,6 +2557,22 @@ impl TrackerEnvironment {
             crate::env::env_usize(MAP_CULL_MIN_OBSERVATIONS_ENV)?,
             crate::env::env_bool(TRACK_TRACE_ENV)?,
         )
+    }
+
+    pub const fn backend_max_respawns(self) -> u32 {
+        self.backend_max_respawns
+    }
+
+    pub const fn descriptor_max_respawns(self) -> u32 {
+        self.descriptor_max_respawns
+    }
+
+    pub const fn cull_min_observations(self) -> usize {
+        self.cull_min_observations.get()
+    }
+
+    pub const fn trace_transitions(self) -> bool {
+        self.trace_transitions
     }
 
     fn from_parsed(
@@ -2563,10 +2644,36 @@ impl SlamTracker {
         stereo: RectifiedStereo,
         config: TrackerConfig,
     ) -> Result<Self, TrackerInitError> {
-        let environment = TrackerEnvironment::parse(
+        let runtime_policy = TrackerRuntimePolicy::from_environment(
             config.backend.is_some(),
             config.global_descriptor_config().is_some(),
         )?;
+        Self::try_new_with_runtime_policy(
+            superpoint_left,
+            superpoint_right,
+            lightglue,
+            stereo,
+            config,
+            runtime_policy,
+        )
+    }
+
+    /// Construct with explicit worker supervision, landmark-culling, and
+    /// transition-diagnostic policy.
+    ///
+    /// Canonical production and wheels-off startup use this entry point with
+    /// `TrackerRuntimePolicy::canonical_nano`. Offline compatibility commands
+    /// retain [`Self::try_new`] and its documented environment tuning. A
+    /// learned-descriptor configuration still resolves its separately
+    /// documented model source; canonical bootstrap mode has no model source.
+    pub fn try_new_with_runtime_policy(
+        superpoint_left: SuperPoint,
+        superpoint_right: SuperPoint,
+        lightglue: LightGlue,
+        stereo: RectifiedStereo,
+        config: TrackerConfig,
+        runtime_policy: TrackerRuntimePolicy,
+    ) -> Result<Self, TrackerInitError> {
         // The tracker has one camera-calibration authority. Derive the PnP,
         // BA, loop, and backend projection from the same parsed left camera
         // that the triangulator consumes.
@@ -2578,19 +2685,18 @@ impl SlamTracker {
                 backend_cfg,
                 intrinsics,
                 config.ba,
-                environment.backend_max_respawns,
+                runtime_policy.backend_max_respawns,
             )?),
             None => None,
         };
         let loop_config = config.loop_closure_config();
         let loop_db = loop_config.map(|cfg| KeyframeDatabase::new(cfg.temporal_gap()));
-        let descriptor_worker = match (loop_config, config.global_descriptor_config()) {
-            (Some(_), Some(cfg)) => Some(DescriptorSupervisor::spawn_with_max_respawns(
-                cfg,
-                environment.descriptor_max_respawns,
-            )?),
-            _ => None,
-        };
+        let descriptor_worker = maybe_spawn_descriptor_supervisor(
+            loop_config,
+            config.global_descriptor_config(),
+            runtime_policy.descriptor_max_respawns,
+            DescriptorSupervisor::spawn_with_max_respawns,
+        )?;
         Ok(Self {
             superpoint_left,
             superpoint_right,
@@ -2620,8 +2726,8 @@ impl SlamTracker {
             last_pose_world: None,
             last_incremental_ba_stamp: None,
             incremental_ba_anchor_keyframe: None,
-            cull_min_observations: environment.cull_min_observations,
-            trace_transitions: environment.trace_transitions,
+            cull_min_observations: runtime_policy.cull_min_observations,
+            trace_transitions: runtime_policy.trace_transitions,
         })
     }
 
@@ -5202,16 +5308,135 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn tracker_environment_defaults_only_absent_values() {
+    fn canonical_nano_runtime_policy_is_fixed_and_explicit() {
+        let policy = TrackerRuntimePolicy::canonical_nano();
+        assert_eq!(policy.backend_max_respawns(), DEFAULT_MAX_RESPAWNS);
+        assert_eq!(policy.descriptor_max_respawns(), DEFAULT_MAX_RESPAWNS);
         assert_eq!(
-            TrackerEnvironment::from_parsed(
+            policy.cull_min_observations(),
+            DEFAULT_CULL_MIN_OBSERVATIONS.get()
+        );
+        assert!(!policy.trace_transitions());
+    }
+
+    #[test]
+    fn bootstrap_loop_configuration_enables_relocalization_without_learned_descriptors() {
+        let config = LoopSubsystemConfig::bootstrap_descriptors(
+            LoopClosureConfig::default(),
+            RelocalizationConfig::default(),
+        );
+
+        assert!(config.is_enabled());
+        assert!(config.uses_bootstrap_descriptors_only());
+        assert!(config.loop_closure().is_some());
+        assert!(config.relocalization().is_some());
+        assert!(config.global_descriptor().is_none());
+    }
+
+    #[test]
+    fn bootstrap_loop_configuration_never_resolves_an_ambient_model_path() {
+        for model_override in [None, Some(OsString::new())] {
+            let config = LoopSubsystemConfig::bootstrap_descriptors(
+                LoopClosureConfig::default(),
+                RelocalizationConfig::default(),
+            );
+            let worker = maybe_spawn_descriptor_supervisor(
+                config.loop_closure(),
+                config.global_descriptor(),
+                DEFAULT_MAX_RESPAWNS,
+                move |_, _| {
+                    let _ = DescriptorWorker::model_path_from_override(model_override)?;
+                    panic!("bootstrap descriptor mode must not invoke the learned-model factory")
+                },
+            )
+            .expect("bootstrap descriptor mode has no learned-model initialization");
+
+            assert!(worker.is_none());
+        }
+    }
+
+    #[test]
+    fn bootstrap_only_mode_registers_and_queries_place_candidates() {
+        let loop_config = LoopClosureConfig::new(crate::loop_closure::LoopClosureConfigInput {
+            temporal_gap: 1,
+            ..crate::loop_closure::LoopClosureConfigInput::default()
+        })
+        .expect("one registered-keyframe exclusion gap");
+        let subsystem = LoopSubsystemConfig::bootstrap_descriptors(
+            loop_config,
+            RelocalizationConfig::default(),
+        );
+        let mut database = KeyframeDatabase::new(
+            subsystem
+                .loop_closure()
+                .expect("bootstrap loop configuration")
+                .temporal_gap(),
+        );
+        let mut descriptor_values = [0.0_f32; 256];
+        descriptor_values[7] = 1.0;
+        let first = KeyframeId::for_test(0);
+        let second = KeyframeId::for_test(1);
+        let third = KeyframeId::for_test(2);
+
+        for (id, frame_id) in [(first, 1_u64), (second, 2_u64)] {
+            let detections = make_single_landmark_keyframe_with_descriptor(
+                frame_id,
+                Descriptor(descriptor_values),
+            );
+            let (_, candidates) = register_bootstrap_loop_descriptor(
+                subsystem.loop_closure(),
+                Some(&mut database),
+                id,
+                detections.detections(),
+            )
+            .expect("bootstrap registration")
+            .expect("enabled bootstrap loop subsystem");
+            assert!(candidates.is_empty());
+            assert_eq!(
+                database.descriptor_source(id),
+                Some(DescriptorSource::Bootstrap)
+            );
+        }
+
+        let query = make_single_landmark_keyframe_with_descriptor(3, Descriptor(descriptor_values));
+        let (_, candidates) = register_bootstrap_loop_descriptor(
+            subsystem.loop_closure(),
+            Some(&mut database),
+            third,
+            query.detections(),
+        )
+        .expect("bootstrap query registration")
+        .expect("enabled bootstrap loop subsystem");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].query, third);
+        assert_eq!(candidates[0].candidate, first);
+        assert!((candidates[0].similarity - 1.0).abs() < f32::EPSILON);
+        assert_eq!(
+            database.descriptor_source(third),
+            Some(DescriptorSource::Bootstrap)
+        );
+
+        let relocalization_descriptor =
+            aggregate_global_descriptor(query.detections().descriptors())
+                .expect("same aggregate representation");
+        let relocalization_candidates =
+            database.query_for_relocalization(&relocalization_descriptor, 1);
+        assert_eq!(relocalization_candidates.len(), 1);
+        assert!((relocalization_candidates[0].similarity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn tracker_runtime_policy_defaults_only_absent_values() {
+        assert_eq!(
+            TrackerRuntimePolicy::from_parsed(
                 DEFAULT_MAX_RESPAWNS,
                 DEFAULT_MAX_RESPAWNS,
                 None,
                 None,
             )
             .expect("default tracker environment"),
-            TrackerEnvironment {
+            TrackerRuntimePolicy {
                 backend_max_respawns: DEFAULT_MAX_RESPAWNS,
                 descriptor_max_respawns: DEFAULT_MAX_RESPAWNS,
                 cull_min_observations: DEFAULT_CULL_MIN_OBSERVATIONS,
@@ -5221,11 +5446,11 @@ mod tests {
     }
 
     #[test]
-    fn tracker_environment_preserves_typed_values() {
+    fn tracker_runtime_policy_preserves_typed_values() {
         assert_eq!(
-            TrackerEnvironment::from_parsed(u32::MAX, 0, Some(7), Some(true))
+            TrackerRuntimePolicy::from_parsed(u32::MAX, 0, Some(7), Some(true))
                 .expect("explicit tracker environment"),
-            TrackerEnvironment {
+            TrackerRuntimePolicy {
                 backend_max_respawns: u32::MAX,
                 descriptor_max_respawns: 0,
                 cull_min_observations: NonZeroUsize::new(7).expect("non-zero threshold"),
@@ -5248,9 +5473,9 @@ mod tests {
     }
 
     #[test]
-    fn tracker_environment_rejects_zero_cull_threshold() {
+    fn tracker_runtime_policy_rejects_zero_cull_threshold() {
         assert!(matches!(
-            TrackerEnvironment::from_parsed(
+            TrackerRuntimePolicy::from_parsed(
                 DEFAULT_MAX_RESPAWNS,
                 DEFAULT_MAX_RESPAWNS,
                 Some(0),

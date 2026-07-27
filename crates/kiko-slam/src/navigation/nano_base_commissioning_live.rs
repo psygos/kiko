@@ -41,8 +41,8 @@ use crate::{
     DownscaleFactor, KeyframePolicy, KeypointLimit, LightGlue, LmConfig, LocalBaConfig,
     LoopSubsystemConfig, OakImuAngularVelocity, PairingInputError, PairingWindowNs, Pose64,
     Pose64Error, RansacConfig, RectifiedStereo, SensorId, SlamTracker, StereoPairer, SuperPoint,
-    TrackerConfig, TrackerError, TrackerInitError, TriangulationConfig, VisualIncrement,
-    oak_to_frame, pin_ort_runtime_from_memory,
+    TrackerConfig, TrackerError, TrackerInitError, TrackerRuntimePolicy, TriangulationConfig,
+    VisualIncrement, oak_to_frame, pin_ort_runtime_from_memory,
 };
 
 const OAK_POLL_TIMEOUT_MS: u32 = 10;
@@ -163,12 +163,13 @@ pub fn prepare_commissioning_live_observation(
             inference.maximum_keypoints(),
             inference.downscale_factor(),
         )?;
-        let tracker = SlamTracker::try_new(
+        let tracker = SlamTracker::try_new_with_runtime_policy(
             superpoint_left,
             superpoint_right,
             lightglue,
             rectified,
             tracker_config,
+            TrackerRuntimePolicy::canonical_nano(),
         )
         .map_err(CommissioningLiveOpenPrimaryError::TrackerInit)?;
         let mut pairer = StereoPairer::new_with_max_pending(

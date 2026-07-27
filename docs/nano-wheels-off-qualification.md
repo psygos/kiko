@@ -58,6 +58,20 @@ This feature includes the common live Nano stack and the qualification
 surface. The raw-PWM qualification modules are compiled out of an ordinary
 production-only `--features nano-agent` build.
 
+Canonical production and wheels-off startup use a fixed geometric/worker
+tracker policy rather than ambient keyframe, bundle-adjustment, loop,
+descriptor-worker, culling, or transition-trace overrides. Loop closure and
+relocalization use deterministic descriptors aggregated from the admitted
+SuperPoint features, so these paths do not open or require an EigenPlaces model
+at startup. This makes the graph runnable without an unbound model path; it
+does not prove place-recognition quality equivalent to EigenPlaces. Retain
+representative-room loop-closure and relocalization observations as physical
+evidence before promoting either behavior. The offline compatibility command
+retains its documented environment-driven learned-descriptor boundary.
+ONNX Runtime session tuning remains a separate compatibility boundary through
+the documented `KIKO_ORT_*` variables; this gate does not infer an
+environment-free inference runtime.
+
 The exact resulting executable is a mandatory renderer input. Start from
 `configs/nano-wheels-off-qualification-template/bundle-render-input-v4.json.template`.
 The prepared qualification render-input boundary includes:

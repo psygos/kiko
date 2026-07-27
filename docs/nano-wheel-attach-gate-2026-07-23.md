@@ -247,9 +247,12 @@ remain disarmed.
       reset/serial loss, client disconnect, command expiry, clock fault,
       SIGTERM, and cold restart. Each motion-relevant path must confirm zero or
       report exact uncertainty.
-      The qualifier now has distinct one-shot declarations for host-clock
-      regression and a one-byte partial UART record; their host tests are not
-      a substitute for this unchecked attended run.
+      The qualifier now has four distinct one-shot declarations: host-clock
+      regression, a one-byte partial UART record, stale depth after a confirmed
+      nonzero step, and localization loss after established localization.
+      Their host tests are not a substitute for these unchecked attended runs;
+      run each declaration in its own fresh qualifier process as specified in
+      `docs/nano-wheels-off-qualification.md`.
 - [ ] With the wheels still absent and separate operator approval, establish
       left/right shaft/body sign conventions through bounded low-output
       candidate commands. This is sign evidence, not a velocity model.

@@ -13,6 +13,8 @@ use kiko_expression_core::{ChannelOrder, ImagePoint, StreamEpochId};
 use kiko_expression_runtime::{
     FaceDetection, FaceDetectorSource, FaceResultAdmission, FaceTargetState, FaceTrackingUpdate,
 };
+#[cfg(all(feature = "nano-agent", unix))]
+use kiko_slam::TrackerRuntimePolicy;
 use kiko_slam::dataset::{
     DatasetDepthCursor, DatasetError, DatasetReader, DepthOpticalFrame, DepthProjectionContract,
 };
@@ -1697,6 +1699,85 @@ fn build_tracker_config(
         triangulation: TriangulationConfig::default(),
         keyframe_policy,
         ba: ba_config,
+        redundancy,
+        backend,
+        loop_subsystem,
+    })
+}
+
+/// Build the canonical robot's geometric/worker tracker policy without
+/// consulting process environment.
+///
+/// The production and attended wheels-off launch documents already bind the
+/// inference models, backends, and keypoint/downscale limits. The remaining
+/// tracker policy is fixed here until a future versioned launch schema owns
+/// it; accepting ambient `KIKO_*` overrides in a system service would create a
+/// second, unaudited configuration authority. ONNX Runtime session tuning is a
+/// separate, pre-existing inference boundary and is not represented by this
+/// builder.
+///
+/// The canonical graph deliberately uses the tracker's existing aggregate
+/// SuperPoint descriptors for loop closure and relocalization. It therefore
+/// opens no ambient EigenPlaces path. This is functionally available loop
+/// closure, not evidence that its place-recognition quality equals a learned
+/// EigenPlaces model; representative-map qualification remains required.
+#[cfg(all(feature = "nano-agent", unix))]
+fn build_canonical_nano_tracker_config(
+    defaults: TrackerDefaults,
+    key_limit: KeypointLimit,
+    downscale: DownscaleFactor,
+) -> Result<TrackerConfig, Box<dyn std::error::Error>> {
+    let ransac_defaults = RansacConfig::default();
+    let ransac = RansacConfig::try_new(
+        ransac_defaults.max_iterations(),
+        ransac_defaults.reprojection_threshold_px(),
+        defaults.min_inliers,
+        ransac_defaults.seed(),
+    )?;
+    let ba = build_ba_config_from_values(BaConfigValues {
+        window: DEFAULT_BA_WINDOW,
+        iterations: DEFAULT_BA_ITERS,
+        min_observations: DEFAULT_BA_MIN_OBS,
+        huber_delta_px: DEFAULT_BA_HUBER_PX,
+        initial_lambda: DEFAULT_BA_DAMPING,
+        lambda_factor: DEFAULT_LM_FACTOR,
+        min_lambda: DEFAULT_LM_MIN,
+        max_lambda: DEFAULT_LM_MAX,
+    })?;
+    let keyframe_policy = KeyframePolicy::new(
+        defaults.refresh_inliers,
+        DEFAULT_KEYFRAME_PARALLAX_PX,
+        DEFAULT_KEYFRAME_COVISIBILITY,
+    )?;
+    let redundancy = Some(RedundancyPolicy::new(
+        DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY,
+    )?);
+    let backend = Some(BackendConfig::new(2)?);
+    let loop_subsystem = LoopSubsystemConfig::bootstrap_descriptors(
+        LoopClosureConfig::default(),
+        RelocalizationConfig::default(),
+    );
+
+    eprintln!(
+        "canonical Nano tracker requested: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={} async_backend=true backend_queue_depth=2 loop_closure_requested=true descriptor_mode=bootstrap descriptor_model_source=none relocalization_requested=true geometric_worker_policy_source=canonical-fixed ort_session_policy_source=environment-compatibility",
+        defaults.min_keyframe_points,
+        defaults.refresh_inliers,
+        DEFAULT_KEYFRAME_PARALLAX_PX,
+        DEFAULT_KEYFRAME_COVISIBILITY,
+        DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY,
+        defaults.min_inliers,
+        downscale.get(),
+        key_limit.get(),
+    );
+
+    Ok(TrackerConfig {
+        max_keypoints: key_limit,
+        downscale,
+        min_keyframe_points: defaults.min_keyframe_points,
+        ransac,
+        triangulation: TriangulationConfig::default(),
+        keyframe_policy,
+        ba,
         redundancy,
         backend,
         loop_subsystem,
@@ -11698,6 +11779,18 @@ enum LiveRerunTarget {
     },
 }
 
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedTrackerInitialization {
+    /// Compatibility/offline live mode retains its documented environment
+    /// tuning boundary.
+    Environment,
+    /// Canonical robot modes use one fixed typed configuration and explicit
+    /// runtime policy; they never inspect ambient tracker variables.
+    #[cfg(all(feature = "nano-agent", unix))]
+    CanonicalNano,
+}
+
 #[cfg(all(feature = "record", feature = "actuation"))]
 enum PreparedLiveMotionSelection {
     Compatibility,
@@ -11788,6 +11881,7 @@ struct PreparedLiveSession {
     rectified_left_intrinsics: OakIntrinsics,
     prepared_navigation_runtime: Option<PreparedLiveNavigationRuntime>,
     inference: InferenceConfig,
+    tracker_initialization: PreparedTrackerInitialization,
     pair_queue_depth: usize,
     viz_queue_depth: usize,
     rerun_decimation: VizDecimation,
@@ -13213,6 +13307,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
         rectified_left_intrinsics: software.rectified_left_intrinsics,
         prepared_navigation_runtime: Some(software.navigation),
         inference: software.inference,
+        tracker_initialization: PreparedTrackerInitialization::CanonicalNano,
         pair_queue_depth: software.queue_size,
         viz_queue_depth: software.queue_size,
         rerun_decimation: software.rerun_decimation,
@@ -13323,6 +13418,7 @@ fn prepare_nano_live_session(
         rectified_left_intrinsics: software.rectified_left_intrinsics,
         prepared_navigation_runtime: Some(software.navigation),
         inference: software.inference,
+        tracker_initialization: PreparedTrackerInitialization::CanonicalNano,
         pair_queue_depth: software.queue_size,
         viz_queue_depth: software.queue_size,
         rerun_decimation: software.rerun_decimation,
@@ -13704,6 +13800,7 @@ fn prepare_compatibility_live_session(
         rectified_left_intrinsics,
         prepared_navigation_runtime,
         inference,
+        tracker_initialization: PreparedTrackerInitialization::Environment,
         pair_queue_depth,
         viz_queue_depth,
         rerun_decimation: args.rerun_decimation.get(),
@@ -13761,6 +13858,7 @@ fn run_prepared_live_session(
         rectified_left_intrinsics,
         mut prepared_navigation_runtime,
         inference,
+        tracker_initialization,
         pair_queue_depth,
         viz_queue_depth,
         rerun_decimation,
@@ -13832,15 +13930,20 @@ fn run_prepared_live_session(
             downscale,
         } = inference;
 
-        let tracker_config = build_tracker_config(
-            TrackerDefaults {
-                min_keyframe_points: 80,
-                refresh_inliers: 20,
-                min_inliers: 15,
-            },
-            key_limit,
-            downscale,
-        )?;
+        let tracker_defaults = TrackerDefaults {
+            min_keyframe_points: 80,
+            refresh_inliers: 20,
+            min_inliers: 15,
+        };
+        let tracker_config = match tracker_initialization {
+            PreparedTrackerInitialization::Environment => {
+                build_tracker_config(tracker_defaults, key_limit, downscale)?
+            }
+            #[cfg(all(feature = "nano-agent", unix))]
+            PreparedTrackerInitialization::CanonicalNano => {
+                build_canonical_nano_tracker_config(tracker_defaults, key_limit, downscale)?
+            }
+        };
         let mut navigation_occupancy_config = prepared_navigation_runtime
             .as_mut()
             .and_then(PreparedLiveNavigationRuntime::take_occupancy_config);
@@ -13888,13 +13991,26 @@ fn run_prepared_live_session(
         };
         #[cfg(all(feature = "nano-agent", unix))]
         nano_setup_guard.require_accessory_healthy_if_present(running.as_ref())?;
-        let tracker = SlamTracker::try_new(
-            superpoint_left,
-            superpoint_right,
-            lightglue,
-            rectified,
-            tracker_config,
-        )?;
+        let tracker = match tracker_initialization {
+            PreparedTrackerInitialization::Environment => SlamTracker::try_new(
+                superpoint_left,
+                superpoint_right,
+                lightglue,
+                rectified,
+                tracker_config,
+            )?,
+            #[cfg(all(feature = "nano-agent", unix))]
+            PreparedTrackerInitialization::CanonicalNano => {
+                SlamTracker::try_new_with_runtime_policy(
+                    superpoint_left,
+                    superpoint_right,
+                    lightglue,
+                    rectified,
+                    tracker_config,
+                    TrackerRuntimePolicy::canonical_nano(),
+                )?
+            }
+        };
         report_tracker_runtime(&tracker_config, &tracker);
         #[cfg(all(feature = "nano-agent", unix))]
         nano_setup_guard.require_accessory_healthy_if_present(running.as_ref())?;
@@ -15886,8 +16002,8 @@ mod tests {
     #[cfg(all(feature = "nano-agent", unix))]
     use super::{
         MAX_NANO_STREAM_EPOCH_ATTEMPTS, NanoOperationAndControllerOwnerError, NanoStreamEpochError,
-        V2ControllerOwnerTerminationError, finish_nano_controller_owner,
-        fresh_nano_stream_epoch_from,
+        TrackerDefaults, V2ControllerOwnerTerminationError, build_canonical_nano_tracker_config,
+        finish_nano_controller_owner, fresh_nano_stream_epoch_from,
     };
     use clap::{Parser as _, error::ErrorKind};
     use kiko_slam::dataset::{DatasetError, DepthOpticalFrame, DepthProjectionContract};
@@ -15921,6 +16037,38 @@ mod tests {
     use std::time::Duration;
     #[cfg(feature = "record")]
     use std::time::Instant;
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[test]
+    fn canonical_nano_tracker_config_keeps_loop_relocalization_without_ambient_model() {
+        let config = build_canonical_nano_tracker_config(
+            TrackerDefaults {
+                min_keyframe_points: 80,
+                refresh_inliers: 20,
+                min_inliers: 15,
+            },
+            kiko_slam::KeypointLimit::try_from(1_024_usize).expect("bounded keypoint limit"),
+            kiko_slam::DownscaleFactor::try_from(2_usize).expect("bounded downscale"),
+        )
+        .expect("fixed canonical tracker policy");
+
+        assert!(config.loop_subsystem.is_enabled());
+        assert!(config.loop_subsystem.uses_bootstrap_descriptors_only());
+        assert!(config.loop_subsystem.loop_closure().is_some());
+        assert!(config.loop_subsystem.global_descriptor().is_none());
+        assert!(config.loop_subsystem.relocalization().is_some());
+        assert_eq!(
+            config
+                .backend
+                .expect("canonical async backend")
+                .queue_depth(),
+            2
+        );
+        assert_eq!(
+            kiko_slam::TrackerRuntimePolicy::canonical_nano().descriptor_max_respawns(),
+            3
+        );
+    }
 
     #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
     #[test]
