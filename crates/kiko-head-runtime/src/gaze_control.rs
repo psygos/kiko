@@ -13,15 +13,17 @@
 //! the observed call time. Elapsed wall time therefore cannot create catch-up
 //! motion.
 //!
-//! A [`HeadGazeControlStep`] is only an uncommitted plan. It must not be sent
-//! to hardware outside the sole head actor. Physical integration requires an
-//! actor-local ordered write, acknowledgement/readback, commit boundary, and
-//! exact partial-prefix recovery before this controller's planned state can be
-//! treated as committed.
+//! A [`PreparedHeadGazeControlStep`] is only an uncommitted plan. Preparing a
+//! step does not advance the controller. It must not be sent to hardware
+//! outside the sole head actor. Physical integration requires an actor-local
+//! ordered write, acknowledgement/readback, and explicit commit. An incomplete
+//! or uncertain application must instead be aborted into an absorbing fault;
+//! it must never be committed as though the complete target were applied.
 
 use std::{
     fmt,
     num::{NonZeroI32, NonZeroU8, NonZeroU16, NonZeroU64},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -30,6 +32,7 @@ use kiko_head_protocol::{ExactHeadTargetPose, HeadJoint, PositionStepLimit, Posi
 use crate::transport::MonotonicTime;
 
 const JOINT_COUNT: usize = 4;
+static NEXT_CONTROLLER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 const fn joint_index(joint: HeadJoint) -> usize {
     match joint {
@@ -607,6 +610,7 @@ pub enum HeadGazeProposalAdmission {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadGazeProposalAdmissionError {
     FaultHeld(HeadGazeFaultReason),
+    FaultLatched(HeadGazeFaultReason),
     AdmissionClockRegression {
         latest_boundary_at: MonotonicTime,
         received_at: MonotonicTime,
@@ -666,6 +670,9 @@ pub enum HeadGazeExternalFault {
     EmergencyStop,
     TelemetryUnavailable,
     ActuatorWriteFailed,
+    ActuatorReadbackFailed,
+    ActuatorReadbackMismatch,
+    ActuatorApplicationUncertain,
 }
 
 /// First fault latched by a controller. Fault state is absorbing.
@@ -684,6 +691,7 @@ pub enum HeadGazeFaultReason {
         serviced_at: MonotonicTime,
         control_period: HeadControlPeriod,
     },
+    PlannerGenerationExhausted,
     MotionConstraintsInfeasible {
         joint: HeadJoint,
     },
@@ -704,50 +712,186 @@ pub enum HeadGazeTickDisposition {
     },
 }
 
-/// One uncommitted pure-planner result.
+/// Process-unique identity of one controller instance.
+///
+/// The constructor allocates this identity internally. It exists so a step
+/// prepared by one actor-local controller cannot be committed into another
+/// controller that happens to be at the same planner generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HeadGazeControllerInstanceId(NonZeroU64);
+
+impl HeadGazeControllerInstanceId {
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Revision of all state on which a prepared step depends.
+///
+/// Successful proposal admission and successful step commit both advance this
+/// value. A proposal admitted after preparation therefore makes the prepared
+/// step stale instead of being silently overwritten by its later commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HeadGazePlannerGeneration(u64);
+
+impl HeadGazePlannerGeneration {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
+    }
+}
+
+/// Opaque binding between an uncommitted step and its source state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HeadGazePreparedStepToken {
+    controller_instance: HeadGazeControllerInstanceId,
+    based_on_generation: HeadGazePlannerGeneration,
+}
+
+impl HeadGazePreparedStepToken {
+    pub const fn controller_instance(self) -> HeadGazeControllerInstanceId {
+        self.controller_instance
+    }
+
+    pub const fn based_on_generation(self) -> HeadGazePlannerGeneration {
+        self.based_on_generation
+    }
+}
+
+/// One generation-bound, uncommitted pure-planner result.
 ///
 /// This value is not a physical command and cannot be consumed directly by a
-/// serial transport. A future integration must keep it inside the sole head
-/// actor, write joints in an actor-defined safe order, retain the exact
-/// completed prefix after any partial write, obtain the required
-/// acknowledgement/readback evidence, and only then commit a new controller
-/// pose. This module performs none of those operations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HeadGazeControlStep {
+/// serial transport. Integration must keep it inside the sole head actor,
+/// write joints in an actor-defined safe order, retain the exact completed
+/// prefix after any partial write, obtain the required
+/// acknowledgement/readback evidence, and only then pass the complete value
+/// to [`HeadGazeController::commit_prepared`]. The value is intentionally not
+/// `Clone` or `Copy`.
+#[derive(Debug)]
+pub struct PreparedHeadGazeControlStep {
+    token: HeadGazePreparedStepToken,
     serviced_at: MonotonicTime,
     next_scheduled_for: MonotonicTime,
     state: HeadGazeControlState,
     planned_target: ExactHeadTargetPose,
     velocity: HeadServoVelocity,
     disposition: HeadGazeTickDisposition,
+    candidate: HeadGazeController,
 }
 
-impl HeadGazeControlStep {
-    pub const fn serviced_at(self) -> MonotonicTime {
+impl PreparedHeadGazeControlStep {
+    pub const fn token(&self) -> HeadGazePreparedStepToken {
+        self.token
+    }
+
+    pub const fn serviced_at(&self) -> MonotonicTime {
         self.serviced_at
     }
 
-    pub const fn next_scheduled_for(self) -> MonotonicTime {
+    pub const fn next_scheduled_for(&self) -> MonotonicTime {
         self.next_scheduled_for
+    }
+
+    pub const fn state(&self) -> HeadGazeControlState {
+        self.state
+    }
+
+    /// Target produced by the pure planner, not a committed hardware pose.
+    pub const fn planned_target(&self) -> ExactHeadTargetPose {
+        self.planned_target
+    }
+
+    pub const fn velocity(&self) -> HeadServoVelocity {
+        self.velocity
+    }
+
+    pub const fn disposition(&self) -> HeadGazeTickDisposition {
+        self.disposition
+    }
+}
+
+/// Evidence that one complete prepared planner step was committed.
+///
+/// This receipt is controller evidence only. It is not evidence that hardware
+/// accepted or reached the target; the sole head actor must retain that
+/// separate acknowledgement/readback evidence before requesting this commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadGazeCommitReceipt {
+    token: HeadGazePreparedStepToken,
+    committed_generation: HeadGazePlannerGeneration,
+    serviced_at: MonotonicTime,
+    state: HeadGazeControlState,
+    committed_target: ExactHeadTargetPose,
+    velocity: HeadServoVelocity,
+    next_scheduled_for: MonotonicTime,
+    disposition: HeadGazeTickDisposition,
+}
+
+impl HeadGazeCommitReceipt {
+    pub const fn token(self) -> HeadGazePreparedStepToken {
+        self.token
+    }
+
+    pub const fn committed_generation(self) -> HeadGazePlannerGeneration {
+        self.committed_generation
+    }
+
+    pub const fn serviced_at(self) -> MonotonicTime {
+        self.serviced_at
     }
 
     pub const fn state(self) -> HeadGazeControlState {
         self.state
     }
 
-    /// Target produced by the pure planner, not a committed hardware pose.
-    pub const fn planned_target(self) -> ExactHeadTargetPose {
-        self.planned_target
+    pub const fn committed_target(self) -> ExactHeadTargetPose {
+        self.committed_target
     }
 
     pub const fn velocity(self) -> HeadServoVelocity {
         self.velocity
     }
 
+    pub const fn next_scheduled_for(self) -> MonotonicTime {
+        self.next_scheduled_for
+    }
+
     pub const fn disposition(self) -> HeadGazeTickDisposition {
         self.disposition
     }
 }
+
+/// Why a prepared step could not be committed or fault-aborted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadGazePreparedStepError {
+    WrongController {
+        expected: HeadGazeControllerInstanceId,
+        actual: HeadGazeControllerInstanceId,
+    },
+    StaleGeneration {
+        current: HeadGazePlannerGeneration,
+        prepared_from: HeadGazePlannerGeneration,
+    },
+    FutureGeneration {
+        current: HeadGazePlannerGeneration,
+        prepared_from: HeadGazePlannerGeneration,
+    },
+    FaultHeld(HeadGazeFaultReason),
+}
+
+impl fmt::Display for HeadGazePreparedStepError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "prepared head-gaze step rejected: {self:?}")
+    }
+}
+
+impl std::error::Error for HeadGazePreparedStepError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadGazeTickError {
@@ -768,7 +912,18 @@ impl fmt::Display for HeadGazeTickError {
 impl std::error::Error for HeadGazeTickError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlannedHeadGazeControlStep {
+    serviced_at: MonotonicTime,
+    next_scheduled_for: MonotonicTime,
+    state: HeadGazeControlState,
+    planned_target: ExactHeadTargetPose,
+    velocity: HeadServoVelocity,
+    disposition: HeadGazeTickDisposition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadGazeControllerInitError {
+    ControllerInstanceIdentityExhausted,
     InitialCommittedTargetOutOfRange {
         joint: HeadJoint,
         position: PositionTicks,
@@ -789,9 +944,11 @@ impl std::error::Error for HeadGazeControllerInitError {}
 ///
 /// This value is intentionally neither `Clone` nor transport-aware. Accepted
 /// proposals replace only the pending slot; the controller consumes at most
-/// one slot and emits at most one bounded position step per serviced tick.
+/// one slot and prepares at most one bounded position step per serviced tick.
 #[derive(Debug)]
 pub struct HeadGazeController {
+    instance_id: HeadGazeControllerInstanceId,
+    generation: HeadGazePlannerGeneration,
     config: HeadGazeControlConfig,
     state: HeadGazeControlState,
     pose: ExactHeadTargetPose,
@@ -818,6 +975,8 @@ impl HeadGazeController {
         initial_committed_target: ExactHeadTargetPose,
         started_at: MonotonicTime,
     ) -> Result<Self, HeadGazeControllerInitError> {
+        let instance_id = allocate_controller_instance_id()
+            .ok_or(HeadGazeControllerInitError::ControllerInstanceIdentityExhausted)?;
         for joint in HeadJoint::ALL {
             let position = initial_committed_target.position(joint);
             let limits = config.motion_limits().joint(joint);
@@ -838,6 +997,8 @@ impl HeadGazeController {
             HeadGazeControlState::ReturningNatural
         };
         Ok(Self {
+            instance_id,
+            generation: HeadGazePlannerGeneration(0),
             config,
             state,
             pose: initial_committed_target,
@@ -857,12 +1018,20 @@ impl HeadGazeController {
         self.config
     }
 
+    pub const fn instance_id(&self) -> HeadGazeControllerInstanceId {
+        self.instance_id
+    }
+
+    pub const fn generation(&self) -> HeadGazePlannerGeneration {
+        self.generation
+    }
+
     pub const fn state(&self) -> HeadGazeControlState {
         self.state
     }
 
-    /// Latest internal planner target, not observed or committed hardware.
-    pub const fn planned_target(&self) -> ExactHeadTargetPose {
+    /// Latest target committed to the planner, not observed hardware.
+    pub const fn committed_target(&self) -> ExactHeadTargetPose {
         self.pose
     }
 
@@ -941,6 +1110,11 @@ impl HeadGazeController {
                 });
             }
         }
+        let Some(next_generation) = self.generation.next() else {
+            let reason = HeadGazeFaultReason::PlannerGenerationExhausted;
+            self.latch_fault(reason);
+            return Err(HeadGazeProposalAdmissionError::FaultLatched(reason));
+        };
 
         let admitted = AdmittedHeadGazeProposal {
             proposal,
@@ -950,6 +1124,7 @@ impl HeadGazeController {
         self.last_admitted_id = Some(proposal.id());
         self.last_admitted_observation = Some(proposal.observed_at());
         self.latest_boundary_at = received_at;
+        self.generation = next_generation;
         Ok(match replaced {
             Some(previous) => HeadGazeProposalAdmission::ReplacedPending {
                 replaced: previous.proposal.id(),
@@ -965,15 +1140,156 @@ impl HeadGazeController {
         }
     }
 
-    /// Produce at most one uncommitted bounded planner step.
+    /// Prepare at most one bounded planner step without advancing committed
+    /// planner state.
     ///
-    /// The returned target cannot be sent directly to a transport. See
-    /// [`HeadGazeControlStep`] for the actor-local write/ack/commit and
-    /// partial-prefix obligations that remain before physical integration.
-    pub fn tick(&mut self, now: MonotonicTime) -> Result<HeadGazeControlStep, HeadGazeTickError> {
+    /// A successful call snapshots all proposal, freshness, lifecycle, motion,
+    /// and deadline changes into the returned value. Those changes become
+    /// visible only through [`Self::commit_prepared`]. Planning failures that
+    /// make continued use unsafe, including clock regression, still latch an
+    /// absorbing fault immediately.
+    pub fn prepare_tick(
+        &mut self,
+        now: MonotonicTime,
+    ) -> Result<PreparedHeadGazeControlStep, HeadGazeTickError> {
         if let Some(reason) = self.fault {
             return Err(HeadGazeTickError::FaultHeld(reason));
         }
+        let Some(next_generation) = self.generation.next() else {
+            let reason = HeadGazeFaultReason::PlannerGenerationExhausted;
+            self.latch_fault(reason);
+            return Err(HeadGazeTickError::FaultLatched(reason));
+        };
+
+        let token = HeadGazePreparedStepToken {
+            controller_instance: self.instance_id,
+            based_on_generation: self.generation,
+        };
+        let mut candidate = self.planning_snapshot();
+        let planned = match candidate.service_tick_in_place(now) {
+            Ok(planned) => planned,
+            Err(HeadGazeTickError::FaultLatched(reason)) => {
+                self.latch_fault(reason);
+                return Err(HeadGazeTickError::FaultLatched(reason));
+            }
+            Err(error) => return Err(error),
+        };
+        candidate.generation = next_generation;
+        Ok(PreparedHeadGazeControlStep {
+            token,
+            serviced_at: planned.serviced_at,
+            next_scheduled_for: planned.next_scheduled_for,
+            state: planned.state,
+            planned_target: planned.planned_target,
+            velocity: planned.velocity,
+            disposition: planned.disposition,
+            candidate,
+        })
+    }
+
+    /// Commit one fully applied and read-back-verified prepared step.
+    ///
+    /// The actor must not call this method after a partial, failed, or
+    /// uncertain hardware application. Use [`Self::abort_prepared_with_fault`]
+    /// in those cases.
+    pub fn commit_prepared(
+        &mut self,
+        prepared: PreparedHeadGazeControlStep,
+    ) -> Result<HeadGazeCommitReceipt, HeadGazePreparedStepError> {
+        self.validate_prepared_token(prepared.token)?;
+        let PreparedHeadGazeControlStep {
+            token,
+            serviced_at,
+            next_scheduled_for,
+            state,
+            planned_target,
+            velocity,
+            disposition,
+            candidate,
+        } = prepared;
+        debug_assert_eq!(candidate.instance_id, self.instance_id);
+        debug_assert_eq!(Some(candidate.generation), self.generation.next());
+        let committed_generation = candidate.generation;
+        *self = candidate;
+        Ok(HeadGazeCommitReceipt {
+            token,
+            committed_generation,
+            serviced_at,
+            state,
+            committed_target: planned_target,
+            velocity,
+            next_scheduled_for,
+            disposition,
+        })
+    }
+
+    /// Reject a prepared step after failed or uncertain actor-local
+    /// application and irreversibly latch the supplied external fault.
+    ///
+    /// The candidate planner pose is discarded. The controller retains its
+    /// last committed target, clears motion velocity and proposal state, and
+    /// will reject every later proposal, preparation, or commit.
+    pub fn abort_prepared_with_fault(
+        &mut self,
+        prepared: PreparedHeadGazeControlStep,
+        fault: HeadGazeExternalFault,
+    ) -> Result<(), HeadGazePreparedStepError> {
+        self.validate_prepared_token(prepared.token)?;
+        self.latch_fault(HeadGazeFaultReason::External(fault));
+        Ok(())
+    }
+
+    fn validate_prepared_token(
+        &self,
+        token: HeadGazePreparedStepToken,
+    ) -> Result<(), HeadGazePreparedStepError> {
+        if token.controller_instance != self.instance_id {
+            return Err(HeadGazePreparedStepError::WrongController {
+                expected: self.instance_id,
+                actual: token.controller_instance,
+            });
+        }
+        if let Some(reason) = self.fault {
+            return Err(HeadGazePreparedStepError::FaultHeld(reason));
+        }
+        if token.based_on_generation < self.generation {
+            return Err(HeadGazePreparedStepError::StaleGeneration {
+                current: self.generation,
+                prepared_from: token.based_on_generation,
+            });
+        }
+        if token.based_on_generation > self.generation {
+            return Err(HeadGazePreparedStepError::FutureGeneration {
+                current: self.generation,
+                prepared_from: token.based_on_generation,
+            });
+        }
+        Ok(())
+    }
+
+    fn planning_snapshot(&self) -> Self {
+        Self {
+            instance_id: self.instance_id,
+            generation: self.generation,
+            config: self.config,
+            state: self.state,
+            pose: self.pose,
+            velocity: self.velocity,
+            pending: self.pending,
+            active: self.active,
+            last_admitted_id: self.last_admitted_id,
+            last_admitted_observation: self.last_admitted_observation,
+            acquisition_count: self.acquisition_count,
+            next_tick_due: self.next_tick_due,
+            latest_boundary_at: self.latest_boundary_at,
+            fault: self.fault,
+        }
+    }
+
+    fn service_tick_in_place(
+        &mut self,
+        now: MonotonicTime,
+    ) -> Result<PlannedHeadGazeControlStep, HeadGazeTickError> {
         if now < self.latest_boundary_at {
             let reason = HeadGazeFaultReason::TickClockRegression {
                 previous: self.latest_boundary_at,
@@ -1036,7 +1352,7 @@ impl HeadGazeController {
         self.latest_boundary_at = now;
         self.next_tick_due = next_scheduled_for;
 
-        Ok(HeadGazeControlStep {
+        Ok(PlannedHeadGazeControlStep {
             serviced_at: now,
             next_scheduled_for,
             state: self.state,
@@ -1171,6 +1487,9 @@ impl HeadGazeController {
     fn latch_fault(&mut self, reason: HeadGazeFaultReason) {
         if self.fault.is_none() {
             self.fault = Some(reason);
+            if let Some(next_generation) = self.generation.next() {
+                self.generation = next_generation;
+            }
         }
         self.state = HeadGazeControlState::FaultHeld;
         self.pending = None;
@@ -1178,6 +1497,16 @@ impl HeadGazeController {
         self.acquisition_count = 0;
         self.velocity = HeadServoVelocity::ZERO;
     }
+}
+
+fn allocate_controller_instance_id() -> Option<HeadGazeControllerInstanceId> {
+    NEXT_CONTROLLER_INSTANCE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .and_then(NonZeroU64::new)
+        .map(HeadGazeControllerInstanceId)
 }
 
 fn checked_timestamp_add(timestamp: MonotonicTime, duration: Duration) -> Option<MonotonicTime> {
@@ -1405,6 +1734,147 @@ mod tests {
         HeadGazeController::try_new(config, config.natural_pose(), started_at).unwrap()
     }
 
+    trait CommitPreparedTickForTest {
+        fn tick(&mut self, now: MonotonicTime) -> Result<HeadGazeCommitReceipt, HeadGazeTickError>;
+    }
+
+    impl CommitPreparedTickForTest for HeadGazeController {
+        fn tick(&mut self, now: MonotonicTime) -> Result<HeadGazeCommitReceipt, HeadGazeTickError> {
+            let prepared = self.prepare_tick(now)?;
+            Ok(self
+                .commit_prepared(prepared)
+                .expect("freshly prepared step commits in test adapter"))
+        }
+    }
+
+    #[test]
+    fn preparing_a_step_does_not_advance_any_committed_planner_state() {
+        let mut controller = natural_controller(config_with_ttl(1_000), at(0));
+        controller
+            .admit_proposal(proposal(1, 0, 1_100), at(0))
+            .unwrap();
+        controller.tick(at(0)).unwrap();
+        controller
+            .admit_proposal(proposal(2, 10, 1_100), at(10))
+            .unwrap();
+
+        let generation = controller.generation();
+        let state = controller.state();
+        let target = controller.committed_target();
+        let velocity = controller.velocity();
+        let next_tick_due = controller.next_tick_due();
+        let prepared = controller.prepare_tick(at(10)).unwrap();
+
+        assert_eq!(prepared.token().based_on_generation(), generation);
+        assert_eq!(prepared.state(), HeadGazeControlState::Tracking);
+        assert_ne!(prepared.planned_target(), target);
+        assert_eq!(controller.generation(), generation);
+        assert_eq!(controller.state(), state);
+        assert_eq!(controller.committed_target(), target);
+        assert_eq!(controller.velocity(), velocity);
+        assert_eq!(controller.next_tick_due(), next_tick_due);
+
+        let prepared_again = controller.prepare_tick(at(10)).unwrap();
+        assert_eq!(prepared_again.token(), prepared.token());
+        assert_eq!(prepared_again.planned_target(), prepared.planned_target());
+        assert_eq!(controller.generation(), generation);
+    }
+
+    #[test]
+    fn one_generation_commits_exactly_once() {
+        let mut controller = natural_controller(config_with_ttl(100), at(0));
+        let first_copy = controller.prepare_tick(at(0)).unwrap();
+        let second_copy = controller.prepare_tick(at(0)).unwrap();
+        let prepared_generation = first_copy.token().based_on_generation();
+
+        let receipt = controller.commit_prepared(first_copy).unwrap();
+        assert_eq!(
+            receipt.committed_generation(),
+            prepared_generation.next().unwrap()
+        );
+        assert_eq!(controller.generation(), receipt.committed_generation());
+        assert_eq!(
+            controller.commit_prepared(second_copy),
+            Err(HeadGazePreparedStepError::StaleGeneration {
+                current: receipt.committed_generation(),
+                prepared_from: prepared_generation,
+            })
+        );
+        assert_eq!(controller.generation(), receipt.committed_generation());
+    }
+
+    #[test]
+    fn admission_after_prepare_invalidates_the_step_without_losing_the_proposal() {
+        let mut controller = natural_controller(config_with_ttl(100), at(0));
+        let prepared = controller.prepare_tick(at(0)).unwrap();
+        let prepared_from = prepared.token().based_on_generation();
+        controller
+            .admit_proposal(proposal(1, 1, 1_100), at(1))
+            .unwrap();
+        let current = controller.generation();
+
+        assert_eq!(
+            controller.commit_prepared(prepared),
+            Err(HeadGazePreparedStepError::StaleGeneration {
+                current,
+                prepared_from,
+            })
+        );
+        assert_eq!(
+            controller.tick(at(1)).unwrap().state(),
+            HeadGazeControlState::Acquiring
+        );
+    }
+
+    #[test]
+    fn controller_rejects_a_step_prepared_by_another_instance() {
+        let config = config_with_ttl(100);
+        let mut source = natural_controller(config, at(0));
+        let prepared = source.prepare_tick(at(0)).unwrap();
+        let actual = prepared.token().controller_instance();
+        let mut destination = natural_controller(config, at(0));
+        let expected = destination.instance_id();
+
+        assert_ne!(expected, actual);
+        assert_eq!(
+            destination.commit_prepared(prepared),
+            Err(HeadGazePreparedStepError::WrongController { expected, actual })
+        );
+        assert_eq!(destination.generation(), HeadGazePlannerGeneration(0));
+    }
+
+    #[test]
+    fn aborted_application_keeps_last_commit_and_latches_an_absorbing_fault() {
+        let mut controller = natural_controller(config_with_ttl(1_000), at(0));
+        controller
+            .admit_proposal(proposal(1, 0, 1_100), at(0))
+            .unwrap();
+        controller.tick(at(0)).unwrap();
+        controller
+            .admit_proposal(proposal(2, 10, 1_100), at(10))
+            .unwrap();
+        let last_commit = controller.committed_target();
+        let prepared = controller.prepare_tick(at(10)).unwrap();
+        assert_ne!(prepared.planned_target(), last_commit);
+
+        controller
+            .abort_prepared_with_fault(prepared, HeadGazeExternalFault::ActuatorReadbackMismatch)
+            .unwrap();
+        let reason = HeadGazeFaultReason::External(HeadGazeExternalFault::ActuatorReadbackMismatch);
+        assert_eq!(controller.fault(), Some(reason));
+        assert_eq!(controller.state(), HeadGazeControlState::FaultHeld);
+        assert_eq!(controller.committed_target(), last_commit);
+        assert_eq!(controller.velocity(), HeadServoVelocity::ZERO);
+        assert!(matches!(
+            controller.prepare_tick(at(10)),
+            Err(HeadGazeTickError::FaultHeld(actual)) if actual == reason
+        ));
+        assert_eq!(
+            controller.admit_proposal(proposal(3, 11, 1_100), at(11)),
+            Err(HeadGazeProposalAdmissionError::FaultHeld(reason))
+        );
+    }
+
     #[test]
     fn pending_slot_replaces_latest_and_rejects_stale_or_out_of_order_inputs() {
         let mut controller = natural_controller(config_with_ttl(100), at(0));
@@ -1447,7 +1917,7 @@ mod tests {
             controller.tick(at(2)).unwrap().state(),
             HeadGazeControlState::Acquiring
         );
-        assert_eq!(controller.planned_target(), pose(1_000));
+        assert_eq!(controller.committed_target(), pose(1_000));
     }
 
     #[test]
@@ -1579,7 +2049,7 @@ mod tests {
             }
         }
         assert_eq!(controller.state(), HeadGazeControlState::NaturalHold);
-        assert_eq!(controller.planned_target(), pose(1_000));
+        assert_eq!(controller.committed_target(), pose(1_000));
         assert_eq!(controller.velocity(), HeadServoVelocity::ZERO);
     }
 
@@ -1594,10 +2064,10 @@ mod tests {
             .admit_proposal(proposal(2, 10, 1_100), at(10))
             .unwrap();
         controller.tick(at(10)).unwrap();
-        let before = controller.planned_target().position(HeadJoint::Yaw).get();
+        let before = controller.committed_target().position(HeadJoint::Yaw).get();
 
         let late = controller.tick(at(100)).unwrap();
-        let after = late.planned_target().position(HeadJoint::Yaw).get();
+        let after = late.committed_target().position(HeadJoint::Yaw).get();
         assert!(matches!(
             late.disposition(),
             HeadGazeTickDisposition::LateTickRevoked {
@@ -1624,7 +2094,8 @@ mod tests {
             let mut controller = natural_controller(config, at(0));
             let mut id = 1_u64;
             let mut now = 0_u64;
-            let mut previous_position = controller.planned_target().position(HeadJoint::Yaw).get();
+            let mut previous_position =
+                controller.committed_target().position(HeadJoint::Yaw).get();
             let mut previous_velocity = 0_i32;
             for step in 0..80 {
                 if step < 2 || step % 20 == 0 {
@@ -1634,7 +2105,7 @@ mod tests {
                     id += 1;
                 }
                 let result = controller.tick(at(now)).unwrap();
-                let position = result.planned_target().position(HeadJoint::Yaw).get();
+                let position = result.committed_target().position(HeadJoint::Yaw).get();
                 let velocity = result.velocity().velocity(HeadJoint::Yaw).get();
                 assert!(position >= limits.minimum().get());
                 assert!(position <= limits.maximum().get());
@@ -1886,13 +2357,13 @@ mod tests {
         let config = config_with_ttl(100);
         let mut controller = HeadGazeController::try_new(config, pose(1_100), at(0)).unwrap();
         assert_eq!(controller.state(), HeadGazeControlState::ReturningNatural);
-        assert_eq!(controller.planned_target(), pose(1_100));
+        assert_eq!(controller.committed_target(), pose(1_100));
         assert_eq!(controller.velocity(), HeadServoVelocity::ZERO);
 
         let first = controller.tick(at(0)).unwrap();
         assert_eq!(first.state(), HeadGazeControlState::ReturningNatural);
-        assert!(first.planned_target().position(HeadJoint::Yaw).get() < 1_100);
-        assert!(first.planned_target().position(HeadJoint::Yaw).get() >= 1_000);
+        assert!(first.committed_target().position(HeadJoint::Yaw).get() < 1_100);
+        assert!(first.committed_target().position(HeadJoint::Yaw).get() >= 1_000);
 
         assert!(matches!(
             HeadGazeController::try_new(config, pose(2_001), at(0)),
