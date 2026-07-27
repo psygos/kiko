@@ -23,6 +23,23 @@ The unexpanded `${...}` tokens are intentional. In particular, every SHA-256
 is a deployment-tool output placeholder. No checked-in digest is presented as
 evidence about a future installed byte sequence.
 
+## Synthetic shadow plant
+
+`qualification-shadow-only-synthetic-unvalidated-plant-v1.json` is a
+checked-in, qualification-shadow-only synthetic fixture. Its numeric values
+are test inputs, not measurements, physical identification, performance
+evidence, or permission to actuate. The explicitly non-calibrated
+`../navigation-shadow-v1.example.json` duplicates the same plant declaration
+and is parser-tested against this artifact. It is only an example: its
+identity camera/base transform and synthetic IMU calibration are not suitable
+for a rendered qualification bundle.
+
+Neither file is wired into the renderer or any production template. A future
+qualification render must supply a separately reviewed navigation document
+whose camera/base transform and IMU calibration bind to the canonical physical
+calibration artifact; qualification bootstrap will also require its embedded
+plant declaration to equal this separately content-addressed plant domain.
+
 ## Fixed candidate contract
 
 The checked-in candidate controller policy requests raw signed timer-duty

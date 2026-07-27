@@ -1558,17 +1558,55 @@ mod tests {
             } => {
                 assert_eq!(
                     fixture_id.as_str(),
-                    "host-shadow-example-not-physically-validated"
+                    "qualification-shadow-only-synthetic-unvalidated-fixture-v1"
                 );
                 assert_eq!(
                     generator_id.as_str(),
-                    "hand-authored-from-shadow-config-v1-test-fixture"
+                    "synthetic-unvalidated-hand-authored-qualification-shadow-v1"
                 );
             }
             PlantEvidenceV1::ClaimedPhysicalIdentification { .. } => {
                 panic!("the checked-in schema example must never imply physical evidence")
             }
         }
+    }
+
+    #[test]
+    fn qualification_shadow_plant_binds_domain_identically_to_non_deployable_example() {
+        let navigation_bytes =
+            include_bytes!("../../../../configs/navigation-shadow-v1.example.json");
+        let plant_bytes = include_bytes!(
+            "../../../../configs/nano-wheels-off-qualification-template/qualification-shadow-only-synthetic-unvalidated-plant-v1.json"
+        );
+        let plant =
+            PlantModelV1::parse_json(plant_bytes).expect("checked-in synthetic plant artifact");
+
+        match plant.evidence() {
+            PlantEvidenceV1::SyntheticFixture {
+                fixture_id,
+                generator_id,
+            } => {
+                assert_eq!(
+                    fixture_id.as_str(),
+                    "qualification-shadow-only-synthetic-unvalidated-fixture-v1"
+                );
+                assert_eq!(
+                    generator_id.as_str(),
+                    "synthetic-unvalidated-hand-authored-qualification-shadow-v1"
+                );
+            }
+            PlantEvidenceV1::ClaimedPhysicalIdentification { .. } => {
+                panic!("qualification shadow fixture must not imply physical evidence")
+            }
+        }
+
+        let parsed = ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+            navigation_bytes,
+            camera(),
+            plant,
+        )
+        .expect("non-deployable example must duplicate the exact plant domain");
+        assert_eq!(parsed.mpc_solver().model(), plant);
     }
 
     #[test]

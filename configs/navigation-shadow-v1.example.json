@@ -76,7 +76,7 @@
   },
   "plant_model": {
     "schema_version": 1,
-    "model_id": "synthetic-non-actuating-unvalidated-v1",
+    "model_id": "qualification-shadow-only-synthetic-unvalidated-v1",
     "model_version": 1,
     "sample_period_s": 0.1,
     "wheelbase_m": 0.4,
@@ -102,8 +102,8 @@
     },
     "evidence": {
       "kind": "synthetic_fixture",
-      "fixture_id": "host-shadow-example-not-physically-validated",
-      "generator_id": "hand-authored-from-shadow-config-v1-test-fixture"
+      "fixture_id": "qualification-shadow-only-synthetic-unvalidated-fixture-v1",
+      "generator_id": "synthetic-unvalidated-hand-authored-qualification-shadow-v1"
     }
   },
   "mpc": {
