@@ -5,6 +5,8 @@
   const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
   const model = globalThis.KikoOperatorConsoleModel;
   if (!model) throw new Error("operator-console view model is unavailable");
+  const driveSafety = model.driveSafety;
+  if (!driveSafety) throw new Error("operator-console drive safety model is unavailable");
   const API_REQUEST_TIMEOUT_MILLISECONDS = 750;
   const PRODUCTION_CONTROL_PROFILE_KIND = "production_body_frame_si";
   const QUALIFICATION_CONTROL_PROFILE_KIND =
@@ -34,15 +36,12 @@
     driveGeneration: 0,
     driveLoopRunning: false,
     manualBegun: false,
-    localInhibit: true,
+    driveSafety: driveSafety.createState(),
     localSafetyLatched: false,
     serverSafetyLatched: false,
     controlProfile: null,
     controlProfileFingerprint: null,
-    snapshotFresh: false,
     snapshot: null,
-    lastSnapshotRevision: 0n,
-    lastSnapshotAdvanceAtPerformanceMilliseconds: null,
     grid: null,
     gridRaster: null,
     gridKey: null,
@@ -52,13 +51,49 @@
     gridRetryAfterPerformanceMilliseconds: 0,
     lastResponseId: null,
     polling: false,
-    connectionKind: "locked",
   };
 
   const canvas = $("map");
   const ctx = canvas.getContext("2d", { alpha: false });
   const pendingResponseBodies = new WeakMap();
   let toastTimer;
+
+  function applyDriveSafetyEvent(event) {
+    const transition = driveSafety.reduce(state.driveSafety, event);
+    state.driveSafety = transition.state;
+    return transition;
+  }
+
+  async function executeDriveSafetyEffects(effects) {
+    for (const effect of effects) {
+      if (effect === driveSafety.effects.ensureDriveLoop) {
+        ensureDriveLoop();
+      } else if (effect === driveSafety.effects.releaseManual) {
+        await releaseManual();
+      } else if (effect === driveSafety.effects.releaseManualBestEffort) {
+        await releaseManual({ bestEffort: true });
+      } else {
+        throw new Error("unsupported drive safety effect");
+      }
+    }
+  }
+
+  function errorDetail(error) {
+    return error instanceof Error && error.message.length > 0
+      ? error.message
+      : "unknown console transport failure";
+  }
+
+  async function failClosedForTransport(error) {
+    const detail = errorDetail(error);
+    const transition = applyDriveSafetyEvent({
+      kind: "transport_failed",
+      detail,
+    });
+    setConnectionView(transition.state.connectionKind, detail);
+    updateControlAvailability();
+    await executeDriveSafetyEffects(transition.effects);
+  }
 
   function toast(message, fault = false) {
     const node = $("toast");
@@ -80,7 +115,6 @@
   }
 
   function setConnectionView(kind, detail = null) {
-    state.connectionKind = kind;
     const view = model.connectionView(kind);
     const pill = $("connection-pill");
     pill.textContent = view.pill;
@@ -140,7 +174,9 @@
       return response;
     } catch (error) {
       if (abort.signal.aborted) {
-        throw new Error(`request timed out after ${timeoutMilliseconds} ms`);
+        throw new Error(
+          driveSafety.requestTimeoutMessage("request", timeoutMilliseconds),
+        );
       }
       throw error;
     } finally {
@@ -154,7 +190,12 @@
       return await consume();
     } catch (error) {
       if (pending?.abort.signal.aborted) {
-        throw new Error(`response timed out after ${pending.timeoutMilliseconds} ms`);
+        throw new Error(
+          driveSafety.requestTimeoutMessage(
+            "response",
+            pending.timeoutMilliseconds,
+          ),
+        );
       }
       throw error;
     } finally {
@@ -372,7 +413,7 @@
     state.driveLoopRunning = true;
     try {
       const begin = await submit({ kind: "begin_manual" }, { quiet: true });
-      if (generation !== state.driveGeneration || state.localInhibit) {
+      if (generation !== state.driveGeneration || state.driveSafety.localInhibit) {
         state.manualBegun = true;
         await sendRelease({ quiet: true });
         return;
@@ -380,7 +421,7 @@
       state.manualBegun = true;
       let unused = begin;
       while (generation === state.driveGeneration
-        && !state.localInhibit
+        && !state.driveSafety.localInhibit
         && qualificationMotionReady()
         && state.held.size) {
         const manualIntent = desiredManualIntent();
@@ -395,8 +436,12 @@
       }
       void unused;
     } catch (error) {
-      toast(error.message, true);
-      if (generation === state.driveGeneration) clearDriveUi();
+      toast(errorDetail(error), true);
+      if (error instanceof ApiError) {
+        if (generation === state.driveGeneration) clearDriveUi();
+      } else {
+        await failClosedForTransport(error);
+      }
     } finally {
       state.driveLoopRunning = false;
       if (generation !== state.driveGeneration && state.manualBegun) {
@@ -405,13 +450,13 @@
       // A release/re-grab can arrive while this generation is still awaiting
       // HTTP completion. Once the old release is ordered, immediately service
       // the newly held desired state without requiring another key press.
-      if (state.held.size && !state.localInhibit) ensureDriveLoop();
+      if (state.held.size && !state.driveSafety.localInhibit) ensureDriveLoop();
     }
   }
 
   function ensureDriveLoop() {
     if (state.driveLoopRunning
-      || state.localInhibit
+      || state.driveSafety.localInhibit
       || !qualificationMotionReady()
       || !state.held.size) return;
     if (!admittedManualCommand()) {
@@ -433,7 +478,7 @@
   }
 
   function startDrive(direction) {
-    if (state.localInhibit || !qualificationMotionReady()) return;
+    if (state.driveSafety.localInhibit || !qualificationMotionReady()) return;
     state.held.add(direction);
     document.querySelector(`[data-drive="${direction}"]`)?.classList.add("active");
     ensureDriveLoop();
@@ -458,20 +503,31 @@
     event.preventDefault();
     state.held.delete(direction);
     document.querySelector(`[data-drive="${direction}"]`)?.classList.remove("active");
-    if (!state.held.size) {
-      void releaseManual();
-    } else if (!desiredManualIntent()) {
+    const transition = applyDriveSafetyEvent({
+      kind: "key_released",
+      held_direction_count: state.held.size,
+      desired_intent_present:
+        state.held.size > 0 && desiredManualIntent() != null,
+    });
+    if (transition.effects[0] === driveSafety.effects.releaseManual
+      && state.held.size > 0) {
       void releaseManual({ clearHeld: false });
-    } else {
-      ensureDriveLoop();
+      return;
     }
+    void executeDriveSafetyEffects(transition.effects);
   });
-  window.addEventListener("blur", () => void releaseManual({ bestEffort: true }));
-  window.addEventListener("offline", () => void releaseManual({ bestEffort: true }));
-  window.addEventListener("pagehide", () => void releaseManual({ bestEffort: true }));
+
+  function releaseForLifecycleLoss(source) {
+    const transition = applyDriveSafetyEvent({ kind: "lifecycle_loss", source });
+    void executeDriveSafetyEffects(transition.effects);
+  }
+
+  window.addEventListener("blur", () => releaseForLifecycleLoss("blur"));
+  window.addEventListener("offline", () => releaseForLifecycleLoss("offline"));
+  window.addEventListener("pagehide", () => releaseForLifecycleLoss("pagehide"));
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
-      void releaseManual({ bestEffort: true });
+      releaseForLifecycleLoss("visibility_hidden");
     }
   });
 
@@ -489,17 +545,32 @@
   $("manual-release").addEventListener("click", () => void releaseManual());
 
   async function ensureExactStopped() {
-    const release = await releaseManual({ awaitAppliedZero: true });
-    if (release) return;
-    const stop = await submit({ kind: "stop" }, { quiet: true });
-    await awaitExactStop(stop.request_id);
+    let terminalStop = driveSafety.createTerminalStopState();
+    while (!terminalStop.completed) {
+      if (terminalStop.nextStep === "release_manual_exact_zero") {
+        const release = await releaseManual({ awaitAppliedZero: true });
+        terminalStop = driveSafety.reduceTerminalStop(
+          terminalStop,
+          release ? "release_confirmed" : "release_unavailable",
+        );
+      } else if (terminalStop.nextStep === "terminal_stop_exact_zero") {
+        const stop = await submit({ kind: "stop" }, { quiet: true });
+        await awaitExactStop(stop.request_id);
+        terminalStop = driveSafety.reduceTerminalStop(
+          terminalStop,
+          "terminal_stop_confirmed",
+        );
+      } else {
+        throw new Error("unsupported terminal stop step");
+      }
+    }
   }
 
   document.querySelectorAll("[data-intent]").forEach((button) => {
     button.addEventListener("click", async () => {
       try {
         const intent = button.dataset.intent;
-        if (state.localInhibit
+        if (state.driveSafety.localInhibit
           && ["arm", "autonomous_frontier_explore", "save_map"].includes(intent)) {
           throw new Error("fresh, non-inhibited runtime state is required");
         }
@@ -521,7 +592,7 @@
 
   function applyLocalSafetyInhibit() {
     state.localSafetyLatched = true;
-    state.localInhibit = true;
+    applyDriveSafetyEvent({ kind: "local_inhibit" });
     clearDriveUi();
     $("software-stop").classList.add("latched");
     $("software-stop").disabled = true;
@@ -710,7 +781,7 @@
     const fingerprint = JSON.stringify(profile);
     if (state.controlProfileFingerprint != null
       && state.controlProfileFingerprint !== fingerprint) {
-      state.localInhibit = true;
+      applyDriveSafetyEvent({ kind: "local_inhibit" });
       throw new Error("control profile changed during this authenticated boot");
     }
     if (state.controlProfileFingerprint == null) {
@@ -732,7 +803,7 @@
     const sensorMotionReady = !production
       || state.snapshot?.health?.oak === "ready";
     const enabled = !terminal
-      && !state.localInhibit
+      && !state.driveSafety.localInhibit
       && qualificationReady
       && sensorMotionReady
       && admittedManualCommand() != null;
@@ -746,16 +817,17 @@
     // because they reduce motion. New authority/motion and persistence require
     // a fresh observation; Save Map also requires an exact published grid.
     const availability = {
-      arm: production && !terminal && !state.localInhibit,
+      arm: production && !terminal && !state.driveSafety.localInhibit,
       disarm: production && !terminal,
       autonomous_map_only: production && !terminal,
       autonomous_frontier_explore:
         production
         && !terminal
-        && !state.localInhibit
+        && !state.driveSafety.localInhibit
         && sensorMotionReady
         && localizedMap,
-      save_map: production && !terminal && !state.localInhibit && mapAvailable,
+      save_map:
+        production && !terminal && !state.driveSafety.localInhibit && mapAvailable,
       stop: !terminal,
     };
     document.querySelectorAll("[data-intent]").forEach((button) => {
@@ -768,7 +840,7 @@
     }
     canvas.classList.toggle(
       "control-inhibited",
-      state.localInhibit || !qualificationReady,
+      state.driveSafety.localInhibit || !qualificationReady,
     );
   }
 
@@ -1179,11 +1251,12 @@
     const map = state.snapshot?.map;
     const metadata = map?.grid;
     const sensorMotionReady = state.snapshot?.health?.oak === "ready";
-    if (state.localInhibit || !sensorMotionReady || !metadata || !state.grid
+    if (state.driveSafety.localInhibit
+      || !sensorMotionReady || !metadata || !state.grid
       || state.gridKey !== `${map.map_epoch_id}:${map.revision}`
       || map.localization !== "localized") {
       toast(
-        state.localInhibit
+        state.driveSafety.localInhibit
           ? "Fresh, non-inhibited control state is required for a point goal."
           : !sensorMotionReady
             ? "Fresh visual, depth, and motion-estimation evidence is required for a point goal."
@@ -1243,14 +1316,16 @@
       applyLocalSafetyInhibit();
     }
     const revision = BigInt(snapshot.revision);
-    if (revision < state.lastSnapshotRevision) {
-      throw new Error("snapshot revision regressed");
-    }
     const now = performance.now();
-    if (revision > state.lastSnapshotRevision) {
-      state.lastSnapshotRevision = revision;
-      state.lastSnapshotAdvanceAtPerformanceMilliseconds = now;
-      state.snapshotFresh = true;
+    const transition = applyDriveSafetyEvent({
+      kind: "snapshot_observed",
+      revision,
+      now_milliseconds: now,
+      stale_after_milliseconds: SNAPSHOT_STALE_AFTER_MILLISECONDS,
+      local_safety_latched: state.localSafetyLatched,
+      server_safety_latched: serverSafetyLatched,
+    });
+    if (transition.snapshotAdvanced) {
       renderSnapshot(snapshot);
     } else {
       // Requested ownership and the process-wide software-stop state are live
@@ -1264,22 +1339,9 @@
       $("request-state").textContent =
         `#${record.downstream_request_id} ${record.state} · ${record.applied ? "EXACT APPLIED RECEIPT" : "NOT APPLIED"}`;
     }
-    const lastAdvance = state.lastSnapshotAdvanceAtPerformanceMilliseconds;
-    const stale = lastAdvance == null
-      || now - lastAdvance > SNAPSHOT_STALE_AFTER_MILLISECONDS;
-    if (stale) {
-      const becameStale = state.snapshotFresh;
-      state.snapshotFresh = false;
-      state.localInhibit = true;
-      setConnectionView("stale");
-      updateControlAvailability();
-      if (becameStale) await releaseManual({ bestEffort: true });
-      return;
-    }
-    state.snapshotFresh = true;
-    setConnectionView("live");
-    state.localInhibit = state.localSafetyLatched || serverSafetyLatched;
+    setConnectionView(transition.state.connectionKind);
     updateControlAvailability();
+    await executeDriveSafetyEffects(transition.effects);
   }
 
   async function pollLoop() {
@@ -1289,11 +1351,7 @@
       try {
         await pollOnce();
       } catch (error) {
-        state.snapshotFresh = false;
-        state.localInhibit = true;
-        setConnectionView("disconnected", error.message);
-        updateControlAvailability();
-        await releaseManual({ bestEffort: true });
+        await failClosedForTransport(error);
       }
       await delay(300);
     }
@@ -1314,14 +1372,14 @@
       await openSession();
       $("unlock-panel").classList.add("hidden");
       $("console").classList.remove("hidden");
-      state.localInhibit = false;
+      applyDriveSafetyEvent({ kind: "session_opened" });
       await pollOnce();
       void pollLoop();
     } catch (error) {
       state.capability = null;
       state.sessionId = null;
       state.sessionCapability = null;
-      state.localInhibit = true;
+      applyDriveSafetyEvent({ kind: "locked" });
       setConnectionView("locked", error.message);
       toast(error.message, true);
     }

@@ -105,7 +105,7 @@ impl OperatorConsoleAccessCapability {
         &self.0
     }
 
-    fn to_hex(self) -> String {
+    pub(super) fn to_hex(self) -> String {
         encode_hex(&self.0)
     }
 }
@@ -2172,14 +2172,59 @@ mod tests {
         assert!(APP_JS.contains("return await consume();"));
         assert!(APP_JS.contains("return responseJson(response);"));
         assert!(APP_JS.contains("await responseArrayBuffer(response)"));
-        assert!(APP_JS.contains("now - lastAdvance > SNAPSHOT_STALE_AFTER_MILLISECONDS"));
-        assert!(APP_JS.contains("setConnectionView(\"stale\");"));
+        assert!(APP_JS.contains("driveSafety.requestTimeoutMessage("));
+        assert!(APP_JS.contains("kind: \"snapshot_observed\""));
+        assert!(APP_JS.contains("kind: \"transport_failed\""));
+        assert!(APP_JS.contains("await executeDriveSafetyEffects(transition.effects);"));
+        assert!(VIEW_MODEL_JS.contains("now - lastAdvance > staleAfter;"));
+        assert!(VIEW_MODEL_JS.contains("connectionKind: \"stale\""));
         assert!(VIEW_MODEL_JS.contains(r#"pill: "STATE STALE""#));
-        assert!(APP_JS.contains("state.localInhibit = true;"));
-        assert!(APP_JS.contains("await releaseManual({ bestEffort: true });"));
-        assert!(APP_JS.contains("state.snapshotFresh = false;"));
-        assert!(APP_JS.contains("setConnectionView(\"disconnected\", error.message);"));
+        assert!(VIEW_MODEL_JS.contains("connectionKind: \"disconnected\""));
+        assert!(VIEW_MODEL_JS.contains("localInhibit: true"));
+        assert!(VIEW_MODEL_JS.contains("snapshotFresh: false"));
+        assert!(VIEW_MODEL_JS.contains("releaseManualBestEffort"));
         assert!(VIEW_MODEL_JS.contains(r#"pill: "CONNECTION LOST""#));
+    }
+
+    #[test]
+    fn embedded_console_routes_browser_loss_and_terminal_stop_through_pure_safety_logic() {
+        assert!(VIEW_MODEL_JS.contains("function reduceDriveSafety(state, event)"));
+        assert!(VIEW_MODEL_JS.contains("function reduceTerminalStop(state, outcome)"));
+        assert!(
+            APP_JS.contains("const transition = driveSafety.reduce(state.driveSafety, event);")
+        );
+        for expected in [
+            r#"window.addEventListener("blur", () => releaseForLifecycleLoss("blur"));"#,
+            r#"window.addEventListener("offline", () => releaseForLifecycleLoss("offline"));"#,
+            r#"window.addEventListener("pagehide", () => releaseForLifecycleLoss("pagehide"));"#,
+            r#"releaseForLifecycleLoss("visibility_hidden");"#,
+            r#"kind: "key_released""#,
+            "driveSafety.createTerminalStopState()",
+            r#"release ? "release_confirmed" : "release_unavailable""#,
+            r#""terminal_stop_confirmed""#,
+        ] {
+            assert!(
+                APP_JS.contains(expected),
+                "missing safety wiring: {expected}"
+            );
+        }
+        let drive_loop_start = APP_JS
+            .find("async function driveLoop(generation)")
+            .expect("manual drive loop");
+        let drive_loop_end = APP_JS[drive_loop_start..]
+            .find("\n  function ensureDriveLoop()")
+            .map(|offset| drive_loop_start + offset)
+            .expect("manual drive loop boundary");
+        let drive_loop = &APP_JS[drive_loop_start..drive_loop_end];
+        assert!(drive_loop.contains("if (error instanceof ApiError)"));
+        assert!(drive_loop.contains("await failClosedForTransport(error);"));
+        assert_eq!(
+            APP_JS
+                .matches("await failClosedForTransport(error);")
+                .count(),
+            2,
+            "polling and manual drive must share one fail-closed transport path"
+        );
     }
 
     #[test]
@@ -2240,7 +2285,7 @@ mod tests {
             .find("} finally {\n      state.driveLoopRunning = false;")
             .expect("drive loop has one explicit terminal handoff");
         let restart = APP_JS
-            .find("if (state.held.size && !state.localInhibit) ensureDriveLoop();")
+            .find("if (state.held.size && !state.driveSafety.localInhibit) ensureDriveLoop();")
             .expect("held desired state is restarted after the old loop");
         assert!(restart > finally);
         assert!(
@@ -2320,8 +2365,8 @@ mod tests {
             "const snapshot = model.parseConsoleSnapshot(await responseJson(response));"
         ));
         assert!(APP_JS.contains("renderAuthorityAndPipeline(snapshot);"));
-        assert!(APP_JS.contains("setConnectionView(\"stale\");"));
-        assert!(APP_JS.contains("setConnectionView(\"disconnected\", error.message);"));
+        assert!(APP_JS.contains("setConnectionView(transition.state.connectionKind);"));
+        assert!(APP_JS.contains("setConnectionView(transition.state.connectionKind, detail);"));
         assert!(APP_JS.contains(
             "Point goals require a currently free cell; selected cell is ${selectedCell}."
         ));
@@ -2332,11 +2377,9 @@ mod tests {
         assert!(APP_JS.contains(
             "&& [\"arm\", \"autonomous_frontier_explore\", \"save_map\"].includes(intent)"
         ));
-        assert!(
-            APP_JS.contains(
-                "save_map: production && !terminal && !state.localInhibit && mapAvailable"
-            )
-        );
+        assert!(APP_JS.contains(
+            "production && !terminal && !state.driveSafety.localInhibit && mapAvailable"
+        ));
         assert!(APP_JS.contains("disarm: production && !terminal"));
         assert!(APP_JS.contains("autonomous_map_only: production && !terminal"));
         assert!(APP_JS.contains("stop: !terminal"));

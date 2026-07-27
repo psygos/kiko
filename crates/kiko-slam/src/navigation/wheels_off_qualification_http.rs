@@ -9,7 +9,8 @@
 
 use std::convert::Infallible;
 use std::fmt;
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,8 +28,8 @@ use warp::hyper::service::{make_service_fn, service_fn};
 use warp::hyper::{Body, Request, Response, Server};
 
 use super::operator_console_http::{
-    APP_JS, INDEX_HTML, STYLES_CSS, encode_hex, error_response, json_response, secure_response,
-    text_response, valid_host,
+    APP_JS, INDEX_HTML, STYLES_CSS, VIEW_MODEL_JS, encode_hex, error_response, json_response,
+    secure_response, text_response, valid_host,
 };
 use super::{
     AgentControlMonotonicOrigin, ConsoleActualAuthority, ConsoleAppliedReceipt,
@@ -52,6 +53,9 @@ const MAX_CONCURRENT_QUALIFICATION_HTTP_REQUESTS: usize = 32;
 const QUALIFICATION_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
 const QUALIFICATION_HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const QUALIFICATION_HTTP_FORCE_SHUTDOWN_AFTER: Duration = Duration::from_secs(1);
+const QUALIFICATION_FRONTEND_READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_QUALIFICATION_FRONTEND_READINESS_RESPONSE_BYTES: usize = 8 * 1_024;
+const QUALIFICATION_FRONTEND_HEALTH_SCHEMA_V1: u32 = 1;
 const MIN_DEADMAN_TICK_MS: u64 = 5;
 const MAX_DEADMAN_TICK_MS: u64 = 100;
 
@@ -509,7 +513,8 @@ struct CloseSessionResponse {
     stop_queued: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct HealthResponse {
     schema_version: u32,
     http_ready: bool,
@@ -616,6 +621,11 @@ fn static_get(path: &str) -> Option<Response<Body>> {
             StatusCode::OK,
             "text/javascript; charset=utf-8",
             APP_JS,
+        )),
+        "/assets/view-model.js" => Some(text_response(
+            StatusCode::OK,
+            "text/javascript; charset=utf-8",
+            VIEW_MODEL_JS,
         )),
         _ => None,
     }
@@ -1349,10 +1359,372 @@ fn failed_server_exit(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelsOffQualificationFrontendReadinessProbeIoOperation {
+    Connect,
+    ConfigureSocket,
+    WriteRequest,
+    ReadResponse,
+}
+
+#[derive(Debug)]
+pub enum WheelsOffQualificationFrontendReadinessProbeError {
+    NonLoopbackAddress(SocketAddr),
+    Io {
+        operation: WheelsOffQualificationFrontendReadinessProbeIoOperation,
+        source: std::io::Error,
+    },
+    TimedOut(WheelsOffQualificationFrontendReadinessProbeIoOperation),
+    EmptyResponse,
+    ResponseTooLarge {
+        maximum_bytes: usize,
+    },
+    InvalidHttpFraming,
+    UnexpectedStatus(u16),
+    MissingContentType,
+    UnexpectedContentType,
+    TransferEncodingNotSupported,
+    MissingContentLength,
+    InvalidContentLength,
+    BodyLengthMismatch {
+        declared: usize,
+        observed: usize,
+    },
+    InvalidJson,
+    UnsupportedSchema(u32),
+    HttpNotReady,
+    BoundAddressMismatch {
+        expected: SocketAddr,
+        observed: SocketAddr,
+    },
+    ProfileMismatch {
+        expected: super::WheelsOffQualificationProfileKind,
+        observed: super::WheelsOffQualificationProfileKind,
+    },
+}
+
+impl fmt::Display for WheelsOffQualificationFrontendReadinessProbeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "qualification frontend authenticated readiness probe failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for WheelsOffQualificationFrontendReadinessProbeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::NonLoopbackAddress(_)
+            | Self::TimedOut(_)
+            | Self::EmptyResponse
+            | Self::ResponseTooLarge { .. }
+            | Self::InvalidHttpFraming
+            | Self::UnexpectedStatus(_)
+            | Self::MissingContentType
+            | Self::UnexpectedContentType
+            | Self::TransferEncodingNotSupported
+            | Self::MissingContentLength
+            | Self::InvalidContentLength
+            | Self::BodyLengthMismatch { .. }
+            | Self::InvalidJson
+            | Self::UnsupportedSchema(_)
+            | Self::HttpNotReady
+            | Self::BoundAddressMismatch { .. }
+            | Self::ProfileMismatch { .. } => None,
+        }
+    }
+}
+
+/// Proof that the exact loopback HTTP owner answered its capability-protected
+/// health endpoint with the expected typed qualification contract.
+///
+/// Fields are private because this value is only minted after the complete
+/// response has passed bounded transport, HTTP framing, JSON schema, ready
+/// state, and control-profile checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WheelsOffQualificationFrontendReadinessEvidence {
+    bound_address: SocketAddr,
+    runtime_known: bool,
+    qualification_profile: super::WheelsOffQualificationProfileKind,
+}
+
+impl WheelsOffQualificationFrontendReadinessEvidence {
+    pub const fn bound_address(self) -> SocketAddr {
+        self.bound_address
+    }
+
+    pub const fn schema_version(self) -> u32 {
+        QUALIFICATION_FRONTEND_HEALTH_SCHEMA_V1
+    }
+
+    pub const fn http_ready(self) -> bool {
+        true
+    }
+
+    pub const fn runtime_known(self) -> bool {
+        self.runtime_known
+    }
+
+    pub const fn qualification_profile(self) -> super::WheelsOffQualificationProfileKind {
+        self.qualification_profile
+    }
+}
+
+fn readiness_probe_io_error(
+    operation: WheelsOffQualificationFrontendReadinessProbeIoOperation,
+    source: std::io::Error,
+) -> WheelsOffQualificationFrontendReadinessProbeError {
+    if matches!(
+        source.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
+        WheelsOffQualificationFrontendReadinessProbeError::TimedOut(operation)
+    } else {
+        WheelsOffQualificationFrontendReadinessProbeError::Io { operation, source }
+    }
+}
+
+fn readiness_probe_remaining(
+    deadline: Instant,
+    operation: WheelsOffQualificationFrontendReadinessProbeIoOperation,
+) -> Result<Duration, WheelsOffQualificationFrontendReadinessProbeError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(WheelsOffQualificationFrontendReadinessProbeError::TimedOut(
+            operation,
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn probe_qualification_frontend_readiness(
+    bound_address: SocketAddr,
+    access_capability: OperatorConsoleAccessCapability,
+    expected_profile: WheelsOffQualificationControlProfile,
+) -> Result<
+    WheelsOffQualificationFrontendReadinessEvidence,
+    WheelsOffQualificationFrontendReadinessProbeError,
+> {
+    use WheelsOffQualificationFrontendReadinessProbeIoOperation as IoOperation;
+
+    if !bound_address.ip().is_loopback() {
+        return Err(
+            WheelsOffQualificationFrontendReadinessProbeError::NonLoopbackAddress(bound_address),
+        );
+    }
+    let deadline = Instant::now() + QUALIFICATION_FRONTEND_READINESS_PROBE_TIMEOUT;
+    let mut stream = TcpStream::connect_timeout(
+        &bound_address,
+        readiness_probe_remaining(deadline, IoOperation::Connect)?,
+    )
+    .map_err(|source| readiness_probe_io_error(IoOperation::Connect, source))?;
+    stream
+        .set_write_timeout(Some(readiness_probe_remaining(
+            deadline,
+            IoOperation::WriteRequest,
+        )?))
+        .map_err(|source| readiness_probe_io_error(IoOperation::ConfigureSocket, source))?;
+    let capability = access_capability.to_hex();
+    let request = format!(
+        "GET /api/v1/health HTTP/1.1\r\nHost: {bound_address}\r\nX-Kiko-Console-Capability: {capability}\r\nConnection: close\r\n\r\n"
+    );
+    let mut unwritten = request.as_bytes();
+    while !unwritten.is_empty() {
+        stream
+            .set_write_timeout(Some(readiness_probe_remaining(
+                deadline,
+                IoOperation::WriteRequest,
+            )?))
+            .map_err(|source| readiness_probe_io_error(IoOperation::ConfigureSocket, source))?;
+        match stream.write(unwritten) {
+            Ok(0) => {
+                return Err(readiness_probe_io_error(
+                    IoOperation::WriteRequest,
+                    std::io::Error::from(std::io::ErrorKind::WriteZero),
+                ));
+            }
+            Ok(written) => unwritten = &unwritten[written..],
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(source) => {
+                return Err(readiness_probe_io_error(IoOperation::WriteRequest, source));
+            }
+        }
+    }
+
+    let mut response = Vec::with_capacity(1_024);
+    let mut chunk = [0_u8; 1_024];
+    loop {
+        stream
+            .set_read_timeout(Some(readiness_probe_remaining(
+                deadline,
+                IoOperation::ReadResponse,
+            )?))
+            .map_err(|source| readiness_probe_io_error(IoOperation::ConfigureSocket, source))?;
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                let next_length = response.len().checked_add(read).ok_or(
+                    WheelsOffQualificationFrontendReadinessProbeError::ResponseTooLarge {
+                        maximum_bytes: MAX_QUALIFICATION_FRONTEND_READINESS_RESPONSE_BYTES,
+                    },
+                )?;
+                if next_length > MAX_QUALIFICATION_FRONTEND_READINESS_RESPONSE_BYTES {
+                    return Err(
+                        WheelsOffQualificationFrontendReadinessProbeError::ResponseTooLarge {
+                            maximum_bytes: MAX_QUALIFICATION_FRONTEND_READINESS_RESPONSE_BYTES,
+                        },
+                    );
+                }
+                response.extend_from_slice(&chunk[..read]);
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(source) => {
+                return Err(readiness_probe_io_error(IoOperation::ReadResponse, source));
+            }
+        }
+    }
+    parse_qualification_frontend_readiness_response(bound_address, &response, expected_profile)
+}
+
+fn parse_qualification_frontend_readiness_response(
+    bound_address: SocketAddr,
+    response: &[u8],
+    expected_profile: WheelsOffQualificationControlProfile,
+) -> Result<
+    WheelsOffQualificationFrontendReadinessEvidence,
+    WheelsOffQualificationFrontendReadinessProbeError,
+> {
+    use WheelsOffQualificationFrontendReadinessProbeError as ProbeError;
+
+    if response.is_empty() {
+        return Err(ProbeError::EmptyResponse);
+    }
+    if response.len() > MAX_QUALIFICATION_FRONTEND_READINESS_RESPONSE_BYTES {
+        return Err(ProbeError::ResponseTooLarge {
+            maximum_bytes: MAX_QUALIFICATION_FRONTEND_READINESS_RESPONSE_BYTES,
+        });
+    }
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or(ProbeError::InvalidHttpFraming)?;
+    let header = std::str::from_utf8(&response[..header_end])
+        .ok()
+        .filter(|header| header.is_ascii())
+        .ok_or(ProbeError::InvalidHttpFraming)?;
+    let body = &response[header_end + 4..];
+    let mut lines = header.split("\r\n");
+    let status_line = lines.next().ok_or(ProbeError::InvalidHttpFraming)?;
+    let mut status_parts = status_line.splitn(3, ' ');
+    if status_parts.next() != Some("HTTP/1.1") {
+        return Err(ProbeError::InvalidHttpFraming);
+    }
+    let raw_status = status_parts.next().ok_or(ProbeError::InvalidHttpFraming)?;
+    if raw_status.len() != 3 || !raw_status.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ProbeError::InvalidHttpFraming);
+    }
+    let status = raw_status
+        .parse::<u16>()
+        .map_err(|_| ProbeError::InvalidHttpFraming)?;
+    if status_parts.next().is_none() {
+        return Err(ProbeError::InvalidHttpFraming);
+    }
+    if status != StatusCode::OK.as_u16() {
+        return Err(ProbeError::UnexpectedStatus(status));
+    }
+
+    let mut content_type = None;
+    let mut content_length = None;
+    let mut transfer_encoding_present = false;
+    for line in lines {
+        if line.is_empty() || line.starts_with([' ', '\t']) {
+            return Err(ProbeError::InvalidHttpFraming);
+        }
+        let (name, raw_value) = line.split_once(':').ok_or(ProbeError::InvalidHttpFraming)?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ProbeError::InvalidHttpFraming);
+        }
+        let value = raw_value.trim_matches([' ', '\t']);
+        if !value.is_ascii()
+            || value
+                .bytes()
+                .any(|byte| (byte < b' ' && byte != b'\t') || byte == 0x7f)
+        {
+            return Err(ProbeError::InvalidHttpFraming);
+        }
+        if name.eq_ignore_ascii_case("content-type") {
+            if content_type.replace(value).is_some() {
+                return Err(ProbeError::InvalidHttpFraming);
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some()
+                || value.is_empty()
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+                || (value.len() > 1 && value.starts_with('0'))
+            {
+                return Err(ProbeError::InvalidContentLength);
+            }
+            let parsed = value
+                .parse::<usize>()
+                .map_err(|_| ProbeError::InvalidContentLength)?;
+            content_length = Some(parsed);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding_present = true;
+        }
+    }
+    if transfer_encoding_present {
+        return Err(ProbeError::TransferEncodingNotSupported);
+    }
+    match content_type {
+        None => return Err(ProbeError::MissingContentType),
+        Some("application/json") => {}
+        Some(_) => return Err(ProbeError::UnexpectedContentType),
+    }
+    let declared = content_length.ok_or(ProbeError::MissingContentLength)?;
+    if declared > MAX_QUALIFICATION_FRONTEND_READINESS_RESPONSE_BYTES {
+        return Err(ProbeError::ResponseTooLarge {
+            maximum_bytes: MAX_QUALIFICATION_FRONTEND_READINESS_RESPONSE_BYTES,
+        });
+    }
+    if body.len() != declared {
+        return Err(ProbeError::BodyLengthMismatch {
+            declared,
+            observed: body.len(),
+        });
+    }
+    let health = parse_exact_json::<HealthResponse>(body).map_err(|_| ProbeError::InvalidJson)?;
+    if health.schema_version != QUALIFICATION_FRONTEND_HEALTH_SCHEMA_V1 {
+        return Err(ProbeError::UnsupportedSchema(health.schema_version));
+    }
+    if !health.http_ready {
+        return Err(ProbeError::HttpNotReady);
+    }
+    let expected = expected_profile.kind();
+    if health.qualification_profile != expected {
+        return Err(ProbeError::ProfileMismatch {
+            expected,
+            observed: health.qualification_profile,
+        });
+    }
+    Ok(WheelsOffQualificationFrontendReadinessEvidence {
+        bound_address,
+        runtime_known: health.runtime_known,
+        qualification_profile: health.qualification_profile,
+    })
+}
+
 #[must_use = "qualification frontend shutdown evidence must be inspected"]
 #[derive(Debug)]
 pub struct WheelsOffQualificationFrontend {
     bound_address: SocketAddr,
+    readiness_evidence: WheelsOffQualificationFrontendReadinessEvidence,
     http: Option<WheelsOffQualificationHttpServer>,
     capability: Option<OperatorConsolePersistedAccessCapability>,
     terminal_evidence: Option<WheelsOffQualificationFrontendShutdownEvidence>,
@@ -1364,6 +1736,29 @@ impl WheelsOffQualificationFrontend {
         console: WheelsOffQualificationConsoleHandle,
         telemetry: WheelsOffQualificationTelemetryStore,
         profile: WheelsOffQualificationControlProfile,
+    ) -> Result<Self, WheelsOffQualificationFrontendStartError> {
+        Self::start_with_readiness_probe(
+            config,
+            console,
+            telemetry,
+            profile,
+            probe_qualification_frontend_readiness,
+        )
+    }
+
+    fn start_with_readiness_probe(
+        config: &WheelsOffQualificationFrontendConfig,
+        console: WheelsOffQualificationConsoleHandle,
+        telemetry: WheelsOffQualificationTelemetryStore,
+        profile: WheelsOffQualificationControlProfile,
+        readiness_probe: impl FnOnce(
+            SocketAddr,
+            OperatorConsoleAccessCapability,
+            WheelsOffQualificationControlProfile,
+        ) -> Result<
+            WheelsOffQualificationFrontendReadinessEvidence,
+            WheelsOffQualificationFrontendReadinessProbeError,
+        >,
     ) -> Result<Self, WheelsOffQualificationFrontendStartError> {
         if console.snapshot().control_profile != profile {
             return Err(WheelsOffQualificationFrontendStartError::ProfileMismatch);
@@ -1379,9 +1774,10 @@ impl WheelsOffQualificationFrontend {
         let capability =
             OperatorConsoleAccessCapability::generate_and_persist_new(config.capability_path())
                 .map_err(WheelsOffQualificationFrontendStartError::Capability)?;
+        let access_capability = capability.access_capability();
         let http_config = QualificationHttpServerConfig {
             bind: config.bind,
-            access_capability: capability.access_capability(),
+            access_capability,
             clock: config.clock,
             deadman_tick: config.deadman_tick,
         };
@@ -1399,14 +1795,47 @@ impl WheelsOffQualificationFrontend {
                 });
             }
         };
-        let mut frontend = Self {
-            bound_address: http.bound_address(),
-            http: Some(http),
-            capability: Some(capability),
-            terminal_evidence: None,
+        let bound_address = http.bound_address();
+        let readiness_evidence = match readiness_probe(bound_address, access_capability, profile) {
+            Ok(evidence) => evidence,
+            Err(source) => {
+                console.signal_internal_fail_closed(None);
+                let frontend_shutdown =
+                    shutdown_unadmitted_qualification_frontend(http, capability);
+                return Err(WheelsOffQualificationFrontendStartError::ReadinessProbe {
+                    source: Box::new(source),
+                    frontend_shutdown,
+                });
+            }
         };
+        if readiness_evidence.bound_address() != bound_address {
+            console.signal_internal_fail_closed(None);
+            let frontend_shutdown = shutdown_unadmitted_qualification_frontend(http, capability);
+            return Err(WheelsOffQualificationFrontendStartError::ReadinessProbe {
+                source: Box::new(
+                    WheelsOffQualificationFrontendReadinessProbeError::BoundAddressMismatch {
+                        expected: bound_address,
+                        observed: readiness_evidence.bound_address(),
+                    },
+                ),
+                frontend_shutdown,
+            });
+        }
+        if readiness_evidence.qualification_profile() != profile.kind() {
+            console.signal_internal_fail_closed(None);
+            let frontend_shutdown = shutdown_unadmitted_qualification_frontend(http, capability);
+            return Err(WheelsOffQualificationFrontendStartError::ReadinessProbe {
+                source: Box::new(
+                    WheelsOffQualificationFrontendReadinessProbeError::ProfileMismatch {
+                        expected: profile.kind(),
+                        observed: readiness_evidence.qualification_profile(),
+                    },
+                ),
+                frontend_shutdown,
+            });
+        }
         if let Err(source) = console.admit_frontend_readiness() {
-            let frontend_shutdown = frontend.shutdown();
+            let frontend_shutdown = shutdown_unadmitted_qualification_frontend(http, capability);
             return Err(
                 WheelsOffQualificationFrontendStartError::ReadinessAdmission {
                     source,
@@ -1414,7 +1843,17 @@ impl WheelsOffQualificationFrontend {
                 },
             );
         }
-        Ok(frontend)
+        Ok(Self {
+            bound_address,
+            readiness_evidence,
+            http: Some(http),
+            capability: Some(capability),
+            terminal_evidence: None,
+        })
+    }
+
+    pub const fn readiness_evidence(&self) -> WheelsOffQualificationFrontendReadinessEvidence {
+        self.readiness_evidence
     }
 
     pub const fn bound_address(&self) -> SocketAddr {
@@ -1483,6 +1922,28 @@ impl WheelsOffQualificationFrontend {
     }
 }
 
+fn shutdown_unadmitted_qualification_frontend(
+    mut http: WheelsOffQualificationHttpServer,
+    capability: OperatorConsolePersistedAccessCapability,
+) -> WheelsOffQualificationFrontendShutdownEvidence {
+    let http_evidence = http.shutdown();
+    let capability_evidence = if matches!(
+        http_evidence,
+        Err(WheelsOffQualificationHttpJoinError::TimedOut)
+    ) {
+        std::mem::forget(http);
+        std::mem::forget(capability);
+        QualificationCapabilityShutdownEvidence::RetainedWhileHttpOwnerLive
+    } else {
+        drop(http);
+        QualificationCapabilityShutdownEvidence::Cleaned(capability.cleanup())
+    };
+    WheelsOffQualificationFrontendShutdownEvidence {
+        http: http_evidence,
+        capability: capability_evidence,
+    }
+}
+
 impl Drop for WheelsOffQualificationFrontend {
     fn drop(&mut self) {
         if self.terminal_evidence.is_some() {
@@ -1522,6 +1983,10 @@ pub enum WheelsOffQualificationFrontendStartError {
     ProfileMismatch,
     Telemetry(WheelsOffQualificationTelemetryError),
     Capability(OperatorConsoleCapabilityPersistError),
+    ReadinessProbe {
+        source: Box<WheelsOffQualificationFrontendReadinessProbeError>,
+        frontend_shutdown: WheelsOffQualificationFrontendShutdownEvidence,
+    },
     ReadinessAdmission {
         source: WheelsOffQualificationFrontendConnectError,
         frontend_shutdown: WheelsOffQualificationFrontendShutdownEvidence,
@@ -1540,6 +2005,13 @@ impl fmt::Display for WheelsOffQualificationFrontendStartError {
             }
             Self::Telemetry(source) => source.fmt(formatter),
             Self::Capability(source) => source.fmt(formatter),
+            Self::ReadinessProbe {
+                source,
+                frontend_shutdown,
+            } => write!(
+                formatter,
+                "qualification frontend authenticated readiness probe failed: {source}; shutdown evidence: {frontend_shutdown:?}"
+            ),
             Self::ReadinessAdmission {
                 source,
                 frontend_shutdown,
@@ -1563,6 +2035,7 @@ impl std::error::Error for WheelsOffQualificationFrontendStartError {
         match self {
             Self::Telemetry(source) => Some(source),
             Self::Capability(source) => Some(source),
+            Self::ReadinessProbe { source, .. } => Some(source.as_ref()),
             Self::ReadinessAdmission { source, .. } => Some(source),
             Self::Http { source, .. } => Some(source),
             Self::ProfileMismatch => None,
@@ -1767,6 +2240,30 @@ mod tests {
         )
         .await;
         assert_eq!(static_response.status(), StatusCode::OK);
+
+        for (path, expected) in [
+            ("/assets/view-model.js", "KikoOperatorConsoleModel"),
+            ("/assets/app.js", "model.driveSafety"),
+        ] {
+            let asset_response = handle_qualification_request_inner(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(path)
+                    .header("host", format!("127.0.0.1:{TEST_PORT}"))
+                    .body(Body::empty())
+                    .unwrap(),
+                Arc::clone(&context),
+            )
+            .await;
+            assert_eq!(asset_response.status(), StatusCode::OK, "{path}");
+            let asset_body = to_bytes(asset_response.into_body()).await.unwrap();
+            assert!(
+                std::str::from_utf8(asset_body.as_ref())
+                    .unwrap()
+                    .contains(expected),
+                "{path} must serve the application dependency it advertises"
+            );
+        }
 
         let unauthorized = handle_qualification_request_inner(
             Request::builder()
@@ -2122,6 +2619,142 @@ mod tests {
         response
     }
 
+    fn readiness_stub(
+        response: Option<Vec<u8>>,
+    ) -> (SocketAddr, mpsc::SyncSender<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (expected_capability_tx, expected_capability_rx) = mpsc::sync_channel(1);
+        let join = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let expected_capability = expected_capability_rx.recv().unwrap();
+            let mut request = Vec::with_capacity(512);
+            let mut chunk = [0_u8; 256];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0, "readiness probe closed before its HTTP head");
+                request.extend_from_slice(&chunk[..read]);
+                assert!(
+                    request.len() <= MAX_QUALIFICATION_HTTP_REQUEST_BYTES,
+                    "readiness probe request exceeded its bound"
+                );
+            }
+            let request = std::str::from_utf8(&request).unwrap();
+            assert!(
+                request.starts_with("GET /api/v1/health HTTP/1.1\r\n"),
+                "readiness probe did not request the health endpoint"
+            );
+            assert!(
+                request.contains(&format!(
+                    "\r\nX-Kiko-Console-Capability: {expected_capability}\r\n"
+                )),
+                "readiness probe did not send the exact generated capability"
+            );
+            if let Some(response) = response {
+                stream.write_all(&response).unwrap();
+            }
+        });
+        (address, expected_capability_tx, join)
+    }
+
+    fn readiness_stub_response(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    fn parse_readiness_body(
+        body: &str,
+    ) -> Result<
+        WheelsOffQualificationFrontendReadinessEvidence,
+        WheelsOffQualificationFrontendReadinessProbeError,
+    > {
+        parse_qualification_frontend_readiness_response(
+            "127.0.0.1:18321".parse().unwrap(),
+            &readiness_stub_response(body),
+            profile(),
+        )
+    }
+
+    fn assert_readiness_probe_failure(
+        response: Option<Vec<u8>>,
+        expected_source: impl FnOnce(&WheelsOffQualificationFrontendReadinessProbeError) -> bool,
+    ) {
+        let directory = PrivateTestDirectory::create();
+        let capability_path = directory.0.join("qualification.cap");
+        let profile = profile();
+        let (console, _receiver) = super::super::wheels_off_qualification_console(profile);
+        let telemetry = WheelsOffQualificationTelemetryStore::parse(
+            profile,
+            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            console.snapshot(),
+        )
+        .unwrap();
+        let config = WheelsOffQualificationFrontendConfig::parse(
+            "127.0.0.1:0".parse().unwrap(),
+            capability_path.clone(),
+            AgentControlMonotonicOrigin::new(
+                Instant::now(),
+                HostMonotonicTimestamp::from_nanos(1_000_000_000),
+            ),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let (stub_address, expected_capability_tx, stub) = readiness_stub(response);
+        let error = WheelsOffQualificationFrontend::start_with_readiness_probe(
+            &config,
+            console.clone(),
+            telemetry,
+            profile,
+            move |_bound_address, access_capability, profile| {
+                expected_capability_tx
+                    .send(access_capability.to_hex())
+                    .unwrap();
+                probe_qualification_frontend_readiness(stub_address, access_capability, profile)
+            },
+        )
+        .unwrap_err();
+        stub.join().unwrap();
+        let evidence = match error {
+            WheelsOffQualificationFrontendStartError::ReadinessProbe {
+                source,
+                frontend_shutdown,
+            } => {
+                assert!(
+                    expected_source(&source),
+                    "unexpected probe error: {source:?}"
+                );
+                frontend_shutdown
+            }
+            other => panic!("unexpected frontend start error: {other:?}"),
+        };
+        let exit = evidence.http().unwrap();
+        assert!(exit.graceful_shutdown);
+        assert!(!exit.forced_shutdown);
+        assert!(!exit.server_error);
+        assert!(matches!(
+            evidence.capability(),
+            QualificationCapabilityShutdownEvidence::Cleaned(
+                OperatorConsoleCapabilityCleanupEvidence::ExactEntryRemovedAndParentSynced
+            )
+        ));
+        assert!(!capability_path.exists());
+        let snapshot = console.snapshot();
+        assert_ne!(
+            snapshot.frontend_state,
+            super::super::WheelsOffQualificationFrontendState::Connected
+        );
+        assert!(snapshot.software_safety_stop_latched);
+    }
+
     #[test]
     fn frontend_bind_failure_never_admits_console_readiness() {
         let directory = PrivateTestDirectory::create();
@@ -2192,6 +2825,16 @@ mod tests {
             WheelsOffQualificationFrontend::start(&config, console.clone(), telemetry, profile)
                 .unwrap();
         assert!(frontend.bound_address().ip().is_loopback());
+        let readiness = frontend.readiness_evidence();
+        assert_eq!(readiness.bound_address(), frontend.bound_address());
+        assert_eq!(readiness.schema_version(), 1);
+        assert!(readiness.http_ready());
+        assert!(!readiness.runtime_known());
+        assert_eq!(readiness.qualification_profile(), profile.kind());
+        assert_eq!(
+            console.snapshot().frontend_state,
+            super::super::WheelsOffQualificationFrontendState::Connected
+        );
         assert_eq!(
             fs::metadata(&capability_path).unwrap().mode() & 0o7777,
             0o600
@@ -2241,5 +2884,56 @@ mod tests {
                 super::super::WheelsOffQualificationMotionAuthorityEnableError::FrontendDisconnected
             )
         );
+    }
+
+    #[test]
+    fn malformed_authenticated_readiness_never_admits_connected() {
+        assert_readiness_probe_failure(
+            Some(readiness_stub_response("{\"schema_version\":1")),
+            |source| {
+                matches!(
+                    source,
+                    WheelsOffQualificationFrontendReadinessProbeError::InvalidJson
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn readiness_response_requires_exact_schema_ready_state_and_profile() {
+        assert!(matches!(
+            parse_readiness_body(
+                "{\"schema_version\":2,\"http_ready\":true,\"runtime_known\":false,\"qualification_profile\":\"wheels_off_raw_timer_pwm_qualification\"}"
+            ),
+            Err(WheelsOffQualificationFrontendReadinessProbeError::UnsupportedSchema(2))
+        ));
+        assert!(matches!(
+            parse_readiness_body(
+                "{\"schema_version\":1,\"http_ready\":false,\"runtime_known\":false,\"qualification_profile\":\"wheels_off_raw_timer_pwm_qualification\"}"
+            ),
+            Err(WheelsOffQualificationFrontendReadinessProbeError::HttpNotReady)
+        ));
+        assert!(matches!(
+            parse_readiness_body(
+                "{\"schema_version\":1,\"http_ready\":true,\"runtime_known\":false,\"qualification_profile\":\"production_navigation\"}"
+            ),
+            Err(WheelsOffQualificationFrontendReadinessProbeError::InvalidJson)
+        ));
+        assert!(matches!(
+            parse_readiness_body(
+                "{\"schema_version\":1,\"http_ready\":true,\"runtime_known\":false,\"qualification_profile\":\"wheels_off_raw_timer_pwm_qualification\",\"invented\":true}"
+            ),
+            Err(WheelsOffQualificationFrontendReadinessProbeError::InvalidJson)
+        ));
+    }
+
+    #[test]
+    fn unserved_authenticated_readiness_never_admits_connected() {
+        assert_readiness_probe_failure(None, |source| {
+            matches!(
+                source,
+                WheelsOffQualificationFrontendReadinessProbeError::EmptyResponse
+            )
+        });
     }
 }

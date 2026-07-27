@@ -684,6 +684,271 @@
     return value === 1 ? "free" : value === 2 ? "occupied" : "unknown";
   }
 
+  const DRIVE_SAFETY_CONNECTIONS = new Set([
+    "locked",
+    "live",
+    "stale",
+    "disconnected",
+  ]);
+  const DRIVE_SAFETY_LIFECYCLE_LOSSES = new Set([
+    "blur",
+    "offline",
+    "pagehide",
+    "visibility_hidden",
+  ]);
+  const DRIVE_SAFETY_EFFECTS = Object.freeze({
+    ensureDriveLoop: "ensure_drive_loop",
+    releaseManual: "release_manual",
+    releaseManualBestEffort: "release_manual_best_effort",
+  });
+  const DRIVE_SAFETY_STATES = new WeakSet();
+  const TERMINAL_STOP_STATES = new WeakSet();
+
+  function frozenDriveSafetyState({
+    connectionKind,
+    localInhibit,
+    snapshotFresh,
+    lastSnapshotRevision,
+    lastSnapshotAdvanceAtMilliseconds,
+  }) {
+    enumValue(
+      connectionKind,
+      DRIVE_SAFETY_CONNECTIONS,
+      "drive safety state.connectionKind",
+    );
+    if (typeof localInhibit !== "boolean"
+      || typeof snapshotFresh !== "boolean") {
+      throw new Error("drive safety state flags must be boolean");
+    }
+    if (typeof lastSnapshotRevision !== "bigint"
+      || lastSnapshotRevision < 0n) {
+      throw new Error("drive safety state revision must be an unsigned bigint");
+    }
+    if (lastSnapshotAdvanceAtMilliseconds != null
+      && (!Number.isFinite(lastSnapshotAdvanceAtMilliseconds)
+        || lastSnapshotAdvanceAtMilliseconds < 0)) {
+      throw new Error("drive safety state advance time must be monotonic");
+    }
+    const state = Object.freeze({
+      connectionKind,
+      localInhibit,
+      snapshotFresh,
+      lastSnapshotRevision,
+      lastSnapshotAdvanceAtMilliseconds,
+    });
+    DRIVE_SAFETY_STATES.add(state);
+    return state;
+  }
+
+  function createDriveSafetyState() {
+    return frozenDriveSafetyState({
+      connectionKind: "locked",
+      localInhibit: true,
+      snapshotFresh: false,
+      lastSnapshotRevision: 0n,
+      lastSnapshotAdvanceAtMilliseconds: null,
+    });
+  }
+
+  function driveSafetyResult(state, effects = [], detail = {}) {
+    return Object.freeze({
+      state,
+      effects: Object.freeze(effects),
+      ...detail,
+    });
+  }
+
+  function driveSafetyStateWith(state, changes) {
+    return frozenDriveSafetyState({ ...state, ...changes });
+  }
+
+  function reduceDriveSafety(state, event) {
+    if (!DRIVE_SAFETY_STATES.has(state)) {
+      throw new Error("drive safety transition requires a parsed state");
+    }
+    object(event, "drive safety event");
+    switch (event.kind) {
+      case "key_released": {
+        const heldDirectionCount = integer(
+          event.held_direction_count,
+          0,
+          4,
+          "drive safety event.held_direction_count",
+        );
+        if (typeof event.desired_intent_present !== "boolean") {
+          throw new Error(
+            "drive safety event.desired_intent_present must be boolean",
+          );
+        }
+        const effect = heldDirectionCount === 0
+          || !event.desired_intent_present
+          ? DRIVE_SAFETY_EFFECTS.releaseManual
+          : DRIVE_SAFETY_EFFECTS.ensureDriveLoop;
+        return driveSafetyResult(state, [effect]);
+      }
+      case "lifecycle_loss":
+        enumValue(
+          event.source,
+          DRIVE_SAFETY_LIFECYCLE_LOSSES,
+          "drive safety event.source",
+        );
+        return driveSafetyResult(
+          state,
+          [DRIVE_SAFETY_EFFECTS.releaseManualBestEffort],
+        );
+      case "local_inhibit":
+        return driveSafetyResult(
+          driveSafetyStateWith(state, { localInhibit: true }),
+        );
+      case "session_opened":
+        return driveSafetyResult(
+          driveSafetyStateWith(state, { localInhibit: false }),
+        );
+      case "locked":
+        return driveSafetyResult(driveSafetyStateWith(state, {
+          connectionKind: "locked",
+          localInhibit: true,
+          snapshotFresh: false,
+        }));
+      case "transport_failed":
+        if (typeof event.detail !== "string" || event.detail.length === 0) {
+          throw new Error("drive safety transport failure requires detail");
+        }
+        return driveSafetyResult(
+          driveSafetyStateWith(state, {
+            connectionKind: "disconnected",
+            localInhibit: true,
+            snapshotFresh: false,
+          }),
+          [DRIVE_SAFETY_EFFECTS.releaseManualBestEffort],
+        );
+      case "snapshot_observed": {
+        if (typeof event.revision !== "bigint" || event.revision < 0n) {
+          throw new Error("snapshot revision must be an unsigned bigint");
+        }
+        const now = finite(
+          event.now_milliseconds,
+          "drive safety event.now_milliseconds",
+        );
+        const staleAfter = finite(
+          event.stale_after_milliseconds,
+          "drive safety event.stale_after_milliseconds",
+        );
+        if (now < 0 || staleAfter <= 0) {
+          throw new Error("snapshot timing bounds must be positive");
+        }
+        for (const field of [
+          "local_safety_latched",
+          "server_safety_latched",
+        ]) {
+          if (typeof event[field] !== "boolean") {
+            throw new Error(`drive safety event.${field} must be boolean`);
+          }
+        }
+        if (event.revision < state.lastSnapshotRevision) {
+          throw new Error("snapshot revision regressed");
+        }
+        if (state.lastSnapshotAdvanceAtMilliseconds != null
+          && now < state.lastSnapshotAdvanceAtMilliseconds) {
+          throw new Error("snapshot observation clock regressed");
+        }
+
+        const snapshotAdvanced =
+          event.revision > state.lastSnapshotRevision;
+        let next = snapshotAdvanced
+          ? driveSafetyStateWith(state, {
+            lastSnapshotRevision: event.revision,
+            lastSnapshotAdvanceAtMilliseconds: now,
+            snapshotFresh: true,
+          })
+          : state;
+        const lastAdvance = next.lastSnapshotAdvanceAtMilliseconds;
+        const stale = lastAdvance == null
+          || now - lastAdvance > staleAfter;
+        if (stale) {
+          const becameStale = next.snapshotFresh;
+          next = driveSafetyStateWith(next, {
+            connectionKind: "stale",
+            localInhibit: true,
+            snapshotFresh: false,
+          });
+          return driveSafetyResult(
+            next,
+            becameStale
+              ? [DRIVE_SAFETY_EFFECTS.releaseManualBestEffort]
+              : [],
+            { snapshotAdvanced },
+          );
+        }
+        next = driveSafetyStateWith(next, {
+          connectionKind: "live",
+          localInhibit:
+            event.local_safety_latched || event.server_safety_latched,
+          snapshotFresh: true,
+        });
+        return driveSafetyResult(next, [], { snapshotAdvanced });
+      }
+      default:
+        throw new Error("drive safety event kind is unsupported");
+    }
+  }
+
+  function requestTimeoutMessage(phase, timeoutMilliseconds) {
+    enumValue(
+      phase,
+      new Set(["request", "response"]),
+      "request timeout phase",
+    );
+    integer(
+      timeoutMilliseconds,
+      1,
+      60_000,
+      "request timeout milliseconds",
+    );
+    return phase === "request"
+      ? `request timed out after ${timeoutMilliseconds} ms`
+      : `request timed out after ${timeoutMilliseconds} ms while reading response`;
+  }
+
+  function frozenTerminalStopState(nextStep, completed) {
+    const state = Object.freeze({ nextStep, completed });
+    TERMINAL_STOP_STATES.add(state);
+    return state;
+  }
+
+  function createTerminalStopState() {
+    return frozenTerminalStopState("release_manual_exact_zero", false);
+  }
+
+  function reduceTerminalStop(state, outcome) {
+    if (!TERMINAL_STOP_STATES.has(state) || state.completed) {
+      throw new Error("terminal stop transition requires an active parsed state");
+    }
+    if (state.nextStep === "release_manual_exact_zero") {
+      if (outcome === "release_confirmed") {
+        return frozenTerminalStopState(null, true);
+      }
+      if (outcome === "release_unavailable") {
+        return frozenTerminalStopState("terminal_stop_exact_zero", false);
+      }
+      throw new Error("release outcome is unsupported");
+    }
+    if (state.nextStep === "terminal_stop_exact_zero"
+      && outcome === "terminal_stop_confirmed") {
+      return frozenTerminalStopState(null, true);
+    }
+    throw new Error("terminal stop outcome is out of order");
+  }
+
+  const driveSafety = Object.freeze({
+    effects: DRIVE_SAFETY_EFFECTS,
+    createState: createDriveSafetyState,
+    reduce: reduceDriveSafety,
+    requestTimeoutMessage,
+    createTerminalStopState,
+    reduceTerminalStop,
+  });
+
   const api = Object.freeze({
     parseConsoleSnapshot,
     parseRerunDiagnosticsUrl,
@@ -696,6 +961,7 @@
     physicalStopView,
     qualificationMotionView,
     cellAt,
+    driveSafety,
   });
   globalThis.KikoOperatorConsoleModel = api;
   if (typeof module !== "undefined" && module.exports) {
