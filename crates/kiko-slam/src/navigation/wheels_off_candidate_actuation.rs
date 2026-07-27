@@ -1024,7 +1024,10 @@ fn bind_candidate_mpc_slew(
 /// Weak operator claim, timestamped in one monotonic process domain.
 ///
 /// The type records what the operator asserted; software cannot observe wheel
-/// removal, external head support, or reachability of the physical power cut.
+/// removal, external head support, motor-power state, or reachability of the
+/// physical power cut. Successful construction means the operator also
+/// asserted that motor power remained disconnected through stopped software
+/// readiness and was reconnected only after that readiness boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OperatorClaimedWheelsOffAttestation {
     issued_at: Instant,
@@ -1035,6 +1038,8 @@ impl OperatorClaimedWheelsOffAttestation {
         wheels_removed: bool,
         head_supported: bool,
         power_cut_reachable: bool,
+        motor_power_remained_disconnected_through_setup: bool,
+        motor_power_reconnected_after_stopped_readiness: bool,
         issued_at: Instant,
     ) -> Result<Self, WheelsOffCandidateAttestationError> {
         if !wheels_removed {
@@ -1045,6 +1050,16 @@ impl OperatorClaimedWheelsOffAttestation {
         }
         if !power_cut_reachable {
             return Err(WheelsOffCandidateAttestationError::PowerCutReachableNotClaimed);
+        }
+        if !motor_power_remained_disconnected_through_setup {
+            return Err(
+                WheelsOffCandidateAttestationError::MotorPowerDisconnectedThroughSetupNotClaimed,
+            );
+        }
+        if !motor_power_reconnected_after_stopped_readiness {
+            return Err(
+                WheelsOffCandidateAttestationError::MotorPowerReconnectedAfterReadinessNotClaimed,
+            );
         }
         Ok(Self { issued_at })
     }
@@ -1369,6 +1384,8 @@ pub enum WheelsOffCandidateAttestationError {
     WheelsRemovedNotClaimed,
     HeadSupportedNotClaimed,
     PowerCutReachableNotClaimed,
+    MotorPowerDisconnectedThroughSetupNotClaimed,
+    MotorPowerReconnectedAfterReadinessNotClaimed,
 }
 
 impl fmt::Display for WheelsOffCandidateAttestationError {
@@ -1901,8 +1918,9 @@ mod tests {
     #[test]
     fn attestation_is_explicit_monotonic_and_bounded() {
         let issued_at = Instant::now();
-        let claim = OperatorClaimedWheelsOffAttestation::try_new(true, true, true, issued_at)
-            .expect("explicit weak claims");
+        let claim =
+            OperatorClaimedWheelsOffAttestation::try_new(true, true, true, true, true, issued_at)
+                .expect("explicit weak claims");
         assert!(
             claim
                 .require_fresh(issued_at + Duration::from_secs(5), Duration::from_secs(5),)
@@ -1916,12 +1934,24 @@ mod tests {
             Err(CandidatePwmAdmissionError::WheelsOffAttestationExpired { .. })
         ));
         assert!(matches!(
-            OperatorClaimedWheelsOffAttestation::try_new(false, true, true, issued_at),
+            OperatorClaimedWheelsOffAttestation::try_new(false, true, true, true, true, issued_at),
             Err(WheelsOffCandidateAttestationError::WheelsRemovedNotClaimed)
         ));
         assert!(matches!(
-            OperatorClaimedWheelsOffAttestation::try_new(true, false, true, issued_at),
+            OperatorClaimedWheelsOffAttestation::try_new(true, false, true, true, true, issued_at),
             Err(WheelsOffCandidateAttestationError::HeadSupportedNotClaimed)
+        ));
+        assert!(matches!(
+            OperatorClaimedWheelsOffAttestation::try_new(true, true, false, true, true, issued_at),
+            Err(WheelsOffCandidateAttestationError::PowerCutReachableNotClaimed)
+        ));
+        assert!(matches!(
+            OperatorClaimedWheelsOffAttestation::try_new(true, true, true, false, true, issued_at),
+            Err(WheelsOffCandidateAttestationError::MotorPowerDisconnectedThroughSetupNotClaimed)
+        ));
+        assert!(matches!(
+            OperatorClaimedWheelsOffAttestation::try_new(true, true, true, true, false, issued_at),
+            Err(WheelsOffCandidateAttestationError::MotorPowerReconnectedAfterReadinessNotClaimed)
         ));
     }
 
@@ -1936,8 +1966,9 @@ mod tests {
             )
             .expect("candidate-only binding");
         let issued_at = Instant::now();
-        let claim = OperatorClaimedWheelsOffAttestation::try_new(true, true, true, issued_at)
-            .expect("explicit weak claims");
+        let claim =
+            OperatorClaimedWheelsOffAttestation::try_new(true, true, true, true, true, issued_at)
+                .expect("explicit weak claims");
         let target = admitted
             .admit_target(
                 CandidatePwmRequest::try_new(10, 0).expect("manual test target"),

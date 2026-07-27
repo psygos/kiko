@@ -8147,7 +8147,7 @@ fn start_wheels_off_qualification_motion_runtime(
         limits.manual_test_magnitude_timer_pwm_percent(),
         limits.manual_deadman().as_millis(),
     );
-    let attestation = match require_fresh_attended_motion_attestation(&preflight) {
+    let attestation = match require_fresh_attended_motion_attestation(preflight) {
         Ok(attestation) => attestation,
         Err(source) => {
             let frontend_shutdown = frontend.shutdown();
@@ -12933,22 +12933,32 @@ fn require_qualification_pre_owner_accessory_healthy(
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
-const MAX_QUALIFICATION_ATTESTATION_LINE_BYTES: usize = 96;
+const MAX_QUALIFICATION_ATTESTATION_LINE_BYTES: usize = 128;
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
-#[derive(Clone, Copy, Debug)]
-struct AttendedWheelsOffPreflight;
+const QUALIFICATION_ATTESTATION_CHALLENGE_BYTES: usize = 16;
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+struct InitialMotorPowerDisconnectedClaim;
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+struct AttendedWheelsOffPreflight {
+    motor_power_disconnected: InitialMotorPowerDisconnectedClaim,
+}
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 #[derive(Debug)]
 enum AttendedWheelsOffAttestationError {
     TtyRequired,
+    ChallengeEntropy(getrandom::Error),
     Input(std::io::Error),
     Output(std::io::Error),
     EndOfInput,
     LineTooLong { maximum_bytes: usize },
     InvalidUtf8,
-    PhraseMismatch { expected: &'static str },
+    PhraseMismatch { expected: String },
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
@@ -12957,6 +12967,10 @@ impl std::fmt::Display for AttendedWheelsOffAttestationError {
         match self {
             Self::TtyRequired => formatter
                 .write_str("wheels-off qualification requires attended terminal input and output"),
+            Self::ChallengeEntropy(source) => write!(
+                formatter,
+                "could not create a fresh qualification confirmation challenge: {source}"
+            ),
             Self::Input(source) => write!(formatter, "could not read qualification TTY: {source}"),
             Self::Output(source) => {
                 write!(
@@ -12987,6 +13001,7 @@ impl std::error::Error for AttendedWheelsOffAttestationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Input(source) | Self::Output(source) => Some(source),
+            Self::ChallengeEntropy(source) => Some(source),
             Self::TtyRequired
             | Self::EndOfInput
             | Self::LineTooLong { .. }
@@ -13021,6 +13036,67 @@ impl std::error::Error for FreshAttendedMotionAttestationError {
             Self::Domain(source) => Some(source),
         }
     }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+struct WheelsOffQualificationAndMotorPowerDisconnectError {
+    operation: Box<dyn std::error::Error>,
+    motor_power_disconnect: AttendedWheelsOffAttestationError,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::fmt::Display for WheelsOffQualificationAndMotorPowerDisconnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "wheels-off qualification failed: {}; mandatory post-run motor-power disconnect confirmation also failed: {}",
+            self.operation, self.motor_power_disconnect,
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::error::Error for WheelsOffQualificationAndMotorPowerDisconnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.operation.as_ref())
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+trait WheelsOffAttestationChallengeSource {
+    fn next_challenge(
+        &mut self,
+    ) -> Result<[u8; QUALIFICATION_ATTESTATION_CHALLENGE_BYTES], AttendedWheelsOffAttestationError>;
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+struct OsWheelsOffAttestationChallengeSource;
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl WheelsOffAttestationChallengeSource for OsWheelsOffAttestationChallengeSource {
+    fn next_challenge(
+        &mut self,
+    ) -> Result<[u8; QUALIFICATION_ATTESTATION_CHALLENGE_BYTES], AttendedWheelsOffAttestationError>
+    {
+        let mut challenge = [0_u8; QUALIFICATION_ATTESTATION_CHALLENGE_BYTES];
+        getrandom::fill(&mut challenge)
+            .map_err(AttendedWheelsOffAttestationError::ChallengeEntropy)?;
+        Ok(challenge)
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn lower_hex_qualification_challenge(
+    bytes: &[u8; QUALIFICATION_ATTESTATION_CHALLENGE_BYTES],
+) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(QUALIFICATION_ATTESTATION_CHALLENGE_BYTES * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
@@ -13061,12 +13137,18 @@ fn read_bounded_tty_line(
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
-fn prompt_exact_attended_phrase(
+fn prompt_fresh_attended_phrase(
     input: &mut impl BufRead,
     output: &mut impl Write,
+    challenges: &mut impl WheelsOffAttestationChallengeSource,
     explanation: &str,
-    expected: &'static str,
+    phrase: &'static str,
 ) -> Result<(), AttendedWheelsOffAttestationError> {
+    // The challenge is created only after this physical boundary is reached.
+    // Input queued for an earlier prompt therefore cannot reuse a known
+    // response; it would have to predict this fresh 128-bit value.
+    let challenge = challenges.next_challenge()?;
+    let expected = format!("{phrase} {}", lower_hex_qualification_challenge(&challenge));
     writeln!(output, "{explanation}")
         .and_then(|()| write!(output, "Type {expected:?}: "))
         .and_then(|()| output.flush())
@@ -13079,6 +13161,45 @@ fn prompt_exact_attended_phrase(
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn read_attended_wheels_off_preflight(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    challenges: &mut impl WheelsOffAttestationChallengeSource,
+) -> Result<AttendedWheelsOffPreflight, AttendedWheelsOffAttestationError> {
+    prompt_fresh_attended_phrase(
+        input,
+        output,
+        challenges,
+        "Confirm that both drive wheels are physically removed. Software cannot observe this.",
+        "WHEELS REMOVED",
+    )?;
+    prompt_fresh_attended_phrase(
+        input,
+        output,
+        challenges,
+        "Confirm that the head is physically supported before the natural-hold actor starts.",
+        "HEAD SUPPORTED",
+    )?;
+    prompt_fresh_attended_phrase(
+        input,
+        output,
+        challenges,
+        "Physically disconnect the motor output power supply while leaving only the controller logic/serial path available for stopped-device qualification. Confirm that motor power is disconnected before any device is opened.",
+        "MOTOR POWER PHYSICALLY DISCONNECTED",
+    )?;
+    prompt_fresh_attended_phrase(
+        input,
+        output,
+        challenges,
+        "Confirm that an independent physical power cut is immediately reachable.",
+        "POWER CUT REACHABLE",
+    )?;
+    Ok(AttendedWheelsOffPreflight {
+        motor_power_disconnected: InitialMotorPowerDisconnectedClaim,
+    })
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 fn require_attended_wheels_off_preflight()
 -> Result<AttendedWheelsOffPreflight, AttendedWheelsOffAttestationError> {
     let stdin = std::io::stdin();
@@ -13086,32 +13207,53 @@ fn require_attended_wheels_off_preflight()
     if !stdin.is_terminal() || !stdout.is_terminal() {
         return Err(AttendedWheelsOffAttestationError::TtyRequired);
     }
-    let mut input = stdin.lock();
-    let mut output = stdout.lock();
-    prompt_exact_attended_phrase(
-        &mut input,
-        &mut output,
-        "Confirm that both drive wheels are physically removed. Software cannot observe this.",
-        "WHEELS REMOVED",
-    )?;
-    prompt_exact_attended_phrase(
-        &mut input,
-        &mut output,
-        "Confirm that the head is physically supported before the natural-hold actor starts.",
-        "HEAD SUPPORTED",
-    )?;
-    prompt_exact_attended_phrase(
-        &mut input,
-        &mut output,
-        "Confirm that an independent physical power cut is immediately reachable.",
-        "POWER CUT REACHABLE",
-    )?;
-    Ok(AttendedWheelsOffPreflight)
+    let mut challenges = OsWheelsOffAttestationChallengeSource;
+    read_attended_wheels_off_preflight(&mut stdin.lock(), &mut stdout.lock(), &mut challenges)
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn read_fresh_attended_motion_attestation(
+    preflight: AttendedWheelsOffPreflight,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    challenges: &mut impl WheelsOffAttestationChallengeSource,
+) -> Result<
+    kiko_slam::navigation::OperatorClaimedWheelsOffAttestation,
+    FreshAttendedMotionAttestationError,
+> {
+    let AttendedWheelsOffPreflight {
+        motor_power_disconnected: _initial_motor_power_disconnected,
+    } = preflight;
+    prompt_fresh_attended_phrase(
+        input,
+        output,
+        challenges,
+        "The full software stack is stopped and ready. Confirm that motor power remained physically disconnected throughout device acquisition, zero/disarm, and every fallible setup step.",
+        "MOTOR POWER REMAINED PHYSICALLY DISCONNECTED THROUGH SETUP",
+    )
+    .map_err(FreshAttendedMotionAttestationError::Terminal)?;
+    prompt_fresh_attended_phrase(
+        input,
+        output,
+        challenges,
+        "Only now physically reconnect motor power. Keep both wheels removed, keep the head supported, and keep the independent power cut immediately reachable throughout the bounded motion window.",
+        "MOTOR POWER RECONNECTED WHEELS OFF HEAD SUPPORTED POWER CUT READY",
+    )
+    .map_err(FreshAttendedMotionAttestationError::Terminal)?;
+    kiko_slam::navigation::OperatorClaimedWheelsOffAttestation::try_new(
+        true,
+        true,
+        true,
+        true,
+        true,
+        Instant::now(),
+    )
+    .map_err(FreshAttendedMotionAttestationError::Domain)
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 fn require_fresh_attended_motion_attestation(
-    _preflight: &AttendedWheelsOffPreflight,
+    preflight: AttendedWheelsOffPreflight,
 ) -> Result<
     kiko_slam::navigation::OperatorClaimedWheelsOffAttestation,
     FreshAttendedMotionAttestationError,
@@ -13123,22 +13265,57 @@ fn require_fresh_attended_motion_attestation(
             AttendedWheelsOffAttestationError::TtyRequired,
         ));
     }
-    let mut input = stdin.lock();
-    let mut output = stdout.lock();
-    prompt_exact_attended_phrase(
-        &mut input,
-        &mut output,
-        "The full software stack is ready. Reconfirm all three physical conditions immediately before the short motion qualification window.",
-        "WHEELS OFF HEAD SUPPORTED POWER CUT READY",
+    let mut challenges = OsWheelsOffAttestationChallengeSource;
+    read_fresh_attended_motion_attestation(
+        preflight,
+        &mut stdin.lock(),
+        &mut stdout.lock(),
+        &mut challenges,
     )
-    .map_err(FreshAttendedMotionAttestationError::Terminal)?;
-    kiko_slam::navigation::OperatorClaimedWheelsOffAttestation::try_new(
-        true,
-        true,
-        true,
-        Instant::now(),
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn read_post_run_motor_power_disconnected(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    challenges: &mut impl WheelsOffAttestationChallengeSource,
+) -> Result<(), AttendedWheelsOffAttestationError> {
+    prompt_fresh_attended_phrase(
+        input,
+        output,
+        challenges,
+        "Software qualification has ended. Regardless of whether a controller owner started or its cleanup proved a stop, physically disconnect motor power now, or confirm that it was never reconnected. Do not leave this foreground qualification until motor power is physically disconnected.",
+        "MOTOR POWER PHYSICALLY DISCONNECTED",
     )
-    .map_err(FreshAttendedMotionAttestationError::Domain)
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn require_post_run_motor_power_disconnected() -> Result<(), AttendedWheelsOffAttestationError> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    if !stdin.is_terminal() || !stdout.is_terminal() {
+        return Err(AttendedWheelsOffAttestationError::TtyRequired);
+    }
+    let mut challenges = OsWheelsOffAttestationChallengeSource;
+    read_post_run_motor_power_disconnected(&mut stdin.lock(), &mut stdout.lock(), &mut challenges)
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn finish_attended_wheels_off_qualification(
+    operation: Result<(), Box<dyn std::error::Error>>,
+    motor_power_disconnect: Result<(), AttendedWheelsOffAttestationError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match (operation, motor_power_disconnect) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Err(motor_power_disconnect)) => Err(Box::new(motor_power_disconnect)),
+        (Err(operation), Err(motor_power_disconnect)) => Err(Box::new(
+            WheelsOffQualificationAndMotorPowerDisconnectError {
+                operation,
+                motor_power_disconnect,
+            },
+        )),
+    }
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
@@ -13473,53 +13650,60 @@ fn run_nano_wheels_off_qualification(
     // No device, serial port, listener, or controller owner is opened before
     // the attended physical preflight succeeds.
     let preflight = require_attended_wheels_off_preflight()?;
-    let capture_clock_origin = Instant::now();
-    let navigation_clock_epoch = NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(0));
-    let stream_epoch = fresh_nano_stream_epoch()?;
-    let request = kiko_slam::navigation::QualificationBootstrapRequest::try_new(
-        args.deployment_root,
-        args.state_root,
-        args.launch_config,
-        capture_clock_origin,
-        args.fault_injection,
-        running.as_ref(),
-    )?;
-    let async_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()?;
-    let owned_bootstrap = async_runtime
-        .block_on(kiko_slam::navigation::bootstrap_nano_wheels_off_qualification(request))?;
-    let (bootstrap, controller_owner, controller_owner_shutdown_timeout) =
-        owned_bootstrap.into_parts();
-    let (request_controller_shutdown, controller_shutdown) = tokio::sync::oneshot::channel();
-    let controller_running = Arc::clone(&running);
-    let controller_task = async_runtime.spawn(async move {
-        let _exit_guard = NanoControllerOwnerExitGuard::new(controller_running);
-        controller_owner
-            .run_until_shutdown(controller_shutdown, controller_owner_shutdown_timeout)
-            .await
-    });
-
-    let operation = prepare_nano_wheels_off_qualification_live_session(
-        bootstrap,
-        preflight,
-        stream_epoch,
-        capture_clock_origin,
-        running.as_ref(),
-    )
-    .and_then(|prepared| {
-        run_prepared_live_session(
-            prepared,
-            running,
+    // Every return after this point—successful or failed—reaches the final
+    // attended physical-disconnect confirmation. The closure scope also makes
+    // all bootstrap/runtime owners drop before that final prompt is issued.
+    let operation = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let capture_clock_origin = Instant::now();
+        let navigation_clock_epoch =
+            NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(0));
+        let stream_epoch = fresh_nano_stream_epoch()?;
+        let request = kiko_slam::navigation::QualificationBootstrapRequest::try_new(
+            args.deployment_root,
+            args.state_root,
+            args.launch_config,
             capture_clock_origin,
-            navigation_clock_epoch,
+            args.fault_injection,
+            running.as_ref(),
+        )?;
+        let async_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
+        let owned_bootstrap = async_runtime
+            .block_on(kiko_slam::navigation::bootstrap_nano_wheels_off_qualification(request))?;
+        let (bootstrap, controller_owner, controller_owner_shutdown_timeout) =
+            owned_bootstrap.into_parts();
+        let (request_controller_shutdown, controller_shutdown) = tokio::sync::oneshot::channel();
+        let controller_running = Arc::clone(&running);
+        let controller_task = async_runtime.spawn(async move {
+            let _exit_guard = NanoControllerOwnerExitGuard::new(controller_running);
+            controller_owner
+                .run_until_shutdown(controller_shutdown, controller_owner_shutdown_timeout)
+                .await
+        });
+
+        let operation = prepare_nano_wheels_off_qualification_live_session(
+            bootstrap,
+            preflight,
+            stream_epoch,
+            capture_clock_origin,
+            running.as_ref(),
         )
-    });
-    let _ = request_controller_shutdown.send(());
-    let controller = async_runtime.block_on(controller_task);
-    drop(async_runtime);
-    finish_nano_controller_owner(operation, controller)
+        .and_then(|prepared| {
+            run_prepared_live_session(
+                prepared,
+                running,
+                capture_clock_origin,
+                navigation_clock_epoch,
+            )
+        });
+        let _ = request_controller_shutdown.send(());
+        let controller = async_runtime.block_on(controller_task);
+        drop(async_runtime);
+        finish_nano_controller_owner(operation, controller)
+    })();
+    finish_attended_wheels_off_qualification(operation, require_post_run_motor_power_disconnected())
 }
 
 #[cfg(all(feature = "nano-agent", unix))]
@@ -15966,8 +16150,13 @@ mod tests {
     use super::LiveNavigationWorkerMotion;
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     use super::{
-        AttendedWheelsOffAttestationError, MAX_QUALIFICATION_ATTESTATION_LINE_BYTES,
-        NanoLiveMotionKind, read_bounded_tty_line,
+        AttendedWheelsOffAttestationError, FreshAttendedMotionAttestationError,
+        MAX_QUALIFICATION_ATTESTATION_LINE_BYTES, NanoLiveMotionKind,
+        QUALIFICATION_ATTESTATION_CHALLENGE_BYTES, WheelsOffAttestationChallengeSource,
+        WheelsOffQualificationAndMotorPowerDisconnectError,
+        finish_attended_wheels_off_qualification, lower_hex_qualification_challenge,
+        read_attended_wheels_off_preflight, read_bounded_tty_line,
+        read_fresh_attended_motion_attestation, read_post_run_motor_power_disconnected,
     };
     use super::{
         BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, LiveDecisionVizKind,
@@ -16035,6 +16224,43 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
     use std::time::Duration;
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    struct FixedWheelsOffChallenges {
+        values: VecDeque<[u8; QUALIFICATION_ATTESTATION_CHALLENGE_BYTES]>,
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    impl FixedWheelsOffChallenges {
+        fn from_bytes(values: impl IntoIterator<Item = u8>) -> Self {
+            Self {
+                values: values
+                    .into_iter()
+                    .map(|value| [value; QUALIFICATION_ATTESTATION_CHALLENGE_BYTES])
+                    .collect(),
+            }
+        }
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    impl WheelsOffAttestationChallengeSource for FixedWheelsOffChallenges {
+        fn next_challenge(
+            &mut self,
+        ) -> Result<
+            [u8; QUALIFICATION_ATTESTATION_CHALLENGE_BYTES],
+            AttendedWheelsOffAttestationError,
+        > {
+            Ok(self.values.pop_front().expect("scripted challenge"))
+        }
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    fn challenged_wheels_off_phrase(phrase: &str, byte: u8) -> String {
+        format!(
+            "{phrase} {}",
+            lower_hex_qualification_challenge(&[byte; QUALIFICATION_ATTESTATION_CHALLENGE_BYTES])
+        )
+    }
     #[cfg(feature = "record")]
     use std::time::Instant;
 
@@ -18226,6 +18452,27 @@ mod tests {
             ])
             .is_err()
         );
+        for forbidden in [
+            "--motor-power-disconnected",
+            "--motor-power-reconnected",
+            "--power-cut-reachable",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "kiko-slam",
+                    "nano-wheels-off-qualification",
+                    "--deployment-root",
+                    "/opt/kiko/deployment",
+                    "--launch-config",
+                    "nano-wheels-off-qualification-launch-v4.json",
+                    "--state-root",
+                    "/var/lib/kiko-nano-qualification",
+                    forbidden,
+                ])
+                .is_err(),
+                "physical claim flag {forbidden} must not exist"
+            );
+        }
 
         let injected = Cli::try_parse_from([
             "kiko-slam",
@@ -18308,6 +18555,260 @@ mod tests {
         assert!(matches!(
             read_bounded_tty_line(&mut invalid),
             Err(AttendedWheelsOffAttestationError::InvalidUtf8)
+        ));
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn qualification_motor_power_transition_requires_every_exact_tty_phrase_in_order() {
+        let mut preflight_challenges = FixedWheelsOffChallenges::from_bytes([1, 2, 3, 4]);
+        let mut preflight_input = std::io::Cursor::new(
+            [
+                challenged_wheels_off_phrase("WHEELS REMOVED", 1),
+                challenged_wheels_off_phrase("HEAD SUPPORTED", 2),
+                challenged_wheels_off_phrase("MOTOR POWER PHYSICALLY DISCONNECTED", 3),
+                challenged_wheels_off_phrase("POWER CUT REACHABLE", 4),
+                String::new(),
+            ]
+            .join("\n")
+            .into_bytes(),
+        );
+        let mut preflight_output = Vec::new();
+        let preflight = read_attended_wheels_off_preflight(
+            &mut preflight_input,
+            &mut preflight_output,
+            &mut preflight_challenges,
+        )
+        .expect("all pre-device physical claims are fresh and exact");
+        let preflight_prompt =
+            String::from_utf8(preflight_output).expect("static prompts are UTF-8");
+        let disconnected_prompt = preflight_prompt
+            .find("MOTOR POWER PHYSICALLY DISCONNECTED")
+            .expect("preflight asks for a physical disconnect");
+        let cut_prompt = preflight_prompt
+            .find("POWER CUT REACHABLE")
+            .expect("preflight asks for an independent cut");
+        assert!(
+            disconnected_prompt < cut_prompt,
+            "motor power is disconnected before the final pre-device precondition"
+        );
+
+        let mut readiness_challenges = FixedWheelsOffChallenges::from_bytes([5, 6]);
+        let mut readiness_input = std::io::Cursor::new(
+            [
+                challenged_wheels_off_phrase(
+                    "MOTOR POWER REMAINED PHYSICALLY DISCONNECTED THROUGH SETUP",
+                    5,
+                ),
+                challenged_wheels_off_phrase(
+                    "MOTOR POWER RECONNECTED WHEELS OFF HEAD SUPPORTED POWER CUT READY",
+                    6,
+                ),
+                String::new(),
+            ]
+            .join("\n")
+            .into_bytes(),
+        );
+        let mut readiness_output = Vec::new();
+        read_fresh_attended_motion_attestation(
+            preflight,
+            &mut readiness_input,
+            &mut readiness_output,
+            &mut readiness_challenges,
+        )
+        .expect("fresh disconnected-through-setup and reconnection claims are exact");
+        let readiness_prompt =
+            String::from_utf8(readiness_output).expect("static prompts are UTF-8");
+        let remained_disconnected = readiness_prompt
+            .find("MOTOR POWER REMAINED PHYSICALLY DISCONNECTED THROUGH SETUP")
+            .expect("readiness first reconfirms the setup state");
+        let reconnected = readiness_prompt
+            .find("MOTOR POWER RECONNECTED WHEELS OFF HEAD SUPPORTED POWER CUT READY")
+            .expect("readiness then authorizes physical reconnection");
+        assert!(
+            remained_disconnected < reconnected,
+            "reconnection cannot precede the through-setup confirmation"
+        );
+
+        let mut post_run_challenges = FixedWheelsOffChallenges::from_bytes([7]);
+        let mut post_run_input = std::io::Cursor::new(
+            format!(
+                "{}\n",
+                challenged_wheels_off_phrase("MOTOR POWER PHYSICALLY DISCONNECTED", 7)
+            )
+            .into_bytes(),
+        );
+        let mut post_run_output = Vec::new();
+        read_post_run_motor_power_disconnected(
+            &mut post_run_input,
+            &mut post_run_output,
+            &mut post_run_challenges,
+        )
+        .expect("post-run physical disconnect is fresh and exact");
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn qualification_rejects_the_old_motion_phrase_and_missing_power_disconnect() {
+        let mut missing_challenges = FixedWheelsOffChallenges::from_bytes([1, 2, 3]);
+        let mut missing_disconnect = std::io::Cursor::new(
+            [
+                challenged_wheels_off_phrase("WHEELS REMOVED", 1),
+                challenged_wheels_off_phrase("HEAD SUPPORTED", 2),
+                challenged_wheels_off_phrase("POWER CUT REACHABLE", 3),
+                String::new(),
+            ]
+            .join("\n")
+            .into_bytes(),
+        );
+        assert!(matches!(
+            read_attended_wheels_off_preflight(
+                &mut missing_disconnect,
+                &mut Vec::new(),
+                &mut missing_challenges,
+            ),
+            Err(AttendedWheelsOffAttestationError::PhraseMismatch {
+                expected
+            }) if expected
+                == challenged_wheels_off_phrase("MOTOR POWER PHYSICALLY DISCONNECTED", 3)
+        ));
+
+        let mut preflight_challenges = FixedWheelsOffChallenges::from_bytes([1, 2, 3, 4]);
+        let mut preflight_input = std::io::Cursor::new(
+            [
+                challenged_wheels_off_phrase("WHEELS REMOVED", 1),
+                challenged_wheels_off_phrase("HEAD SUPPORTED", 2),
+                challenged_wheels_off_phrase("MOTOR POWER PHYSICALLY DISCONNECTED", 3),
+                challenged_wheels_off_phrase("POWER CUT REACHABLE", 4),
+                String::new(),
+            ]
+            .join("\n")
+            .into_bytes(),
+        );
+        let preflight = read_attended_wheels_off_preflight(
+            &mut preflight_input,
+            &mut Vec::new(),
+            &mut preflight_challenges,
+        )
+        .expect("fresh exact preflight");
+        let mut readiness_challenges = FixedWheelsOffChallenges::from_bytes([5]);
+        let mut old_motion_phrase =
+            std::io::Cursor::new(b"WHEELS OFF HEAD SUPPORTED POWER CUT READY\n".as_slice());
+        assert!(matches!(
+            read_fresh_attended_motion_attestation(
+                preflight,
+                &mut old_motion_phrase,
+                &mut Vec::new(),
+                &mut readiness_challenges,
+            ),
+            Err(FreshAttendedMotionAttestationError::Terminal(
+                AttendedWheelsOffAttestationError::PhraseMismatch {
+                    expected
+                }
+            )) if expected
+                == challenged_wheels_off_phrase(
+                    "MOTOR POWER REMAINED PHYSICALLY DISCONNECTED THROUGH SETUP",
+                    5,
+                )
+        ));
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn queued_or_replayed_physical_claims_cannot_cross_a_fresh_challenge_boundary() {
+        let mut preflight_challenges = FixedWheelsOffChallenges::from_bytes([1, 2, 3, 4]);
+        let mut preflight_input = std::io::Cursor::new(
+            [
+                challenged_wheels_off_phrase("WHEELS REMOVED", 1),
+                challenged_wheels_off_phrase("HEAD SUPPORTED", 2),
+                challenged_wheels_off_phrase("MOTOR POWER PHYSICALLY DISCONNECTED", 3),
+                challenged_wheels_off_phrase("POWER CUT REACHABLE", 4),
+                String::new(),
+            ]
+            .join("\n")
+            .into_bytes(),
+        );
+        let preflight = read_attended_wheels_off_preflight(
+            &mut preflight_input,
+            &mut Vec::new(),
+            &mut preflight_challenges,
+        )
+        .expect("fresh exact preflight");
+
+        let mut transition_challenges = FixedWheelsOffChallenges::from_bytes([5, 6]);
+        let mut replayed_transition = std::io::Cursor::new(
+            [
+                challenged_wheels_off_phrase(
+                    "MOTOR POWER REMAINED PHYSICALLY DISCONNECTED THROUGH SETUP",
+                    5,
+                ),
+                challenged_wheels_off_phrase(
+                    "MOTOR POWER RECONNECTED WHEELS OFF HEAD SUPPORTED POWER CUT READY",
+                    5,
+                ),
+                String::new(),
+            ]
+            .join("\n")
+            .into_bytes(),
+        );
+        assert!(matches!(
+            read_fresh_attended_motion_attestation(
+                preflight,
+                &mut replayed_transition,
+                &mut Vec::new(),
+                &mut transition_challenges,
+            ),
+            Err(FreshAttendedMotionAttestationError::Terminal(
+                AttendedWheelsOffAttestationError::PhraseMismatch { expected }
+            )) if expected
+                == challenged_wheels_off_phrase(
+                    "MOTOR POWER RECONNECTED WHEELS OFF HEAD SUPPORTED POWER CUT READY",
+                    6,
+                )
+        ));
+
+        let mut final_challenges = FixedWheelsOffChallenges::from_bytes([7]);
+        let mut static_final =
+            std::io::Cursor::new(b"MOTOR POWER PHYSICALLY DISCONNECTED\n".as_slice());
+        assert!(matches!(
+            read_post_run_motor_power_disconnected(
+                &mut static_final,
+                &mut Vec::new(),
+                &mut final_challenges,
+            ),
+            Err(AttendedWheelsOffAttestationError::PhraseMismatch { expected })
+                if expected
+                    == challenged_wheels_off_phrase(
+                        "MOTOR POWER PHYSICALLY DISCONNECTED",
+                        7,
+                    )
+        ));
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn qualification_preserves_operation_and_post_run_disconnect_failures() {
+        let operation: Result<(), Box<dyn std::error::Error>> =
+            Err(std::io::Error::other("synthetic operation failure").into());
+        let disconnect = Err(AttendedWheelsOffAttestationError::PhraseMismatch {
+            expected: "MOTOR POWER PHYSICALLY DISCONNECTED challenge".to_owned(),
+        });
+
+        let error = finish_attended_wheels_off_qualification(operation, disconnect)
+            .expect_err("both failures remain visible");
+        let combined = error
+            .downcast_ref::<WheelsOffQualificationAndMotorPowerDisconnectError>()
+            .expect("combined failure remains typed");
+        assert_eq!(
+            combined.operation.to_string(),
+            "synthetic operation failure"
+        );
+        assert!(matches!(
+            &combined.motor_power_disconnect,
+            AttendedWheelsOffAttestationError::PhraseMismatch {
+                expected
+            }
+            if expected == "MOTOR POWER PHYSICALLY DISCONNECTED challenge"
         ));
     }
 }

@@ -16,10 +16,12 @@ starting:
 
 1. physically remove both drive wheels;
 2. support the head so a loss of torque cannot let it fall;
-3. keep an independent motor-power cut immediately reachable;
-4. inspect the current owners of the OAK, STM32, head bus, and eye serial
+3. physically disconnect the motor output power supply while leaving only the
+   controller logic/serial path available for stopped-device qualification;
+4. keep an independent motor-power cut immediately reachable;
+5. inspect the current owners of the OAK, STM32, head bus, and eye serial
    endpoints; and
-5. refuse to start while any competing device owner or automatic launcher is
+6. refuse to start while any competing device owner or automatic launcher is
    present.
 
 Never use `killall`, `pkill`, or an unrelated process kill to obtain a device.
@@ -50,6 +52,7 @@ Build the reviewed commit on Linux aarch64 with the lockfile:
 
 ```bash
 cargo build --locked --release -p kiko-slam \
+  --no-default-features \
   --features nano-wheels-off-qualification \
   --bin kiko-slam
 ```
@@ -265,6 +268,8 @@ Recheck:
 
 - wheels physically removed;
 - head physically supported;
+- motor output power physically disconnected while controller logic/serial
+  remains available;
 - independent power cut reachable;
 - motor area clear;
 - correct immutable bundle selected; and
@@ -288,13 +293,20 @@ sudo /usr/bin/env LD_LIBRARY_PATH=/opt/kiko/qualification/lib \
 ```
 
 There are no physical-attestation flags or environment aliases. Before any
-device is opened, the process requires these exact separate terminal replies:
+device is opened, the process generates a fresh 128-bit challenge for each
+claim and requires the exact displayed phrase plus its 32-lowercase-hex
+challenge:
 
 ```text
-WHEELS REMOVED
-HEAD SUPPORTED
-POWER CUT REACHABLE
+WHEELS REMOVED <32-lowercase-hex-challenge>
+HEAD SUPPORTED <32-lowercase-hex-challenge>
+MOTOR POWER PHYSICALLY DISCONNECTED <32-lowercase-hex-challenge>
+POWER CUT REACHABLE <32-lowercase-hex-challenge>
 ```
+
+Each challenge is generated only when its physical boundary is reached.
+Prequeued, pasted-ahead, static, or replayed replies cannot satisfy a later
+claim without predicting its fresh 128-bit challenge.
 
 Before opening a device, the Linux-only process proves that `/proc/self/exe`
 is the exact launch-bound executable by byte identity and filesystem
@@ -315,7 +327,10 @@ OAK/head/eye identity, requires OAK SuperSpeed readback, starts and acquires
 the exact candidate STM32 session, observes exact inventory, applies zero,
 confirms zero, disarms, prepares storage/models/SLAM, and starts the natural
 head hold. The candidate controller remains stopped through fallible
-preparation.
+preparation. Motor output power must remain physically disconnected throughout
+all of those steps. The software cannot measure that physical supply state;
+the initial exact reply is an operator claim, and the later readiness reply
+reconfirms it before reconnection is permitted.
 
 This admission proves the launch-bound executable and seven required
 native-runtime files each have a file-backed executable mapping with those
@@ -330,10 +345,19 @@ with its manual-motion boundary still disabled and reports
 capability in a separate authenticated Nano shell, open the console through
 the already-established tunnel, and confirm that requests other than the
 one-way software safety stop are rejected. The process then requires one fresh
-exact reply:
+fresh challenged through-setup reply:
 
 ```text
-WHEELS OFF HEAD SUPPORTED POWER CUT READY
+MOTOR POWER REMAINED PHYSICALLY DISCONNECTED THROUGH SETUP <32-lowercase-hex-challenge>
+```
+
+Only after accepting that reply does the terminal instruct the operator to
+physically reconnect motor power. With both wheels still removed, the head
+still supported, and the independent cut still immediately reachable, it then
+requires:
+
+```text
+MOTOR POWER RECONNECTED WHEELS OFF HEAD SUPPORTED POWER CUT READY <32-lowercase-hex-challenge>
 ```
 
 Only after that reply does the process create the stopped runtime owner and
@@ -435,6 +459,21 @@ With the wheels removed and the power cut in hand:
    motion; separately keep the physical E-stop/power cut reachable.
 7. End the process normally and confirm the exact disarm receipt and capability
    cleanup.
+
+After the software returns from its cleanup path on every success or failure
+following the initial preflight, physically disconnect motor power. This
+requirement applies whether a controller owner started and whether its cleanup
+proved an exact stop. The foreground process requires this final exact terminal
+fresh challenged reply:
+
+```text
+MOTOR POWER PHYSICALLY DISCONNECTED <32-lowercase-hex-challenge>
+```
+
+If the terminal is lost, the disconnect reply is wrong, or controller stop is
+uncertain, the run cannot succeed. Use the independent physical cut first,
+retain the uncertainty, and do not leave motor power connected merely to
+obtain another software receipt.
 
 Run exactly one fault in each fresh qualification process. Retain the process
 ID, controller boot/session identity, last applied receipt, terminal stop or
