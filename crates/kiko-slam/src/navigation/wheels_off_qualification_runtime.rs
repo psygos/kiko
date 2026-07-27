@@ -25,9 +25,9 @@ use super::{
     WheelsOffQualificationAppliedStep, WheelsOffQualificationAppliedStepRecordError,
     WheelsOffQualificationCompletionError, WheelsOffQualificationConsoleHandle,
     WheelsOffQualificationDisconnectError, WheelsOffQualificationEventId,
-    WheelsOffQualificationIngressEvent, WheelsOffQualificationIngressReceiver,
-    WheelsOffQualificationReceiveError, WheelsOffQualificationSnapshot,
-    WheelsOffQualificationTerminalCompletion,
+    WheelsOffQualificationFrontendState, WheelsOffQualificationIngressEvent,
+    WheelsOffQualificationIngressReceiver, WheelsOffQualificationReceiveError,
+    WheelsOffQualificationSnapshot, WheelsOffQualificationTerminalCompletion,
 };
 use crate::HostMonotonicTimestamp;
 
@@ -175,6 +175,9 @@ pub enum WheelsOffQualificationRuntimeStartError {
     InitialDisarmWasNotExactSafeStop,
     InitialReceiptControllerMismatch,
     InitialReceiptBootMismatch,
+    ConsoleFrontendNotConnected,
+    ConsoleFrontendDisconnected,
+    ConsoleMotionAuthorityAlreadyEnabled,
     ConsoleMaximumPwmMismatch {
         console: u8,
         controller: u8,
@@ -388,7 +391,9 @@ impl WheelsOffQualificationRuntime {
         stopped
             .require_fresh_attestation(&attestation, Instant::now())
             .map_err(WheelsOffQualificationRuntimeStartError::Attestation)?;
-        let profile = console.snapshot().control_profile;
+        let console_snapshot = console.snapshot();
+        admit_console_before_runtime(&console_snapshot)?;
+        let profile = console_snapshot.control_profile;
         if profile.maximum_abs_timer_pwm_percent() != limits.effective_max_abs_pwm_percent() {
             return Err(
                 WheelsOffQualificationRuntimeStartError::ConsoleMaximumPwmMismatch {
@@ -958,6 +963,24 @@ fn exact_safe_applied_zero(receipt: &AppliedCommandReceipt) -> bool {
     receipt.verified_host_result().requested_timer_pwm.is_zero() && receipt.is_confirmed_zero()
 }
 
+fn admit_console_before_runtime(
+    snapshot: &WheelsOffQualificationSnapshot,
+) -> Result<(), WheelsOffQualificationRuntimeStartError> {
+    match snapshot.frontend_state {
+        WheelsOffQualificationFrontendState::AwaitingConnection => {
+            return Err(WheelsOffQualificationRuntimeStartError::ConsoleFrontendNotConnected);
+        }
+        WheelsOffQualificationFrontendState::Connected => {}
+        WheelsOffQualificationFrontendState::Disconnected => {
+            return Err(WheelsOffQualificationRuntimeStartError::ConsoleFrontendDisconnected);
+        }
+    }
+    if snapshot.motion_authority_enabled {
+        return Err(WheelsOffQualificationRuntimeStartError::ConsoleMotionAuthorityAlreadyEnabled);
+    }
+    Ok(())
+}
+
 fn exact_safe_disarm(receipt: &DisarmReceipt) -> bool {
     receipt.output_state().is_safe() && receipt.controller_faults().is_clear()
 }
@@ -1039,6 +1062,33 @@ mod tests {
             owner_after_unretained_stop(WheelsOffQualificationFailClosedStop::Uncertain)
                 .state_for_test(),
             WheelsOffQualificationControllerState::StopUncertain
+        );
+    }
+
+    #[test]
+    fn runtime_start_admission_rejects_frontend_loss_before_motion_enablement() {
+        let profile = super::super::WheelsOffQualificationControlProfile::parse(30, 10, 250)
+            .expect("test profile");
+        let (console, _receiver) = super::super::wheels_off_qualification_console(profile);
+        console
+            .report_frontend_connection_lost(HostMonotonicTimestamp::from_nanos(1))
+            .expect("no authority means no stop event is needed");
+
+        assert_eq!(
+            admit_console_before_runtime(&console.snapshot()),
+            Err(WheelsOffQualificationRuntimeStartError::ConsoleFrontendDisconnected)
+        );
+    }
+
+    #[test]
+    fn runtime_start_admission_rejects_console_without_frontend_readiness() {
+        let profile = super::super::WheelsOffQualificationControlProfile::parse(30, 10, 250)
+            .expect("test profile");
+        let (console, _receiver) = super::super::wheels_off_qualification_console(profile);
+
+        assert_eq!(
+            admit_console_before_runtime(&console.snapshot()),
+            Err(WheelsOffQualificationRuntimeStartError::ConsoleFrontendNotConnected)
         );
     }
 

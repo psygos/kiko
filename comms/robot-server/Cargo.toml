@@ -3,6 +3,12 @@ name = "robot-server"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Attended wheels-off qualification only. Production owners do not compile
+# the fault declarations, actor state, or recovery evidence.
+qualification-fault-injection = []
+
 [dependencies]
 tokio = { version = "1.35", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-serial = "5.4"

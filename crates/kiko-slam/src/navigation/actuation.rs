@@ -7,6 +7,10 @@
 //! exact requested PWM has been acknowledged by the controller.
 
 use std::fmt;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+use std::sync::Arc;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 use robot_command_client::{
@@ -17,6 +21,8 @@ use robot_command_client::{
 };
 use robot_protocol::v2::{DomainError, ForceStopReason, TimerPwm, V2CommandLeaseMs};
 
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+use super::WheelsOffQualificationHostClockFaultInjection;
 use super::actuation_config::NavigationActuationConfigV1;
 use super::{SafetyDecision, SafetyDecisionOutcome, ShadowPwmPair};
 use crate::HostMonotonicTimestamp;
@@ -31,27 +37,123 @@ type ConcreteApplyFailure = ApplyFailure<ConcreteTransport, ActuationMonotonicCl
 type ConcreteDisarmFailure = DisarmFailure<ConcreteTransport, ActuationMonotonicClock>;
 
 /// A monotonic domain sharing the live navigation clock's exact origin.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct ActuationMonotonicClock {
     origin: Instant,
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    qualification_fault: Option<Arc<QualificationClockFaultState>>,
 }
 
 impl ActuationMonotonicClock {
     const fn new(origin: Instant) -> Self {
-        Self { origin }
+        Self {
+            origin,
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            qualification_fault: None,
+        }
     }
 
-    fn host_now(self) -> Result<HostMonotonicTimestamp, PhysicalDecisionError> {
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    fn new_candidate(
+        origin: Instant,
+        fault: Option<WheelsOffQualificationHostClockFaultInjection>,
+    ) -> Self {
+        Self {
+            origin,
+            qualification_fault: fault.map(|_| Arc::new(QualificationClockFaultState::new())),
+        }
+    }
+
+    fn host_now(&self) -> Result<HostMonotonicTimestamp, PhysicalDecisionError> {
         let nanoseconds = u64::try_from(self.origin.elapsed().as_nanos())
             .map_err(|_| PhysicalDecisionError::HostTimestampOutOfRange)?;
+        #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+        let nanoseconds = if self.qualification_fault.is_some() {
+            nanoseconds
+                .checked_add(QUALIFICATION_CLOCK_BIAS_NS)
+                .ok_or(PhysicalDecisionError::HostTimestampOutOfRange)?
+        } else {
+            nanoseconds
+        };
         Ok(HostMonotonicTimestamp::from_nanos(nanoseconds))
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    fn arm_qualification_regression(&self) {
+        if let Some(fault) = &self.qualification_fault {
+            fault.arm();
+        }
     }
 }
 
 impl MonotonicClock for ActuationMonotonicClock {
     fn now(&self) -> MonotonicInstant {
+        #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+        if let Some(fault) = &self.qualification_fault {
+            let elapsed = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let normal = elapsed.saturating_add(QUALIFICATION_CLOCK_BIAS_NS);
+            return MonotonicInstant::from_nanos_since_clock_start(u128::from(fault.now(normal)));
+        }
         MonotonicInstant::from_nanos_since_clock_start(self.origin.elapsed().as_nanos())
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+const QUALIFICATION_CLOCK_BIAS_NS: u64 = 1_000_000_000;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+const QUALIFICATION_CLOCK_DORMANT: u8 = 0;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+const QUALIFICATION_CLOCK_ARMED: u8 = 1;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+const QUALIFICATION_CLOCK_FIRED: u8 = 2;
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+struct QualificationClockFaultState {
+    phase: AtomicU8,
+    greatest_normal_ns: AtomicU64,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl QualificationClockFaultState {
+    const fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(QUALIFICATION_CLOCK_DORMANT),
+            greatest_normal_ns: AtomicU64::new(QUALIFICATION_CLOCK_BIAS_NS),
+        }
+    }
+
+    fn arm(&self) {
+        let _ = self.phase.compare_exchange(
+            QUALIFICATION_CLOCK_DORMANT,
+            QUALIFICATION_CLOCK_ARMED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    fn now(&self, normal_ns: u64) -> u64 {
+        if self
+            .phase
+            .compare_exchange(
+                QUALIFICATION_CLOCK_ARMED,
+                QUALIFICATION_CLOCK_FIRED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.greatest_normal_ns
+                .load(Ordering::SeqCst)
+                .checked_sub(1)
+                .expect("qualification clock bias makes regression representable")
+        } else {
+            let previous = self
+                .greatest_normal_ns
+                .fetch_max(normal_ns, Ordering::SeqCst);
+            previous.max(normal_ns)
+        }
     }
 }
 
@@ -167,6 +269,27 @@ fn pending_command(
     ))
 }
 
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn candidate_pending_command(
+    clock: &ActuationMonotonicClock,
+    timing: ActuationTiming,
+    timer_pwm: TimerPwm,
+) -> Result<PendingPhysicalCommand, PhysicalDecisionError> {
+    if !timer_pwm.is_zero() {
+        clock.arm_qualification_regression();
+    }
+    let now = clock.host_now()?;
+    let acknowledgement_deadline_ns = now
+        .as_nanos()
+        .checked_add(timing.apply_ack_budget_ns)
+        .ok_or(PhysicalDecisionError::DeadlineArithmeticOverflow)?;
+    Ok(PendingPhysicalCommand::new(
+        timer_pwm,
+        timing.lease,
+        MonotonicInstant::from_nanos_since_clock_start(u128::from(acknowledgement_deadline_ns)),
+    ))
+}
+
 /// Sole owner of an armed physical session in the navigation worker.
 ///
 /// `armed == None` means the session was consumed by a terminal failure or an
@@ -219,7 +342,7 @@ impl PhysicalActuationSession {
     ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
         Self::acquire_from_client_config(
             config.client_config(),
-            clock_origin,
+            ActuationMonotonicClock::new(clock_origin),
             ActuationTiming::from_authority(config),
         )
     }
@@ -228,9 +351,14 @@ impl PhysicalActuationSession {
     pub(super) fn acquire_candidate(
         config: ClientConfig,
         clock_origin: Instant,
+        clock_fault: Option<WheelsOffQualificationHostClockFaultInjection>,
     ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
         let timing = ActuationTiming::from_zero_client(&config);
-        Self::acquire_from_client_config(config, clock_origin, timing)
+        Self::acquire_from_client_config(
+            config,
+            ActuationMonotonicClock::new_candidate(clock_origin, clock_fault),
+            timing,
+        )
     }
 
     #[cfg(all(feature = "nano-base-commissioning", unix))]
@@ -239,18 +367,18 @@ impl PhysicalActuationSession {
         clock_origin: Instant,
     ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
         let timing = ActuationTiming::from_zero_client(&config);
-        Self::acquire_from_client_config(config, clock_origin, timing)
+        Self::acquire_from_client_config(config, ActuationMonotonicClock::new(clock_origin), timing)
     }
 
     fn acquire_from_client_config(
         config: ClientConfig,
-        clock_origin: Instant,
+        clock: ActuationMonotonicClock,
         timing: ActuationTiming,
     ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
         let transport = UdpV2Transport::connect_canonical(config.endpoint())
             .map_err(LiveActuationError::TransportBuild)?;
-        let clock = ActuationMonotonicClock::new(clock_origin);
-        let client = robot_command_client::DisarmedCommandClient::new(transport, clock, config);
+        let client =
+            robot_command_client::DisarmedCommandClient::new(transport, clock.clone(), config);
         let (armed, receipt) = client.acquire_zero().map_err(LiveActuationError::Acquire)?;
         Ok((
             Self {
@@ -329,24 +457,12 @@ impl PhysicalActuationSession {
         &mut self,
         admitted: super::wheels_off_candidate_actuation::AdmittedCandidatePwm,
     ) -> Result<AppliedCommandReceipt, LiveActuationError> {
-        let timer_pwm = admitted.timer_pwm();
-        let now = self.clock.host_now().map_err(|source| {
-            let stop_reason = source.force_stop_reason();
-            self.reject_local_decision(source, stop_reason)
-        })?;
-        let acknowledgement_deadline_ns = now
-            .as_nanos()
-            .checked_add(self.timing.apply_ack_budget_ns)
-            .ok_or(PhysicalDecisionError::DeadlineArithmeticOverflow)
+        let pending = candidate_pending_command(&self.clock, self.timing, admitted.timer_pwm())
             .map_err(|source| {
                 let stop_reason = source.force_stop_reason();
                 self.reject_local_decision(source, stop_reason)
             })?;
-        self.apply_pending(PendingPhysicalCommand::new(
-            timer_pwm,
-            self.timing.lease,
-            MonotonicInstant::from_nanos_since_clock_start(u128::from(acknowledgement_deadline_ns)),
-        ))
+        self.apply_pending(pending)
     }
 
     #[cfg(all(feature = "nano-base-commissioning", unix))]
@@ -591,6 +707,24 @@ impl std::error::Error for PhysicalDecisionError {}
 mod tests {
     use super::*;
     use robot_command_client::TimeoutNs;
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    use robot_command_client::fake::{FakeClock, FakeStep, FakeTransport};
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    use robot_command_client::{
+        ClientConfigInput, DisarmedCommandClient, FailureCause, LatchedStopKnowledge,
+    };
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    use robot_protocol::ControllerUptimeMsWrapping;
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    use robot_protocol::v2::{
+        AcquireResult, AcquireResultCode, ActuatorConfigFingerprint, ControllerBootId,
+        ControllerCapabilities, ControllerDeadlineMsWrapping, ControllerFaults,
+        ControllerSessionClass, ControllerUid, HostCommandResult, HostCommandResultCode,
+        HostStopResult, Message, MessageKind, OutputState, RemainingLeaseMs, RequestId, StatusCode,
+        StatusReport, StopResultCode, TargetBootId, V2CommandSequence,
+    };
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    use std::time::Duration;
 
     fn pwm(left: i8, right: i8) -> ShadowPwmPair {
         ShadowPwmPair::try_new(left, right).expect("valid fixture PWM")
@@ -723,5 +857,190 @@ mod tests {
         ] {
             assert_eq!(error.force_stop_reason(), ForceStopReason::TransportFault);
         }
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn qualification_clock_fault_is_one_shot_and_strictly_regresses() {
+        let state = QualificationClockFaultState::new();
+        let first = state.now(QUALIFICATION_CLOCK_BIAS_NS + 100);
+        state.arm();
+        let injected = state.now(QUALIFICATION_CLOCK_BIAS_NS + 200);
+        let recovered = state.now(QUALIFICATION_CLOCK_BIAS_NS + 300);
+
+        assert_eq!(injected, first - 1);
+        assert!(injected < first);
+        assert!(recovered > first);
+        state.arm();
+        assert_eq!(
+            state.now(QUALIFICATION_CLOCK_BIAS_NS + 400),
+            QUALIFICATION_CLOCK_BIAS_NS + 400,
+            "a fired declaration cannot inject twice"
+        );
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn dormant_qualification_clock_is_monotonic_across_concurrent_callers() {
+        let state = Arc::new(QualificationClockFaultState::new());
+        let mut workers = Vec::new();
+        for worker in 0..8_u64 {
+            let state = Arc::clone(&state);
+            workers.push(std::thread::spawn(move || {
+                for sample in 0..1_000_u64 {
+                    let normal =
+                        QUALIFICATION_CLOCK_BIAS_NS + worker.saturating_mul(1_000) + sample;
+                    assert!(state.now(normal) >= normal);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("clock worker");
+        }
+        assert_eq!(
+            state.phase.load(Ordering::SeqCst),
+            QUALIFICATION_CLOCK_DORMANT
+        );
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn candidate_apply_clock_fault_latches_before_nonzero_transport_and_confirms_stop() {
+        let uid = ControllerUid::try_new([0x11; 12]).expect("fixture UID");
+        let boot = ControllerBootId::try_new(17).expect("fixture boot");
+        let epoch = robot_protocol::v2::ControlEpoch::try_new(23).expect("fixture epoch");
+        let fingerprint =
+            ActuatorConfigFingerprint::try_new(*b"KIKO-4PWM-CAND1!").expect("fingerprint");
+        let capabilities = ControllerCapabilities::try_from_bits(
+            ControllerCapabilities::SOFTWARE_GUARD_BITS
+                | ControllerCapabilities::OPERATOR_SUPERVISED_FOUR_PWM_CANDIDATE,
+        )
+        .expect("candidate capabilities");
+        let config = ClientConfig::parse_for_session(
+            ClientConfigInput {
+                command_endpoint: "127.0.0.1:8080",
+                controller_uid_hex: "111111111111111111111111",
+                expected_firmware_abi: "2",
+                expected_firmware_build_id: "135169",
+                expected_actuator_config_fingerprint_hex: "4b494b4f2d3450574d2d43414e443121",
+                status_timeout_ns: "50000000",
+                acquire_timeout_ns: "50000000",
+                applied_ack_timeout_ns: "50000000",
+                stop_attempt_timeout_ns: "50000000",
+                max_stop_recovery_attempts: "1",
+                zero_acquisition_lease_ms: "100",
+            },
+            ControllerSessionClass::OperatorSupervisedFourPwmCandidate,
+        )
+        .expect("candidate client config");
+        let fake_clock = FakeClock::new(0);
+        let (transport, probe) = FakeTransport::scripted(
+            fake_clock,
+            [
+                FakeStep::respond(
+                    MessageKind::StatusQuery,
+                    Duration::ZERO,
+                    Message::StatusReport(StatusReport {
+                        controller_uid: uid,
+                        observed_boot_id: TargetBootId::Exact(boot),
+                        request_id: RequestId::new(0),
+                        status: StatusCode::ReadyStopped,
+                        control_epoch: None,
+                        controller_uptime: ControllerUptimeMsWrapping::new(1_000),
+                        capabilities,
+                        output_state: OutputState::Disabled,
+                        controller_timer_pwm: TimerPwm::ZERO,
+                        remaining_lease: RemainingLeaseMs::ZERO,
+                        faults: ControllerFaults::NONE,
+                    }),
+                ),
+                FakeStep::respond(
+                    MessageKind::AcquireControl,
+                    Duration::ZERO,
+                    Message::AcquireResult(AcquireResult {
+                        controller_uid: uid,
+                        boot_id: boot,
+                        request_id: RequestId::new(1),
+                        control_epoch: Some(epoch),
+                        result: AcquireResultCode::Granted,
+                        capabilities,
+                        faults: ControllerFaults::NONE,
+                        observed_firmware_abi: 2,
+                        observed_firmware_build_id: 0x0002_1001,
+                        observed_actuator_config_fingerprint: fingerprint,
+                    }),
+                ),
+                FakeStep::respond(
+                    MessageKind::HostCommand,
+                    Duration::ZERO,
+                    Message::HostCommandResult(HostCommandResult {
+                        controller_uid: uid,
+                        boot_id: boot,
+                        control_epoch: epoch,
+                        sequence: V2CommandSequence::FIRST,
+                        result: HostCommandResultCode::AppliedNew,
+                        requested_timer_pwm: TimerPwm::ZERO,
+                        controller_timer_pwm: TimerPwm::ZERO,
+                        output_state: OutputState::ZeroPwm,
+                        controller_applied_at: ControllerUptimeMsWrapping::new(2_000),
+                        controller_expires_at: ControllerDeadlineMsWrapping::new(2_100),
+                        remaining_lease: RemainingLeaseMs::try_new(90).expect("remaining lease"),
+                        faults: ControllerFaults::NONE,
+                    }),
+                ),
+                FakeStep::respond(
+                    MessageKind::HostStop,
+                    Duration::ZERO,
+                    Message::HostStopResult(HostStopResult {
+                        controller_uid: uid,
+                        observed_boot_id: TargetBootId::Exact(boot),
+                        request_id: RequestId::new(2),
+                        result: StopResultCode::ControllerConfirmed,
+                        output_state: OutputState::Disabled,
+                        controller_uptime: ControllerUptimeMsWrapping::new(3_000),
+                        faults: ControllerFaults::NONE,
+                    }),
+                ),
+            ],
+        );
+        let clock = ActuationMonotonicClock::new_candidate(
+            Instant::now(),
+            Some(WheelsOffQualificationHostClockFaultInjection::RegressionOnFirstNonzeroCommand),
+        );
+        let client = DisarmedCommandClient::new(transport, clock.clone(), config);
+        let (armed, _) = match client.acquire_zero() {
+            Ok(acquired) => acquired,
+            Err(_) => panic!("zero acquisition"),
+        };
+        let requested = TimerPwm::try_new(1, -1).expect("bounded nonzero candidate PWM");
+        let pending =
+            candidate_pending_command(&clock, timing(), requested).expect("candidate pending");
+        let failure = match armed.apply(pending) {
+            Ok(_) => panic!("injected candidate clock regression must latch"),
+            Err(failure) => failure,
+        };
+        assert!(matches!(
+            failure.cause(),
+            FailureCause::ClockRegressed { previous, observed } if observed < previous
+        ));
+        assert_eq!(
+            failure.stop_knowledge(),
+            LatchedStopKnowledge::ConfirmedStop
+        );
+        assert_eq!(
+            probe
+                .exchanges()
+                .into_iter()
+                .map(|exchange| exchange.request().kind())
+                .collect::<Vec<_>>(),
+            vec![
+                MessageKind::StatusQuery,
+                MessageKind::AcquireControl,
+                MessageKind::HostCommand,
+                MessageKind::HostStop,
+            ],
+            "the only HostCommand was acquisition zero; the nonzero command never reached transport"
+        );
+        assert_eq!(probe.remaining_steps(), 0);
     }
 }

@@ -33,6 +33,16 @@
     "controller_reported_safe",
     "uncertain",
   ]);
+  const QUALIFICATION_RUNTIME_INGRESS = new Set([
+    "connected",
+    "disconnected_stop_confirmed",
+    "disconnected_stop_unconfirmed",
+  ]);
+  const QUALIFICATION_FRONTEND_STATE = new Set([
+    "awaiting_connection",
+    "connected",
+    "disconnected",
+  ]);
   const GRID_ENCODING = "unknown0_free1_occupied2";
   const GRID_LINEARIZATION = "row_major_x_fast_rows_increase_positive_map_y";
   // This is the exact serde `snake_case` spelling of
@@ -295,6 +305,53 @@
     return receipt;
   }
 
+  function parseQualificationMotionGate(value) {
+    const qualification = optionalObject(value, "wheels_off_qualification");
+    if (!qualification) return null;
+    if (qualification.schema_version !== 2) {
+      throw new Error("wheels_off_qualification.schema_version is unsupported");
+    }
+    if (typeof qualification.motion_authority_enabled !== "boolean") {
+      throw new Error(
+        "wheels_off_qualification.motion_authority_enabled must be boolean",
+      );
+    }
+    if (typeof qualification.stop_barrier_pending !== "boolean") {
+      throw new Error(
+        "wheels_off_qualification.stop_barrier_pending must be boolean",
+      );
+    }
+    if (typeof qualification.software_safety_stop_latched !== "boolean") {
+      throw new Error(
+        "wheels_off_qualification.software_safety_stop_latched must be boolean",
+      );
+    }
+    const runtimeIngressState = enumValue(
+      qualification.runtime_ingress_state,
+      QUALIFICATION_RUNTIME_INGRESS,
+      "wheels_off_qualification.runtime_ingress_state",
+    );
+    const frontendState = enumValue(
+      qualification.frontend_state,
+      QUALIFICATION_FRONTEND_STATE,
+      "wheels_off_qualification.frontend_state",
+    );
+    const ready = qualification.motion_authority_enabled
+      && frontendState === "connected"
+      && runtimeIngressState === "connected"
+      && !qualification.stop_barrier_pending
+      && !qualification.software_safety_stop_latched;
+    return Object.freeze({
+      motionAuthorityEnabled: qualification.motion_authority_enabled,
+      frontendState,
+      runtimeIngressState,
+      stopBarrierPending: qualification.stop_barrier_pending,
+      softwareSafetyStopLatched:
+        qualification.software_safety_stop_latched,
+      ready,
+    });
+  }
+
   function parseRerunDiagnosticsUrl(value) {
     if (value == null) return null;
     if (typeof value !== "string") {
@@ -365,11 +422,15 @@
     if (snapshot.stop_certainty != null) {
       enumValue(snapshot.stop_certainty, STOP_CERTAINTY, "stop_certainty");
     }
+    const qualificationMotionGate = parseQualificationMotionGate(
+      snapshot.wheels_off_qualification,
+    );
     return {
       ...snapshot,
       rerun_diagnostics_url: parseRerunDiagnosticsUrl(
         snapshot.rerun_diagnostics_url,
       ),
+      qualification_motion_gate: qualificationMotionGate,
     };
   }
 
@@ -520,6 +581,96 @@
     };
   }
 
+  function qualificationMotionView(snapshot) {
+    const gate = snapshot.qualification_motion_gate;
+    if (!gate) return null;
+    if (gate.softwareSafetyStopLatched) {
+      return {
+        ready: false,
+        ownerLabel: "QUALIFICATION SAFETY STOP LATCHED",
+        requestedOwnerLabel: "manual motion permanently locked for this process",
+        modeLabel:
+          "Manual qualification motion is locked by the one-way software safety stop.",
+        readinessLabel: "manual motion locked · software safety stop latched",
+        className: "fault",
+      };
+    }
+    if (gate.frontendState !== "connected") {
+      const awaiting = gate.frontendState === "awaiting_connection";
+      return {
+        ready: false,
+        ownerLabel: awaiting
+          ? "QUALIFICATION FRONTEND STARTING"
+          : "QUALIFICATION FRONTEND DISCONNECTED",
+        requestedOwnerLabel: awaiting
+          ? "manual motion locked until frontend readiness"
+          : "manual motion locked after frontend loss",
+        modeLabel: awaiting
+          ? "Manual qualification motion is locked until the loopback frontend is ready."
+          : "Manual qualification motion is locked because the loopback frontend exited.",
+        readinessLabel: awaiting
+          ? "manual motion locked · frontend awaiting connection"
+          : "manual motion locked · frontend disconnected",
+        className: awaiting ? "warn" : "fault",
+      };
+    }
+    if (!gate.motionAuthorityEnabled) {
+      const additionalBlockers = [];
+      if (gate.runtimeIngressState !== "connected") {
+        additionalBlockers.push(
+          `runtime ingress ${words(gate.runtimeIngressState)}`,
+        );
+      }
+      if (gate.stopBarrierPending) additionalBlockers.push("stop barrier pending");
+      const suffix = additionalBlockers.length
+        ? ` · ${additionalBlockers.join(" · ")}`
+        : "";
+      return {
+        ready: false,
+        ownerLabel: "MOTION ATTESTATION PENDING",
+        requestedOwnerLabel: "manual motion locked pending attended attestation",
+        modeLabel:
+          "Manual qualification motion is locked pending attended startup attestation.",
+        readinessLabel:
+          `manual motion locked · attended attestation pending${suffix}`,
+        className: "warn",
+      };
+    }
+    if (gate.runtimeIngressState !== "connected") {
+      return {
+        ready: false,
+        ownerLabel: "QUALIFICATION INGRESS DISCONNECTED",
+        requestedOwnerLabel: "manual motion locked by runtime ingress state",
+        modeLabel:
+          "Manual qualification motion is locked because runtime ingress is disconnected.",
+        readinessLabel:
+          `manual motion locked · runtime ingress ${words(gate.runtimeIngressState)}`,
+        className: gate.runtimeIngressState === "disconnected_stop_unconfirmed"
+          ? "fault"
+          : "warn",
+      };
+    }
+    if (gate.stopBarrierPending) {
+      return {
+        ready: false,
+        ownerLabel: "QUALIFICATION STOP BARRIER PENDING",
+        requestedOwnerLabel: "manual motion locked by stop barrier",
+        modeLabel:
+          "Manual qualification motion is locked until the stop barrier completes.",
+        readinessLabel: "manual motion locked · stop barrier pending",
+        className: "warn",
+      };
+    }
+    return {
+      ready: true,
+      ownerLabel: null,
+      requestedOwnerLabel: null,
+      modeLabel: null,
+      readinessLabel: null,
+      className: "ready",
+    };
+  }
+
   function cellAt(cells, metadata, xCell, yCell) {
     if (!(cells instanceof Uint8Array)
       || !Number.isFinite(xCell) || !Number.isFinite(yCell)
@@ -543,6 +694,7 @@
     mpcView,
     faultView,
     physicalStopView,
+    qualificationMotionView,
     cellAt,
   });
   globalThis.KikoOperatorConsoleModel = api;

@@ -7,14 +7,18 @@ configuration, or permission to attach the wheels.
 The qualification contracts are deliberately different from production:
 
 - `bundle-render-input-v4.json.template` is the qualification-only renderer
-  boundary with its bundle kind, exact face-cascade and head-gaze-policy
-  sources, warm-start policy, and all seven exact native-runtime SONAMEs fixed;
+  boundary with its bundle kind, exact face-cascade sources, optional
+  head-gaze input disabled by absence, warm-start policy, and all seven exact
+  native-runtime SONAMEs fixed;
 - `nano-wheels-off-qualification-launch-v4.json.template` is launch schema V4;
 - `device-inventory-candidate-v2.json.template` is candidate inventory schema
   V2;
 - `candidate-controller-policy-v1.json` is candidate host-policy schema V1;
 - `controller-server-candidate-v2.json.template` is controller-server schema
-  V2; and
+  V2;
+- `head-gaze-policy-v1.json.template` is a non-deployable, proposal-only
+  head-gaze source template that fixes only the facts already declared by the
+  host contract; and
 - `agent-policy-v3.json.template` supplies the common OAK, accessory,
   persistence, and loopback-console policy while leaving all production motion
   modes disabled.
@@ -22,6 +26,39 @@ The qualification contracts are deliberately different from production:
 The unexpanded `${...}` tokens are intentional. In particular, every SHA-256
 is a deployment-tool output placeholder. No checked-in digest is presented as
 evidence about a future installed byte sequence.
+
+## Proposal-only head gaze
+
+The checked-in head-gaze template is deliberately not a calibration artifact
+and is not valid deployment JSON until every `${...}` token is replaced. It
+fixes only these currently declared facts:
+
+- the head centre is `[0.0, -0.25, -0.20] m` in OAK camera coordinates, where
+  OAK `+y` is image-down and `+z` is forward;
+- the neutral head axes are parallel to the OAK optical axes;
+- a two-dimensional face ray uses an assumed `1.5 m` camera-forward focus
+  plane, not observed range;
+- the natural encoder declaration is bow/curl/yaw/roll
+  `[2155, 2545, 2943, 2876]`; and
+- the lifecycle is `proposal_only`.
+
+The assembly identifier, retained proposal-evidence identifier and digest,
+hard encoder envelopes, encoder signs/scales, controller timing, hysteresis,
+and per-joint motion limits remain visibly named `UNVALIDATED` sentinels.
+Replacing a sentinel proves neither its physical value nor its safety. The
+rendered policy must continue to use `proposal_only`; it must not be converted
+to `operator_claimed_physical_review` without a separate, retained, physically
+witnessed review transaction.
+
+The controller declaration remains non-command metadata even after it parses.
+Gate A leaves `assets.head_gaze_policy_source_path` absent, so the renderer
+emits no policy leaf or hash and bootstrap makes no gaze-adapter claim. A
+future qualification bundle may supply the field only with complete exact
+proposal bytes. Bootstrap then requires a `proposal_only` lifecycle before
+opening hardware. Even then, the policy supplies no torque consent, motion
+consent, or conversion into a commanded head pose. Gate A only requires the
+separately reviewed natural-return-and-hold policy in `agent-policy-v3.json`;
+head-gaze activation is not part of the wheels-off attachment gate.
 
 ## Synthetic shadow plant
 
@@ -71,11 +108,13 @@ Render into a staging directory, never directly into the live deployment:
 1. prepare `bundle-render-input-v4.json.template`, setting
    `bundle.qualification_executable_path` to the absolute path of the reviewed
    Linux-aarch64 qualification executable and supplying the distinct exact
-   frontal/profile cascades plus the exact head-gaze policy bytes; renderer
-   binding proves their path, size, and digest only, while the typed consumer
-   must separately prove policy semantics and any physical review claim; its
-   qualification bundle kind, schema version, and cold-start selection are
-   fixed rather than caller placeholders;
+   frontal/profile cascades; its qualification bundle kind, schema version,
+   and cold-start selection are fixed rather than caller placeholders. Leave
+   `assets.head_gaze_policy_source_path` absent for Gate A. A later
+   proposal-only qualification may render `head-gaze-policy-v1.json.template`
+   to a separate source, retain the exact proposal evidence named by its
+   lifecycle claim, and add that field; never point the renderer at the
+   checked-in `.template`;
 2. install the exact canonical calibration artifact, shadow-only plant,
    navigation-shadow configuration, model bytes, and all seven required roles
    in the closed qualification native-runtime manifest under their reviewed
@@ -99,8 +138,9 @@ Render into a staging directory, never directly into the live deployment:
 8. compute the byte count and lowercase SHA-256 of every rendered JSON input;
 9. render the evidence manifest and launch document last from those exact
    values, including exact bindings for the executable, native-runtime
-   manifest, two cascades, and head-gaze policy. Retain the qualification
-   render input as `evidence/render-input-v4.json`; and
+   manifest, two cascades, and the optional head-gaze policy only when
+   supplied. Retain the qualification render input as
+   `evidence/render-input-v4.json`; and
 10. reject the staging tree if any `${` token remains or any rendered JSON
    fails `jq -e .`.
 
@@ -110,10 +150,10 @@ byte array used by inventory artifact entries from the same digest. Do not
 transcribe either representation manually.
 
 The two cascade leaves are independently bounded to 4 MiB and must have
-distinct destinations and exact content. The qualification-only head-gaze
-policy is bounded to 256 KiB, parsed as exact JSON, retained at
-`head-gaze-policy-v1.json`, and rejected if its path or content aliases another
-launch-bound input.
+distinct destinations and exact content. When supplied, the qualification-only
+head-gaze policy is bounded to 256 KiB, parsed as exact JSON, retained at
+`head-gaze-policy-v1.json`, rejected if its path or content aliases another
+launch-bound input, and admitted by bootstrap only as `proposal_only`.
 
 Qualification render-input/launch V1, V2, and V3 were already published
 contracts. They must not be relabelled: V2 incorrectly selected the system ABI

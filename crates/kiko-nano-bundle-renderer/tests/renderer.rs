@@ -744,7 +744,7 @@ fn render_input_versions_are_bundle_specific_and_fail_closed() {
 }
 
 #[test]
-fn qualification_v4_requires_exact_face_and_head_gaze_assets() {
+fn qualification_v4_requires_exact_face_assets_and_allows_head_gaze_to_be_absent() {
     let (temporary, input) = source_fixture();
     let root = canonical_root(&temporary);
 
@@ -766,12 +766,51 @@ fn qualification_v4_requires_exact_face_and_head_gaze_assets() {
         .as_object_mut()
         .expect("fixture assets")
         .remove("head_gaze_policy_source_path");
-    let error = render_bundle(&write_input(&root, &missing_head_gaze), RenderMode::DryRun)
-        .expect_err("V4 head-gaze policy is mandatory");
+    let destination = root.join("qualification-without-head-gaze");
+    let plan = render_bundle(
+        &write_input(&root, &missing_head_gaze),
+        RenderMode::Stage {
+            destination: &destination,
+        },
+    )
+    .expect("Gate A qualification does not require a head-gaze policy");
+    assert!(
+        plan.files
+            .iter()
+            .all(|file| file.relative_path != "head-gaze-policy-v1.json")
+    );
+    let launch: Value = serde_json::from_slice(
+        &fs::read(destination.join("nano-wheels-off-qualification-launch-v4.json"))
+            .expect("read launch without head gaze"),
+    )
+    .expect("parse launch without head gaze");
+    assert!(launch.get("head_gaze_policy_asset").is_none());
+    let evidence: Value = serde_json::from_slice(
+        &fs::read(destination.join("evidence/render-evidence-v1.json"))
+            .expect("read evidence without head gaze"),
+    )
+    .expect("parse evidence without head gaze");
+    assert!(
+        evidence["sources"]
+            .as_array()
+            .expect("evidence sources")
+            .iter()
+            .all(|source| source["role"] != "head_gaze_policy")
+    );
+}
+
+#[test]
+fn qualification_v4_rejects_explicit_null_head_gaze_policy() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    input["assets"]["head_gaze_policy_source_path"] = Value::Null;
+
+    let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
+        .expect_err("explicit null must not alias absent/disabled head gaze");
     assert!(
         error
             .to_string()
-            .contains("requires an exact head-gaze policy source")
+            .contains("must be omitted to disable it; explicit null is forbidden")
     );
 }
 
@@ -924,6 +963,26 @@ fn production_v1_rejects_the_qualification_only_head_gaze_input() {
     });
     let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
         .expect_err("production must reject the qualification-only policy input");
+    assert!(
+        error
+            .to_string()
+            .contains("qualification-only head-gaze policy input is forbidden")
+    );
+}
+
+#[test]
+fn production_v1_rejects_explicit_null_head_gaze_input() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    add_production_face_assets(&root, &mut input);
+    input["assets"]["head_gaze_policy_source_path"] = Value::Null;
+    input["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": null
+    });
+
+    let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
+        .expect_err("production must reject presence even when the field is null");
     assert!(
         error
             .to_string()

@@ -26,7 +26,8 @@ use super::{
 };
 use crate::HostMonotonicTimestamp;
 
-pub const WHEELS_OFF_QUALIFICATION_SCHEMA_V1: u32 = 1;
+pub const WHEELS_OFF_QUALIFICATION_INTENT_SCHEMA_V1: u32 = 1;
+pub const WHEELS_OFF_QUALIFICATION_SNAPSHOT_SCHEMA_V2: u32 = 2;
 pub const WHEELS_OFF_QUALIFICATION_PROFILE_KIND: &str = "wheels_off_raw_timer_pwm_qualification";
 pub const WHEELS_OFF_QUALIFICATION_INTENT_ENDPOINT: &str =
     "/api/v1/wheels-off-qualification/intents";
@@ -409,7 +410,7 @@ impl WheelsOffQualificationIntentRequestDto {
         self,
         profile: WheelsOffQualificationControlProfile,
     ) -> Result<WheelsOffQualificationRequest, WheelsOffQualificationRequestParseError> {
-        if self.schema_version != WHEELS_OFF_QUALIFICATION_SCHEMA_V1 {
+        if self.schema_version != WHEELS_OFF_QUALIFICATION_INTENT_SCHEMA_V1 {
             return Err(WheelsOffQualificationRequestParseError::UnsupportedSchema(
                 self.schema_version,
             ));
@@ -862,7 +863,10 @@ pub enum WheelsOffQualificationSubmitError {
     },
     ManualAuthorityRequired(ConsoleSessionId),
     StopBarrierPending,
+    MotionAuthorityNotEnabled,
     SoftwareSafetyStopLatched,
+    FrontendNotConnected,
+    FrontendDisconnected,
     RuntimeReceiverDisconnected,
     DeadmanDeadlineOverflow,
     EventIdentityExhausted,
@@ -879,6 +883,28 @@ impl fmt::Display for WheelsOffQualificationSubmitError {
 
 impl std::error::Error for WheelsOffQualificationSubmitError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelsOffQualificationMotionAuthorityEnableError {
+    AlreadyEnabled,
+    FrontendNotConnected,
+    FrontendDisconnected,
+    SoftwareSafetyStopLatched,
+    StopBarrierPending,
+    RuntimeReceiverDisconnected,
+    RevisionExhausted,
+}
+
+impl fmt::Display for WheelsOffQualificationMotionAuthorityEnableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "wheels-off qualification motion authority cannot be enabled: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for WheelsOffQualificationMotionAuthorityEnableError {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WheelsOffQualificationRuntimeIngressState {
@@ -886,6 +912,32 @@ pub enum WheelsOffQualificationRuntimeIngressState {
     DisconnectedStopConfirmed,
     DisconnectedStopUnconfirmed,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WheelsOffQualificationFrontendState {
+    AwaitingConnection,
+    Connected,
+    Disconnected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelsOffQualificationFrontendConnectError {
+    AlreadyConnected,
+    PermanentlyDisconnected,
+    RuntimeReceiverDisconnected,
+}
+
+impl fmt::Display for WheelsOffQualificationFrontendConnectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "qualification frontend readiness cannot be admitted: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for WheelsOffQualificationFrontendConnectError {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WheelsOffQualificationSnapshot {
@@ -899,7 +951,9 @@ pub struct WheelsOffQualificationSnapshot {
     pub last_terminal_stop: Option<CandidateMotionTerminalEvent>,
     pub last_terminal_completion: Option<WheelsOffQualificationTerminalCompletion>,
     pub stop_barrier_pending: bool,
+    pub motion_authority_enabled: bool,
     pub software_safety_stop_latched: bool,
+    pub frontend_state: WheelsOffQualificationFrontendState,
     pub runtime_ingress_state: WheelsOffQualificationRuntimeIngressState,
 }
 
@@ -985,7 +1039,9 @@ struct QualificationState {
     pending_terminal: Option<CandidateMotionTerminalEvent>,
     terminal_in_flight: Option<CandidateMotionTerminalEvent>,
     safety_stop_event_id: Option<WheelsOffQualificationEventId>,
+    motion_authority_enabled: bool,
     software_safety_stop_latched: bool,
+    frontend_state: WheelsOffQualificationFrontendState,
     runtime_ingress_state: WheelsOffQualificationRuntimeIngressState,
     last_requested: Option<WheelsOffQualificationRequestedCommand>,
     last_applied_step: Option<WheelsOffQualificationAppliedStep>,
@@ -1133,7 +1189,9 @@ pub fn wheels_off_qualification_console_with_limits(
             pending_terminal: None,
             terminal_in_flight: None,
             safety_stop_event_id: None,
+            motion_authority_enabled: false,
             software_safety_stop_latched: false,
+            frontend_state: WheelsOffQualificationFrontendState::AwaitingConnection,
             runtime_ingress_state: WheelsOffQualificationRuntimeIngressState::Connected,
             last_requested: None,
             last_applied_step: None,
@@ -1181,12 +1239,88 @@ impl WheelsOffQualificationConsoleHandle {
         }
     }
 
+    /// Admit the one frontend owner only after its loopback HTTP readiness
+    /// handshake has completed. A lost frontend can never reconnect within
+    /// the same console lifetime.
+    pub(super) fn admit_frontend_readiness(
+        &self,
+    ) -> Result<(), WheelsOffQualificationFrontendConnectError> {
+        let mut state = self.lock_state();
+        match state.frontend_state {
+            WheelsOffQualificationFrontendState::AwaitingConnection => {}
+            WheelsOffQualificationFrontendState::Connected => {
+                return Err(WheelsOffQualificationFrontendConnectError::AlreadyConnected);
+            }
+            WheelsOffQualificationFrontendState::Disconnected => {
+                return Err(WheelsOffQualificationFrontendConnectError::PermanentlyDisconnected);
+            }
+        }
+        if state.runtime_ingress_state != WheelsOffQualificationRuntimeIngressState::Connected {
+            return Err(WheelsOffQualificationFrontendConnectError::RuntimeReceiverDisconnected);
+        }
+        state.frontend_state = WheelsOffQualificationFrontendState::Connected;
+        state.bump_revision();
+        Ok(())
+    }
+
+    /// Open the manual candidate boundary exactly once, after the attended
+    /// motion attestation has been created and the stopped runtime owner is
+    /// ready to consume requests.
+    pub fn enable_motion_authority(
+        &self,
+    ) -> Result<(), WheelsOffQualificationMotionAuthorityEnableError> {
+        let mut state = self.lock_state();
+        if state.motion_authority_enabled {
+            return Err(WheelsOffQualificationMotionAuthorityEnableError::AlreadyEnabled);
+        }
+        match state.frontend_state {
+            WheelsOffQualificationFrontendState::AwaitingConnection => {
+                return Err(WheelsOffQualificationMotionAuthorityEnableError::FrontendNotConnected);
+            }
+            WheelsOffQualificationFrontendState::Connected => {}
+            WheelsOffQualificationFrontendState::Disconnected => {
+                return Err(WheelsOffQualificationMotionAuthorityEnableError::FrontendDisconnected);
+            }
+        }
+        if state.runtime_ingress_state != WheelsOffQualificationRuntimeIngressState::Connected {
+            return Err(
+                WheelsOffQualificationMotionAuthorityEnableError::RuntimeReceiverDisconnected,
+            );
+        }
+        if state.software_safety_stop_latched {
+            return Err(
+                WheelsOffQualificationMotionAuthorityEnableError::SoftwareSafetyStopLatched,
+            );
+        }
+        if state.stop_barrier_pending() {
+            return Err(WheelsOffQualificationMotionAuthorityEnableError::StopBarrierPending);
+        }
+        let revision = state
+            .revision
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(WheelsOffQualificationMotionAuthorityEnableError::RevisionExhausted)?;
+        state.motion_authority_enabled = true;
+        state.revision = revision;
+        Ok(())
+    }
+
     pub fn open_session(
         &self,
         source: ConsoleSourceKind,
         capability: ConsoleSessionCapability,
     ) -> Result<ConsoleSessionId, WheelsOffQualificationSubmitError> {
         let mut state = self.lock_state();
+        match state.frontend_state {
+            WheelsOffQualificationFrontendState::AwaitingConnection => {
+                return Err(WheelsOffQualificationSubmitError::FrontendNotConnected);
+            }
+            WheelsOffQualificationFrontendState::Connected => {}
+            WheelsOffQualificationFrontendState::Disconnected => {
+                return Err(WheelsOffQualificationSubmitError::FrontendDisconnected);
+            }
+        }
         if state.runtime_ingress_state != WheelsOffQualificationRuntimeIngressState::Connected {
             return Err(WheelsOffQualificationSubmitError::RuntimeReceiverDisconnected);
         }
@@ -1230,6 +1364,15 @@ impl WheelsOffQualificationConsoleHandle {
         received_at: HostMonotonicTimestamp,
     ) -> Result<WheelsOffQualificationSubmitOutcome, WheelsOffQualificationSubmitError> {
         let mut state = self.lock_state();
+        match state.frontend_state {
+            WheelsOffQualificationFrontendState::AwaitingConnection => {
+                return Err(WheelsOffQualificationSubmitError::FrontendNotConnected);
+            }
+            WheelsOffQualificationFrontendState::Connected => {}
+            WheelsOffQualificationFrontendState::Disconnected => {
+                return Err(WheelsOffQualificationSubmitError::FrontendDisconnected);
+            }
+        }
         if state.runtime_ingress_state != WheelsOffQualificationRuntimeIngressState::Connected {
             return Err(WheelsOffQualificationSubmitError::RuntimeReceiverDisconnected);
         }
@@ -1275,6 +1418,11 @@ impl WheelsOffQualificationConsoleHandle {
                 );
             }
             return Err(WheelsOffQualificationSubmitError::SoftwareSafetyStopLatched);
+        }
+        if !state.motion_authority_enabled
+            && request.intent != WheelsOffQualificationIntent::SoftwareSafetyStop
+        {
+            return Err(WheelsOffQualificationSubmitError::MotionAuthorityNotEnabled);
         }
         if state.stop_barrier_pending()
             && !matches!(
@@ -1509,13 +1657,18 @@ impl WheelsOffQualificationConsoleHandle {
     ) -> Result<bool, WheelsOffQualificationSubmitError> {
         let mut state = self.lock_state();
         let could_have_candidate_motion = state.authority.is_some() || state.pending_pwm.is_some();
+        state.frontend_state = WheelsOffQualificationFrontendState::Disconnected;
         state.sessions.clear();
-        if could_have_candidate_motion {
-            state.queue_terminal(
+        if could_have_candidate_motion
+            && let Err(source) = state.queue_terminal(
                 CandidateMotionTerminalCause::FrontendConnectionLost,
                 None,
                 Some(received_at),
-            )?;
+            )
+        {
+            state.software_safety_stop_latched = true;
+            state.bump_revision();
+            return Err(source);
         }
         state.bump_revision();
         Ok(could_have_candidate_motion)
@@ -1582,7 +1735,7 @@ impl WheelsOffQualificationConsoleHandle {
     pub fn snapshot(&self) -> WheelsOffQualificationSnapshot {
         let state = self.lock_state();
         WheelsOffQualificationSnapshot {
-            schema_version: WHEELS_OFF_QUALIFICATION_SCHEMA_V1,
+            schema_version: WHEELS_OFF_QUALIFICATION_SNAPSHOT_SCHEMA_V2,
             control_profile: state.profile,
             revision: state.revision,
             manual_authority: state.authority,
@@ -1591,7 +1744,9 @@ impl WheelsOffQualificationConsoleHandle {
             last_terminal_stop: state.last_terminal_stop,
             last_terminal_completion: state.last_terminal_completion,
             stop_barrier_pending: state.stop_barrier_pending(),
+            motion_authority_enabled: state.motion_authority_enabled,
             software_safety_stop_latched: state.software_safety_stop_latched,
+            frontend_state: state.frontend_state,
             runtime_ingress_state: state.runtime_ingress_state,
         }
     }
@@ -1834,6 +1989,24 @@ mod tests {
         QualificationTimerPwmPair::parse(left, right, profile()).unwrap()
     }
 
+    fn connected_console() -> (
+        WheelsOffQualificationConsoleHandle,
+        WheelsOffQualificationIngressReceiver,
+    ) {
+        let pair = wheels_off_qualification_console(profile());
+        pair.0.admit_frontend_readiness().unwrap();
+        pair
+    }
+
+    fn enabled_console() -> (
+        WheelsOffQualificationConsoleHandle,
+        WheelsOffQualificationIngressReceiver,
+    ) {
+        let pair = connected_console();
+        pair.0.enable_motion_authority().unwrap();
+        pair
+    }
+
     #[test]
     fn profile_is_explicitly_wheels_off_raw_and_shadow_only() {
         let value = serde_json::to_value(profile()).unwrap();
@@ -1936,8 +2109,132 @@ mod tests {
     }
 
     #[test]
-    fn operator_and_agent_sessions_share_one_authority_arbiter() {
+    fn console_without_frontend_readiness_cannot_open_or_enable_motion() {
         let (console, _receiver) = wheels_off_qualification_console(profile());
+        assert_eq!(
+            console.snapshot().schema_version,
+            WHEELS_OFF_QUALIFICATION_SNAPSHOT_SCHEMA_V2
+        );
+        assert_eq!(
+            console.snapshot().frontend_state,
+            WheelsOffQualificationFrontendState::AwaitingConnection
+        );
+        assert_eq!(
+            console.enable_motion_authority(),
+            Err(WheelsOffQualificationMotionAuthorityEnableError::FrontendNotConnected)
+        );
+        assert_eq!(
+            console.open_session(ConsoleSourceKind::Operator, capability(1)),
+            Err(WheelsOffQualificationSubmitError::FrontendNotConnected)
+        );
+    }
+
+    #[test]
+    fn motion_authority_stays_closed_until_the_owner_enables_it_once() {
+        let (console, _receiver) = connected_console();
+        let session = console
+            .open_session(ConsoleSourceKind::Operator, capability(1))
+            .unwrap();
+        assert!(!console.snapshot().motion_authority_enabled);
+        assert_eq!(
+            console.submit(
+                request(session, 1, 1, WheelsOffQualificationIntent::BeginManual),
+                capability(1),
+                HostMonotonicTimestamp::from_nanos(1),
+            ),
+            Err(WheelsOffQualificationSubmitError::MotionAuthorityNotEnabled)
+        );
+        console.enable_motion_authority().unwrap();
+        assert!(console.snapshot().motion_authority_enabled);
+        assert_eq!(
+            console.enable_motion_authority(),
+            Err(WheelsOffQualificationMotionAuthorityEnableError::AlreadyEnabled)
+        );
+        console
+            .submit(
+                request(session, 1, 1, WheelsOffQualificationIntent::BeginManual),
+                capability(1),
+                HostMonotonicTimestamp::from_nanos(2),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn pre_attestation_safety_stop_prevents_motion_enablement() {
+        let (console, mut receiver) = connected_console();
+        let session = console
+            .open_session(ConsoleSourceKind::Operator, capability(1))
+            .unwrap();
+        console
+            .submit(
+                request(
+                    session,
+                    1,
+                    1,
+                    WheelsOffQualificationIntent::SoftwareSafetyStop,
+                ),
+                capability(1),
+                HostMonotonicTimestamp::from_nanos(1),
+            )
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WheelsOffQualificationIngressEvent::TerminalStop(_))
+        ));
+        assert_eq!(
+            console.enable_motion_authority(),
+            Err(WheelsOffQualificationMotionAuthorityEnableError::SoftwareSafetyStopLatched)
+        );
+    }
+
+    #[test]
+    fn frontend_loss_before_attestation_permanently_blocks_motion_enablement() {
+        let (console, mut receiver) = connected_console();
+        let session = console
+            .open_session(ConsoleSourceKind::Operator, capability(1))
+            .unwrap();
+
+        assert!(
+            !console
+                .report_frontend_connection_lost(HostMonotonicTimestamp::from_nanos(1))
+                .unwrap()
+        );
+        let snapshot = console.snapshot();
+        assert_eq!(
+            snapshot.frontend_state,
+            WheelsOffQualificationFrontendState::Disconnected
+        );
+        assert_eq!(
+            snapshot.runtime_ingress_state,
+            WheelsOffQualificationRuntimeIngressState::Connected
+        );
+        assert!(!snapshot.motion_authority_enabled);
+        assert!(!snapshot.stop_barrier_pending);
+        assert_eq!(
+            console.enable_motion_authority(),
+            Err(WheelsOffQualificationMotionAuthorityEnableError::FrontendDisconnected)
+        );
+        assert_eq!(
+            console.open_session(ConsoleSourceKind::Agent, capability(2)),
+            Err(WheelsOffQualificationSubmitError::FrontendDisconnected)
+        );
+        assert_eq!(
+            console.submit(
+                request(session, 1, 1, WheelsOffQualificationIntent::BeginManual),
+                capability(1),
+                HostMonotonicTimestamp::from_nanos(2),
+            ),
+            Err(WheelsOffQualificationSubmitError::FrontendDisconnected)
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Err(WheelsOffQualificationReceiveError::Empty)
+        );
+    }
+
+    #[test]
+    fn operator_and_agent_sessions_share_one_authority_arbiter() {
+        let (console, _receiver) = enabled_console();
         let operator = console
             .open_session(ConsoleSourceKind::Operator, capability(1))
             .unwrap();
@@ -1966,7 +2263,7 @@ mod tests {
 
     #[test]
     fn latest_pwm_is_bounded_and_stop_preempts_it() {
-        let (console, mut receiver) = wheels_off_qualification_console(profile());
+        let (console, mut receiver) = enabled_console();
         let session = console
             .open_session(ConsoleSourceKind::Operator, capability(1))
             .unwrap();
@@ -2030,7 +2327,7 @@ mod tests {
 
     #[test]
     fn stop_barrier_requires_observed_applied_zero_before_reacquisition() {
-        let (console, mut receiver) = wheels_off_qualification_console(profile());
+        let (console, mut receiver) = enabled_console();
         let session = console
             .open_session(ConsoleSourceKind::Operator, capability(1))
             .unwrap();
@@ -2079,7 +2376,7 @@ mod tests {
 
     #[test]
     fn deadman_connection_loss_and_safety_stop_are_typed_terminal_events() {
-        let (console, mut receiver) = wheels_off_qualification_console(profile());
+        let (console, mut receiver) = enabled_console();
         let session = console
             .open_session(ConsoleSourceKind::Agent, capability(1))
             .unwrap();
@@ -2172,7 +2469,7 @@ mod tests {
 
     #[test]
     fn idempotency_replay_cannot_change_the_raw_pwm_pair() {
-        let (console, _receiver) = wheels_off_qualification_console(profile());
+        let (console, _receiver) = enabled_console();
         let session = console
             .open_session(ConsoleSourceKind::Operator, capability(1))
             .unwrap();
@@ -2231,7 +2528,7 @@ mod tests {
 
     #[test]
     fn dropping_sole_receiver_latches_and_rejects_future_motion() {
-        let (console, receiver) = wheels_off_qualification_console(profile());
+        let (console, receiver) = enabled_console();
         let session = console
             .open_session(ConsoleSourceKind::Operator, capability(1))
             .unwrap();
@@ -2261,7 +2558,7 @@ mod tests {
 
     #[test]
     fn confirmed_direct_host_stop_disconnects_without_false_unconfirmed_latch() {
-        let (console, mut receiver) = wheels_off_qualification_console(profile());
+        let (console, mut receiver) = enabled_console();
         let session = console
             .open_session(ConsoleSourceKind::Agent, capability(1))
             .unwrap();

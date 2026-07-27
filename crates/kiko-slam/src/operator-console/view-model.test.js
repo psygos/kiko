@@ -75,6 +75,159 @@ function snapshot() {
 
 assert.equal(model.parseConsoleSnapshot(snapshot()).revision, "9");
 
+function qualificationSnapshot(motionAuthorityEnabled) {
+  const value = snapshot();
+  value.wheels_off_qualification = {
+    schema_version: 2,
+    motion_authority_enabled: motionAuthorityEnabled,
+    frontend_state: "connected",
+    stop_barrier_pending: false,
+    software_safety_stop_latched: false,
+    runtime_ingress_state: "connected",
+  };
+  return value;
+}
+
+{
+  const retired = qualificationSnapshot(false);
+  retired.wheels_off_qualification.schema_version = 1;
+  assert.throws(
+    () => model.parseConsoleSnapshot(retired),
+    /wheels_off_qualification.schema_version is unsupported/,
+  );
+}
+
+{
+  const parsed = model.parseConsoleSnapshot(qualificationSnapshot(false));
+  assert.deepEqual(parsed.qualification_motion_gate, {
+    motionAuthorityEnabled: false,
+    frontendState: "connected",
+    runtimeIngressState: "connected",
+    stopBarrierPending: false,
+    softwareSafetyStopLatched: false,
+    ready: false,
+  });
+  assert(Object.isFrozen(parsed.qualification_motion_gate));
+  assert.deepEqual(model.qualificationMotionView(parsed), {
+    ready: false,
+    ownerLabel: "MOTION ATTESTATION PENDING",
+    requestedOwnerLabel: "manual motion locked pending attended attestation",
+    modeLabel:
+      "Manual qualification motion is locked pending attended startup attestation.",
+    readinessLabel: "manual motion locked · attended attestation pending",
+    className: "warn",
+  });
+}
+
+{
+  const parsed = model.parseConsoleSnapshot(qualificationSnapshot(true));
+  assert.equal(parsed.qualification_motion_gate.ready, true);
+  assert.equal(model.qualificationMotionView(parsed).ready, true);
+}
+
+for (const invalid of [undefined, null, "false", 0, 1]) {
+  const value = qualificationSnapshot(false);
+  value.wheels_off_qualification.motion_authority_enabled = invalid;
+  assert.throws(
+    () => model.parseConsoleSnapshot(value),
+    /motion_authority_enabled must be boolean/,
+  );
+}
+
+for (const invalid of [undefined, null, "false", 0, 1]) {
+  const value = qualificationSnapshot(true);
+  value.wheels_off_qualification.stop_barrier_pending = invalid;
+  assert.throws(
+    () => model.parseConsoleSnapshot(value),
+    /stop_barrier_pending must be boolean/,
+  );
+}
+
+for (const invalid of [undefined, null, "false", 0, 1]) {
+  const value = qualificationSnapshot(true);
+  value.wheels_off_qualification.software_safety_stop_latched = invalid;
+  assert.throws(
+    () => model.parseConsoleSnapshot(value),
+    /software_safety_stop_latched must be boolean/,
+  );
+}
+
+{
+  const value = qualificationSnapshot(true);
+  value.wheels_off_qualification.runtime_ingress_state = "reconnecting";
+  assert.throws(
+    () => model.parseConsoleSnapshot(value),
+    /runtime_ingress_state is unsupported/,
+  );
+}
+
+{
+  const value = qualificationSnapshot(true);
+  value.wheels_off_qualification.frontend_state = "reconnecting";
+  assert.throws(
+    () => model.parseConsoleSnapshot(value),
+    /frontend_state is unsupported/,
+  );
+}
+
+{
+  const value = qualificationSnapshot(false);
+  value.wheels_off_qualification.stop_barrier_pending = true;
+  value.wheels_off_qualification.runtime_ingress_state =
+    "disconnected_stop_unconfirmed";
+  const view = model.qualificationMotionView(model.parseConsoleSnapshot(value));
+  assert.equal(view.ready, false);
+  assert.match(view.readinessLabel, /attestation pending/);
+  assert.match(view.readinessLabel, /runtime ingress disconnected stop unconfirmed/);
+  assert.match(view.readinessLabel, /stop barrier pending/);
+}
+
+{
+  const value = qualificationSnapshot(true);
+  value.wheels_off_qualification.stop_barrier_pending = true;
+  const view = model.qualificationMotionView(model.parseConsoleSnapshot(value));
+  assert.equal(view.ready, false);
+  assert.equal(view.ownerLabel, "QUALIFICATION STOP BARRIER PENDING");
+}
+
+{
+  const value = qualificationSnapshot(true);
+  value.wheels_off_qualification.software_safety_stop_latched = true;
+  const parsed = model.parseConsoleSnapshot(value);
+  assert.equal(parsed.qualification_motion_gate.ready, false);
+  const view = model.qualificationMotionView(parsed);
+  assert.equal(view.ownerLabel, "QUALIFICATION SAFETY STOP LATCHED");
+  assert.equal(view.className, "fault");
+}
+
+{
+  const value = qualificationSnapshot(false);
+  value.wheels_off_qualification.frontend_state = "awaiting_connection";
+  const awaiting =
+    model.qualificationMotionView(model.parseConsoleSnapshot(value));
+  assert.equal(awaiting.ownerLabel, "QUALIFICATION FRONTEND STARTING");
+  assert.equal(awaiting.className, "warn");
+
+  value.wheels_off_qualification.frontend_state = "disconnected";
+  const disconnected =
+    model.qualificationMotionView(model.parseConsoleSnapshot(value));
+  assert.equal(
+    disconnected.ownerLabel,
+    "QUALIFICATION FRONTEND DISCONNECTED",
+  );
+  assert.equal(disconnected.className, "fault");
+}
+
+{
+  const value = qualificationSnapshot(true);
+  value.wheels_off_qualification.runtime_ingress_state =
+    "disconnected_stop_unconfirmed";
+  const view = model.qualificationMotionView(model.parseConsoleSnapshot(value));
+  assert.equal(view.ready, false);
+  assert.equal(view.ownerLabel, "QUALIFICATION INGRESS DISCONNECTED");
+  assert.equal(view.className, "fault");
+}
+
 {
   const legacy = snapshot();
   legacy.schema_version = 2;

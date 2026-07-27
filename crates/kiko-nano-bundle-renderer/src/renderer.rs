@@ -1263,11 +1263,13 @@ fn render_launch(
                 "candidate_controller_policy_asset".to_owned(),
                 binding(policy),
             );
-            let head_gaze_policy = find_staged(staged, HEAD_GAZE_POLICY_RELATIVE_PATH)?;
-            object.insert(
-                "head_gaze_policy_asset".to_owned(),
-                binding(head_gaze_policy),
-            );
+            if input.bundle.head_gaze_policy_source_path().is_some() {
+                let head_gaze_policy = find_staged(staged, HEAD_GAZE_POLICY_RELATIVE_PATH)?;
+                object.insert(
+                    "head_gaze_policy_asset".to_owned(),
+                    binding(head_gaze_policy),
+                );
+            }
             insert_face_perception_launch_binding(input, staged, &mut object)?;
         }
         BundleSelection::Production { .. } => {
@@ -1383,12 +1385,14 @@ fn render_evidence_manifest(
             QUALIFICATION_EXECUTABLE_RELATIVE_PATH,
             staged,
         )?);
-        sources.push(SourceEvidence::from_staged_source(
-            "head_gaze_policy",
-            head_gaze_policy_source_path.as_path(),
-            HEAD_GAZE_POLICY_RELATIVE_PATH,
-            staged,
-        )?);
+        if let Some(head_gaze_policy_source_path) = head_gaze_policy_source_path {
+            sources.push(SourceEvidence::from_staged_source(
+                "head_gaze_policy",
+                head_gaze_policy_source_path.as_path(),
+                HEAD_GAZE_POLICY_RELATIVE_PATH,
+                staged,
+            )?);
+        }
     }
     if let Some(face) = input.bundle.face_perception() {
         sources.push(SourceEvidence::from_staged_source(

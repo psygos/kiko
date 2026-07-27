@@ -27,11 +27,11 @@ Wheels-off qualification requires render-input schema V4. Its field layout
 is the exact
 `configs/nano-wheels-off-qualification-template/bundle-render-input-v4.json.template`;
 it fixes the qualification bundle kind, cold-start selection, cascade
-destinations, head-gaze-policy destination, and reviewed SONAMEs while
-requiring canonical absolute source paths. Production keeps its complete
-two-cascade object and has no qualification executable or head-gaze-policy
-field. Unresolved `${...}` fields make either prepared file non-deployable.
-The strict renderer rejects cross-version and bundle/asset mismatches.
+destinations, disabled-by-absence optional head-gaze input, and reviewed
+SONAMEs while requiring canonical absolute source paths. Production keeps its
+complete two-cascade object and forbids the qualification-only head-gaze field.
+Unresolved `${...}` fields make either prepared file non-deployable. The
+strict renderer rejects cross-version and bundle/asset mismatches.
 
 Qualification render-input/launch V1 through V3 were already published. V2
 incorrectly selected the system ABI name `libusb-1.0.so.0` for the pinned
@@ -79,12 +79,15 @@ resolves a by-id path to a transient `ttyACM*` name.
 
 The qualification executable, navigation-shadow document, canonical
 calibration artifact, plant artifact, models, frontal/profile face cascades,
-qualification head-gaze policy, and native libraries are exact leaf sources.
-The renderer retains their exact bytes. Both bundle variants require the two
-cascade sources as one typed set. Qualification additionally requires one
-JSON head-gaze policy, caps it at 256 KiB, fixes its retained path to
-`head-gaze-policy-v1.json`, and rejects path or content aliasing. Each cascade
-is independently capped at 4 MiB and the two exact contents must differ.
+optional qualification head-gaze policy, and native libraries are exact leaf
+sources. The renderer retains their exact bytes. Both bundle variants require
+the two cascade sources as one typed set. Qualification represents disabled
+head gaze by omitting the source field, producing no leaf, binding, or evidence
+claim. When the field is supplied, the renderer caps the JSON at 256 KiB,
+fixes its retained path to `head-gaze-policy-v1.json`, and rejects path or
+content aliasing; bootstrap separately requires `proposal_only` before opening
+hardware. Each cascade is independently capped at 4 MiB and the two exact
+contents must differ.
 The calibration input key is deliberately
 `assets.calibration`, not `camera_calibration`: the one artifact owns the
 exact OAK MXID, rectified stereo intrinsics/dimensions/baseline, raw IMU
@@ -114,8 +117,8 @@ production installation.
 
 The renderer constructs and writes:
 
-1. the exact qualification executable and head-gaze policy when selected,
-   plus calibration, plant, navigation-shadow, model, face-cascade, and
+1. the exact qualification executable, optional head-gaze policy when
+   supplied, calibration, plant, navigation-shadow, model, face-cascade, and
    native-library leaves;
 2. the native-runtime manifest, inventory, controller contract, motion
    contract when applicable, candidate policy when applicable, and agent

@@ -654,8 +654,9 @@
       throw new Error("qualification test patterns do not match their typed magnitude");
     }
     const qualification = snapshot.wheels_off_qualification;
-    if (qualification?.schema_version !== 1
-      || qualification.control_profile?.kind !== QUALIFICATION_CONTROL_PROFILE_KIND) {
+    if (qualification?.schema_version !== 2
+      || qualification.control_profile?.kind !== QUALIFICATION_CONTROL_PROFILE_KIND
+      || snapshot.qualification_motion_gate == null) {
       throw new Error("qualification snapshot projection is absent or mismatched");
     }
     return Object.freeze(raw);
@@ -721,9 +722,7 @@
 
   function qualificationMotionReady() {
     if (!qualificationProfile()) return true;
-    const qualification = state.snapshot?.wheels_off_qualification;
-    return qualification?.runtime_ingress_state === "connected"
-      && qualification.stop_barrier_pending !== true;
+    return state.snapshot?.qualification_motion_gate?.ready === true;
   }
 
   function updateControlAvailability() {
@@ -827,15 +826,25 @@
     const authority = model.authorityView(snapshot, state.sessionId);
     const qualificationAuthority =
       snapshot.wheels_off_qualification?.manual_authority;
+    const qualificationMotion = qualificationProfile()
+      ? model.qualificationMotionView(snapshot)
+      : null;
     const ownerPill = $("owner-pill");
     if (qualificationProfile()) {
-      ownerPill.textContent = qualificationAuthority
-        ? `${qualificationAuthority.source} · raw PWM · generation ${qualificationAuthority.authority_generation}`
-        : "NO QUALIFICATION AUTHORITY";
-      ownerPill.className = `pill ${qualificationAuthority ? "warn" : "unknown"}`;
-      $("requested-owner-state").textContent = qualificationAuthority
-        ? "qualification-only manual authority"
-        : "none";
+      if (qualificationMotion && !qualificationMotion.ready) {
+        ownerPill.textContent = qualificationMotion.ownerLabel;
+        ownerPill.className = `pill ${qualificationMotion.className}`;
+        $("requested-owner-state").textContent =
+          qualificationMotion.requestedOwnerLabel;
+      } else {
+        ownerPill.textContent = qualificationAuthority
+          ? `${qualificationAuthority.source} · raw PWM · generation ${qualificationAuthority.authority_generation}`
+          : "NO QUALIFICATION AUTHORITY";
+        ownerPill.className = `pill ${qualificationAuthority ? "warn" : "unknown"}`;
+        $("requested-owner-state").textContent = qualificationAuthority
+          ? "qualification-only manual authority"
+          : "none";
+      }
     } else {
       ownerPill.textContent = authority.actualLabel.toUpperCase();
       ownerPill.className = `pill ${snapshot.actual_authority ? "ready" : "unknown"}`;
@@ -844,17 +853,27 @@
     const activeMode = authority.activeMode;
     $("mode-state").textContent = snapshot.terminal
       ? "FINALIZING RESTART CHECKPOINT: capture stop is requested, sensor/map streams are draining, control is ending, and the exact final occupancy plus finalized session will be selected after drain. This does not claim current-camera localization."
-      : activeMode
-        ? `Published active mode: ${activeMode.replaceAll("_", " ")}.`
-        : `Runtime: ${readiness.runtimeLabel}; no active motion mode is published.`;
+      : qualificationMotion && !qualificationMotion.ready
+        ? qualificationMotion.modeLabel
+        : activeMode
+          ? `Published active mode: ${activeMode.replaceAll("_", " ")}.`
+          : `Runtime: ${readiness.runtimeLabel}; no active motion mode is published.`;
     document.querySelectorAll("[data-intent]").forEach((button) => {
       button.classList.toggle(
         "mode-active",
         button.dataset.intent === authority.activeIntent,
       );
     });
-    $("readiness-state").textContent = readiness.readinessLabel;
-    setEvidenceClass($("readiness-state"), readiness.className);
+    $("readiness-state").textContent =
+      qualificationMotion && !qualificationMotion.ready
+        ? qualificationMotion.readinessLabel
+        : readiness.readinessLabel;
+    setEvidenceClass(
+      $("readiness-state"),
+      qualificationMotion && !qualificationMotion.ready
+        ? qualificationMotion.className
+        : readiness.className,
+    );
 
     const runtimePill = $("runtime-pill");
     runtimePill.textContent = readiness.runtimeLabel.toUpperCase();

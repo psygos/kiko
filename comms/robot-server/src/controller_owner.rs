@@ -9,11 +9,15 @@ use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio::task::{JoinError, JoinHandle};
 
+#[cfg(feature = "qualification-fault-injection")]
+use crate::actuation_v2::OperatorSupervisedCandidateSerialFaultInjection;
 use crate::actuation_v2::{
     self, ActuationActorError, ActuationShutdownHandle, ActuationShutdownReason,
     ActuationStartError, ActuationTelemetry, NoopActuationTelemetry, UdpServiceError,
 };
 use crate::config::ControllerServerConfig;
+#[cfg(feature = "qualification-fault-injection")]
+use crate::config::ControllerServerConfigV2;
 
 /// The sole in-process owner of one exact V2 controller and its loopback
 /// command endpoint.
@@ -31,6 +35,34 @@ pub struct V2ControllerOwner {
     actuation_shutdown: ActuationShutdownHandle,
     actuation_task: Option<JoinHandle<Result<(), ActuationActorError>>>,
     udp_task: Option<JoinHandle<Result<(), UdpServiceError>>>,
+}
+
+enum ControllerActorStart {
+    Normal(ControllerServerConfig),
+    #[cfg(feature = "qualification-fault-injection")]
+    CandidateFault {
+        controller: ControllerServerConfig,
+        candidate: ControllerServerConfigV2,
+        fault: OperatorSupervisedCandidateSerialFaultInjection,
+    },
+}
+
+impl ControllerActorStart {
+    fn controller_ready_timeout(&self) -> Duration {
+        match self {
+            Self::Normal(controller) => controller.controller_ready_timeout(),
+            #[cfg(feature = "qualification-fault-injection")]
+            Self::CandidateFault { controller, .. } => controller.controller_ready_timeout(),
+        }
+    }
+
+    fn coordinated_shutdown_budget(&self) -> Duration {
+        match self {
+            Self::Normal(controller) => controller.coordinated_shutdown_budget(),
+            #[cfg(feature = "qualification-fault-injection")]
+            Self::CandidateFault { controller, .. } => controller.coordinated_shutdown_budget(),
+        }
+    }
 }
 
 impl V2ControllerOwner {
@@ -57,19 +89,61 @@ impl V2ControllerOwner {
     where
         Config: Into<ControllerServerConfig>,
     {
-        let controller = controller.into();
-        let controller_ready_timeout = controller.controller_ready_timeout();
-        let shutdown_timeout = controller.coordinated_shutdown_budget();
+        Self::start_inner(
+            ControllerActorStart::Normal(controller.into()),
+            command_bind,
+            telemetry,
+        )
+        .await
+    }
+
+    /// Start the exact operator-supervised candidate owner with one typed,
+    /// one-shot serial fault. The production and commissioning config types
+    /// cannot call this API.
+    #[cfg(feature = "qualification-fault-injection")]
+    pub async fn start_operator_supervised_candidate_with_fault(
+        controller: ControllerServerConfigV2,
+        command_bind: SocketAddr,
+        fault: OperatorSupervisedCandidateSerialFaultInjection,
+    ) -> Result<Self, V2ControllerOwnerStartError> {
+        Self::start_inner(
+            ControllerActorStart::CandidateFault {
+                controller: controller.clone().into(),
+                candidate: controller,
+                fault,
+            },
+            command_bind,
+            Arc::new(NoopActuationTelemetry),
+        )
+        .await
+    }
+
+    async fn start_inner(
+        actor_start: ControllerActorStart,
+        command_bind: SocketAddr,
+        telemetry: Arc<dyn ActuationTelemetry>,
+    ) -> Result<Self, V2ControllerOwnerStartError> {
+        let controller_ready_timeout = actor_start.controller_ready_timeout();
+        let shutdown_timeout = actor_start.coordinated_shutdown_budget();
         let socket = actuation_v2::bind_udp_socket(command_bind)
             .await
             .map_err(V2ControllerOwnerStartError::CommandEndpoint)?;
         let command_address = socket
             .local_addr()
             .map_err(V2ControllerOwnerStartError::ReadBoundCommandAddress)?;
-        let (actuation, startup_ready, actuation_task) =
-            actuation_v2::start_serial_actor(controller, telemetry)
-                .await
-                .map_err(V2ControllerOwnerStartError::Controller)?;
+        let (actuation, startup_ready, actuation_task) = match actor_start {
+            ControllerActorStart::Normal(controller) => {
+                actuation_v2::start_serial_actor(controller, telemetry).await
+            }
+            #[cfg(feature = "qualification-fault-injection")]
+            ControllerActorStart::CandidateFault {
+                candidate, fault, ..
+            } => {
+                actuation_v2::start_candidate_serial_actor_with_fault(candidate, telemetry, fault)
+                    .await
+            }
+        }
+        .map_err(V2ControllerOwnerStartError::Controller)?;
         let owner =
             Self::from_acquired_resources(command_address, socket, actuation, actuation_task);
         match tokio::time::timeout(controller_ready_timeout, startup_ready).await {

@@ -40,9 +40,10 @@ use super::{
     OperatorConsoleBindError, OperatorConsoleCapabilityCleanupEvidence,
     OperatorConsoleCapabilityPersistError, OperatorConsolePersistedAccessCapability,
     OperatorConsoleSnapshot, WheelsOffQualificationConsoleHandle,
-    WheelsOffQualificationControlProfile, WheelsOffQualificationIntentRequestDto,
-    WheelsOffQualificationRequestParseError, WheelsOffQualificationRuntimeIngressState,
-    WheelsOffQualificationSnapshot, WheelsOffQualificationSubmitError,
+    WheelsOffQualificationControlProfile, WheelsOffQualificationFrontendConnectError,
+    WheelsOffQualificationIntentRequestDto, WheelsOffQualificationRequestParseError,
+    WheelsOffQualificationRuntimeIngressState, WheelsOffQualificationSnapshot,
+    WheelsOffQualificationSubmitError,
 };
 
 const ACCESS_CAPABILITY_BYTES: usize = 32;
@@ -159,7 +160,9 @@ impl WheelsOffQualificationTelemetryStore {
         initial_qualification: WheelsOffQualificationSnapshot,
     ) -> Result<Self, WheelsOffQualificationTelemetryError> {
         validate_observational_base(&initial_base)?;
-        if initial_qualification.schema_version != super::WHEELS_OFF_QUALIFICATION_SCHEMA_V1 {
+        if initial_qualification.schema_version
+            != super::WHEELS_OFF_QUALIFICATION_SNAPSHOT_SCHEMA_V2
+        {
             return Err(
                 WheelsOffQualificationTelemetryError::UnsupportedQualificationSchema(
                     initial_qualification.schema_version,
@@ -822,6 +825,9 @@ fn qualification_intent_response(
         Err(WheelsOffQualificationSubmitError::SoftwareSafetyStopLatched) => {
             error_response(StatusCode::LOCKED, "software_safety_stop_latched")
         }
+        Err(WheelsOffQualificationSubmitError::MotionAuthorityNotEnabled) => {
+            error_response(StatusCode::LOCKED, "motion_attestation_pending")
+        }
         Err(WheelsOffQualificationSubmitError::RuntimeReceiverDisconnected) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "runtime_receiver_disconnected",
@@ -1379,23 +1385,36 @@ impl WheelsOffQualificationFrontend {
             clock: config.clock,
             deadman_tick: config.deadman_tick,
         };
-        let http =
-            match WheelsOffQualificationHttpServer::start(http_config, console, telemetry, profile)
-            {
-                Ok(http) => http,
-                Err(source) => {
-                    return Err(WheelsOffQualificationFrontendStartError::Http {
-                        source,
-                        capability_cleanup: capability.cleanup(),
-                    });
-                }
-            };
-        Ok(Self {
+        let http = match WheelsOffQualificationHttpServer::start(
+            http_config,
+            console.clone(),
+            telemetry,
+            profile,
+        ) {
+            Ok(http) => http,
+            Err(source) => {
+                return Err(WheelsOffQualificationFrontendStartError::Http {
+                    source,
+                    capability_cleanup: capability.cleanup(),
+                });
+            }
+        };
+        let mut frontend = Self {
             bound_address: http.bound_address(),
             http: Some(http),
             capability: Some(capability),
             terminal_evidence: None,
-        })
+        };
+        if let Err(source) = console.admit_frontend_readiness() {
+            let frontend_shutdown = frontend.shutdown();
+            return Err(
+                WheelsOffQualificationFrontendStartError::ReadinessAdmission {
+                    source,
+                    frontend_shutdown,
+                },
+            );
+        }
+        Ok(frontend)
     }
 
     pub const fn bound_address(&self) -> SocketAddr {
@@ -1503,6 +1522,10 @@ pub enum WheelsOffQualificationFrontendStartError {
     ProfileMismatch,
     Telemetry(WheelsOffQualificationTelemetryError),
     Capability(OperatorConsoleCapabilityPersistError),
+    ReadinessAdmission {
+        source: WheelsOffQualificationFrontendConnectError,
+        frontend_shutdown: WheelsOffQualificationFrontendShutdownEvidence,
+    },
     Http {
         source: WheelsOffQualificationHttpServerStartError,
         capability_cleanup: OperatorConsoleCapabilityCleanupEvidence,
@@ -1517,6 +1540,13 @@ impl fmt::Display for WheelsOffQualificationFrontendStartError {
             }
             Self::Telemetry(source) => source.fmt(formatter),
             Self::Capability(source) => source.fmt(formatter),
+            Self::ReadinessAdmission {
+                source,
+                frontend_shutdown,
+            } => write!(
+                formatter,
+                "qualification frontend readiness admission failed: {source}; shutdown evidence: {frontend_shutdown:?}"
+            ),
             Self::Http {
                 source,
                 capability_cleanup,
@@ -1533,6 +1563,7 @@ impl std::error::Error for WheelsOffQualificationFrontendStartError {
         match self {
             Self::Telemetry(source) => Some(source),
             Self::Capability(source) => Some(source),
+            Self::ReadinessAdmission { source, .. } => Some(source),
             Self::Http { source, .. } => Some(source),
             Self::ProfileMismatch => None,
         }
@@ -1574,7 +1605,7 @@ impl WheelsOffQualificationFrontendShutdownEvidence {
 mod tests {
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1590,12 +1621,18 @@ mod tests {
         WheelsOffQualificationControlProfile::parse(30, 10, 250).unwrap()
     }
 
-    fn test_context() -> (
+    fn test_context_with_motion_authority(
+        motion_authority_enabled: bool,
+    ) -> (
         Arc<QualificationHttpContext>,
         super::super::WheelsOffQualificationIngressReceiver,
     ) {
         let profile = profile();
         let (console, receiver) = super::super::wheels_off_qualification_console(profile);
+        console.admit_frontend_readiness().unwrap();
+        if motion_authority_enabled {
+            console.enable_motion_authority().unwrap();
+        }
         let telemetry = WheelsOffQualificationTelemetryStore::parse(
             profile,
             OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
@@ -1619,6 +1656,13 @@ mod tests {
             }),
             receiver,
         )
+    }
+
+    fn test_context() -> (
+        Arc<QualificationHttpContext>,
+        super::super::WheelsOffQualificationIngressReceiver,
+    ) {
+        test_context_with_motion_authority(true)
     }
 
     fn api_request(method: Method, path: &str, body: Body) -> Request<Body> {
@@ -1813,6 +1857,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn frontend_rejects_motion_while_attestation_is_pending() {
+        let (context, mut receiver) = test_context_with_motion_authority(false);
+        let (session_id, session_capability) =
+            open_session(Arc::clone(&context), ConsoleSourceKind::Operator).await;
+        let begin = handle_qualification_request_inner(
+            authenticated_intent_request(
+                &session_id,
+                &session_capability,
+                1,
+                "{\"kind\":\"begin_manual\"}",
+            ),
+            Arc::clone(&context),
+        )
+        .await;
+        assert_eq!(begin.status(), StatusCode::LOCKED);
+        assert!(!context.console.snapshot().motion_authority_enabled);
+
+        let safety_stop = handle_qualification_request_inner(
+            authenticated_intent_request(
+                &session_id,
+                &session_capability,
+                1,
+                "{\"kind\":\"software_safety_stop\"}",
+            ),
+            Arc::clone(&context),
+        )
+        .await;
+        assert_eq!(safety_stop.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(super::super::WheelsOffQualificationIngressEvent::TerminalStop(_))
+        ));
+        assert!(context.console.snapshot().software_safety_stop_latched);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn adversarial_headers_content_types_and_bodies_are_rejected() {
         let (context, _receiver) = test_context();
 
@@ -1924,6 +2004,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn exact_grid_and_poisoned_telemetry_fail_closed_deterministically() {
         let (context, _receiver) = test_context();
+        let mut legacy_schema = context.console.snapshot();
+        legacy_schema.schema_version = super::super::WHEELS_OFF_QUALIFICATION_INTENT_SCHEMA_V1;
+        assert!(matches!(
+            WheelsOffQualificationTelemetryStore::parse(
+                profile(),
+                OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+                legacy_schema,
+            ),
+            Err(WheelsOffQualificationTelemetryError::UnsupportedQualificationSchema(1))
+        ));
         let mut wrong_schema = context.console.snapshot();
         wrong_schema.schema_version = 99;
         assert!(matches!(
@@ -2033,7 +2123,51 @@ mod tests {
     }
 
     #[test]
-    fn real_loopback_frontend_publishes_and_cleans_capability_with_shutdown_evidence() {
+    fn frontend_bind_failure_never_admits_console_readiness() {
+        let directory = PrivateTestDirectory::create();
+        let capability_path = directory.0.join("qualification.cap");
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let profile = profile();
+        let (console, _receiver) = super::super::wheels_off_qualification_console(profile);
+        let telemetry = WheelsOffQualificationTelemetryStore::parse(
+            profile,
+            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            console.snapshot(),
+        )
+        .unwrap();
+        let config = WheelsOffQualificationFrontendConfig::parse(
+            occupied.local_addr().unwrap(),
+            capability_path.clone(),
+            AgentControlMonotonicOrigin::new(
+                Instant::now(),
+                HostMonotonicTimestamp::from_nanos(1_000_000_000),
+            ),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            WheelsOffQualificationFrontend::start(&config, console.clone(), telemetry, profile),
+            Err(WheelsOffQualificationFrontendStartError::Http {
+                source: WheelsOffQualificationHttpServerStartError::Bind(_),
+                ..
+            })
+        ));
+        assert!(!capability_path.exists());
+        assert_eq!(
+            console.snapshot().frontend_state,
+            super::super::WheelsOffQualificationFrontendState::AwaitingConnection
+        );
+        assert_eq!(
+            console.enable_motion_authority(),
+            Err(
+                super::super::WheelsOffQualificationMotionAuthorityEnableError::FrontendNotConnected
+            )
+        );
+    }
+
+    #[test]
+    fn frontend_exit_while_attestation_is_pending_is_observable_and_blocks_enable() {
         let directory = PrivateTestDirectory::create();
         let capability_path = directory.0.join("qualification.cap");
         let profile = profile();
@@ -2055,7 +2189,8 @@ mod tests {
         )
         .unwrap();
         let mut frontend =
-            WheelsOffQualificationFrontend::start(&config, console, telemetry, profile).unwrap();
+            WheelsOffQualificationFrontend::start(&config, console.clone(), telemetry, profile)
+                .unwrap();
         assert!(frontend.bound_address().ip().is_loopback());
         assert_eq!(
             fs::metadata(&capability_path).unwrap().mode() & 0o7777,
@@ -2073,7 +2208,18 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("\"http_ready\":true"));
 
-        let evidence = frontend.shutdown();
+        frontend.request_shutdown();
+        let poll_deadline = Instant::now() + Duration::from_secs(2);
+        let evidence = loop {
+            if let Some(evidence) = frontend.poll_unexpected_exit() {
+                break evidence;
+            }
+            assert!(
+                Instant::now() < poll_deadline,
+                "frontend owner did not expose terminal evidence"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
         let exit = evidence.http().unwrap();
         assert!(exit.graceful_shutdown);
         assert!(!exit.forced_shutdown);
@@ -2085,5 +2231,15 @@ mod tests {
             )
         ));
         assert!(!capability_path.exists());
+        assert_eq!(
+            console.snapshot().frontend_state,
+            super::super::WheelsOffQualificationFrontendState::Disconnected
+        );
+        assert_eq!(
+            console.enable_motion_authority(),
+            Err(
+                super::super::WheelsOffQualificationMotionAuthorityEnableError::FrontendDisconnected
+            )
+        );
     }
 }

@@ -40,26 +40,26 @@ use super::nano_bootstrap::{
 };
 use super::{
     AdmittedOakSuperSpeedEvidence, CandidateActuationSessionStartError, CandidateMpcBindingError,
-    CandidateRuntimeServiceIntervalError, HeadGazePolicyParseError, HeadGazePolicyV1,
-    LoadedNanoWheelsOffQualificationLaunchV4, ManifestBoundNanoAgentPolicyConfigV3,
-    NanoAccessoryManifestBindingError, NanoAgentPolicyConfigParseError, NanoAgentPolicyConfigV3,
-    NanoBootstrapAccessoryEvidence, NanoBootstrapOakCloseDisposition, NanoBootstrapPrimaryError,
-    NanoBootstrapRootError, NanoBootstrapRoots, NanoBootstrapStereoEvidence,
-    NanoCalibrationArtifactParseError, NanoCalibrationArtifactV1, NanoCalibrationBindingError,
-    NanoFaceCascadeAssetRole, NanoLaunchBoundAssetLoadError, NanoObservedInventoryBuildError,
-    NanoObservedInventoryBuilder, NanoObservedInventoryEvidenceError,
-    NanoWheelsOffMappedImageError, NanoWheelsOffNativeRuntimeBindingError,
-    NanoWheelsOffNativeRuntimeParseError, NanoWheelsOffNativeRuntimeV1,
-    NanoWheelsOffNativeRuntimeVerificationError, NanoWheelsOffQualificationAssetRole,
-    NanoWheelsOffQualificationLaunchLoadError, NanoWheelsOffQualificationLaunchV4,
-    NanoWheelsOffQualificationV4AssetRole, ParsedNanoLiveConfiguration,
-    ShadowNavigationConfigParseError, ShadowNavigationConfigV1,
+    CandidateRuntimeServiceIntervalError, HeadGazePolicyLifecycleClaim, HeadGazePolicyParseError,
+    HeadGazePolicyV1, LoadedNanoWheelsOffQualificationLaunchV4,
+    ManifestBoundNanoAgentPolicyConfigV3, NanoAccessoryManifestBindingError,
+    NanoAgentPolicyConfigParseError, NanoAgentPolicyConfigV3, NanoBootstrapAccessoryEvidence,
+    NanoBootstrapOakCloseDisposition, NanoBootstrapPrimaryError, NanoBootstrapRootError,
+    NanoBootstrapRoots, NanoBootstrapStereoEvidence, NanoCalibrationArtifactParseError,
+    NanoCalibrationArtifactV1, NanoCalibrationBindingError, NanoFaceCascadeAssetRole,
+    NanoLaunchBoundAssetLoadError, NanoObservedInventoryBuildError, NanoObservedInventoryBuilder,
+    NanoObservedInventoryEvidenceError, NanoWheelsOffMappedImageError,
+    NanoWheelsOffNativeRuntimeBindingError, NanoWheelsOffNativeRuntimeParseError,
+    NanoWheelsOffNativeRuntimeV1, NanoWheelsOffNativeRuntimeVerificationError,
+    NanoWheelsOffQualificationAssetRole, NanoWheelsOffQualificationLaunchLoadError,
+    NanoWheelsOffQualificationLaunchV4, NanoWheelsOffQualificationV4AssetRole,
+    ParsedNanoLiveConfiguration, ShadowNavigationConfigParseError, ShadowNavigationConfigV1,
     StoppedWheelsOffCandidateController, VerifiedNanoWheelsOffMappedImages,
     VerifiedNanoWheelsOffNativeRuntimeDependencies, WheelsOffCandidateActuationSession,
     WheelsOffCandidateControllerBinding, WheelsOffCandidateControllerBindingError,
     WheelsOffCandidateLimits, WheelsOffCandidatePolicyError,
-    WheelsOffCandidateRuntimeServiceInterval, load_nano_wheels_off_qualification_launch_v4,
-    verify_linux_mapped_qualification_images,
+    WheelsOffCandidateRuntimeServiceInterval, WheelsOffQualificationFaultInjection,
+    load_nano_wheels_off_qualification_launch_v4, verify_linux_mapped_qualification_images,
 };
 use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
 use crate::live_runtime::LiveOccupancyHostPolicy;
@@ -70,6 +70,7 @@ pub struct QualificationBootstrapRequest<'running> {
     roots: NanoBootstrapRoots,
     launch_relative_path: ArtifactRelativePath,
     controller_clock_origin: Instant,
+    fault_injection: Option<WheelsOffQualificationFaultInjection>,
     running: &'running AtomicBool,
 }
 
@@ -79,6 +80,7 @@ impl<'running> QualificationBootstrapRequest<'running> {
         state_root: PathBuf,
         launch_relative_path: String,
         controller_clock_origin: Instant,
+        fault_injection: Option<WheelsOffQualificationFaultInjection>,
         running: &'running AtomicBool,
     ) -> Result<Self, QualificationBootstrapRequestError> {
         Ok(Self {
@@ -87,6 +89,7 @@ impl<'running> QualificationBootstrapRequest<'running> {
             launch_relative_path: ArtifactRelativePath::parse(launch_relative_path)
                 .map_err(QualificationBootstrapRequestError::LaunchRelativePath)?,
             controller_clock_origin,
+            fault_injection,
             running,
         })
     }
@@ -97,6 +100,10 @@ impl<'running> QualificationBootstrapRequest<'running> {
 
     pub const fn launch_relative_path(&self) -> &ArtifactRelativePath {
         &self.launch_relative_path
+    }
+
+    pub const fn fault_injection(&self) -> Option<WheelsOffQualificationFaultInjection> {
+        self.fault_injection
     }
 }
 
@@ -133,7 +140,7 @@ pub struct LoadedNanoWheelsOffQualificationAssets {
     pub native_runtime: NanoWheelsOffNativeRuntimeV1,
     pub native_runtime_dependency_identities: VerifiedNanoWheelsOffNativeRuntimeDependencies,
     pub agent_policy: LoadedDeploymentAsset,
-    pub head_gaze_policy: LoadedDeploymentAsset,
+    pub head_gaze_policy: Option<LoadedDeploymentAsset>,
     pub frontal_face_cascade: LoadedDeploymentAsset,
     pub profile_face_cascade: LoadedDeploymentAsset,
     pub navigation_shadow_config: LoadedDeploymentAsset,
@@ -165,10 +172,12 @@ impl LoadedNanoWheelsOffQualificationAssets {
         let load_v4 = |role| {
             launch
                 .v4_asset(role)
-                .load_exact(deployment_root)
-                .map_err(
-                    |source| QualificationBootstrapPrimaryError::V4BoundAssetLoad { role, source },
-                )
+                .map(|asset| {
+                    asset.load_exact(deployment_root).map_err(|source| {
+                        QualificationBootstrapPrimaryError::V4BoundAssetLoad { role, source }
+                    })
+                })
+                .transpose()
         };
         let load_face = |role| {
             launch
@@ -220,7 +229,9 @@ impl LoadedNanoWheelsOffQualificationAssets {
                     .chain(
                         NanoWheelsOffQualificationV4AssetRole::ALL
                             .into_iter()
-                            .map(|role| launch.v4_asset(role).relative_path()),
+                            .filter_map(|role| {
+                                launch.v4_asset(role).map(|asset| asset.relative_path())
+                            }),
                     )
                     .chain(
                         NanoFaceCascadeAssetRole::ALL
@@ -435,7 +446,7 @@ pub struct PreparedNanoWheelsOffQualificationBootstrap {
     pub roots: NanoBootstrapRoots,
     pub launch: LoadedNanoWheelsOffQualificationLaunchV4,
     pub assets: LoadedNanoWheelsOffQualificationAssets,
-    pub head_gaze_policy: HeadGazePolicyV1,
+    pub head_gaze_policy: Option<QualificationHeadGazeProposalOnlyPolicy>,
     pub manifest: LoadedExpectedManifestV2,
     pub policy: ManifestBoundNanoAgentPolicyConfigV3,
     pub calibration: NanoCalibrationArtifactV1,
@@ -454,6 +465,63 @@ pub struct PreparedNanoWheelsOffQualificationBootstrap {
     pub initial_stop: DisarmReceipt,
     pub stopped_controller: StoppedWheelsOffCandidateController,
     pub oak: Device,
+}
+
+/// A qualification head-gaze policy whose lifecycle was parsed as
+/// proposal-only before any hardware was opened.
+///
+/// This is metadata for a future adapter. Its presence grants no torque,
+/// motion, or head-command authority.
+#[derive(Debug, PartialEq)]
+pub struct QualificationHeadGazeProposalOnlyPolicy {
+    policy: HeadGazePolicyV1,
+}
+
+impl QualificationHeadGazeProposalOnlyPolicy {
+    pub const fn policy(&self) -> &HeadGazePolicyV1 {
+        &self.policy
+    }
+}
+
+impl TryFrom<HeadGazePolicyV1> for QualificationHeadGazeProposalOnlyPolicy {
+    type Error = QualificationHeadGazePolicyAdmissionError;
+
+    fn try_from(policy: HeadGazePolicyV1) -> Result<Self, Self::Error> {
+        if !matches!(
+            policy.lifecycle(),
+            HeadGazePolicyLifecycleClaim::ProposalOnly(_)
+        ) {
+            return Err(QualificationHeadGazePolicyAdmissionError::NotProposalOnly);
+        }
+        Ok(Self { policy })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualificationHeadGazePolicyAdmissionError {
+    NotProposalOnly,
+}
+
+impl fmt::Display for QualificationHeadGazePolicyAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .write_str("qualification head-gaze policy must retain the proposal-only lifecycle")
+    }
+}
+
+impl std::error::Error for QualificationHeadGazePolicyAdmissionError {}
+
+fn parse_qualification_head_gaze_policy(
+    asset: Option<&LoadedDeploymentAsset>,
+) -> Result<Option<QualificationHeadGazeProposalOnlyPolicy>, QualificationBootstrapPrimaryError> {
+    let Some(asset) = asset else {
+        return Ok(None);
+    };
+    let policy = HeadGazePolicyV1::parse_json(asset.bytes())
+        .map_err(QualificationBootstrapPrimaryError::HeadGazePolicy)?;
+    QualificationHeadGazeProposalOnlyPolicy::try_from(policy)
+        .map(Some)
+        .map_err(QualificationBootstrapPrimaryError::HeadGazePolicyAdmission)
 }
 
 /// Prepared qualification bootstrap plus the sole in-process STM32/UDP owner.
@@ -489,6 +557,7 @@ pub async fn bootstrap_nano_wheels_off_qualification(
         roots,
         launch_relative_path,
         controller_clock_origin,
+        fault_injection,
         running,
     } = request;
 
@@ -505,8 +574,7 @@ pub async fn bootstrap_nano_wheels_off_qualification(
     let assets =
         LoadedNanoWheelsOffQualificationAssets::load(roots.deployment_root(), launch.launch())
             .map_err(QualificationBootstrapError::before_hardware)?;
-    let head_gaze_policy = HeadGazePolicyV1::parse_json(assets.head_gaze_policy.bytes())
-        .map_err(QualificationBootstrapPrimaryError::HeadGazePolicy)
+    let head_gaze_policy = parse_qualification_head_gaze_policy(assets.head_gaze_policy.as_ref())
         .map_err(QualificationBootstrapError::before_hardware)?;
 
     let parsed_policy = NanoAgentPolicyConfigV3::parse_json(assets.agent_policy.bytes())
@@ -697,12 +765,19 @@ pub async fn bootstrap_nano_wheels_off_qualification(
 
     let controller_serial_device = controller_server.serial_device().to_path_buf();
     let controller_owner_shutdown_timeout = controller_server.coordinated_shutdown_budget();
-    let controller_owner = match V2ControllerOwner::start(
-        controller_server,
-        launch.launch().controller_server().command_udp_endpoint(),
-    )
-    .await
-    {
+    let command_endpoint = launch.launch().controller_server().command_udp_endpoint();
+    let controller_owner_result = match fault_injection.and_then(|fault| fault.serial_fault()) {
+        Some(fault) => {
+            V2ControllerOwner::start_operator_supervised_candidate_with_fault(
+                controller_server,
+                command_endpoint,
+                fault,
+            )
+            .await
+        }
+        None => V2ControllerOwner::start(controller_server, command_endpoint).await,
+    };
+    let controller_owner = match controller_owner_result {
         Ok(owner) => owner,
         Err(source) => {
             return Err(close_oak_after_failure(
@@ -713,9 +788,10 @@ pub async fn bootstrap_nano_wheels_off_qualification(
     };
     let observed_command_endpoint = controller_owner.command_address();
 
-    let session = match WheelsOffCandidateActuationSession::acquire(
+    let session = match WheelsOffCandidateActuationSession::acquire_with_clock_fault(
         candidate_admission,
         controller_clock_origin,
+        fault_injection.and_then(WheelsOffQualificationFaultInjection::host_clock_fault),
     ) {
         Ok(session) => session,
         Err(source) => {
@@ -1507,6 +1583,7 @@ pub enum QualificationBootstrapPrimaryError {
     MappedImages(NanoWheelsOffMappedImageError),
     AgentPolicy(NanoAgentPolicyConfigParseError),
     HeadGazePolicy(HeadGazePolicyParseError),
+    HeadGazePolicyAdmission(QualificationHeadGazePolicyAdmissionError),
     ManifestPathMismatch {
         launch: PathBuf,
         policy: PathBuf,
@@ -1635,6 +1712,7 @@ impl std::error::Error for QualificationBootstrapPrimaryError {
             Self::MappedImages(source) => Some(source),
             Self::AgentPolicy(source) => Some(source),
             Self::HeadGazePolicy(source) => Some(source),
+            Self::HeadGazePolicyAdmission(source) => Some(source),
             Self::Manifest(source) => Some(source),
             Self::AccessoryManifestBinding(source) => Some(source),
             Self::ArtifactHash(source) => Some(source),

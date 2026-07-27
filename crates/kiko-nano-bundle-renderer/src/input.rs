@@ -7,7 +7,7 @@ use kiko_expression_runtime::{
     CameraToHeadGazeExtrinsics, CameraToHeadGazeExtrinsicsInput, MotionThresholds, SamplingGeometry,
 };
 use robot_protocol::v2::ControllerCapabilities;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const PRODUCTION_RENDER_INPUT_SCHEMA_VERSION: u32 = 1;
 pub const WHEELS_OFF_QUALIFICATION_RENDER_INPUT_SCHEMA_VERSION: u32 = 4;
@@ -142,7 +142,31 @@ struct AssetSetDto {
     superpoint_model: FileSourceDto,
     lightglue_model: FileSourceDto,
     face_perception: Option<FacePerceptionAssetsDto>,
-    head_gaze_policy_source_path: Option<PathBuf>,
+    #[serde(default)]
+    head_gaze_policy_source_path: JsonFieldPresence<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+enum JsonFieldPresence<T> {
+    #[default]
+    Absent,
+    Null,
+    Value(T),
+}
+
+impl<'de, T> Deserialize<'de> for JsonFieldPresence<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -381,7 +405,7 @@ pub(crate) enum BundleSelection {
     WheelsOffQualification {
         qualification_executable_path: AbsoluteSourcePath,
         face_perception: FacePerceptionAssets,
-        head_gaze_policy_source_path: AbsoluteSourcePath,
+        head_gaze_policy_source_path: Option<AbsoluteSourcePath>,
     },
     Production {
         production_controller_profile_path: Option<AbsoluteSourcePath>,
@@ -427,7 +451,7 @@ impl BundleSelection {
             Self::WheelsOffQualification {
                 head_gaze_policy_source_path,
                 ..
-            } => Some(head_gaze_policy_source_path),
+            } => head_gaze_policy_source_path.as_ref(),
             Self::Production { .. } => None,
         }
     }
@@ -648,21 +672,32 @@ impl RenderInput {
         let bundle = match dto.bundle {
             BundleSelectionDto::WheelsOffQualification {
                 qualification_executable_path,
-            } => BundleSelection::WheelsOffQualification {
-                qualification_executable_path: parse_absolute_source_path(
-                    "bundle.qualification_executable_path",
-                    qualification_executable_path
-                        .ok_or(InputError::QualificationExecutablePathRequired)?,
-                )?,
-                face_perception: face_perception
-                    .ok_or(InputError::QualificationFacePerceptionAssetsRequired)?,
-                head_gaze_policy_source_path: head_gaze_policy_source_path
-                    .ok_or(InputError::QualificationHeadGazePolicyRequired)?,
-            },
+            } => {
+                let head_gaze_policy_source_path = match head_gaze_policy_source_path {
+                    JsonFieldPresence::Absent => None,
+                    JsonFieldPresence::Null => {
+                        return Err(InputError::QualificationHeadGazePolicyNullForbidden);
+                    }
+                    JsonFieldPresence::Value(path) => Some(parse_absolute_source_path(
+                        "assets.head_gaze_policy_source_path",
+                        path,
+                    )?),
+                };
+                BundleSelection::WheelsOffQualification {
+                    qualification_executable_path: parse_absolute_source_path(
+                        "bundle.qualification_executable_path",
+                        qualification_executable_path
+                            .ok_or(InputError::QualificationExecutablePathRequired)?,
+                    )?,
+                    face_perception: face_perception
+                        .ok_or(InputError::QualificationFacePerceptionAssetsRequired)?,
+                    head_gaze_policy_source_path,
+                }
+            }
             BundleSelectionDto::Production {
                 production_controller_profile_path,
             } => {
-                if head_gaze_policy_source_path.is_some() {
+                if !matches!(head_gaze_policy_source_path, JsonFieldPresence::Absent) {
                     return Err(InputError::QualificationHeadGazePolicyForbiddenInProduction);
                 }
                 BundleSelection::Production {
@@ -831,7 +866,7 @@ impl AssetSet {
         (
             Self,
             Option<FacePerceptionAssets>,
-            Option<AbsoluteSourcePath>,
+            JsonFieldPresence<PathBuf>,
         ),
         InputError,
     > {
@@ -850,10 +885,6 @@ impl AssetSet {
                 })
             })
             .transpose()?;
-        let head_gaze_policy_source_path = dto
-            .head_gaze_policy_source_path
-            .map(|path| parse_absolute_source_path("assets.head_gaze_policy_source_path", path))
-            .transpose()?;
         Ok((
             Self {
                 calibration: parse_artifact_source("assets.calibration", dto.calibration)?,
@@ -869,7 +900,7 @@ impl AssetSet {
                 lightglue_model: parse_file_source("assets.lightglue_model", dto.lightglue_model)?,
             },
             face_perception,
-            head_gaze_policy_source_path,
+            dto.head_gaze_policy_source_path,
         ))
     }
 }
@@ -2039,7 +2070,7 @@ pub enum InputError {
     WarmStartForbiddenInQualification,
     ProductionFacePerceptionAssetsRequired,
     QualificationFacePerceptionAssetsRequired,
-    QualificationHeadGazePolicyRequired,
+    QualificationHeadGazePolicyNullForbidden,
     QualificationHeadGazePolicyForbiddenInProduction,
     QualificationExecutablePathRequired,
 }
@@ -2177,8 +2208,8 @@ impl fmt::Display for InputError {
             Self::QualificationFacePerceptionAssetsRequired => formatter.write_str(
                 "wheels-off qualification requires exact frontal and profile face-cascade sources",
             ),
-            Self::QualificationHeadGazePolicyRequired => formatter.write_str(
-                "wheels-off qualification requires an exact head-gaze policy source",
+            Self::QualificationHeadGazePolicyNullForbidden => formatter.write_str(
+                "wheels-off qualification head-gaze policy must be omitted to disable it; explicit null is forbidden",
             ),
             Self::QualificationHeadGazePolicyForbiddenInProduction => formatter.write_str(
                 "qualification-only head-gaze policy input is forbidden in production render-input V1",

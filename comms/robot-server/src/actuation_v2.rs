@@ -39,6 +39,8 @@ use tokio_serial::{
 use crate::config::ControllerServerConfig;
 #[cfg(test)]
 use crate::config::ControllerServerConfigV1;
+#[cfg(feature = "qualification-fault-injection")]
+use crate::config::ControllerServerConfigV2;
 use crate::config::CONTROLLER_SERIAL_BAUD_BPS;
 use crate::deadline::{
     conservative_remaining_lease, translate_command_deadline, HeartbeatClockSample,
@@ -52,6 +54,84 @@ const INACTIVE_TIMER_SLEEP: Duration = Duration::from_secs(24 * 60 * 60);
 const UDP_EMISSION_QUANTIZATION_MARGIN_MS: u64 = 1;
 const SERIAL_READ_TURN_BYTES: usize = robot_protocol::v2::MAX_UART_RECORD_BYTES;
 const UART_RECORD_DELIMITER: [u8; 1] = [0];
+#[cfg(feature = "qualification-fault-injection")]
+const QUALIFICATION_PARTIAL_UART_PREFIX_BYTES: usize = 1;
+
+/// Candidate-only, one-shot serial corruption used by the attended
+/// wheels-off qualifier.
+///
+/// The only variant has no free-form byte count: it writes exactly one
+/// non-delimiter byte from the first nonzero translated `ApplyPwm`, then the actor's
+/// typed recovery path re-delimits the stream and issues `ForceStop`.
+#[cfg(feature = "qualification-fault-injection")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorSupervisedCandidateSerialFaultInjection {
+    PartialUartRecordOnFirstNonzeroCommand,
+}
+
+#[cfg(feature = "qualification-fault-injection")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QualificationPartialUartRecordPrefix([u8; QUALIFICATION_PARTIAL_UART_PREFIX_BYTES]);
+
+#[cfg(feature = "qualification-fault-injection")]
+impl QualificationPartialUartRecordPrefix {
+    fn from_encoded_record(
+        record: &UartRecord,
+    ) -> Result<Self, QualificationPartialUartRecordPrefixError> {
+        let bytes = record.as_bytes();
+        if bytes.len() <= QUALIFICATION_PARTIAL_UART_PREFIX_BYTES {
+            return Err(QualificationPartialUartRecordPrefixError::RecordTooShort {
+                actual_bytes: bytes.len(),
+            });
+        }
+        let prefix = [bytes[0]];
+        if prefix[0] == UART_RECORD_DELIMITER[0] {
+            return Err(QualificationPartialUartRecordPrefixError::StartsWithDelimiter);
+        }
+        Ok(Self(prefix))
+    }
+
+    const fn as_bytes(&self) -> &[u8; QUALIFICATION_PARTIAL_UART_PREFIX_BYTES] {
+        &self.0
+    }
+}
+
+#[cfg(feature = "qualification-fault-injection")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualificationPartialUartRecordPrefixError {
+    RecordTooShort { actual_bytes: usize },
+    StartsWithDelimiter,
+}
+
+#[cfg(feature = "qualification-fault-injection")]
+impl fmt::Display for QualificationPartialUartRecordPrefixError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "encoded qualification UART record cannot supply a strict partial prefix: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "qualification-fault-injection")]
+impl std::error::Error for QualificationPartialUartRecordPrefixError {}
+
+#[cfg(feature = "qualification-fault-injection")]
+fn qualification_partial_uart_record_error(
+    logical_record_bytes: usize,
+    prefix_result: Result<(), SerialTransmitError>,
+) -> SerialTransmitError {
+    debug_assert!(logical_record_bytes > QUALIFICATION_PARTIAL_UART_PREFIX_BYTES);
+    let prefix_outcome = match prefix_result {
+        Ok(()) => QualificationPartialUartPrefixTransmitOutcome::Transmitted,
+        Err(source) => QualificationPartialUartPrefixTransmitOutcome::Uncertain(Box::new(source)),
+    };
+    SerialTransmitError::QualificationPartialRecord {
+        prefix_bytes_may_have_reached_transport: QUALIFICATION_PARTIAL_UART_PREFIX_BYTES,
+        logical_record_bytes,
+        prefix_outcome,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActuationSnapshot {
@@ -773,6 +853,13 @@ pub enum ActuationActorError {
         interrupted: SerialTransmitError,
         recovery: Box<ShutdownInterruptedTransmitRecovery>,
     },
+    #[cfg(feature = "qualification-fault-injection")]
+    QualificationPartialUartRecordInjected {
+        interrupted: SerialTransmitError,
+        recovery: Box<QualificationPartialUartRecordInjectionRecovery>,
+    },
+    #[cfg(feature = "qualification-fault-injection")]
+    QualificationPartialUartRecordInvariant(QualificationPartialUartRecordPrefixError),
     ShutdownStopConfirmationTimedOut {
         maximum_wait: Duration,
     },
@@ -800,6 +887,16 @@ impl fmt::Display for ActuationActorError {
                 formatter,
                 "{interrupted}; bounded shutdown recovery preserved that uncertainty and reported {recovery}"
             ),
+            #[cfg(feature = "qualification-fault-injection")]
+            Self::QualificationPartialUartRecordInjected {
+                interrupted,
+                recovery,
+            } => write!(
+                formatter,
+                "qualification injected {interrupted}; bounded delimiter/ForceStop recovery reported {recovery}"
+            ),
+            #[cfg(feature = "qualification-fault-injection")]
+            Self::QualificationPartialUartRecordInvariant(source) => source.fmt(formatter),
             Self::ShutdownStopConfirmationTimedOut { maximum_wait } => write!(
                 formatter,
                 "shutdown ForceStop had no exact controller confirmation within {maximum_wait:?}; physical stop remains uncertain"
@@ -824,6 +921,10 @@ impl std::error::Error for ActuationActorError {
             Self::SerialRead(source) => Some(source),
             Self::SerialTransmit(source) => Some(source),
             Self::ShutdownInterruptedTransmit { interrupted, .. } => Some(interrupted),
+            #[cfg(feature = "qualification-fault-injection")]
+            Self::QualificationPartialUartRecordInjected { interrupted, .. } => Some(interrupted),
+            #[cfg(feature = "qualification-fault-injection")]
+            Self::QualificationPartialUartRecordInvariant(source) => Some(source),
             Self::Encode(source) => Some(source),
             Self::SerialEof
             | Self::ShutdownStopConfirmationTimedOut { .. }
@@ -884,6 +985,37 @@ impl fmt::Display for ShutdownInterruptedTransmitRecovery {
     }
 }
 
+/// Exact recovery evidence after the qualification actor intentionally wrote
+/// one byte of a nonzero command record.
+#[cfg(feature = "qualification-fault-injection")]
+#[derive(Debug)]
+pub struct QualificationPartialUartRecordInjectionRecovery {
+    resynchronization: SerialResynchronizationOutcome,
+    force_stop: ShutdownForceStopOutcome,
+}
+
+#[cfg(feature = "qualification-fault-injection")]
+impl QualificationPartialUartRecordInjectionRecovery {
+    pub const fn resynchronization(&self) -> &SerialResynchronizationOutcome {
+        &self.resynchronization
+    }
+
+    pub const fn force_stop(&self) -> &ShutdownForceStopOutcome {
+        &self.force_stop
+    }
+}
+
+#[cfg(feature = "qualification-fault-injection")]
+impl fmt::Display for QualificationPartialUartRecordInjectionRecovery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "resynchronization={:?}, force_stop={:?}",
+            self.resynchronization, self.force_stop
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SerialTransmitPhase {
     Write,
@@ -895,6 +1027,29 @@ pub enum SerialTransmitInterruption {
     DeadlineExceeded,
     ShutdownRequested,
     PriorityStopRequested,
+}
+
+/// What the serial API reported after the qualification actor attempted its
+/// one-byte unterminated prefix.
+///
+/// A write error cannot prove that the byte did not cross the host/driver
+/// boundary, so every failure is retained as uncertain. Recovery therefore
+/// always treats the logical command record as possibly started.
+#[cfg(feature = "qualification-fault-injection")]
+#[derive(Debug)]
+pub enum QualificationPartialUartPrefixTransmitOutcome {
+    Transmitted,
+    Uncertain(Box<SerialTransmitError>),
+}
+
+#[cfg(feature = "qualification-fault-injection")]
+impl fmt::Display for QualificationPartialUartPrefixTransmitOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transmitted => formatter.write_str("prefix transport completed"),
+            Self::Uncertain(source) => write!(formatter, "prefix transport uncertain: {source}"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -914,6 +1069,12 @@ pub enum SerialTransmitError {
         written_bytes: usize,
         record_bytes: usize,
         maximum_duration: Duration,
+    },
+    #[cfg(feature = "qualification-fault-injection")]
+    QualificationPartialRecord {
+        prefix_bytes_may_have_reached_transport: usize,
+        logical_record_bytes: usize,
+        prefix_outcome: QualificationPartialUartPrefixTransmitOutcome,
     },
 }
 
@@ -945,6 +1106,15 @@ impl fmt::Display for SerialTransmitError {
                 formatter,
                 "controller serial {phase:?} was interrupted by {cause:?} after {written_bytes}/{record_bytes} record bytes (transmit bound {maximum_duration:?}); controller receipt and stop state are uncertain"
             ),
+            #[cfg(feature = "qualification-fault-injection")]
+            Self::QualificationPartialRecord {
+                prefix_bytes_may_have_reached_transport,
+                logical_record_bytes,
+                prefix_outcome,
+            } => write!(
+                formatter,
+                "qualification UART injection attempted an unterminated {prefix_bytes_may_have_reached_transport}-byte prefix of a {logical_record_bytes}-byte logical command record; the prefix may have reached the transport ({prefix_outcome}), so controller receipt and stop state are uncertain"
+            ),
         }
     }
 }
@@ -954,6 +1124,16 @@ impl std::error::Error for SerialTransmitError {
         match self {
             Self::Write { source, .. } | Self::Flush { source, .. } => Some(source),
             Self::Interrupted { .. } => None,
+            #[cfg(feature = "qualification-fault-injection")]
+            Self::QualificationPartialRecord {
+                prefix_outcome: QualificationPartialUartPrefixTransmitOutcome::Uncertain(source),
+                ..
+            } => Some(source.as_ref()),
+            #[cfg(feature = "qualification-fault-injection")]
+            Self::QualificationPartialRecord {
+                prefix_outcome: QualificationPartialUartPrefixTransmitOutcome::Transmitted,
+                ..
+            } => None,
         }
     }
 }
@@ -980,15 +1160,24 @@ impl SerialTransmitError {
     }
 
     const fn left_partial_record(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Interrupted {
                 phase: SerialTransmitPhase::Write,
                 written_bytes,
                 record_bytes,
                 ..
-            } if *written_bytes > 0 && *written_bytes < *record_bytes
-        )
+            } => *written_bytes > 0 && *written_bytes < *record_bytes,
+            #[cfg(feature = "qualification-fault-injection")]
+            Self::QualificationPartialRecord {
+                prefix_bytes_may_have_reached_transport,
+                logical_record_bytes,
+                ..
+            } => {
+                *prefix_bytes_may_have_reached_transport > 0
+                    && *prefix_bytes_may_have_reached_transport < *logical_record_bytes
+            }
+            Self::Write { .. } | Self::Flush { .. } | Self::Interrupted { .. } => false,
+        }
     }
 }
 
@@ -1005,6 +1194,25 @@ pub(crate) async fn start_serial_actor(
     telemetry: Arc<dyn ActuationTelemetry>,
 ) -> Result<StartedActuationActor, ActuationStartError> {
     let actor_config = ActorConfig::from_server_config(&config)?;
+    start_serial_actor_inner_with_config(config, telemetry, actor_config).await
+}
+
+#[cfg(feature = "qualification-fault-injection")]
+pub(crate) async fn start_candidate_serial_actor_with_fault(
+    config: ControllerServerConfigV2,
+    telemetry: Arc<dyn ActuationTelemetry>,
+    fault: OperatorSupervisedCandidateSerialFaultInjection,
+) -> Result<StartedActuationActor, ActuationStartError> {
+    let config = ControllerServerConfig::from(config);
+    let actor_config = ActorConfig::from_server_config_with_fault(&config, Some(fault))?;
+    start_serial_actor_inner_with_config(config, telemetry, actor_config).await
+}
+
+async fn start_serial_actor_inner_with_config(
+    config: ControllerServerConfig,
+    telemetry: Arc<dyn ActuationTelemetry>,
+    actor_config: ActorConfig,
+) -> Result<StartedActuationActor, ActuationStartError> {
     let device = config
         .serial_device()
         .to_str()
@@ -1091,9 +1299,49 @@ struct ActorConfig {
     expected_physical_stop_semantics: PhysicalStopSemantics,
     controller_session_class: ControllerSessionClass,
     maximum_command_step_percent: Option<u8>,
+    #[cfg(feature = "qualification-fault-injection")]
+    qualification_serial_fault: Option<OperatorSupervisedCandidateSerialFaultInjection>,
 }
 
 impl ActorConfig {
+    #[cfg(feature = "qualification-fault-injection")]
+    fn from_server_config(config: &ControllerServerConfig) -> Result<Self, ActuationStartError> {
+        Self::from_server_config_with_fault(config, None)
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    fn from_server_config_with_fault(
+        config: &ControllerServerConfig,
+        qualification_serial_fault: Option<OperatorSupervisedCandidateSerialFaultInjection>,
+    ) -> Result<Self, ActuationStartError> {
+        let heartbeat_ms = u16::try_from(config.heartbeat_period().as_millis())
+            .map_err(|_| ActuationStartError::InvalidHeartbeatPeriod)?;
+        let heartbeat_period = HeartbeatPeriodMs::try_new(heartbeat_ms)
+            .map_err(|_| ActuationStartError::InvalidHeartbeatPeriod)?;
+        Ok(Self {
+            controller_uid: config.controller_uid(),
+            firmware_abi: config.firmware_abi().get(),
+            firmware_build_id: config.firmware_build_id().get(),
+            actuator_config_fingerprint: config.actuator_config_fingerprint(),
+            heartbeat_period,
+            maximum_heartbeat_age: config.maximum_heartbeat_age(),
+            minimum_host_command_interval: config.minimum_host_command_interval(),
+            serial_transmit_timeout: config.serial_transmit_timeout(),
+            serial_applied_ack_timeout: config.serial_applied_ack_timeout(),
+            controller_clock_abs_error_ppm_bound: config.controller_clock_abs_error_ppm_bound(),
+            deadline_quantization_margin_ms: config.deadline_quantization_margin_ms(),
+            expected_max_abs_pwm_percent: config.expected_max_abs_pwm_percent(),
+            expected_pwm_frequency: config.expected_pwm_frequency(),
+            expected_watchdog_nominal_period: config.expected_watchdog_nominal_period(),
+            expected_neutral_output: config.expected_neutral_output(),
+            expected_physical_stop_semantics: config.expected_physical_stop_semantics(),
+            controller_session_class: config.controller_session_class(),
+            maximum_command_step_percent: config.maximum_command_step_percent(),
+            qualification_serial_fault,
+        })
+    }
+
+    #[cfg(not(feature = "qualification-fault-injection"))]
     fn from_server_config(config: &ControllerServerConfig) -> Result<Self, ActuationStartError> {
         let heartbeat_ms = u16::try_from(config.heartbeat_period().as_millis())
             .map_err(|_| ActuationStartError::InvalidHeartbeatPeriod)?;
@@ -1316,6 +1564,17 @@ where
                         .unwrap_or(ActuationShutdownReason::SiblingFailure);
                     break Err(self
                         .recover_shutdown_interrupted_transmit(interrupted, reason)
+                        .await);
+                }
+                #[cfg(feature = "qualification-fault-injection")]
+                Err(ActuationActorError::SerialTransmit(interrupted))
+                    if matches!(
+                        interrupted,
+                        SerialTransmitError::QualificationPartialRecord { .. }
+                    ) =>
+                {
+                    break Err(self
+                        .recover_qualification_partial_uart_record(interrupted)
                         .await);
                 }
                 result => break result,
@@ -2653,6 +2912,16 @@ where
 
     async fn send_serial(&mut self, message: Message) -> Result<Instant, ActuationActorError> {
         let is_force_stop = matches!(&message, Message::ForceStop(_));
+        #[cfg(feature = "qualification-fault-injection")]
+        let inject_partial_uart_record = matches!(
+            (&message, self.config.qualification_serial_fault),
+            (
+                Message::ApplyPwm(command),
+                Some(
+                    OperatorSupervisedCandidateSerialFaultInjection::PartialUartRecordOnFirstNonzeroCommand
+                )
+            ) if !command.timer_pwm.is_zero()
+        );
         let record = UartRecord::encode(message).map_err(ActuationActorError::Encode)?;
         let sent_at = Instant::now();
         let shutdown = if self.shutdown_in_progress {
@@ -2667,6 +2936,23 @@ where
                 .as_deref()
                 .map(|priority_stop| (priority_stop, self.priority_stop_generation))
         };
+        #[cfg(feature = "qualification-fault-injection")]
+        if inject_partial_uart_record {
+            self.config.qualification_serial_fault = None;
+            let prefix = QualificationPartialUartRecordPrefix::from_encoded_record(&record)
+                .map_err(ActuationActorError::QualificationPartialUartRecordInvariant)?;
+            let prefix_result = transmit_serial_record(
+                &mut self.transport,
+                prefix.as_bytes(),
+                self.config.serial_transmit_timeout,
+                shutdown,
+                priority_stop,
+            )
+            .await;
+            return Err(ActuationActorError::SerialTransmit(
+                qualification_partial_uart_record_error(record.as_bytes().len(), prefix_result),
+            ));
+        }
         transmit_serial_record(
             &mut self.transport,
             record.as_bytes(),
@@ -2808,6 +3094,66 @@ where
         ActuationActorError::ShutdownInterruptedTransmit {
             interrupted,
             recovery: Box::new(ShutdownInterruptedTransmitRecovery {
+                resynchronization,
+                force_stop,
+            }),
+        }
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    async fn recover_qualification_partial_uart_record(
+        &mut self,
+        interrupted: SerialTransmitError,
+    ) -> ActuationActorError {
+        debug_assert!(matches!(
+            interrupted,
+            SerialTransmitError::QualificationPartialRecord { .. }
+        ));
+        self.shutdown_in_progress = true;
+        self.fail_all_pending(
+            HostCommandResultCode::ForceStopped,
+            StopResultCode::ControllerUnavailable,
+        );
+
+        debug_assert!(interrupted.left_partial_record());
+        let resynchronization = match transmit_serial_record(
+            &mut self.transport,
+            &UART_RECORD_DELIMITER,
+            self.config.serial_transmit_timeout,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(()) => SerialResynchronizationOutcome::DelimiterTransmitted,
+            Err(source) => SerialResynchronizationOutcome::Failed(source),
+        };
+
+        let force_stop = match self
+            .issue_internal_stop(ForceStopReason::TransportFault)
+            .await
+        {
+            Ok(()) => {
+                self.clear_authority(true);
+                match self.await_internal_stop_result().await {
+                    Ok(result)
+                        if result.result.proves_controller_stop()
+                            && result.output_state.is_safe() =>
+                    {
+                        ShutdownForceStopOutcome::Confirmed(result)
+                    }
+                    Ok(result) => ShutdownForceStopOutcome::ExactButUnconfirmed(result),
+                    Err(source) => ShutdownForceStopOutcome::Uncertain(Box::new(source)),
+                }
+            }
+            Err(source) => {
+                self.clear_authority(true);
+                ShutdownForceStopOutcome::Uncertain(Box::new(source))
+            }
+        };
+        ActuationActorError::QualificationPartialUartRecordInjected {
+            interrupted,
+            recovery: Box::new(QualificationPartialUartRecordInjectionRecovery {
                 resynchronization,
                 force_stop,
             }),
@@ -3565,8 +3911,8 @@ async fn udp_service_on_socket_inner(
                     try_send_udp_response(&socket, source, request, first_received_at, response)
                 {
                     log::warn!(
-                    "bounded V2 UDP overload response to {source} could not be emitted: {error}"
-                );
+                        "bounded V2 UDP overload response to {source} could not be emitted: {error}"
+                    );
                 }
                 continue;
             }
@@ -3876,6 +4222,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::num::{NonZeroU16, NonZeroU32};
     use std::pin::Pin;
+    #[cfg(feature = "qualification-fault-injection")]
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
 
@@ -3886,6 +4234,8 @@ mod tests {
     use robot_protocol::v2::{
         ApplyPwm, ControllerDeadlineMsWrapping, ControllerReady, ReadinessFlags, V2CommandLeaseMs,
     };
+    #[cfg(feature = "qualification-fault-injection")]
+    use tokio::io::ReadBuf;
     use tokio::io::{AsyncWrite, DuplexStream};
     use tokio::time::{sleep, timeout};
 
@@ -3951,6 +4301,139 @@ mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    #[derive(Clone, Copy)]
+    enum QualificationPrefixTransportFault {
+        Write,
+        Flush,
+        Deadline,
+        Shutdown,
+        PriorityStop,
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    struct QualificationFaultControl {
+        armed: Arc<AtomicBool>,
+        triggered: Arc<AtomicBool>,
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    impl QualificationFaultControl {
+        fn arm(&self) {
+            self.armed.store(true, AtomicOrdering::Release);
+        }
+
+        async fn wait_until_triggered(&self) {
+            timeout(IO_TIMEOUT, async {
+                while !self.triggered.load(AtomicOrdering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("qualification transport fault trigger timeout");
+        }
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    struct QualificationFaultingDuplex {
+        inner: DuplexStream,
+        fault: QualificationPrefixTransportFault,
+        armed: Arc<AtomicBool>,
+        observed: Arc<AtomicBool>,
+        triggered: bool,
+        fail_next_flush: bool,
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    impl QualificationFaultingDuplex {
+        fn new(
+            inner: DuplexStream,
+            fault: QualificationPrefixTransportFault,
+        ) -> (Self, QualificationFaultControl) {
+            let armed = Arc::new(AtomicBool::new(false));
+            let observed = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    inner,
+                    fault,
+                    armed: Arc::clone(&armed),
+                    observed: Arc::clone(&observed),
+                    triggered: false,
+                    fail_next_flush: false,
+                },
+                QualificationFaultControl {
+                    armed,
+                    triggered: observed,
+                },
+            )
+        }
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    impl AsyncRead for QualificationFaultingDuplex {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(context, buffer)
+        }
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    impl AsyncWrite for QualificationFaultingDuplex {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.armed.load(AtomicOrdering::Acquire)
+                && !self.triggered
+                && buffer.len() == QUALIFICATION_PARTIAL_UART_PREFIX_BYTES
+            {
+                let count = match Pin::new(&mut self.inner).poll_write(context, buffer) {
+                    Poll::Ready(Ok(count)) => count,
+                    Poll::Ready(Err(source)) => return Poll::Ready(Err(source)),
+                    Poll::Pending => return Poll::Pending,
+                };
+                self.triggered = true;
+                self.observed.store(true, AtomicOrdering::Release);
+                return match self.fault {
+                    QualificationPrefixTransportFault::Write => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "injected write failure after forwarding qualification prefix",
+                    ))),
+                    QualificationPrefixTransportFault::Flush => {
+                        self.fail_next_flush = true;
+                        Poll::Ready(Ok(count))
+                    }
+                    QualificationPrefixTransportFault::Deadline
+                    | QualificationPrefixTransportFault::Shutdown
+                    | QualificationPrefixTransportFault::PriorityStop => Poll::Pending,
+                };
+            }
+            Pin::new(&mut self.inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.fail_next_flush {
+                self.fail_next_flush = false;
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected flush failure after qualification prefix",
+                )));
+            }
+            Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(context)
         }
     }
 
@@ -4145,6 +4628,8 @@ mod tests {
             expected_physical_stop_semantics: PhysicalStopSemantics::CoastVerified,
             controller_session_class: ControllerSessionClass::ProductionExternalInterlocks,
             maximum_command_step_percent: None,
+            #[cfg(feature = "qualification-fault-injection")]
+            qualification_serial_fault: None,
         }
     }
 
@@ -4171,6 +4656,8 @@ mod tests {
             maximum_command_step_percent: Some(
                 OPERATOR_SUPERVISED_FOUR_PWM_MAX_COMMAND_STEP_PERCENT,
             ),
+            #[cfg(feature = "qualification-fault-injection")]
+            qualification_serial_fault: None,
         }
     }
 
@@ -4456,11 +4943,17 @@ mod tests {
         }
 
         async fn receive(&mut self) -> Message {
+            self.receive_result()
+                .await
+                .expect("actor emits valid V2 only")
+        }
+
+        async fn receive_result(&mut self) -> Result<Message, UartStreamError> {
             timeout(IO_TIMEOUT, async {
                 loop {
                     let byte = self.stream.read_u8().await.expect("fake serial read");
                     if let Some(decoded) = self.decoder.push(byte) {
-                        return decoded.expect("actor emits valid V2 only");
+                        return decoded;
                     }
                 }
             })
@@ -4488,8 +4981,36 @@ mod tests {
         }
 
         async fn ready_with_serial_capacity(serial_capacity: usize) -> Self {
-            let (mut harness, mut startup_ready) =
-                Self::awaiting_startup_heartbeat(serial_capacity, 1_000).await;
+            Self::ready_with_actor_config(serial_capacity, actor_config()).await
+        }
+
+        async fn ready_with_actor_config(serial_capacity: usize, config: ActorConfig) -> Self {
+            let (harness, startup_ready) =
+                Self::awaiting_startup_heartbeat_with_config(serial_capacity, 1_000, config).await;
+            Self::finish_ready(harness, startup_ready).await
+        }
+
+        #[cfg(feature = "qualification-fault-injection")]
+        async fn ready_with_qualification_transport_fault(
+            fault: QualificationPrefixTransportFault,
+        ) -> (Self, QualificationFaultControl) {
+            let mut config = actor_config();
+            config.qualification_serial_fault = Some(
+                OperatorSupervisedCandidateSerialFaultInjection::PartialUartRecordOnFirstNonzeroCommand,
+            );
+            let (actor_stream, controller_stream) = tokio::io::duplex(4_096);
+            let (actor_stream, control) = QualificationFaultingDuplex::new(actor_stream, fault);
+            let (harness, startup_ready) = Self::awaiting_startup_heartbeat_with_transport(
+                actor_stream,
+                controller_stream,
+                1_000,
+                config,
+            )
+            .await;
+            (Self::finish_ready(harness, startup_ready).await, control)
+        }
+
+        async fn finish_ready(mut harness: Self, mut startup_ready: oneshot::Receiver<()>) -> Self {
             assert!(
                 timeout(SHORT_ABSENCE, &mut startup_ready).await.is_err(),
                 "ControllerReady without an exact stopped heartbeat is not startup evidence"
@@ -4510,11 +5031,42 @@ mod tests {
             serial_capacity: usize,
             ready_uptime: u32,
         ) -> (Self, oneshot::Receiver<()>) {
-            let boot_id = boot(7);
+            Self::awaiting_startup_heartbeat_with_config(
+                serial_capacity,
+                ready_uptime,
+                actor_config(),
+            )
+            .await
+        }
+
+        async fn awaiting_startup_heartbeat_with_config(
+            serial_capacity: usize,
+            ready_uptime: u32,
+            config: ActorConfig,
+        ) -> (Self, oneshot::Receiver<()>) {
             let (actor_stream, controller_stream) = tokio::io::duplex(serial_capacity);
+            Self::awaiting_startup_heartbeat_with_transport(
+                actor_stream,
+                controller_stream,
+                ready_uptime,
+                config,
+            )
+            .await
+        }
+
+        async fn awaiting_startup_heartbeat_with_transport<Transport>(
+            actor_stream: Transport,
+            controller_stream: DuplexStream,
+            ready_uptime: u32,
+            config: ActorConfig,
+        ) -> (Self, oneshot::Receiver<()>)
+        where
+            Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        {
+            let boot_id = boot(7);
             let (handle, startup_ready, actor) = spawn_actor(
                 actor_stream,
-                actor_config(),
+                config,
                 Arc::new(NoopActuationTelemetry),
                 UartStreamDecoder::new(),
             );
@@ -4648,6 +5200,328 @@ mod tests {
             HostCommandResultCode::Stopped
         );
         harness
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    #[test]
+    fn qualification_partial_prefix_is_non_delimiter_and_strictly_partial() {
+        let message = Message::ApplyPwm(ApplyPwm {
+            controller_uid: uid(),
+            boot_id: boot(7),
+            control_epoch: epoch(),
+            sequence: V2CommandSequence::new(1),
+            expires_at: ControllerDeadlineMsWrapping::new(1_100),
+            timer_pwm: TimerPwm::try_new(1, -1).expect("nonzero candidate PWM"),
+        });
+        let record = UartRecord::encode(message).expect("ApplyPwm UART record");
+        let prefix = QualificationPartialUartRecordPrefix::from_encoded_record(&record)
+            .expect("COBS record has a non-delimiter prefix");
+        assert_eq!(prefix.as_bytes().len(), 1);
+        assert_ne!(prefix.as_bytes()[0], UART_RECORD_DELIMITER[0]);
+        assert!(prefix.as_bytes().len() < record.as_bytes().len());
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    #[test]
+    fn qualification_partial_record_wraps_every_uncertain_prefix_transport_outcome() {
+        let logical_record_bytes = 37;
+        let cases = [
+            (
+                "write",
+                SerialTransmitError::Write {
+                    source: io::Error::new(io::ErrorKind::BrokenPipe, "injected write failure"),
+                    written_bytes: 0,
+                    record_bytes: 1,
+                },
+            ),
+            (
+                "flush",
+                SerialTransmitError::Flush {
+                    source: io::Error::new(io::ErrorKind::BrokenPipe, "injected flush failure"),
+                    record_bytes: 1,
+                },
+            ),
+            (
+                "deadline",
+                SerialTransmitError::Interrupted {
+                    phase: SerialTransmitPhase::Write,
+                    cause: SerialTransmitInterruption::DeadlineExceeded,
+                    written_bytes: 0,
+                    record_bytes: 1,
+                    maximum_duration: Duration::from_millis(10),
+                },
+            ),
+            (
+                "shutdown",
+                SerialTransmitError::Interrupted {
+                    phase: SerialTransmitPhase::Flush,
+                    cause: SerialTransmitInterruption::ShutdownRequested,
+                    written_bytes: 1,
+                    record_bytes: 1,
+                    maximum_duration: Duration::from_millis(10),
+                },
+            ),
+            (
+                "priority",
+                SerialTransmitError::Interrupted {
+                    phase: SerialTransmitPhase::Write,
+                    cause: SerialTransmitInterruption::PriorityStopRequested,
+                    written_bytes: 0,
+                    record_bytes: 1,
+                    maximum_duration: Duration::from_millis(10),
+                },
+            ),
+        ];
+
+        for (expected, source) in cases {
+            let wrapped =
+                qualification_partial_uart_record_error(logical_record_bytes, Err(source));
+            assert!(
+                wrapped.left_partial_record(),
+                "{expected} must retain possible logical-record corruption"
+            );
+            let SerialTransmitError::QualificationPartialRecord {
+                prefix_bytes_may_have_reached_transport,
+                logical_record_bytes: observed_logical_record_bytes,
+                prefix_outcome: QualificationPartialUartPrefixTransmitOutcome::Uncertain(source),
+            } = wrapped
+            else {
+                panic!("{expected} was not wrapped as qualification uncertainty");
+            };
+            assert_eq!(prefix_bytes_may_have_reached_transport, 1);
+            assert_eq!(observed_logical_record_bytes, logical_record_bytes);
+            match expected {
+                "write" => assert!(matches!(*source, SerialTransmitError::Write { .. })),
+                "flush" => assert!(matches!(*source, SerialTransmitError::Flush { .. })),
+                "deadline" => assert!(matches!(
+                    *source,
+                    SerialTransmitError::Interrupted {
+                        cause: SerialTransmitInterruption::DeadlineExceeded,
+                        ..
+                    }
+                )),
+                "shutdown" => assert!(matches!(
+                    *source,
+                    SerialTransmitError::Interrupted {
+                        cause: SerialTransmitInterruption::ShutdownRequested,
+                        ..
+                    }
+                )),
+                "priority" => assert!(matches!(
+                    *source,
+                    SerialTransmitError::Interrupted {
+                        cause: SerialTransmitInterruption::PriorityStopRequested,
+                        ..
+                    }
+                )),
+                _ => unreachable!("closed test table"),
+            }
+        }
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    #[derive(Clone, Copy)]
+    enum QualificationPrefixExternalInterruption {
+        None,
+        Shutdown,
+        PriorityStop,
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    async fn exercise_qualification_partial_record_fault(
+        mut harness: Harness,
+        transport_fault: Option<&QualificationFaultControl>,
+        external_interruption: QualificationPrefixExternalInterruption,
+    ) -> (
+        SerialTransmitError,
+        Box<QualificationPartialUartRecordInjectionRecovery>,
+    ) {
+        harness.acquire().await;
+
+        let zero = command(harness.boot_id, 0, TimerPwm::ZERO);
+        let zero_exchange = harness.exchange_command(zero);
+        let zero_apply = receive_apply(&mut harness.controller).await;
+        harness
+            .controller
+            .send(Message::AppliedResult(applied(zero_apply)))
+            .await;
+        assert_eq!(
+            command_result(zero_exchange).await.result,
+            HostCommandResultCode::AppliedNew,
+            "the one-shot declaration must not corrupt acquisition zero"
+        );
+
+        if let Some(transport_fault) = transport_fault {
+            transport_fault.arm();
+        }
+        sleep(Duration::from_millis(11)).await;
+        let requested = command(
+            harness.boot_id,
+            1,
+            TimerPwm::try_new(1, -1).expect("nonzero candidate PWM"),
+        );
+        let exchange = harness.exchange_command(requested);
+        if let Some(transport_fault) = transport_fault {
+            transport_fault.wait_until_triggered().await;
+        }
+        match external_interruption {
+            QualificationPrefixExternalInterruption::None => {}
+            QualificationPrefixExternalInterruption::Shutdown => {
+                harness
+                    .shutdown
+                    .request(ActuationShutdownReason::SiblingFailure);
+            }
+            QualificationPrefixExternalInterruption::PriorityStop => {
+                let _priority_response = harness.handle.enqueue_for_test(
+                    harness.source,
+                    Instant::now(),
+                    Message::HostStop(HostStop {
+                        controller_uid: uid(),
+                        target_boot_id: TargetBootId::Exact(harness.boot_id),
+                        request_id: RequestId::new(0x7171),
+                        reason: ForceStopReason::Operator,
+                    }),
+                );
+            }
+        }
+        assert!(
+            harness.controller.receive_result().await.is_err(),
+            "the explicit delimiter must expose the possibly forwarded prefix as malformed"
+        );
+        let Message::ForceStop(force_stop) = harness.controller.receive().await else {
+            panic!("partial-record recovery must issue ForceStop")
+        };
+        let mut stop = confirmed_stop(force_stop, harness.boot_id);
+        stop.faults = ControllerFaults::try_from_bits(ControllerFaults::SERIAL_INTEGRITY)
+            .expect("known serial-integrity bit");
+        harness.controller.send(Message::HostStopResult(stop)).await;
+        assert_eq!(
+            command_result(exchange).await.result,
+            HostCommandResultCode::ForceStopped
+        );
+
+        let Harness { actor, .. } = harness;
+        let error = timeout(IO_TIMEOUT, actor)
+            .await
+            .expect("actor terminal evidence timeout")
+            .expect("actor task join")
+            .expect_err("injected fault is a terminal qualification outcome");
+        let ActuationActorError::QualificationPartialUartRecordInjected {
+            interrupted,
+            recovery,
+        } = error
+        else {
+            panic!("wrong qualification terminal evidence: {error}")
+        };
+        assert!(matches!(
+            recovery.resynchronization(),
+            SerialResynchronizationOutcome::DelimiterTransmitted
+        ));
+        assert!(matches!(
+            recovery.force_stop(),
+            ShutdownForceStopOutcome::Confirmed(result)
+                if result.output_state.is_safe()
+                    && result.faults.bits() == ControllerFaults::SERIAL_INTEGRITY
+        ));
+        (interrupted, recovery)
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    #[tokio::test]
+    async fn qualification_partial_record_fault_redelimits_and_force_stops_once() {
+        let mut config = actor_config();
+        config.qualification_serial_fault = Some(
+            OperatorSupervisedCandidateSerialFaultInjection::PartialUartRecordOnFirstNonzeroCommand,
+        );
+        let harness = Harness::ready_with_actor_config(4_096, config).await;
+        let (interrupted, _) = exercise_qualification_partial_record_fault(
+            harness,
+            None,
+            QualificationPrefixExternalInterruption::None,
+        )
+        .await;
+        assert!(matches!(
+            interrupted,
+            SerialTransmitError::QualificationPartialRecord {
+                prefix_bytes_may_have_reached_transport: 1,
+                logical_record_bytes,
+                prefix_outcome: QualificationPartialUartPrefixTransmitOutcome::Transmitted,
+            } if logical_record_bytes > 1
+        ));
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    #[tokio::test]
+    async fn qualification_prefix_write_and_flush_errors_still_redelimit_and_force_stop() {
+        for (fault, expected) in [
+            (QualificationPrefixTransportFault::Write, "write"),
+            (QualificationPrefixTransportFault::Flush, "flush"),
+        ] {
+            let (harness, control) = Harness::ready_with_qualification_transport_fault(fault).await;
+            let (interrupted, _) = exercise_qualification_partial_record_fault(
+                harness,
+                Some(&control),
+                QualificationPrefixExternalInterruption::None,
+            )
+            .await;
+            let SerialTransmitError::QualificationPartialRecord {
+                prefix_bytes_may_have_reached_transport: 1,
+                logical_record_bytes,
+                prefix_outcome: QualificationPartialUartPrefixTransmitOutcome::Uncertain(source),
+            } = interrupted
+            else {
+                panic!("{expected} failure lost qualification uncertainty");
+            };
+            assert!(logical_record_bytes > 1);
+            match expected {
+                "write" => assert!(matches!(*source, SerialTransmitError::Write { .. })),
+                "flush" => assert!(matches!(*source, SerialTransmitError::Flush { .. })),
+                _ => unreachable!("closed transport-fault table"),
+            }
+        }
+    }
+
+    #[cfg(feature = "qualification-fault-injection")]
+    #[tokio::test]
+    async fn qualification_prefix_interruptions_still_redelimit_and_force_stop() {
+        for (fault, external_interruption, expected_cause) in [
+            (
+                QualificationPrefixTransportFault::Deadline,
+                QualificationPrefixExternalInterruption::None,
+                SerialTransmitInterruption::DeadlineExceeded,
+            ),
+            (
+                QualificationPrefixTransportFault::Shutdown,
+                QualificationPrefixExternalInterruption::Shutdown,
+                SerialTransmitInterruption::ShutdownRequested,
+            ),
+            (
+                QualificationPrefixTransportFault::PriorityStop,
+                QualificationPrefixExternalInterruption::PriorityStop,
+                SerialTransmitInterruption::PriorityStopRequested,
+            ),
+        ] {
+            let (harness, control) = Harness::ready_with_qualification_transport_fault(fault).await;
+            let (interrupted, _) = exercise_qualification_partial_record_fault(
+                harness,
+                Some(&control),
+                external_interruption,
+            )
+            .await;
+            let SerialTransmitError::QualificationPartialRecord {
+                prefix_bytes_may_have_reached_transport: 1,
+                logical_record_bytes,
+                prefix_outcome: QualificationPartialUartPrefixTransmitOutcome::Uncertain(source),
+            } = interrupted
+            else {
+                panic!("{expected_cause:?} lost qualification uncertainty");
+            };
+            assert!(logical_record_bytes > 1);
+            assert!(matches!(
+                *source,
+                SerialTransmitError::Interrupted { cause, .. } if cause == expected_cause
+            ));
+        }
     }
 
     #[tokio::test]

@@ -42,7 +42,10 @@ nano-face-perception = [
 # Manually invoked, wheels-off-only qualification surface. The production
 # deployment is built with `nano-agent` alone, so its exact binary contains no
 # candidate entry point.
-nano-wheels-off-qualification = ["nano-agent"]
+nano-wheels-off-qualification = [
+    "nano-agent",
+    "robot-server/qualification-fault-injection",
+]
 # Manually invoked, attended, wheel-on commissioning lane. Production
 # `nano-agent` does not enable this feature and therefore contains no
 # commissioning actuation entry point.

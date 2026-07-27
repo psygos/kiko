@@ -4,10 +4,11 @@
 //! This schema deliberately has no production physical-actuation document.
 //! V3 binds the common OAK/SLAM/occupancy/inference graph to a schema-V2
 //! candidate inventory, a candidate-only controller contract, and a
-//! candidate-only host policy. V4 adds exact frontal/profile face-cascade and
-//! head-gaze-policy bindings without reinterpreting V3. Production and
-//! qualification documents are different Rust types and reject each other's
-//! schemas.
+//! candidate-only host policy. V4 adds exact frontal/profile face-cascade
+//! bindings and an optional head-gaze-policy binding without reinterpreting
+//! V3. Bootstrap separately admits any bound policy only as proposal-only.
+//! Production and qualification documents are different Rust types and reject
+//! each other's schemas.
 
 use std::fmt;
 use std::path::Path;
@@ -18,7 +19,7 @@ use kiko_device_inventory::{
     LoadedDeploymentAsset, MAX_DEPLOYMENT_ASSET_BYTES, MAX_MANIFEST_JSON_BYTES, MAX_ROBOT_ID_BYTES,
     load_deployment_asset,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use super::nano_agent_launch::{
     MAX_OPENCV_HAAR_CASCADE_BYTES, NanoAgentLaunchParseError, NanoFaceCascadeAssetRole,
@@ -358,14 +359,14 @@ impl NanoWheelsOffQualificationFacePerception {
 }
 
 /// Qualification V4 retains the complete V3 graph, exact face cascades, and
-/// one exact head-gaze-policy binding.
+/// optionally one exact head-gaze-policy binding.
 ///
 /// This is a separate type so a V3 document can never silently gain face
 /// semantics. Runtime wiring must explicitly select and load V4.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NanoWheelsOffQualificationLaunchV4 {
     common: NanoWheelsOffQualificationLaunchV3,
-    head_gaze_policy: NanoLaunchAssetBinding,
+    head_gaze_policy: Option<NanoLaunchAssetBinding>,
     face_perception: NanoWheelsOffQualificationFacePerception,
 }
 
@@ -397,16 +398,23 @@ impl NanoWheelsOffQualificationLaunchV4 {
             face_perception_dto
                 .ok_or(NanoWheelsOffQualificationLaunchParseError::MissingFacePerception)?,
         )?;
-        let launch = Self {
-            common: NanoWheelsOffQualificationLaunchV3::from_dto(common_dto)?,
-            head_gaze_policy: parse_v4_asset(
-                NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy,
-                head_gaze_policy_dto.ok_or(
-                    NanoWheelsOffQualificationLaunchParseError::MissingV4RequiredAsset {
+        let head_gaze_policy = match head_gaze_policy_dto {
+            JsonFieldPresence::Absent => None,
+            JsonFieldPresence::Null => {
+                return Err(
+                    NanoWheelsOffQualificationLaunchParseError::NullV4AssetForbidden {
                         role: NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy,
                     },
-                )?,
-            )?,
+                );
+            }
+            JsonFieldPresence::Value(dto) => Some(parse_v4_asset(
+                NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy,
+                dto,
+            )?),
+        };
+        let launch = Self {
+            common: NanoWheelsOffQualificationLaunchV3::from_dto(common_dto)?,
+            head_gaze_policy,
             face_perception,
         };
         ensure_distinct_v4_assets(&launch)?;
@@ -486,16 +494,16 @@ impl NanoWheelsOffQualificationLaunchV4 {
         self.common.asset(role)
     }
 
-    pub const fn head_gaze_policy(&self) -> &NanoLaunchAssetBinding {
-        &self.head_gaze_policy
+    pub const fn head_gaze_policy(&self) -> Option<&NanoLaunchAssetBinding> {
+        self.head_gaze_policy.as_ref()
     }
 
     pub const fn v4_asset(
         &self,
         role: NanoWheelsOffQualificationV4AssetRole,
-    ) -> &NanoLaunchAssetBinding {
+    ) -> Option<&NanoLaunchAssetBinding> {
         match role {
-            NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy => &self.head_gaze_policy,
+            NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy => self.head_gaze_policy.as_ref(),
         }
     }
 
@@ -602,7 +610,10 @@ pub fn load_nano_wheels_off_qualification_launch_v4(
         }
     }
     for role in NanoWheelsOffQualificationV4AssetRole::ALL {
-        if launch.v4_asset(role).relative_path() == source.relative_path() {
+        if launch
+            .v4_asset(role)
+            .is_some_and(|asset| asset.relative_path() == source.relative_path())
+        {
             return Err(
                 NanoWheelsOffQualificationLaunchLoadError::V4InputAliasesLaunchDocument {
                     role,
@@ -743,7 +754,7 @@ pub enum NanoWheelsOffQualificationLaunchParseError {
         input: NanoWheelsOffQualificationV4AssetRole,
         expected_sha256: [u8; 32],
     },
-    MissingV4RequiredAsset {
+    NullV4AssetForbidden {
         role: NanoWheelsOffQualificationV4AssetRole,
     },
     InvalidV4AssetPath {
@@ -822,7 +833,7 @@ impl std::error::Error for NanoWheelsOffQualificationLaunchParseError {
             | Self::FaceAssetAliasesInputAsset { .. }
             | Self::FaceAssetAliasesInputContent { .. }
             | Self::FaceAssetAliasesV4Content { .. }
-            | Self::MissingV4RequiredAsset { .. }
+            | Self::NullV4AssetForbidden { .. }
             | Self::V4AssetByteLimitAboveRoleMaximum { .. }
             | Self::V4AssetAliasesInputPath { .. }
             | Self::V4AssetAliasesFacePath { .. }
@@ -864,7 +875,8 @@ struct NanoWheelsOffQualificationLaunchV4Dto {
     navigation_shadow_config_asset: NanoLaunchAssetBindingDto,
     candidate_inventory_manifest_asset: CandidateAssetBindingDto,
     candidate_controller_policy_asset: CandidateAssetBindingDto,
-    head_gaze_policy_asset: Option<CandidateAssetBindingDto>,
+    #[serde(default)]
+    head_gaze_policy_asset: JsonFieldPresence<CandidateAssetBindingDto>,
     controller_server: NanoLaunchControllerServerDto,
     calibration_artifact: NanoLaunchCalibrationArtifactDto,
     plant_artifact: NanoLaunchPlantArtifactDto,
@@ -881,7 +893,7 @@ impl NanoWheelsOffQualificationLaunchV4Dto {
         self,
     ) -> (
         NanoWheelsOffQualificationLaunchV3Dto,
-        Option<CandidateAssetBindingDto>,
+        JsonFieldPresence<CandidateAssetBindingDto>,
         Option<QualificationFacePerceptionDto>,
     ) {
         (
@@ -906,6 +918,29 @@ impl NanoWheelsOffQualificationLaunchV4Dto {
             self.head_gaze_policy_asset,
             self.face_perception,
         )
+    }
+}
+
+#[derive(Debug, Default)]
+enum JsonFieldPresence<T> {
+    #[default]
+    Absent,
+    Null,
+    Value(T),
+}
+
+impl<'de, T> Deserialize<'de> for JsonFieldPresence<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
     }
 }
 
@@ -1109,7 +1144,9 @@ fn ensure_distinct_v4_assets(
             }
         }
         for input in NanoWheelsOffQualificationV4AssetRole::ALL {
-            let existing = launch.v4_asset(input);
+            let Some(existing) = launch.v4_asset(input) else {
+                continue;
+            };
             if face_asset.expected_sha256() == existing.expected_sha256() {
                 return Err(
                     NanoWheelsOffQualificationLaunchParseError::FaceAssetAliasesV4Content {
@@ -1122,7 +1159,9 @@ fn ensure_distinct_v4_assets(
         }
     }
     for role in NanoWheelsOffQualificationV4AssetRole::ALL {
-        let additional = launch.v4_asset(role);
+        let Some(additional) = launch.v4_asset(role) else {
+            continue;
+        };
         for input in NanoWheelsOffQualificationAssetRole::ALL {
             let existing = launch.asset(input);
             if additional.relative_path() == existing.relative_path() {
@@ -1404,7 +1443,11 @@ mod tests {
             "models/opencv/haarcascade_profileface.xml"
         );
         assert_eq!(
-            launch.head_gaze_policy().relative_path().as_str(),
+            launch
+                .head_gaze_policy()
+                .expect("fixture head-gaze policy")
+                .relative_path()
+                .as_str(),
             "head-gaze-policy-v1.json"
         );
         assert!(
@@ -1537,7 +1580,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_requires_a_bounded_head_gaze_policy_that_aliases_nothing() {
+    fn v4_allows_absent_head_gaze_and_bounds_any_present_policy() {
         let original: Value =
             serde_json::from_slice(&launch_v4_document()).expect("qualification V4 fixture");
 
@@ -1546,12 +1589,20 @@ mod tests {
             .as_object_mut()
             .expect("V4 launch object")
             .remove("head_gaze_policy_asset");
+        let without_head_gaze = NanoWheelsOffQualificationLaunchV4::parse_json(
+            &serde_json::to_vec(&missing).expect("missing head-gaze fixture"),
+        )
+        .expect("head gaze is optional for Gate A");
+        assert!(without_head_gaze.head_gaze_policy().is_none());
+
+        let mut null = original.clone();
+        null["head_gaze_policy_asset"] = Value::Null;
         assert!(matches!(
             NanoWheelsOffQualificationLaunchV4::parse_json(
-                &serde_json::to_vec(&missing).expect("missing head-gaze fixture")
+                &serde_json::to_vec(&null).expect("null head-gaze fixture")
             ),
             Err(
-                NanoWheelsOffQualificationLaunchParseError::MissingV4RequiredAsset {
+                NanoWheelsOffQualificationLaunchParseError::NullV4AssetForbidden {
                     role: NanoWheelsOffQualificationV4AssetRole::HeadGazePolicy
                 }
             )

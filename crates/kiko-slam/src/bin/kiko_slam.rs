@@ -828,6 +828,9 @@ struct NanoWheelsOffQualificationArgs {
     /// Persistent state root for the qualification dataset and diagnostics.
     #[arg(long, value_name = "ABSOLUTE_DIRECTORY")]
     state_root: PathBuf,
+    /// One typed, one-shot fault on the first nonzero candidate command.
+    #[arg(long, value_name = "QUALIFICATION_FAULT")]
+    fault_injection: Option<kiko_slam::navigation::WheelsOffQualificationFaultInjection>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -5754,7 +5757,6 @@ struct LiveWheelsOffQualificationMotionInput {
     limits: kiko_slam::navigation::WheelsOffCandidateLimits,
     runtime_service_interval: kiko_slam::navigation::WheelsOffCandidateRuntimeServiceInterval,
     preflight: Option<AttendedWheelsOffPreflight>,
-    attestation: Option<kiko_slam::navigation::OperatorClaimedWheelsOffAttestation>,
     profile: kiko_slam::navigation::WheelsOffQualificationControlProfile,
     frontend_config: kiko_slam::navigation::WheelsOffQualificationFrontendConfig,
     initial_health: ConsoleSubsystemHealth,
@@ -5785,24 +5787,12 @@ impl LiveWheelsOffQualificationMotionInput {
             limits,
             runtime_service_interval,
             preflight: Some(preflight),
-            attestation: None,
             profile,
             frontend_config,
             initial_health,
             accessory_health,
             rerun_diagnostics_url,
         }
-    }
-
-    fn require_fresh_attended_motion_attestation(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let preflight = self
-            .preflight
-            .take()
-            .expect("qualification attended preflight is consumed exactly once");
-        self.attestation = Some(require_fresh_attended_motion_attestation(&preflight)?);
-        Ok(())
     }
 
     #[allow(clippy::type_complexity)]
@@ -5814,7 +5804,7 @@ impl LiveWheelsOffQualificationMotionInput {
         DisarmReceipt,
         kiko_slam::navigation::WheelsOffCandidateLimits,
         kiko_slam::navigation::WheelsOffCandidateRuntimeServiceInterval,
-        kiko_slam::navigation::OperatorClaimedWheelsOffAttestation,
+        AttendedWheelsOffPreflight,
         kiko_slam::navigation::WheelsOffQualificationControlProfile,
         kiko_slam::navigation::WheelsOffQualificationFrontendConfig,
         ConsoleSubsystemHealth,
@@ -5833,9 +5823,9 @@ impl LiveWheelsOffQualificationMotionInput {
                 .expect("qualification initial stop transfers once"),
             self.limits,
             self.runtime_service_interval,
-            self.attestation
+            self.preflight
                 .take()
-                .expect("qualification motion starts only after fresh attended attestation"),
+                .expect("qualification motion starts only after attended preflight"),
             self.profile,
             self.frontend_config.clone(),
             self.initial_health,
@@ -7780,7 +7770,21 @@ type LiveWheelsOffQualificationMotionStartFailure = Box<(
 enum LiveWheelsOffQualificationMotionStartPrimary {
     Receipt(ConsoleReceiptProjectionError),
     Telemetry(kiko_slam::navigation::WheelsOffQualificationTelemetryError),
-    Runtime(kiko_slam::navigation::WheelsOffQualificationRuntimeStartError),
+    Attestation {
+        source: FreshAttendedMotionAttestationError,
+        frontend_shutdown: kiko_slam::navigation::WheelsOffQualificationFrontendShutdownEvidence,
+    },
+    Runtime {
+        source: kiko_slam::navigation::WheelsOffQualificationRuntimeStartError,
+        frontend_shutdown: kiko_slam::navigation::WheelsOffQualificationFrontendShutdownEvidence,
+    },
+    MotionAuthorityEnable {
+        source: kiko_slam::navigation::WheelsOffQualificationMotionAuthorityEnableError,
+        frontend_shutdown: kiko_slam::navigation::WheelsOffQualificationFrontendShutdownEvidence,
+    },
+    FrontendExited {
+        frontend_shutdown: kiko_slam::navigation::WheelsOffQualificationFrontendShutdownEvidence,
+    },
     Frontend(kiko_slam::navigation::WheelsOffQualificationFrontendStartError),
 }
 
@@ -7790,7 +7794,31 @@ impl std::fmt::Display for LiveWheelsOffQualificationMotionStartPrimary {
         match self {
             Self::Receipt(source) => source.fmt(formatter),
             Self::Telemetry(source) => source.fmt(formatter),
-            Self::Runtime(source) => source.fmt(formatter),
+            Self::Attestation {
+                source,
+                frontend_shutdown,
+            } => write!(
+                formatter,
+                "{source}; already-bound frontend shutdown evidence: {frontend_shutdown:?}"
+            ),
+            Self::Runtime {
+                source,
+                frontend_shutdown,
+            } => write!(
+                formatter,
+                "{source}; already-bound frontend shutdown evidence: {frontend_shutdown:?}"
+            ),
+            Self::MotionAuthorityEnable {
+                source,
+                frontend_shutdown,
+            } => write!(
+                formatter,
+                "{source}; already-bound frontend shutdown evidence: {frontend_shutdown:?}"
+            ),
+            Self::FrontendExited { frontend_shutdown } => write!(
+                formatter,
+                "qualification frontend exited before motion enablement; shutdown evidence: {frontend_shutdown:?}"
+            ),
             Self::Frontend(source) => source.fmt(formatter),
         }
     }
@@ -7802,7 +7830,10 @@ impl std::error::Error for LiveWheelsOffQualificationMotionStartPrimary {
         match self {
             Self::Receipt(source) => Some(source),
             Self::Telemetry(source) => Some(source),
-            Self::Runtime(source) => Some(source),
+            Self::Attestation { source, .. } => Some(source),
+            Self::Runtime { source, .. } => Some(source),
+            Self::MotionAuthorityEnable { source, .. } => Some(source),
+            Self::FrontendExited { .. } => None,
             Self::Frontend(source) => Some(source),
         }
     }
@@ -7902,7 +7933,7 @@ fn start_wheels_off_qualification_motion_runtime(
         initial_stop,
         limits,
         admitted_runtime_service_interval,
-        attestation,
+        preflight,
         profile,
         frontend_config,
         initial_health,
@@ -7947,6 +7978,57 @@ fn start_wheels_off_qualification_motion_runtime(
             ));
         }
     };
+    // Bind the loopback UI while the console's motion boundary is still
+    // closed. Requests other than the one-way safety stop fail with
+    // `motion_attestation_pending` until the stopped runtime owner and the
+    // fresh attended attestation are both ready.
+    let mut frontend = match kiko_slam::navigation::WheelsOffQualificationFrontend::start(
+        &frontend_config,
+        console.clone(),
+        telemetry.clone(),
+        profile,
+    ) {
+        Ok(frontend) => frontend,
+        Err(source) => {
+            return Err(fail_wheels_off_qualification_before_runtime(
+                coordinator,
+                LiveWheelsOffQualificationMotionStartPrimary::Frontend(source),
+                boot_id,
+                stop_request_id,
+            ));
+        }
+    };
+    eprintln!(
+        "wheels-off qualification console ready but motion-attestation-pending on {}; capability={}; raw_timer_pwm_cap={} test_magnitude={} deadman_ms={}; autonomous actuation disabled (SLAM/MPC shadow only)",
+        frontend.bound_address(),
+        frontend_config.capability_path().display(),
+        limits.effective_max_abs_pwm_percent(),
+        limits.manual_test_magnitude_timer_pwm_percent(),
+        limits.manual_deadman().as_millis(),
+    );
+    let attestation = match require_fresh_attended_motion_attestation(&preflight) {
+        Ok(attestation) => attestation,
+        Err(source) => {
+            let frontend_shutdown = frontend.shutdown();
+            return Err(fail_wheels_off_qualification_before_runtime(
+                coordinator,
+                LiveWheelsOffQualificationMotionStartPrimary::Attestation {
+                    source,
+                    frontend_shutdown,
+                },
+                boot_id,
+                stop_request_id,
+            ));
+        }
+    };
+    if let Some(frontend_shutdown) = frontend.poll_unexpected_exit() {
+        return Err(fail_wheels_off_qualification_before_runtime(
+            coordinator,
+            LiveWheelsOffQualificationMotionStartPrimary::FrontendExited { frontend_shutdown },
+            boot_id,
+            stop_request_id,
+        ));
+    }
     let mut controller = match kiko_slam::navigation::WheelsOffQualificationRuntime::try_new(
         stopped_controller,
         initial_zero,
@@ -7960,41 +8042,50 @@ fn start_wheels_off_qualification_motion_runtime(
     ) {
         Ok(runtime) => runtime,
         Err(source) => {
+            let frontend_shutdown = frontend.shutdown();
             return Err(fail_wheels_off_qualification_before_runtime(
                 coordinator,
-                LiveWheelsOffQualificationMotionStartPrimary::Runtime(source),
+                LiveWheelsOffQualificationMotionStartPrimary::Runtime {
+                    source,
+                    frontend_shutdown,
+                },
                 boot_id,
                 stop_request_id,
             ));
         }
     };
-    let frontend = match kiko_slam::navigation::WheelsOffQualificationFrontend::start(
-        &frontend_config,
-        console,
-        telemetry.clone(),
-        profile,
-    ) {
-        Ok(frontend) => frontend,
-        Err(source) => {
-            let controller_stop = controller.shutdown().map_err(Box::new);
-            return Err(Box::new((
-                coordinator,
-                LiveWheelsOffQualificationMotionStartError {
-                    primary: LiveWheelsOffQualificationMotionStartPrimary::Frontend(source),
-                    controller_stop: LiveWheelsOffQualificationStartStop::RuntimeShutdown(
-                        controller_stop,
-                    ),
+    if let Some(frontend_shutdown) = frontend.poll_unexpected_exit() {
+        let controller_stop = controller.shutdown().map_err(Box::new);
+        return Err(Box::new((
+            coordinator,
+            LiveWheelsOffQualificationMotionStartError {
+                primary: LiveWheelsOffQualificationMotionStartPrimary::FrontendExited {
+                    frontend_shutdown,
                 },
-            )));
-        }
-    };
+                controller_stop: LiveWheelsOffQualificationStartStop::RuntimeShutdown(
+                    controller_stop,
+                ),
+            },
+        )));
+    }
+    if let Err(source) = console.enable_motion_authority() {
+        let frontend_shutdown = frontend.shutdown();
+        let controller_stop = controller.shutdown().map_err(Box::new);
+        return Err(Box::new((
+            coordinator,
+            LiveWheelsOffQualificationMotionStartError {
+                primary: LiveWheelsOffQualificationMotionStartPrimary::MotionAuthorityEnable {
+                    source,
+                    frontend_shutdown,
+                },
+                controller_stop: LiveWheelsOffQualificationStartStop::RuntimeShutdown(
+                    controller_stop,
+                ),
+            },
+        )));
+    }
     eprintln!(
-        "wheels-off qualification console ready on {}; capability={}; raw_timer_pwm_cap={} test_magnitude={} deadman_ms={}; autonomous actuation disabled (SLAM/MPC shadow only)",
-        frontend.bound_address(),
-        frontend_config.capability_path().display(),
-        limits.effective_max_abs_pwm_percent(),
-        limits.manual_test_magnitude_timer_pwm_percent(),
-        limits.manual_deadman().as_millis(),
+        "wheels-off qualification manual motion boundary enabled from the fresh attended attestation"
     );
     Ok(LiveWheelsOffQualificationMotionRuntime {
         coordinator,
@@ -11659,18 +11750,6 @@ impl NanoLiveSetupGuard {
             Err(source) => Err(LiveAccessoryError::FaultMonitor(source)),
         }
     }
-
-    #[cfg(feature = "nano-wheels-off-qualification")]
-    fn require_fresh_qualification_attestation(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(PreparedLiveMotionSelection::WheelsOffQualification(input)) =
-            self.motion.as_mut()
-        {
-            input.require_fresh_attended_motion_attestation()?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(all(feature = "nano-agent", unix))]
@@ -12695,6 +12774,33 @@ impl std::error::Error for AttendedWheelsOffAttestationError {
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+enum FreshAttendedMotionAttestationError {
+    Terminal(AttendedWheelsOffAttestationError),
+    Domain(kiko_slam::navigation::WheelsOffCandidateAttestationError),
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::fmt::Display for FreshAttendedMotionAttestationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Terminal(source) => source.fmt(formatter),
+            Self::Domain(source) => source.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::error::Error for FreshAttendedMotionAttestationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Terminal(source) => Some(source),
+            Self::Domain(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 fn read_bounded_tty_line(
     input: &mut impl BufRead,
 ) -> Result<String, AttendedWheelsOffAttestationError> {
@@ -12783,12 +12889,16 @@ fn require_attended_wheels_off_preflight()
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 fn require_fresh_attended_motion_attestation(
     _preflight: &AttendedWheelsOffPreflight,
-) -> Result<kiko_slam::navigation::OperatorClaimedWheelsOffAttestation, Box<dyn std::error::Error>>
-{
+) -> Result<
+    kiko_slam::navigation::OperatorClaimedWheelsOffAttestation,
+    FreshAttendedMotionAttestationError,
+> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     if !stdin.is_terminal() || !stdout.is_terminal() {
-        return Err(Box::new(AttendedWheelsOffAttestationError::TtyRequired));
+        return Err(FreshAttendedMotionAttestationError::Terminal(
+            AttendedWheelsOffAttestationError::TtyRequired,
+        ));
     }
     let mut input = stdin.lock();
     let mut output = stdout.lock();
@@ -12797,15 +12907,15 @@ fn require_fresh_attended_motion_attestation(
         &mut output,
         "The full software stack is ready. Reconfirm all three physical conditions immediately before the short motion qualification window.",
         "WHEELS OFF HEAD SUPPORTED POWER CUT READY",
-    )?;
-    Ok(
-        kiko_slam::navigation::OperatorClaimedWheelsOffAttestation::try_new(
-            true,
-            true,
-            true,
-            Instant::now(),
-        )?,
     )
+    .map_err(FreshAttendedMotionAttestationError::Terminal)?;
+    kiko_slam::navigation::OperatorClaimedWheelsOffAttestation::try_new(
+        true,
+        true,
+        true,
+        Instant::now(),
+    )
+    .map_err(FreshAttendedMotionAttestationError::Domain)
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
@@ -13128,6 +13238,11 @@ fn run_nano_wheels_off_qualification(
     args: NanoWheelsOffQualificationArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let running = install_live_shutdown_handler()?;
+    if let Some(fault) = args.fault_injection {
+        eprintln!(
+            "wheels-off qualification fault session selected: {fault}; one-shot trigger is the first nonzero candidate command"
+        );
+    }
     // No device, serial port, listener, or controller owner is opened before
     // the attended physical preflight succeeds.
     let preflight = require_attended_wheels_off_preflight()?;
@@ -13139,6 +13254,7 @@ fn run_nano_wheels_off_qualification(
         args.state_root,
         args.launch_config,
         capture_clock_origin,
+        args.fault_injection,
         running.as_ref(),
     )?;
     let async_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -13762,11 +13878,6 @@ fn run_prepared_live_session(
         }
 
         let mut depth_ring = DepthRingBuffer::try_new(depth_ring_capacity.get())?;
-        // All expensive model, tracker, warm-start, and queue construction is
-        // complete. Only now request the short-lived physical claim that can
-        // be consumed by the candidate controller owner.
-        #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
-        nano_setup_guard.require_fresh_qualification_attestation()?;
         // Dataset creation is intentionally the final fallible setup boundary.
         // From this point every exit path consumes its handle through either
         // bound finalization or abort_without_manifest.
@@ -17805,6 +17916,7 @@ mod tests {
             args.state_root,
             Path::new("/var/lib/kiko-nano-qualification")
         );
+        assert_eq!(args.fault_injection, None);
 
         assert!(
             Cli::try_parse_from([
@@ -17817,6 +17929,60 @@ mod tests {
                 "--state-root",
                 "/var/lib/kiko-nano-qualification",
                 "--wheels-removed",
+            ])
+            .is_err()
+        );
+
+        let injected = Cli::try_parse_from([
+            "kiko-slam",
+            "nano-wheels-off-qualification",
+            "--deployment-root",
+            "/opt/kiko/qualification",
+            "--launch-config",
+            "nano-wheels-off-qualification-launch-v4.json",
+            "--state-root",
+            "/var/lib/kiko-nano-qualification",
+            "--fault-injection",
+            "partial-uart-record-on-first-nonzero-command",
+        ])
+        .expect("closed qualification fault declaration");
+        let Command::NanoWheelsOffQualification(injected) = injected.command else {
+            panic!("expected wheels-off qualification command");
+        };
+        assert_eq!(
+            injected.fault_injection,
+            Some(
+                kiko_slam::navigation::WheelsOffQualificationFaultInjection::PartialUartRecordOnFirstNonzeroCommand
+            )
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "kiko-slam",
+                "nano-wheels-off-qualification",
+                "--deployment-root",
+                "/opt/kiko/qualification",
+                "--launch-config",
+                "nano-wheels-off-qualification-launch-v4.json",
+                "--state-root",
+                "/var/lib/kiko-nano-qualification",
+                "--fault-injection",
+                "partial-uart-record-on-first-nonzero-command=3",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "kiko-slam",
+                "nano-agent",
+                "--deployment-root",
+                "/opt/kiko/deployment",
+                "--launch-config",
+                "nano-agent-launch-v3.json",
+                "--state-root",
+                "/var/lib/kiko-nano-agent",
+                "--fault-injection",
+                "partial-uart-record-on-first-nonzero-command",
             ])
             .is_err()
         );

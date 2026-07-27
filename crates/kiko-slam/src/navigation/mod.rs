@@ -110,6 +110,8 @@ mod wheels_off_candidate_actuation;
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 mod wheels_off_qualification_console;
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+mod wheels_off_qualification_fault_injection;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 mod wheels_off_qualification_http;
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 mod wheels_off_qualification_runtime;
@@ -430,6 +432,8 @@ pub use wheels_off_candidate_actuation::{
 };
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 pub use wheels_off_qualification_console::*;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+pub use wheels_off_qualification_fault_injection::*;
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 pub use wheels_off_qualification_http::*;
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]

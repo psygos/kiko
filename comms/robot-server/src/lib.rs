@@ -15,6 +15,11 @@ pub use actuation_v2::{
     SerialTransmitPhase, ShutdownForceStopOutcome, ShutdownInterruptedTransmitRecovery,
     UdpServiceError,
 };
+#[cfg(feature = "qualification-fault-injection")]
+pub use actuation_v2::{
+    OperatorSupervisedCandidateSerialFaultInjection, QualificationPartialUartPrefixTransmitOutcome,
+    QualificationPartialUartRecordInjectionRecovery, QualificationPartialUartRecordPrefixError,
+};
 pub use controller_owner::{
     ActuationTaskOutcome, UdpTaskOutcome, V2ControllerOwner, V2ControllerOwnerExitTrigger,
     V2ControllerOwnerStartCleanup, V2ControllerOwnerStartError, V2ControllerOwnerTerminationError,

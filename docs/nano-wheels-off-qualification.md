@@ -19,20 +19,24 @@ starting:
 3. keep an independent motor-power cut immediately reachable;
 4. inspect the current owners of the OAK, STM32, head bus, and eye serial
    endpoints; and
-5. coordinate a normal Fable/legacy-owner handoff.
+5. refuse to start while any competing device owner or automatic launcher is
+   present.
 
 Never use `killall`, `pkill`, or an unrelated process kill to obtain a device.
 The qualifier is the sole OAK, accessory, in-process UDP, and STM32 owner only
 after exact acquisition succeeds. An ownership conflict is a failed
 qualification, not a reason to kill other workloads.
 
-Follow the exact
-[Fable handoff](nano-qualified-deployment.md#exact-fable-handoff) before
-acquisition. The audited `makerspace` owner had two separate crontab entries
-that preserved its guardian; killing only `kiko_face_follow.py` lets that
-guardian respawn it in about eight seconds. Preserve all unrelated crontab
-entries and processes, disable only the two identified owner entries, and
-terminate only the exact guardian/child PIDs in the documented order.
+Before acquisition, perform a fresh endpoint-by-endpoint owner check and
+follow the exact
+[exclusive-endpoint acquisition](nano-qualified-deployment.md#exact-exclusive-endpoint-acquisition).
+If no conflicting owner exists, start exactly one canonical Kiko owner after
+proving the endpoints free. A historical
+`makerspace` snapshot found two separate crontab entries preserving one
+guardian, but that observation is not current authority to edit either entry.
+Preserve all unrelated crontab entries and processes. If a current owner or
+respawn authority is found, retain the conflict and stop this procedure; do
+not disable, signal, or kill it here.
 
 The candidate contract deliberately says physical stop semantics are
 `unverified`. The operator's reachable power cut remains the independent stop.
@@ -71,12 +75,26 @@ The prepared qualification render-input boundary includes:
 Qualification render-input/launch V1 through V3 were already published. Do
 not relabel an old document: V2 incorrectly selected the system ABI name
 `libusb-1.0.so.0` for the pinned DepthAI libusb role, and V3 had no exact
-face-cascade or head-gaze-policy binding. The current renderer requires
-qualification input V4 and emits qualification launch V4. Production input V1
-and launch V3 are unchanged.
+face-cascade or optional head-gaze-policy binding. The current renderer
+requires qualification input V4 and emits qualification launch V4. Production
+input V1 and launch V3 are unchanged.
+
+Gate A omits `assets.head_gaze_policy_source_path`. Consequently its bundle
+contains no head-gaze policy file or hash, bootstrap returns no policy, and no
+gaze adapter is claimed. This does not disable the separately reviewed natural
+head hold.
+
+For later proposal-only qualification work, start from
+`configs/nano-wheels-off-qualification-template/head-gaze-policy-v1.json.template`.
+It fixes the declared camera/head geometry, parallel neutral axes, assumed
+`1.5 m` gaze plane, and natural encoder declaration, but deliberately leaves
+every unmeasured mapping and controller value as an `UNVALIDATED` sentinel.
+It is a non-deployable template, not calibration evidence. If supplied, the
+policy must parse as `proposal_only` before bootstrap opens hardware; it
+cannot authorize torque or head motion.
 
 Do not install a qualification systemd unit. Do not add qualification to the
-production unit, qualified-boot drop-in, cron, Fable guardian, or any other
+production unit, qualified-boot drop-in, cron, a legacy guardian, or any other
 automatic startup path.
 
 Never replace `/opt/kiko/bin/kiko-slam` with this feature-expanded binary.
@@ -105,7 +123,6 @@ staging root. The canonical installed layout is:
 ├── candidate-controller-policy-v1.json
 ├── controller-server-candidate-v2.json
 ├── device-inventory-candidate-v2.json
-├── head-gaze-policy-v1.json
 ├── nano-wheels-off-qualification-launch-v4.json
 ├── navigation-shadow-v1.json
 ├── native-runtime-v1.json
@@ -129,6 +146,10 @@ staging root. The canonical installed layout is:
 │   │   └── haarcascade_profileface.xml
 │   └── <exact SuperPoint and LightGlue model paths>
 ```
+
+`head-gaze-policy-v1.json` appears only in a later bundle whose render input
+explicitly supplies a complete proposal-only policy source. Its absence is the
+typed Gate A state.
 
 The deployment tool must discover and render the following instead of
 guessing them:
@@ -215,9 +236,10 @@ systemctl is-enabled kiko-nano-agent.service
 Production and any legacy standalone controller service must be inactive. The
 repository no longer ships the standalone service; `unknown` is therefore the
 expected result on a clean installation. The qualification process must remain
-a foreground attended command. If a Fable owner currently holds the
-OAK/head/eye, stop it through its documented normal handoff and verify that it
-exited before continuing.
+a foreground attended command. If any other owner or automatic launcher can
+hold the OAK, head, or eye endpoint, do not start qualification. Retain the
+conflict and resolve that workload separately, then repeat the read-only owner
+check.
 
 Recheck:
 
@@ -229,6 +251,10 @@ Recheck:
 - operator and Nano terminal clocks/log destination identified.
 
 ## Start exactly once, in the foreground
+
+Before starting the foreground process, establish the loopback SSH forwards
+shown in the next section. A forward can wait while the Nano port is not yet
+listening; do not expose either listener on the LAN.
 
 Run from an attended TTY:
 
@@ -278,20 +304,35 @@ a hermetic transitive OS-library closure. Retain exact
 `DT_NEEDED`/loader-graph evidence from the final ELF as a separate target-side
 `readelf` release gate.
 
-Immediately before the short raw-PWM window, the process requires one fresh
+After the fallible setup completes, the process binds the loopback console
+with its manual-motion boundary still disabled and reports
+`motion-attestation-pending`. While the terminal waits, read the newly created
+capability in a separate authenticated Nano shell, open the console through
+the already-established tunnel, and confirm that requests other than the
+one-way software safety stop are rejected. The process then requires one fresh
 exact reply:
 
 ```text
 WHEELS OFF HEAD SUPPORTED POWER CUT READY
 ```
 
-That attestation may authorize nonzero candidate requests for at most 30
-seconds from its monotonic creation. It is not a 30-second continuous-motion
-request. A safely stopped mapping session may continue after expiry, but a new
-nonzero request—or a retained nonzero target crossing the deadline—fails
-closed. Restart and repeat the attended preflight for a new motion window.
+Only after that reply does the process create the stopped runtime owner and
+atomically enable the console's manual-motion boundary. A pre-attestation
+software safety stop prevents enablement. The attestation may authorize
+nonzero candidate requests for at most 30 seconds from its monotonic creation;
+console and dataset startup no longer consume that window. It is not a
+30-second continuous-motion request. A safely stopped mapping session may
+continue after expiry, but a new nonzero request—or a retained nonzero target
+crossing the deadline—fails closed. Restart and repeat the attended preflight
+for a new motion window.
 
-## Open the unified human/agent console
+Treat the pending prompt as a short, continuously attended startup check, not
+an indefinite pause. Sensor/navigation processing is not claimed to advance
+while that worker is waiting for the terminal reply. If console inspection is
+delayed or the frontend exits, do not attest into an aged startup: stop and
+restart the qualification.
+
+## Use the unified human/agent console
 
 The qualifier listens only on Nano loopback at `127.0.0.1:9877`. From the
 operator computer, keep this tunnel open:
@@ -339,6 +380,12 @@ then use the returned session ID and `x-kiko-session-capability`. The ordinary
 production velocity-intent endpoint is not a raw-PWM alias and must not be used
 for this session.
 
+The nested `wheels_off_qualification` snapshot projection is schema V2. V2
+adds the required frontend lifecycle, attended-motion-authority, and stop-latch
+state. Clients must reject retired V1 snapshots rather than deriving readiness
+without those fields. Intent submissions remain the separate request schema
+V1.
+
 The UI must show the qualification banner, raw left/right timer-duty requests,
 last exact applied receipt, stop/disarm state, runtime health, pose, live
 occupancy grid, path, and shadow MPC state. Use arrow/WASD only while observing
@@ -375,6 +422,31 @@ record, and controller lease expiry. Keep the wheels removed. On every fault,
 record whether stop certainty is exact or uncertain. If software stop is
 uncertain, use the independent power cut and report uncertainty; never promote
 that run.
+
+Two host faults have closed, qualifier-only declarations. Add exactly one of
+these arguments to the normal `nano-wheels-off-qualification` invocation:
+
+```text
+--fault-injection host-monotonic-clock-regression-on-first-nonzero-command
+--fault-injection partial-uart-record-on-first-nonzero-command
+```
+
+Run them separately. The clock declaration arms only after bootstrap zero and
+reacquisition; the first nonzero candidate request then makes the command
+client observe one strict regression. It must latch before transmitting that
+nonzero command and retain the exact `HostStop` recovery result. The UART
+declaration lets bootstrap and reacquisition zero pass normally, writes exactly
+one checked non-delimiter byte of the first nonzero `ApplyPwm` record, writes a
+delimiter, issues `ForceStop`, and terminates the controller owner with the
+typed resynchronization and stop outcome. A controller serial-integrity fault
+is retained, not rewritten as a clean run.
+
+There is no free-form regression size, prefix length, repeat count, or combined
+mode. Unknown declarations fail command-line parsing. The production
+`nano-agent` subcommand has no `--fault-injection` argument, and an ordinary
+qualification run omits the injection state. These host tests prove
+deterministic fault routing; only a later attended wheels-off session can
+provide controller and output evidence from the physical link.
 
 Live SLAM/occupancy/Rerun and shadow MPC are observational in this lane. No MPC
 output, point goal, frontier exploration, or body-frame velocity command is

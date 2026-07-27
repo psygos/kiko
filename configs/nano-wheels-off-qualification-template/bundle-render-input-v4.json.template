@@ -68,8 +68,7 @@
         "source_path": "${PROFILE_FACE_CASCADE_SOURCE_ABSOLUTE_PATH}",
         "destination_relative_path": "models/opencv/haarcascade_profileface.xml"
       }
-    },
-    "head_gaze_policy_source_path": "${HEAD_GAZE_POLICY_SOURCE_ABSOLUTE_PATH}"
+    }
   },
   "native_libraries": [
     {

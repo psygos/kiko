@@ -27,6 +27,7 @@ use robot_protocol::v2::{
 use robot_server::config::ControllerServerConfigV2;
 use serde::Deserialize;
 
+use super::WheelsOffQualificationHostClockFaultInjection;
 use super::actuation::{
     LiveActuationError, PhysicalActuationSession, StoppedCandidateActuationClient,
 };
@@ -671,12 +672,23 @@ impl WheelsOffCandidateActuationSession {
         authority: AdmittedWheelsOffCandidateController,
         clock_origin: Instant,
     ) -> Result<Self, CandidateActuationSessionStartError> {
+        Self::acquire_with_clock_fault(authority, clock_origin, None)
+    }
+
+    pub(crate) fn acquire_with_clock_fault(
+        authority: AdmittedWheelsOffCandidateController,
+        clock_origin: Instant,
+        clock_fault: Option<WheelsOffQualificationHostClockFaultInjection>,
+    ) -> Result<Self, CandidateActuationSessionStartError> {
         let target_authority = authority.target_authority();
         let inventory_content_sha256 = authority.inventory_content_sha256;
         let command_interval = authority.command_interval;
-        let (inner, last_applied) =
-            PhysicalActuationSession::acquire_candidate(authority.client, clock_origin)
-                .map_err(CandidateActuationSessionStartError::Actuation)?;
+        let (inner, last_applied) = PhysicalActuationSession::acquire_candidate(
+            authority.client,
+            clock_origin,
+            clock_fault,
+        )
+        .map_err(CandidateActuationSessionStartError::Actuation)?;
         Self::from_acquired(
             inner,
             last_applied,

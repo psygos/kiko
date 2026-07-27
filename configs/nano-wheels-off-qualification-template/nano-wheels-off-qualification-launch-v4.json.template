@@ -31,11 +31,6 @@
     "maximum_bytes": ${CANDIDATE_CONTROLLER_POLICY_MAXIMUM_BYTES},
     "sha256_hex": "${CANDIDATE_CONTROLLER_POLICY_SHA256}"
   },
-  "head_gaze_policy_asset": {
-    "relative_path": "head-gaze-policy-v1.json",
-    "maximum_bytes": ${HEAD_GAZE_POLICY_MAXIMUM_BYTES},
-    "sha256_hex": "${HEAD_GAZE_POLICY_SHA256}"
-  },
   "controller_server": {
     "contract_asset": {
       "relative_path": "controller-server-candidate-v2.json",
