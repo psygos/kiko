@@ -416,19 +416,44 @@ With the wheels removed and the power cut in hand:
 7. End the process normally and confirm the exact disarm receipt and capability
    cleanup.
 
-Run separate fault sessions for STM32 reset, serial disconnect, OAK disconnect,
-browser/tunnel loss, host termination, stale/deferred command, partial serial
-record, and controller lease expiry. Keep the wheels removed. On every fault,
-record whether stop certainty is exact or uncertain. If software stop is
-uncertain, use the independent power cut and report uncertainty; never promote
-that run.
+Run exactly one fault in each fresh qualification process. Retain the process
+ID, controller boot/session identity, last applied receipt, terminal stop or
+disarm receipt, and whether output certainty is exact or uncertain. A stopped
+process must not be reused for another fault. Keep the wheels removed and the
+independent power cut reachable throughout. If software stop is uncertain, cut
+motor power and retain that uncertainty; never promote the run.
 
-Two host faults have closed, qualifier-only declarations. Add exactly one of
+The minimum separate-session matrix is:
+
+- close the browser or SSH tunnel while a brief request is being refreshed,
+  then require the server-side deadman to produce a journaled exact zero;
+- let one request expire without refresh, then require the same terminal-zero
+  evidence;
+- replay a source sequence or idempotency key and require rejection without a
+  new nonzero applied step;
+- stop refreshing the controller lease, without killing its owner, and require
+  the firmware lease/watchdog stop before clean host recovery;
+- reset the STM32 and, in a different session, physically disconnect its
+  serial link; treat either result as uncertain unless an exact zero from the
+  same reacquired boot/session can be proved;
+- physically disconnect the OAK for the camera-loss test and require the host
+  safety latch and terminal stop;
+- send `SIGTERM` to the exact foreground qualifier PID, never a broad process
+  signal, and require normal cleanup, exact stop/disarm evidence, and capability
+  removal;
+- after a proved stop and disarm with motor power cut, cold-restart the
+  controller and qualifier and require a new boot/session that begins at zero
+  with no stale authority; and
+- run each qualifier-only deterministic seam below in its own fresh process.
+
+Four host faults have closed, qualifier-only declarations. Add exactly one of
 these arguments to the normal `nano-wheels-off-qualification` invocation:
 
 ```text
 --fault-injection host-monotonic-clock-regression-on-first-nonzero-command
 --fault-injection partial-uart-record-on-first-nonzero-command
+--fault-injection stale-depth-on-first-nonzero-command
+--fault-injection localization-loss-on-first-nonzero-command
 ```
 
 Run them separately. The clock declaration arms only after bootstrap zero and
@@ -439,12 +464,26 @@ declaration lets bootstrap and reacquisition zero pass normally, writes exactly
 one checked non-delimiter byte of the first nonzero `ApplyPwm` record, writes a
 delimiter, issues `ForceStop`, and terminates the controller owner with the
 typed resynchronization and stop outcome. A controller serial-integrity fault
-is retained, not rewritten as a clean run.
+is retained, not rewritten as a clean run. The stale-depth declaration latches
+depth stale only after a controller-confirmed nonzero applied step, prevents
+later depth observations from making the injected navigation state fresh, and
+queues the existing terminal stop. The localization-loss declaration first
+requires established localization at that confirmed step, then latches
+localization lost and queues the same terminal stop; if localization was never
+established, the seam fails closed instead of fabricating a loss.
+
+The stale-depth and localization-loss declarations are synthetic software
+seams inside a live hardware qualification process. They do not prove a
+physical OAK disconnect, frame loss, or real localization failure. Retain the
+selected and triggered declaration with the applied receipt and stop evidence,
+and run the physical OAK-disconnect session separately.
 
 There is no free-form regression size, prefix length, repeat count, or combined
 mode. Unknown declarations fail command-line parsing. The production
 `nano-agent` subcommand has no `--fault-injection` argument, and an ordinary
-qualification run omits the injection state. These host tests prove
+qualification run omits the injection state. A selected declaration that
+reaches normal teardown without exercising its exact path is a typed failed
+session, not a clean run. These host tests prove
 deterministic fault routing; only a later attended wheels-off session can
 provide controller and output evidence from the physical link.
 

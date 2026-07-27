@@ -481,6 +481,13 @@ impl WheelsOffQualificationRuntime {
         self.console.snapshot()
     }
 
+    /// Queue the console's existing process-lifetime fail-closed terminal
+    /// transition. The next runtime tick drains this stop before any retained
+    /// candidate command.
+    pub fn signal_internal_fail_closed(&self, observed_at: Option<HostMonotonicTimestamp>) {
+        self.console.signal_internal_fail_closed(observed_at);
+    }
+
     pub fn tick(
         &mut self,
     ) -> Result<WheelsOffQualificationRuntimeTick, WheelsOffQualificationRuntimeError> {

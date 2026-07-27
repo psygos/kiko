@@ -5762,6 +5762,7 @@ struct LiveWheelsOffQualificationMotionInput {
     initial_health: ConsoleSubsystemHealth,
     accessory_health: NanoAccessoryHealthObserver,
     rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
+    fault_injection: Option<kiko_slam::navigation::WheelsOffQualificationFaultInjection>,
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
@@ -5779,6 +5780,7 @@ impl LiveWheelsOffQualificationMotionInput {
         initial_health: ConsoleSubsystemHealth,
         accessory_health: NanoAccessoryHealthObserver,
         rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
+        fault_injection: Option<kiko_slam::navigation::WheelsOffQualificationFaultInjection>,
     ) -> Self {
         Self {
             stopped_controller: Some(stopped_controller),
@@ -5792,6 +5794,7 @@ impl LiveWheelsOffQualificationMotionInput {
             initial_health,
             accessory_health,
             rerun_diagnostics_url,
+            fault_injection,
         }
     }
 
@@ -5810,6 +5813,7 @@ impl LiveWheelsOffQualificationMotionInput {
         ConsoleSubsystemHealth,
         NanoAccessoryHealthObserver,
         ConsoleRerunDiagnosticsUrl,
+        Option<kiko_slam::navigation::WheelsOffQualificationFaultInjection>,
     ) {
         (
             self.stopped_controller
@@ -5831,6 +5835,7 @@ impl LiveWheelsOffQualificationMotionInput {
             self.initial_health,
             self.accessory_health.clone(),
             self.rerun_diagnostics_url,
+            self.fault_injection,
         )
     }
 }
@@ -6230,6 +6235,13 @@ enum LiveSensorStream {
 }
 
 #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+impl LiveSensorStream {
+    const fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
+}
+
+#[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
 const LIVE_SENSOR_CONSOLE_MAX_SAMPLE_AGE_NS: u64 = 1_000_000_000;
 
 #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
@@ -6241,6 +6253,7 @@ struct LiveSensorStreamHealth {
     visual_open: bool,
     depth_open: bool,
     imu_open: bool,
+    latched_stale_streams: u8,
 }
 
 #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
@@ -6253,14 +6266,28 @@ impl LiveSensorStreamHealth {
             visual_open: true,
             depth_open: true,
             imu_open: true,
+            latched_stale_streams: 0,
         }
     }
 
     fn observe(&mut self, stream: LiveSensorStream, observed_at: HostMonotonicTimestamp) {
+        if self.latched_stale_streams & stream.bit() != 0 {
+            return;
+        }
         match stream {
             LiveSensorStream::Visual => self.visual_observed_at = Some(observed_at),
             LiveSensorStream::Depth => self.depth_observed_at = Some(observed_at),
             LiveSensorStream::Imu => self.imu_observed_at = Some(observed_at),
+        }
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    fn latch_stale(&mut self, stream: LiveSensorStream) {
+        self.latched_stale_streams |= stream.bit();
+        match stream {
+            LiveSensorStream::Visual => self.visual_observed_at = None,
+            LiveSensorStream::Depth => self.depth_observed_at = None,
+            LiveSensorStream::Imu => self.imu_observed_at = None,
         }
     }
 
@@ -6552,6 +6579,15 @@ enum LiveNavigationWorkerError {
         source: kiko_slam::navigation::WheelsOffQualificationAppliedStepJournalError,
     },
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationFaultTrigger {
+        selected: kiko_slam::navigation::WheelsOffQualificationFaultInjection,
+        source: kiko_slam::navigation::WheelsOffQualificationLiveFaultTriggerError,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationFaultNotExercised {
+        selected: kiko_slam::navigation::WheelsOffQualificationFaultInjection,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     WheelsOffQualificationFrontendExited {
         evidence: Box<kiko_slam::navigation::WheelsOffQualificationFrontendShutdownEvidence>,
     },
@@ -6749,6 +6785,16 @@ impl std::fmt::Display for LiveNavigationWorkerError {
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
             Self::WheelsOffQualificationAppliedStepCorrelation { source } => source.fmt(formatter),
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationFaultTrigger { selected, source } => write!(
+                formatter,
+                "wheels-off qualification fault {selected} was not exercised: {source}"
+            ),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationFaultNotExercised { selected } => write!(
+                formatter,
+                "wheels-off qualification fault {selected} was selected but the process reached normal teardown without exercising its exact injected-fault path"
+            ),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
             Self::WheelsOffQualificationFrontendExited { evidence } => write!(
                 formatter,
                 "wheels-off qualification frontend exited before shutdown; controller is being stopped: {evidence:?}"
@@ -6941,7 +6987,10 @@ impl std::error::Error for LiveNavigationWorkerError {
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
             Self::WheelsOffQualificationAppliedStepCorrelation { source } => Some(source),
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
-            Self::WheelsOffQualificationFrontendExited { .. }
+            Self::WheelsOffQualificationFaultTrigger { source, .. } => Some(source),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationFaultNotExercised { .. }
+            | Self::WheelsOffQualificationFrontendExited { .. }
             | Self::WheelsOffQualificationFrontendShutdown { .. } => None,
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
             Self::WheelsOffQualificationTelemetry { source } => Some(source),
@@ -7155,6 +7204,7 @@ struct LiveWheelsOffQualificationMotionRuntime {
     sensor_health: LiveSensorStreamHealth,
     map_revision: Option<u64>,
     localized: bool,
+    fault_injection: kiko_slam::navigation::WheelsOffQualificationLiveFaultState,
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
@@ -7258,9 +7308,13 @@ impl LiveNavigationRuntime {
             }
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
             Self::WheelsOffQualification(runtime) => {
+                if runtime.fault_injection.forces_localization_lost() {
+                    runtime.sensor_health.observe(LiveSensorStream::Visual, now);
+                    return Ok(());
+                }
                 let outcome = runtime.coordinator.accept_visual(admission, now)?;
                 runtime.sensor_health.observe(LiveSensorStream::Visual, now);
-                runtime.localized = match &outcome {
+                let observed_localized = match &outcome {
                     VisualAdmissionOutcome::Reanchored(state)
                     | VisualAdmissionOutcome::Updated(state) => runtime
                         .coordinator
@@ -7271,6 +7325,8 @@ impl LiveNavigationRuntime {
                     VisualAdmissionOutcome::ChainBroken(_)
                     | VisualAdmissionOutcome::Rejected(_) => false,
                 };
+                runtime.localized =
+                    observed_localized && !runtime.fault_injection.forces_localization_lost();
                 Ok(())
             }
         }
@@ -7295,6 +7351,9 @@ impl LiveNavigationRuntime {
             }
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
             Self::WheelsOffQualification(runtime) => {
+                if runtime.fault_injection.suppresses_depth_admission() {
+                    return Ok(());
+                }
                 runtime.coordinator.accept_depth(observation, now)?;
                 runtime.sensor_health.observe(LiveSensorStream::Depth, now);
                 Ok(())
@@ -7939,6 +7998,7 @@ fn start_wheels_off_qualification_motion_runtime(
         initial_health,
         accessory_health,
         rerun_diagnostics_url,
+        fault_injection,
     ) = input.take_for_owner();
     let boot_id = initial_stop.observed_boot_id().get();
     let stop_request_id = initial_stop.request_id().get();
@@ -8106,6 +8166,9 @@ fn start_wheels_off_qualification_motion_runtime(
         sensor_health: LiveSensorStreamHealth::awaiting_first_samples(),
         map_revision: None,
         localized: false,
+        fault_injection: kiko_slam::navigation::WheelsOffQualificationLiveFaultState::new(
+            fault_injection,
+        ),
     })
 }
 
@@ -8832,6 +8895,57 @@ fn observe_wheels_off_qualification_controller(
             Some(ConsoleStopCertainty::uncertain())
         }
     };
+    Ok(())
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn trigger_wheels_off_qualification_live_fault(
+    runtime: &mut LiveWheelsOffQualificationMotionRuntime,
+    actual_applied: robot_protocol::v2::TimerPwm,
+    applied_observed_at: HostMonotonicTimestamp,
+) -> Result<(), LiveNavigationWorkerError> {
+    let trigger = match runtime
+        .fault_injection
+        .observe_controller_confirmed_applied_step(actual_applied, runtime.localized)
+    {
+        Ok(trigger) => trigger,
+        Err(source) => {
+            runtime
+                .controller()
+                .signal_internal_fail_closed(Some(applied_observed_at));
+            return Err(
+                LiveNavigationWorkerError::WheelsOffQualificationFaultTrigger {
+                    selected: source.selected(),
+                    source,
+                },
+            );
+        }
+    };
+    let Some(trigger) = trigger else {
+        return Ok(());
+    };
+    match trigger {
+        kiko_slam::navigation::WheelsOffQualificationLiveFaultTrigger::StaleDepthOnFirstNonzeroCommand => {
+            runtime
+                .coordinator
+                .inject_wheels_off_qualification_stale_depth();
+            runtime.sensor_health.latch_stale(LiveSensorStream::Depth);
+        }
+        kiko_slam::navigation::WheelsOffQualificationLiveFaultTrigger::LocalizationLossOnFirstNonzeroCommand => {
+            runtime
+                .coordinator
+                .inject_wheels_off_qualification_localization_loss();
+            runtime.localized = false;
+        }
+    }
+    runtime
+        .controller()
+        .signal_internal_fail_closed(Some(applied_observed_at));
+    eprintln!(
+        "wheels-off qualification synthetic fault triggered: selected={} triggered={}; basis=controller-confirmed nonzero applied step; process-lifetime terminal stop queued; this qualifier seam does not claim a physical sensor disconnect",
+        trigger.declaration(),
+        trigger.as_str(),
+    );
     Ok(())
 }
 
@@ -9994,6 +10108,7 @@ fn run_live_navigation_worker(
                                 pending,
                             } = controller_tick
                             {
+                                let actual_applied = pending.actual_applied();
                                 let applied_observed_at = clock
                                     .checked_now()
                                     .map_err(LiveNavigationWorkerError::HostClock)?;
@@ -10033,6 +10148,11 @@ fn run_live_navigation_worker(
                                             source: Box::new(source),
                                         }
                                     })?;
+                                trigger_wheels_off_qualification_live_fault(
+                                    qualification,
+                                    actual_applied,
+                                    applied_observed_at,
+                                )?;
                             }
                             let outcome = qualification
                                 .coordinator
@@ -10530,6 +10650,11 @@ fn run_live_navigation_worker(
         }
         #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
         LiveNavigationRuntime::WheelsOffQualification(mut qualification) => {
+            if let Some(selected) = qualification.fault_injection.unexercised_on_normal_exit() {
+                failures.push(
+                    LiveNavigationWorkerError::WheelsOffQualificationFaultNotExercised { selected },
+                );
+            }
             qualification.frontend_mut().request_shutdown();
             let (mut controller, mut frontend) = qualification.take_terminal_parts();
             if let Err(source) = controller.shutdown() {
@@ -12947,6 +13072,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
         exact_inventory_admission: _,
         candidate_limits,
         candidate_runtime_service_interval,
+        fault_injection,
         initial_zero,
         initial_stop,
         stopped_controller,
@@ -13102,6 +13228,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
                 initial_health,
                 accessory_health,
                 software.rerun_diagnostics_url,
+                fault_injection,
             ),
         )),
         accessory: Some(accessory),
@@ -15823,6 +15950,21 @@ mod tests {
             health.console_health(before_first),
             kiko_slam::navigation::ConsoleHealth::Degraded
         );
+        #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+        {
+            health.latch_stale(LiveSensorStream::Depth);
+            let after_latch =
+                kiko_slam::HostMonotonicTimestamp::from_nanos(first.as_nanos().saturating_add(1));
+            health.observe(LiveSensorStream::Visual, after_latch);
+            health.observe(LiveSensorStream::Depth, after_latch);
+            health.observe(LiveSensorStream::Imu, after_latch);
+            assert_eq!(health.depth_observed_at, None);
+            assert_eq!(
+                health.console_health(after_latch),
+                kiko_slam::navigation::ConsoleHealth::Degraded,
+                "a latched synthetic stale stream cannot recover from later frames"
+            );
+        }
         health.mark_closed(LiveSensorStream::Visual);
         assert_eq!(
             health.console_health(first),

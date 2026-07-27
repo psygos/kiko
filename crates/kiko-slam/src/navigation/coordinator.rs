@@ -1141,6 +1141,28 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         self.current_map.map(|current| current.binding)
     }
 
+    /// Qualification-only synthetic stale-depth seam.
+    ///
+    /// This invalidates navigation depth readiness immediately without
+    /// claiming that the physical camera disconnected. The live qualifier
+    /// separately suppresses later depth admissions for the process lifetime.
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    pub fn inject_wheels_off_qualification_stale_depth(&mut self) {
+        self.depth_readiness = DepthReadiness::NoObservation;
+    }
+
+    /// Qualification-only synthetic localization-loss seam.
+    ///
+    /// This revokes navigation's continuous-visual readiness and its direct
+    /// localization binding without claiming a physical camera failure. The
+    /// live qualifier separately suppresses later visual admissions for the
+    /// process lifetime.
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    pub fn inject_wheels_off_qualification_localization_loss(&mut self) {
+        self.visual_readiness = VisualReadiness::BrokenAttempt;
+        self.direct_localization_binding = None;
+    }
+
     /// Evaluate the exact sensor-side prerequisites for granting new motion
     /// authority at `now`.
     ///
@@ -3311,6 +3333,36 @@ mod tests {
         ));
         accept_aligned_depth(&mut coordinator);
         coordinator
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn qualification_stale_depth_seam_invalidates_navigation_readiness_immediately() {
+        let mut coordinator = ready_fixture(1_000, 10, 2.0);
+        let now = host(1_120);
+        assert!(coordinator.motion_start_readiness_at(now).is_ok());
+
+        coordinator.inject_wheels_off_qualification_stale_depth();
+
+        assert!(matches!(
+            coordinator.motion_start_readiness_at(now),
+            Err(CoordinatorTickBlocker::DepthUnavailable)
+        ));
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn qualification_localization_loss_seam_revokes_navigation_readiness_immediately() {
+        let mut coordinator = ready_fixture(1_000, 10, 2.0);
+        let now = host(1_120);
+        assert!(coordinator.motion_start_readiness_at(now).is_ok());
+
+        coordinator.inject_wheels_off_qualification_localization_loss();
+
+        assert!(matches!(
+            coordinator.motion_start_readiness_at(now),
+            Err(CoordinatorTickBlocker::VisualOdometryRejected)
+        ));
     }
 
     fn manual_command(
