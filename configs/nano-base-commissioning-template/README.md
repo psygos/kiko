@@ -87,19 +87,21 @@ The durable flash boot journal is part of this identity. A V1 production or V2
 wheels-off image must be rejected; changing JSON to resemble V3 does not
 convert the firmware. No hardware success is claimed by this template.
 
-## Ownership handoff
+## Exclusive-endpoint acquisition
 
 Before the attended command:
 
-1. Coordinate a normal stop of all current OAK/head/eye owners, including
-   Fable where present. Do not kill unrelated processes.
-2. The prior head owner must issue no torque-disable write. Support the head
-   throughout the handoff; serial cleanup does not prove physical torque
-   continuity.
+1. Inspect the current OAK/head/eye owners and their automatic launch
+   authorities. If a conflict is present, retain it and stop; do not disable,
+   signal, or kill another workload from commissioning. Resolve it separately
+   and repeat this read-only check.
+2. Support the head throughout acquisition. Absence of another owner does not
+   prove physical torque continuity.
 3. Freshly check each exact OAK, head-serial, eye-serial, STM32-serial, and
    controller UDP endpoint and confirm there is no competing owner.
 4. Confirm the head and eye by-ID paths, exact OAK MXID, STM32 by-ID path, and
-   loopback endpoint match the rendered inventory.
+   loopback endpoint match the rendered inventory, then start exactly one
+   canonical Kiko owner.
 5. Place Kiko on a flat, high-friction test surface with both wheels attached,
    the full motion envelope clear, the operator continuously attending, and a
    separately powered emergency cut already tested and immediately reachable.

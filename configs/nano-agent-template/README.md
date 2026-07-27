@@ -10,7 +10,8 @@ replaced every token with measured or independently reviewed values.
 `native-runtime-v1.json.template` is likewise a non-deployable source
 template. Render it from the exact staged native-library names, byte
 ceilings, and lowercase SHA-256 values. The complete offline qualification,
-native closure, Fable handoff, and qualified-only boot procedure is in
+native closure, exclusive-endpoint acquisition, and qualified-only boot
+procedure is in
 `docs/nano-qualified-deployment.md`.
 
 Launch schema V3 retains V2's separate map and navigation-dataset contracts
@@ -124,8 +125,8 @@ without both distinct assets.
 
 The wheels-off renderer uses the separate exact schema-V4 source at
 `configs/nano-wheels-off-qualification-template/bundle-render-input-v4.json.template`.
-It fixes the qualification bundle kind, exact face-cascade and
-head-gaze-policy inputs, cold-start selection, and reviewed SONAMEs while
+It fixes the qualification bundle kind, exact face-cascade and optional
+proposal-only head-gaze inputs, cold-start selection, and reviewed SONAMEs while
 requiring `qualification_executable_path`, the canonical absolute path of the
 exact Linux-aarch64 executable retained into the qualification bundle. The
 strict renderer rejects cross-version or bundle-specific fields instead of
@@ -198,12 +199,14 @@ The production unit invokes
 `/opt/kiko/bin/kiko-slam nano-agent`. That process owns the admitted OAK,
 accessories, control API, and in-process typed STM32 lifecycle. The repository
 no longer ships a standalone `kiko-robot-server.service` or the former
-wheels-off bench unit. Do not kill an older installed unit or any Fable owner
-blindly: inspect ownership, perform a coordinated normal handoff, and let exact
-endpoint/serial acquisition fail closed if anything still competes. An older
-installation may still have the retired standalone unit enabled; after it is
-confirmed inactive, remove/disable that legacy installation without starting
-production.
+wheels-off bench unit. Do not kill an older installed unit or any endpoint
+owner: inspect ownership and let exact endpoint/serial acquisition fail closed
+if anything still competes. A conflicting process or automatic launcher is a
+failed precondition; do not disable, signal, or kill it from this launch
+workflow. Resolve the other workload separately, then repeat the read-only
+owner check. An older installation may still have the retired standalone unit
+enabled; production must remain stopped until that separate installation has
+been deliberately resolved.
 
 After the immutable bundle, exact device admission, independent power cut,
 and wheels-off fault prerequisites have been reviewed, start production

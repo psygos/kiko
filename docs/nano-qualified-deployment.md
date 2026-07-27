@@ -201,9 +201,9 @@ The `onnxruntime` native-manifest path and digest must exactly equal the
 launch document's ONNX Runtime asset binding. A successful load still proves
 neither provider selection nor inference accuracy, latency, or speed.
 
-## Exact Fable handoff
+## Exact exclusive-endpoint acquisition
 
-At the time of the audit, these two `makerspace` crontab entries owned restart
+At one historical audit, these two `makerspace` crontab entries owned restart
 authority:
 
 ```text
@@ -211,33 +211,30 @@ authority:
 * * * * * pgrep -f 'engine-guardian[.]sh' >/dev/null || (setsid /home/makerspace/kiko-follow/engine-guardian.sh >/dev/null 2>&1 &)
 ```
 
-The guardian respawned `kiko_face_follow.py` every eight seconds. The child
-owned the exact OAK, head adapter, and eye controller. Stopping only that child
-is not a handoff.
+The guardian respawned `kiko_face_follow.py` every eight seconds. Its child
+then owned the exact OAK, head adapter, and eye controller. This snapshot is
+historical provenance only, not proof that either entry or process is still
+active and not an operational release recipe.
 
 Perform this attended, with motor power independently cut, the robot
 restrained, and the head supported:
 
-1. Save the current user crontab and identify the exact guardian and child
-   PIDs plus their parent/child relationship.
-2. Remove only the two exact launch entries above from the `makerspace`
-   crontab. Do not use a substring rewrite that could remove unrelated jobs.
-3. Send normal termination to the exact guardian PID and wait for its cleanup.
-   If its already-identified child remains only after the guardian is proven
-   gone, terminate that exact child normally and retain the cleanup result.
-4. Wait longer than the guardian's eight-second respawn interval and the
-   one-minute cron interval. Re-read the crontab and process tree and prove
-   neither process returned.
-5. Prove no process owns the exact OAK USB node, head adapter, eye controller,
-   STM32 by-id endpoint, production loopback endpoint, or Kiko runtime socket.
-6. Start exactly one canonical owner. Its typed identity and exclusive-open
-   failures remain authoritative; never bypass them because the process list
-   looked empty.
+1. Re-read the current user crontab, service state, process tree, and exact
+   endpoint owners, including their launch/respawn authorities.
+2. If any other process or automatic launcher owns or can reacquire an OAK,
+   head, eye, STM32, production-loopback, or Kiko-runtime endpoint, stop this
+   procedure and retain the conflict. Do not edit its launcher, signal it, or
+   kill it from this qualification workflow.
+3. After a conflicting workload has been resolved separately, rerun the
+   read-only owner check. Prove every exact endpoint free.
+4. Start exactly one canonical Kiko owner. Its typed identity and
+   exclusive-open failures remain authoritative; never bypass them because the
+   process list looked empty.
 
 Never use `pkill`, `killall`, a broad `pgrep`-driven kill, or automatic
 service-side cleanup. Never start the standalone `kiko-robot-server` beside
-the production agent. If an exact owner cannot be handed off normally, stop
-and preserve the uncertainty.
+the production agent. A conflicting owner is a failed precondition, not
+authority to mutate another workload.
 
 ## Build and offline production-install phase
 

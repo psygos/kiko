@@ -155,7 +155,13 @@ DepthAI dependencies if they are copied outside an independently managed
 system installation. A successful build or `ldd` result does not qualify the
 OAK stream graph, SLAM, inference correctness, latency, or physical control.
 
-## Immediate gate implications
+## Immediate gate implications recorded at audit time
+
+This dated list preserves the conclusion drawn from that live snapshot. It is
+not the current operational owner-release procedure. The 2026-07-27 Gate A
+refresh and current qualification runbook supersede item 4: freshly prove no
+competing owner or respawner exists; if one is found, retain the conflict and
+stop without disabling, signalling, or killing that workload.
 
 Before the wheel-attachment question is allowed:
 
@@ -163,7 +169,8 @@ Before the wheel-attachment question is allowed:
 2. render a sentinel-free, byte-bound deployment package;
 3. let the exact canonical owner request SuperSpeed and require its readback,
    relocating the connection only if that admission actually fails;
-4. coordinate the exact Fable cron/guardian handoff while preserving neck
+4. freshly prove no competing endpoint owner or respawner exists; retain any
+   conflict and stop without mutating another workload, while preserving neck
    support and tension continuity;
 5. install and admit the KRP2 firmware with an exact zero receipt;
 6. start one canonical owner and prove head hold, RGB/eyes, all OAK streams,

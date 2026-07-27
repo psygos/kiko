@@ -94,14 +94,15 @@ an active same-user program controlling the process's PTY. Account/session
 control, the attended procedure, direct observation, and the independent
 physical cut remain explicit trust boundaries.
 
-Before launch, coordinate release of any Fable or other OAK/head/eye owner.
-Do not kill unrelated processes. The previous head owner must release serial
-ownership without issuing a torque-disable write, and the head must remain
-physically supported throughout. The canonical commissioning worker verifies
-and retains a fresh natural hold before opening OAK; absence of a
-torque-disable write does not prove physical torque continuity across power,
-protection, or owner changes. There must also be no competing STM32 serial or
-controller-UDP owner.
+Before launch, prove the OAK/head/eye endpoints free. If a conflicting owner
+is present, retain the conflict and stop; do not disable, signal, or kill it
+from commissioning. Resolve that workload separately and repeat the read-only
+owner check. The head must remain physically supported throughout. The
+canonical commissioning worker verifies and retains a fresh natural hold
+before opening OAK; that does not prove physical torque continuity across
+power or protection changes. There must also be no competing STM32 serial or
+controller-UDP owner. Start exactly one canonical Kiko owner after all
+endpoint checks pass.
 
 The exact provisioning and command are in
 `configs/nano-base-commissioning-template/README.md`.

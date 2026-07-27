@@ -199,17 +199,19 @@ remain disarmed.
 
 - [ ] Freeze an immutable, reviewable source revision and
       wheels-off/commissioning bundle.
-- [x] Build that exact source natively on the Nano with its pinned native
-      dependencies; record source and binary identities. Revision `3f262f1`
-      and the exact release/runtime identities are recorded above.
-- [ ] Perform a coordinated handoff from every existing Fable device owner.
-      Never start a second OAK, head, or eye owner and never use a broad
-      process kill.
+- [ ] Build the final frozen source natively on the Nano with its pinned native
+      dependencies and record source and binary identities. Earlier revisions,
+      including `3f262f1` and `b3df4b5`, have exact predecessor evidence but do
+      not satisfy this item for a later final revision.
+- [ ] Freshly prove that no conflicting process or automatic launcher owns or
+      can reacquire any exact device endpoint. If a conflict exists, retain it
+      and stop; do not disable, signal, or kill another workload from Gate A.
+      Start exactly one canonical Kiko owner only after this proof.
 - [ ] Have the canonical owner request SuperSpeed for the exact OAK, read back
       the negotiated transport, and admit RGB, stereo, rectified-left depth,
       and IMU from one graph. Request a physical port/cable move only if that
-      canonical attempt fails; Fable's forced High-Speed mode is not such an
-      attempt.
+      canonical attempt fails; a historical process's forced High-Speed mode
+      is not such an attempt.
 - [ ] Provision and read back the boot journal, flash and exactly identify the
       operator-supervised four-PWM candidate, and keep it distinct from both
       the motion-disabled diagnostic image and any later production image.
@@ -245,6 +247,9 @@ remain disarmed.
       reset/serial loss, client disconnect, command expiry, clock fault,
       SIGTERM, and cold restart. Each motion-relevant path must confirm zero or
       report exact uncertainty.
+      The qualifier now has distinct one-shot declarations for host-clock
+      regression and a one-byte partial UART record; their host tests are not
+      a substitute for this unchecked attended run.
 - [ ] With the wheels still absent and separate operator approval, establish
       left/right shaft/body sign conventions through bounded low-output
       candidate commands. This is sign evidence, not a velocity model.

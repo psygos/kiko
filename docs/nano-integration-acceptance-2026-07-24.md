@@ -10,11 +10,12 @@ qualification, and attended wheel-on identification.
 
 The attended calibration-only wheel-attach handoff remains **closed** until
 Gate A in `docs/nano-wheel-attach-gate-2026-07-23.md` has fresh Nano evidence.
-That gate requires the coordinated device handoff, canonical SuperSpeed OAK
+That gate requires the exclusive-endpoint proof, canonical SuperSpeed OAK
 graph, exact-zero candidate, accessories, live SLAM/occupancy/Rerun, unified
 console, wheels-off commands/faults, and an independently tested reachable
-motor-power cut. Passing it authorizes attachment and the separate attended
-commissioning executable only.
+motor-power cut. This proof requires that no competing owner or respawner
+exists; it does not mutate or kill another workload. Passing Gate A authorizes
+attachment and the separate attended commissioning executable only.
 
 Production motion is a second, stricter gate. Under the evidenced PA0/PA1 plus
 PB4/PB5 four-PWM wiring, the repository has no known default-off external
@@ -293,9 +294,9 @@ and
 
 These results close the source-native-build, detector-boundary, release-link,
 and refreshed motor-inert transport portions of Gate A. They do not close the
-coordinated Fable handoff, OAK SuperSpeed/live-stream admission, head thermal
-and hold evidence, candidate firmware/zero/sign/fault matrix, immutable
-qualification bundle, live SLAM/occupancy/Rerun, or console checks.
+current exclusive-endpoint proof, OAK SuperSpeed/live-stream admission, head
+thermal and hold evidence, candidate firmware/zero/sign/fault matrix,
+immutable qualification bundle, live SLAM/occupancy/Rerun, or console checks.
 
 ## Live Nano evidence preserved
 
@@ -855,9 +856,11 @@ Before the attended calibration-only wheel-attachment sentence is allowed:
 1. ensure an independent, immediately reachable physical cut removes motor
    power outside Jetson and STM32 control, and keep it open while the wheels
    are attached;
-2. diagnose the recurrent historical Fable `bow overtemp` reports, then
-   coordinate an endpoint-by-endpoint Fable handoff with the head supported;
-   never use broad process killing or start a second OAK/head/eye owner;
+2. with the head supported, perform a fresh read-only proof that no competing
+   OAK/head/eye owner or respawner exists; if one is found, retain the conflict
+   and stop rather than mutating or killing another workload. The historical
+   `bow overtemp` reports remain provenance for the canonical head-health
+   review, not a dependency on a Fable runtime;
 3. provision and read back the boot journal, flash and admit the exact
    operator-supervised wheels-off candidate, prove exact applied zero, and
    complete its attended command/fault matrix. The separate motor-inert 20/50
