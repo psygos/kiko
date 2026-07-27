@@ -10200,6 +10200,8 @@ fn run_live_navigation_worker(
         Ok(())
     })();
 
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    let operation_completed_without_error = operation_result.is_ok();
     let mut failures = Vec::new();
     if let Err(source) = operation_result {
         failures.push(source);
@@ -10650,7 +10652,9 @@ fn run_live_navigation_worker(
         }
         #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
         LiveNavigationRuntime::WheelsOffQualification(mut qualification) => {
-            if let Some(selected) = qualification.fault_injection.unexercised_on_normal_exit() {
+            if operation_completed_without_error
+                && let Some(selected) = qualification.fault_injection.unexercised_on_normal_exit()
+            {
                 failures.push(
                     LiveNavigationWorkerError::WheelsOffQualificationFaultNotExercised { selected },
                 );
