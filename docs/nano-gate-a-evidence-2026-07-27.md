@@ -4,7 +4,91 @@ This file records current, bounded evidence for the wheel-attachment gate. It
 does not declare Gate A passed and does not authorize wheel attachment,
 powered motion, deployment, or production use.
 
-## Exact native qualification build
+## Superseding native tracker-startup refresh
+
+The clean Nano checkout at `/home/makerspace/kiko` was fast-forwarded to the
+exact code-bearing revision:
+
+```text
+5d1b1bc939dc34e0c80b861baa21afd81073f2df
+```
+
+This revision removes the canonical tracker's unbound EigenPlaces startup
+dependency. Production and wheels-off startup now use deterministic aggregate
+SuperPoint descriptors for loop closure and relocalization plus an explicit
+worker/culling policy. Offline compatibility mode retains the learned
+descriptor boundary. This software result does not prove representative-room
+place-recognition quality.
+
+The first noninteractive native build attempt omitted the retained DepthAI
+include/library environment and failed closed in `oak-sys` before a native
+bridge or Kiko executable was produced. The retained build-input file from the
+prior evidence directory was then rechecked against its SHA-256 manifest and
+used without modification. The exact successful command was:
+
+```text
+CARGO_BUILD_JOBS=2 nice -n 15 cargo build --locked --release \
+  -p kiko-slam --no-default-features \
+  --features nano-wheels-off-qualification --bin kiko-slam
+```
+
+The Linux aarch64 release build completed in 4m30s. That duration records
+completion context only; it is not a benchmark or performance claim. The
+resulting executable identity is:
+
+```text
+path: /home/makerspace/kiko/target/release/kiko-slam
+size_bytes: 28994536
+sha256: ded41b4c2f2a024efde0de5aef744ee6a2d518201156f3e70b12324137036caa
+elf_machine: AArch64
+elf_type: PIE
+build_id_sha1: 12505297ee34baa04e9d88acda682b05f83a818a
+```
+
+`readelf -d` recorded the direct DepthAI, OpenCV, C++, and system dependencies.
+`ldd` under the retained native library path resolved the complete dependency
+closure with `not_found_count=0`. The device-free
+`nano-wheels-off-qualification --help` boundary loaded successfully, and an
+invalid fault declaration exited at parsing with status 2 while naming the
+exact four supported one-shot fault declarations.
+
+The new owner-private directory is mode `0700`, every retained file is mode
+`0600`, and its 35-entry SHA-256 manifest verifies:
+
+```text
+/home/makerspace/kiko-native-evidence/5d1b1bc-20260728T014635+0530
+```
+
+It retains source/clean-status evidence, the verified build inputs and command,
+toolchain identity, executable identity, ELF metadata, the complete loader
+closure, CLI parsing evidence, and the fresh read-only owner/USB snapshot. No
+camera, serial endpoint, service, actuator, STM32, or running Kiko process was
+opened, stopped, signalled, reconfigured, or replaced.
+
+## Fresh post-build owner and USB snapshot
+
+At `2026-07-28T01:47:30+05:30`, read-only inspection found:
+
+- all three persistent serial-by-id endpoints present;
+- the STM32 endpoint `/dev/ttyACM0` free;
+- PID 65144, the `kiko_face_follow.py` child of the existing
+  `/home/makerspace/kiko-follow/engine-guardian.sh`, owning `/dev/ttyACM1`,
+  `/dev/ttyACM2`, and the OAK USB node;
+- both the reboot entry and minute-level guardian restoration entry still in
+  the user crontab;
+- the OAK `03e7:f63b` USBFS device under the `480M` USB2 tree while the separate
+  `10000M` USB3 root/hub had no OAK below it;
+- both canonical Kiko services inactive, with
+  `kiko-nano-agent.service` not installed; and
+- the Nano repository clean on the expected tracking branch after the build.
+
+Fable is not a current subsystem, runtime owner, dependency, or operator. The
+observed process is recorded only as a legacy Kiko runtime component and exact
+endpoint owner. Its ownership still conflicts with starting the single
+canonical owner, irrespective of its provenance. No process or respawn entry
+was changed during this snapshot.
+
+## Prior 9da248a native qualification build (superseded)
 
 The clean Nano checkout at `/home/makerspace/kiko` was fast-forwarded to exact
 source revision:
@@ -77,7 +161,7 @@ claim. This build did not open a device or exercise camera frames, serial
 traffic, SLAM, occupancy, head motion, eye output, motor output, MPC timing, or
 physical safety behavior.
 
-## Live owner and USB snapshot
+## Prior live owner and USB snapshot
 
 At `2026-07-28T01:01:40+05:30`, read-only inspection found:
 
@@ -118,7 +202,7 @@ after a conflict-free observation.
 ## Gate status after this refresh
 
 This is exact native build evidence for the final code-bearing revision
-`9da248a`. A later evidence-only documentation commit does not change the
+`5d1b1bc`. A later evidence-only documentation commit does not change the
 executable inputs; any later executable change would supersede this evidence
 and require a new native build and identity. These physical/current items
 remain open:
