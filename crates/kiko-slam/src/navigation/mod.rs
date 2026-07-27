@@ -25,6 +25,8 @@ mod frames;
 mod frontier;
 mod global_planner;
 mod goal_input;
+#[cfg(feature = "agent-runtime")]
+mod head_gaze_policy;
 mod ingress;
 #[cfg(all(feature = "agent-runtime", feature = "actuation", unix))]
 mod live_motion_owner;
@@ -219,6 +221,17 @@ pub use global_planner::{
 pub use goal_input::{
     MapPointGoalSelection, MapPointGoalSelectionDto, MapPointGoalSelectionParseError,
     NavigationGoalArg, NavigationGoalArgError, NavigationGoalAxis,
+};
+#[cfg(feature = "agent-runtime")]
+pub use head_gaze_policy::{
+    HEAD_GAZE_POLICY_V1, HeadGazeControllerDeclaration, HeadGazeControllerDeclarationParseError,
+    HeadGazeErrorBandField, HeadGazeEvidenceContentSha256, HeadGazeEvidenceContentSha256Error,
+    HeadGazeLifecycleClaimParseError, HeadGazeLifecycleIdentifierError,
+    HeadGazeLifecycleIdentifierField, HeadGazeMotionField, HeadGazeMotionValueError,
+    HeadGazeOperatorId, HeadGazePolicyLifecycleClaim, HeadGazePolicyParseError, HeadGazePolicyV1,
+    HeadGazeProposalClaimId, HeadGazeProposalOnlyClaim, HeadGazeReviewClaimId,
+    HeadGazeReviewEvidenceId, HeadGazeTimingField, MAX_HEAD_GAZE_POLICY_JSON_BYTES,
+    OperatorClaimedHeadGazePhysicalReview, REQUIRED_HEAD_GAZE_ACQUISITION_PROPOSALS,
 };
 pub use ingress::{
     AcceptedDepthIngress, ControlTickIngress, CurrentMapEpochBinding, FinalizedNavigationIngress,
