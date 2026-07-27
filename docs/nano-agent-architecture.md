@@ -239,7 +239,7 @@ byte-limit claim.
 The canonical V3 RGB expression path moves each already-owned OAK frame into a
 capacity-one detector lane after one authoritative ingress-time sample. That
 lane parses the frame identity once, borrows the same pixel allocation for the
-bound OpenCV frontal/profile cascades, applies the bounded Fable-derived face
+bound OpenCV frontal/profile cascades, applies the bounded checked-in face
 association policy, and moves the exact parsed frame and result into the
 existing expression actor. The actor combines deterministic scene motion with
 an `Important` face-attention intent and sends KEP2 eye intentions. Haar level
@@ -254,11 +254,11 @@ join evidence is a shutdown failure, not a successful fallback claim.
 
 OpenCV is used only for this bounded, host-side Haar rectangle detector. The
 cascades are pretrained static assets; Kiko performs no online training or
-model update. This choice preserves the audited Fable behavior without adding
-a second OAK owner or making expression attention part of SLAM, MPC, obstacle
-avoidance, identity, or the safety case. Replacing it with an OAK-NPU detector
-is a separate measured optimization and accuracy qualification, not a current
-performance claim.
+model update. This choice preserves the audited Kiko expression behavior
+without adding a second OAK owner or making expression attention part of SLAM,
+MPC, obstacle avoidance, identity, or the safety case. Replacing it with an
+OAK-NPU detector is a separate measured optimization and accuracy
+qualification, not a current performance claim.
 
 The default head intention is always `NaturalHold`. RGB does not directly map
 to servo ticks. An optional, explicitly configured camera-to-neutral-head
@@ -270,7 +270,7 @@ behavior, voltage/temperature
 limits, process-kill behavior, and safe natural-pose approach have been
 qualified on this assembly.
 
-The production start window is the exact per-joint union of the evidenced Fable
+The production start window is the exact per-joint union of the evidenced
 return-start envelope and the reviewed natural target plus/minus its 20-tick
 readback tolerance:
 `[2135..2227,2525..2592,2842..2963,2856..2922]`. Policy parsing rejects a

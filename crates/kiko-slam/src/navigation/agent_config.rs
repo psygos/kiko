@@ -116,21 +116,21 @@ pub const MIN_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS: u64 = 5;
 /// Loosest admitted operator-console deadman scheduler period.
 pub const MAX_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS: u64 = 100;
 
-/// The only target qualified by the recorded Fable return-to-natural run.
+/// The only target qualified by the recorded prior Kiko return-to-natural run.
 ///
 /// Values are raw bow/curl/yaw/roll encoder ticks. This is not a geometric
 /// servo calibration and changing it requires new reviewed physical evidence.
 pub const KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS: [u16; 4] = [2_155, 2_545, 2_943, 2_876];
 
-/// Exact per-joint union of the evidenced Fable return-start envelope and the
+/// Exact per-joint union of the evidenced prior return-start envelope and the
 /// reviewed natural target minus its 20-tick readback tolerance.
 pub const KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS: [u16; 4] = [2_135, 2_525, 2_842, 2_856];
 
-/// Exact per-joint union of the evidenced Fable return-start envelope and the
+/// Exact per-joint union of the evidenced prior return-start envelope and the
 /// reviewed natural target plus its 20-tick readback tolerance.
 pub const KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS: [u16; 4] = [2_227, 2_592, 2_963, 2_922];
 
-/// The only torque envelope qualified by the recorded Fable natural return.
+/// The only torque envelope qualified by the recorded prior Kiko natural return.
 ///
 /// Values are bow/curl/yaw/roll permille of each servo's configured maximum.
 pub const KIKO_REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE: [u16; 4] = [600, 400, 400, 400];

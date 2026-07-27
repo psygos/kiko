@@ -3928,7 +3928,7 @@ mod tests {
 
     #[cfg(feature = "nano-agent")]
     #[test]
-    fn canonical_face_detector_config_exactly_matches_audited_fable_policy() {
+    fn canonical_face_detector_config_exactly_matches_reviewed_kiko_policy() {
         let config = canonical_nano_face_detector_config().expect("canonical config");
         assert_eq!(config.scale_factor(), 1.15);
         assert_eq!(config.frontal_minimum_neighbors(), 6);

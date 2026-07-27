@@ -88,6 +88,80 @@ endpoint owner. Its ownership still conflicts with starting the single
 canonical owner, irrespective of its provenance. No process or respawn entry
 was changed during this snapshot.
 
+## V4 software-leaf inventory
+
+At `2026-07-28T01:56:58+05:30`, a second read-only inspection resolved the
+source leaves that do not depend on a new physical calibration or candidate
+STM32 flash. Every listed source was a regular file, not a symbolic link, and
+`namei` found no symbolic-link component in its absolute path:
+
+| V4 role | Absolute source path | Bytes | SHA-256 |
+|---|---|---:|---|
+| qualification executable | `/home/makerspace/kiko/target/release/kiko-slam` | 28,994,536 | `ded41b4c2f2a024efde0de5aef744ee6a2d518201156f3e70b12324137036caa` |
+| SuperPoint | `/home/makerspace/kiko/crates/kiko-slam/models/sp.onnx` | 5,226,093 | `aaefb94ad6dd3624fe4300b39f0f1a77e8739ed6d5430162729fd6a72c265431` |
+| LightGlue | `/home/makerspace/kiko/crates/kiko-slam/models/lg.onnx` | 46,463,559 | `7fbb5814811dbc6d170de1c86bc0352a14691efa32cae33d952b6039258f74ef` |
+| frontal-face cascade | `/home/makerspace/.local/lib/python3.10/site-packages/cv2/data/haarcascade_frontalface_default.xml` | 930,127 | `0f7d4527844eb514d4a4948e822da90fbb16a34a0bbbbc6adc6498747a5aafb0` |
+| profile-face cascade | `/home/makerspace/.local/lib/python3.10/site-packages/cv2/data/haarcascade_profileface.xml` | 828,514 | `b39a4a3be45539db146a7fc1d3e761a292c196eb88421185e6a615b3055e612d` |
+| DepthAI core | `/home/makerspace/work/depthai-core-v34/build/libdepthai-core.so` | 42,632,152 | `0744500ab4f665af0641fd10881988146b73241212ac9523a86294e5737edae8` |
+| dynamic calibration | `/home/makerspace/work/depthai-core-v34/build/_deps/dynamic_calibration-src/lib/libdynamic_calibration.so` | 36,820,008 | `30730ae6d367dcd927be7081f6a21d3bc4af65d857421ea3d3776d4ac00c7c53` |
+| pinned DepthAI libusb | `/home/makerspace/work/depthai-core-v34/build/vcpkg_installed/arm64-linux/lib/libusb-1.0.so` | 202,888 | `74eac03235e61b326ecb6532bd1d840f7b8fbaf55cfaa32b7e3079fc1208ede0` |
+| ONNX Runtime | `/home/makerspace/work/onnxruntime/build-jetson/Release/libonnxruntime.so.1.24.2` | 25,969,728 | `5246cdc32cf54afe0a108b9326f232ed1ed2bfcb9b4431738e2ad35eb20329aa` |
+| OpenCV core | `/usr/lib/aarch64-linux-gnu/libopencv_core.so.4.5.4d` | 2,607,080 | `3abc549967c52f594b2b597db44b0013c55edb2198e11f9110d564277eb00beb` |
+| OpenCV image processing | `/usr/lib/aarch64-linux-gnu/libopencv_imgproc.so.4.5.4d` | 2,906,064 | `15b2448af215493a79f4638cad8eefcb9b43f15926724caffbdbd06a9c018261` |
+| OpenCV object detection | `/usr/lib/aarch64-linux-gnu/libopencv_objdetect.so.4.5.4d` | 366,632 | `94d3ddfb2111e72658d4bd005d22fd0ce402f8ae45ff8a79e9f7bdbd9b194b0b` |
+
+The same inspection read the OAK USB descriptor from sysfs without opening the
+device. It reported serial/MXID `19443010F1B43A2E00`, corroborating the
+retained identity, and link speed `480`, which remains a current SuperSpeed
+gate failure rather than a camera-function diagnosis. The three persistent
+serial-by-id paths were also unchanged.
+
+This inventory makes these exact files eligible as later renderer inputs; it
+does not freeze them or substitute for the renderer's own one-read hashing and
+readback. Rehash every leaf immediately before rendering. It does not provide
+the missing camera-to-base or native-IMU-to-base measurements, a current
+candidate STM32 identity, a staged-loader proof, or any live camera, SLAM,
+head, eye, motor, MPC, or performance evidence.
+
+## Gate-A shadow-contract repair
+
+The V4 input audit found that the prior synthetic shadow plant could not
+possibly pass the candidate bootstrap. Its fixed 100 ms sample period had to
+equal both the MPC step and control period, while the controller lease,
+acknowledgement, and scheduling budgets impose a strict maximum runtime
+service interval of 54,999,999 ns. No token choice could satisfy both
+contracts.
+
+The corrected qualification-only V2 plant uses a 50 ms period and narrows its
+synthetic envelope to the candidate's ±30% PWM range and corresponding
+synthetic ±0.3 m/s endpoints. Its exact checked-in identity is:
+
+```text
+path: configs/nano-wheels-off-qualification-template/qualification-shadow-only-synthetic-unvalidated-plant-v2.json
+size_bytes: 962
+sha256: aa96e9a3e75c540112d645a8dbefa54ba647574e90fc33e48b314b3c0094ded8
+```
+
+The paired navigation seed uses a 50 ms MPC/control period, 100 ms shadow
+lease, ±30% PWM bounds, 5% slew bounds, and a 5% initial search radius. A
+collision-free regression starts from STOP with a nonzero reference and
+requires the solver to choose a nonzero command while respecting that slew
+bound. This proves that the discrete search contains a useful candidate; it
+does not tune the physical robot, prove Nano solver latency, or authorize
+actuation.
+
+The preparation template now fixes the remaining software policy and leaves
+only seven unresolved values: the two calibration-preparer replacement
+markers plus physically reviewed world-to-occupancy rotation/translation,
+footprint radius, and obstacle-height bounds. The V4 render-input template
+likewise fixes one bounded OAK/occupancy/inference/Rerun/storage/head/expression
+policy and leaves only observed identity, exact source-path, build-provenance,
+and generated-calibration fields. The renderer binds the supplied plant bytes
+to the exact V2 ID, destination, semantic identity, and checked-in digest; a
+valid JSON mutation under the same label is rejected. A fresh rendered bundle
+must use the V2 plant and new derived hashes; no prior V1 bundle or digest is
+reinterpreted.
+
 ## Prior 9da248a native qualification build (superseded)
 
 The clean Nano checkout at `/home/makerspace/kiko` was fast-forwarded to exact
