@@ -639,6 +639,14 @@ pub async fn bootstrap_nano_wheels_off_qualification(
         .require_manifest_oak_mxid(manifest.manifest().as_inventory().oak().mxid().as_str())
         .map_err(QualificationBootstrapPrimaryError::CalibrationBinding)
         .map_err(QualificationBootstrapError::before_hardware)?;
+    let launch_rectified_stereo = launch.launch().oak().rectified_stereo();
+    calibration
+        .require_launch_stereo_dimensions(
+            launch_rectified_stereo.width_px(),
+            launch_rectified_stereo.height_px(),
+        )
+        .map_err(QualificationBootstrapPrimaryError::CalibrationBinding)
+        .map_err(QualificationBootstrapError::before_hardware)?;
     let plant = select_plant(
         &roots,
         launch.launch(),
@@ -671,19 +679,6 @@ pub async fn bootstrap_nano_wheels_off_qualification(
         .map_err(QualificationBootstrapError::before_hardware)?;
     let candidate_limits = candidate_admission.limits();
     let expected_rectified_stereo = calibration.rectified_stereo();
-    let launch_rectified_stereo = launch.launch().oak().rectified_stereo();
-    if expected_rectified_stereo.width() != launch_rectified_stereo.width_px()
-        || expected_rectified_stereo.height() != launch_rectified_stereo.height_px()
-    {
-        return Err(QualificationBootstrapError::before_hardware(
-            QualificationBootstrapPrimaryError::CalibrationLaunchStereoDimensionsMismatch {
-                calibration_width_px: expected_rectified_stereo.width(),
-                calibration_height_px: expected_rectified_stereo.height(),
-                launch_width_px: launch_rectified_stereo.width_px(),
-                launch_height_px: launch_rectified_stereo.height_px(),
-            },
-        ));
-    }
     let expected_depth_camera = DepthCameraModel::new(
         expected_rectified_stereo.left(),
         expected_rectified_stereo.dimensions(),
@@ -1603,12 +1598,6 @@ pub enum QualificationBootstrapPrimaryError {
     ArtifactHash(ArtifactHashError),
     CalibrationArtifact(NanoCalibrationArtifactParseError),
     CalibrationBinding(NanoCalibrationBindingError),
-    CalibrationLaunchStereoDimensionsMismatch {
-        calibration_width_px: u32,
-        calibration_height_px: u32,
-        launch_width_px: u32,
-        launch_height_px: u32,
-    },
     CalibrationNotInManifest {
         artifact_id: String,
     },
@@ -1740,7 +1729,6 @@ impl std::error::Error for QualificationBootstrapPrimaryError {
             | Self::ArtifactRootOutsideDeployment { .. }
             | Self::RobotIdMismatch { .. }
             | Self::CalibrationNotInManifest { .. }
-            | Self::CalibrationLaunchStereoDimensionsMismatch { .. }
             | Self::CalibrationPolicyBindingMissing { .. }
             | Self::CalibrationHashMissing { .. }
             | Self::CalibrationDigestMismatch { .. }

@@ -13,7 +13,8 @@ use kiko_nano_bundle_renderer::{
 };
 use kiko_slam::navigation::{
     NanoAgentLaunchV3, NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1,
-    NanoWheelsOffNativeRuntimeV1, NanoWheelsOffQualificationLaunchV4,
+    NanoCalibrationBindingError, NanoWheelsOffNativeRuntimeV1, NanoWheelsOffQualificationLaunchV4,
+    OfflineNavigationGraphParseError, ProductionNavigationControllerBindingError,
     WheelsOffCandidateControllerBinding,
 };
 use robot_server::config::{ControllerServerConfig, ControllerServerConfigV1};
@@ -289,13 +290,107 @@ fn add_face_assets(root: &Path, input: &mut Value) {
     });
 }
 
-fn add_production_face_assets(root: &Path, input: &mut Value) {
+fn navigation_for_plant(plant: &Value) -> Value {
+    let mut navigation: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/navigation-shadow-v1.example.json"
+    )))
+    .expect("checked-in navigation example is JSON");
+    navigation["coordinate_frames"]["tracking_camera_to_base"] = json!({
+        "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        "translation_m": [0.20, 0.0, -0.25]
+    });
+    navigation["odometry"]["raw_imu_calibration"] = json!({
+        "format_version": 1,
+        "source_id": "fixture",
+        "content_id": "imu-v1",
+        "gyro_affine": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        "gyro_bias_native_rad_per_sec": [0.0, 0.0, 0.0],
+        "accel_affine": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        "accel_bias_native_m_per_sec2": [0.0, 0.0, 0.0],
+        "native_imu_to_base_rotation": [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0]
+        ]
+    });
+    navigation["plant_model"] = plant.clone();
+    navigation
+}
+
+fn reviewed_production_plant() -> Value {
+    json!({
+        "schema_version": 1,
+        "model_id": "reviewed-plant-v1",
+        "model_version": 1,
+        "sample_period_s": 0.1,
+        "wheelbase_m": 0.4,
+        "left": {
+            "velocity_gain_mps_per_pwm_percent": 0.01,
+            "time_constant_s": 0.5
+        },
+        "right": {
+            "velocity_gain_mps_per_pwm_percent": 0.01,
+            "time_constant_s": 0.6
+        },
+        "validity": {
+            "left_pwm_min_percent": -30,
+            "left_pwm_max_percent": 30,
+            "right_pwm_min_percent": -30,
+            "right_pwm_max_percent": 30,
+            "left_velocity_min_mps": -0.3,
+            "left_velocity_max_mps": 0.3,
+            "right_velocity_min_mps": -0.3,
+            "right_velocity_max_mps": 0.3,
+            "maximum_absolute_yaw_rate_rad_per_sec": 2.0,
+            "maximum_absolute_lateral_velocity_m_per_sec": 0.1
+        },
+        "evidence": {
+            "kind": "claimed_physical_identification",
+            "dataset_content_id": format!("sha256:{}", "aa".repeat(32)),
+            "identification_method_id": "method-v1",
+            "sample_count": 1000,
+            "residuals": {
+                "left_velocity_rmse_mps": 0.01,
+                "right_velocity_rmse_mps": 0.01,
+                "yaw_rate_rmse_rad_s": 0.02,
+                "maximum_absolute_velocity_error_mps": 0.04
+            }
+        }
+    })
+}
+
+fn prepare_production_assets(root: &Path, input: &mut Value) {
     input["schema_version"] = json!(1);
     add_face_assets(root, input);
     input["assets"]
         .as_object_mut()
         .expect("assets object")
         .remove("head_gaze_policy_source_path");
+
+    let plant = reviewed_production_plant();
+    let plant_path = write_source(
+        root,
+        "reviewed-production-plant.json",
+        &serde_json::to_vec_pretty(&plant).expect("serialize reviewed production plant"),
+    );
+    input["assets"]["plant"] = json!({
+        "artifact_id": "reviewed-plant-v1",
+        "source_path": plant_path,
+        "destination_relative_path": "artifacts/plant/reviewed-plant-v1.json"
+    });
+
+    let mut navigation = navigation_for_plant(&plant);
+    navigation["mpc"]["step_period_s"] = json!(0.1);
+    navigation["control_loop"]["control_period_ns"] = json!(100_000_000_u64);
+    navigation["control_loop"]["solver_budget_ns"] = json!(50_000_000_u64);
+    navigation["shadow_command"]["lease_ms"] = json!(200);
+    let navigation_path = write_source(
+        root,
+        "reviewed-production-navigation.json",
+        &serde_json::to_vec_pretty(&navigation).expect("serialize production navigation"),
+    );
+    input["assets"]["navigation_shadow_source_path"] = json!(navigation_path);
 }
 
 fn source_fixture() -> (TempDir, Value) {
@@ -348,15 +443,19 @@ fn source_fixture() -> (TempDir, Value) {
     }))
     .expect("serialize calibration fixture");
     let calibration = write_source(&root, "calibration.json", &calibration_bytes);
-    let plant = write_source(
+    let plant_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/nano-wheels-off-qualification-template/qualification-shadow-only-synthetic-unvalidated-plant-v2.json"
+    ));
+    let plant = write_source(&root, "plant.json", plant_bytes);
+    let plant_value: Value =
+        serde_json::from_slice(plant_bytes).expect("Gate-A plant fixture is JSON");
+    let navigation = write_source(
         &root,
-        "plant.json",
-        include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../configs/nano-wheels-off-qualification-template/qualification-shadow-only-synthetic-unvalidated-plant-v2.json"
-        )),
+        "navigation.json",
+        &serde_json::to_vec_pretty(&navigation_for_plant(&plant_value))
+            .expect("serialize valid qualification navigation"),
     );
-    let navigation = write_source(&root, "navigation.json", br#"{"navigation":"exact"}"#);
     let superpoint = write_source(&root, "superpoint.onnx", b"superpoint-exact");
     let lightglue = write_source(&root, "lightglue.onnx", b"lightglue-exact");
     let depthai = write_source(&root, "libdepthai-core.so", b"depthai-exact");
@@ -968,7 +1067,7 @@ fn render_input_versions_are_bundle_specific_and_fail_closed() {
     );
 
     let mut production = input;
-    add_production_face_assets(&root, &mut production);
+    prepare_production_assets(&root, &mut production);
     production["bundle"] = json!({
         "kind": "production",
         "production_controller_profile_path": null
@@ -1090,6 +1189,93 @@ fn qualification_v4_rejects_valid_plant_bytes_under_the_fixed_gate_a_v2_label() 
 }
 
 #[test]
+fn qualification_rejects_valid_json_navigation_with_a_different_plant_before_staging() {
+    let (temporary, input) = source_fixture();
+    let root = canonical_root(&temporary);
+    let navigation_path = input["assets"]["navigation_shadow_source_path"]
+        .as_str()
+        .expect("navigation source path");
+    let mut navigation: Value =
+        serde_json::from_slice(&fs::read(navigation_path).expect("read valid navigation fixture"))
+            .expect("navigation fixture is JSON");
+    navigation["plant_model"]["wheelbase_m"] = json!(0.41);
+    fs::write(
+        navigation_path,
+        serde_json::to_vec_pretty(&navigation).expect("serialize mismatched navigation"),
+    )
+    .expect("write mismatched navigation");
+
+    let destination = root.join("must-not-stage-mismatched-navigation");
+    let error = render_bundle(
+        &write_input(&root, &input),
+        RenderMode::Stage {
+            destination: &destination,
+        },
+    )
+    .expect_err("navigation must bind to the exact retained Gate-A plant");
+    assert!(matches!(
+        error,
+        RenderError::OfflineNavigationGraph(OfflineNavigationGraphParseError::Navigation(_))
+    ));
+    assert!(
+        !destination.exists(),
+        "semantic rejection must precede the first staging write"
+    );
+}
+
+#[test]
+fn qualification_rejects_calibration_for_a_different_oak_before_staging() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    input["discovery"]["oak"]["mxid"] = json!("19443010F1B43A2E01");
+
+    let destination = root.join("must-not-stage-calibration-for-another-oak");
+    let error = render_bundle(
+        &write_input(&root, &input),
+        RenderMode::Stage {
+            destination: &destination,
+        },
+    )
+    .expect_err("calibration must bind to the deployment OAK identity");
+    assert!(matches!(
+        error,
+        RenderError::CalibrationDeploymentBinding(
+            NanoCalibrationBindingError::ManifestOakMxidMismatch
+        )
+    ));
+    assert!(
+        !destination.exists(),
+        "calibration identity binding must precede the first staging write"
+    );
+}
+
+#[test]
+fn qualification_rejects_calibration_with_different_launch_dimensions_before_staging() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    input["runtime"]["oak"]["stereo_width_px"] = json!(800);
+
+    let destination = root.join("must-not-stage-calibration-with-different-dimensions");
+    let error = render_bundle(
+        &write_input(&root, &input),
+        RenderMode::Stage {
+            destination: &destination,
+        },
+    )
+    .expect_err("calibration dimensions must bind to the launch stereo dimensions");
+    assert!(matches!(
+        error,
+        RenderError::CalibrationDeploymentBinding(
+            NanoCalibrationBindingError::LaunchStereoDimensionsMismatch { .. }
+        )
+    ));
+    assert!(
+        !destination.exists(),
+        "calibration dimension binding must precede the first staging write"
+    );
+}
+
+#[test]
 fn qualification_v4_rejects_face_and_head_gaze_aliases() {
     let (temporary, input) = source_fixture();
     let root = canonical_root(&temporary);
@@ -1189,7 +1375,7 @@ fn qualification_requires_every_reviewed_exact_nano_soname() {
 fn production_without_separate_profile_is_fail_closed() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
-    add_production_face_assets(&root, &mut input);
+    prepare_production_assets(&root, &mut input);
     input["bundle"] = json!({
         "kind": "production",
         "production_controller_profile_path": null
@@ -1230,7 +1416,7 @@ fn production_v1_rejects_the_qualification_only_head_gaze_input() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
     let head_gaze_policy = input["assets"]["head_gaze_policy_source_path"].clone();
-    add_production_face_assets(&root, &mut input);
+    prepare_production_assets(&root, &mut input);
     input["assets"]["head_gaze_policy_source_path"] = head_gaze_policy;
     input["bundle"] = json!({
         "kind": "production",
@@ -1249,7 +1435,7 @@ fn production_v1_rejects_the_qualification_only_head_gaze_input() {
 fn production_v1_rejects_explicit_null_head_gaze_input() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
-    add_production_face_assets(&root, &mut input);
+    prepare_production_assets(&root, &mut input);
     input["assets"]["head_gaze_policy_source_path"] = Value::Null;
     input["bundle"] = json!({
         "kind": "production",
@@ -1269,7 +1455,7 @@ fn production_v1_rejects_explicit_null_head_gaze_input() {
 fn production_open_cv_roles_require_the_observed_nano_sonames() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
-    add_production_face_assets(&root, &mut input);
+    prepare_production_assets(&root, &mut input);
     input["bundle"] = json!({
         "kind": "production",
         "production_controller_profile_path": null
@@ -1294,7 +1480,7 @@ fn production_open_cv_roles_require_the_observed_nano_sonames() {
 fn production_derives_navigation_digest_and_loopback_port() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
-    add_production_face_assets(&root, &mut input);
+    prepare_production_assets(&root, &mut input);
     input["discovery"]["stm32"]["firmware_build_id"] = json!(196609);
     input["discovery"]["stm32"]["hardware_profile_fingerprint_hex"] =
         json!("4b494b4f2d3450574d2d50524f443121");
@@ -1347,12 +1533,7 @@ fn production_derives_navigation_digest_and_loopback_port() {
     assert_eq!(actuation["schema_version"], 2);
     assert_eq!(
         actuation["plant_artifact_sha256_hex"],
-        sha256_hex(
-            &fs::read(destination.join(
-                "artifacts/plant/qualification-shadow-only-synthetic-unvalidated-plant-v2.json",
-            ),)
-            .unwrap()
-        )
+        sha256_hex(&fs::read(destination.join("artifacts/plant/reviewed-plant-v1.json")).unwrap())
     );
     assert_eq!(
         actuation["operator_claimed_physical_approval"]["plant_dataset_content_id"],
@@ -1458,10 +1639,219 @@ fn production_derives_navigation_digest_and_loopback_port() {
 }
 
 #[test]
+fn production_rejects_semantically_invalid_plant_json_before_staging() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    prepare_production_assets(&root, &mut input);
+    input["discovery"]["stm32"]["firmware_build_id"] = json!(196609);
+    input["discovery"]["stm32"]["hardware_profile_fingerprint_hex"] =
+        json!("4b494b4f2d3450574d2d50524f443121");
+    input["discovery"]["stm32"]["capabilities_bits"] = json!(255);
+    let plant_path = input["assets"]["plant"]["source_path"]
+        .as_str()
+        .expect("production plant source path");
+    let mut plant: Value =
+        serde_json::from_slice(&fs::read(plant_path).expect("read production plant"))
+            .expect("production plant is JSON");
+    plant["left"]["time_constant_s"] = json!(0.0);
+    fs::write(
+        plant_path,
+        serde_json::to_vec_pretty(&plant).expect("serialize invalid semantic plant"),
+    )
+    .expect("write invalid semantic plant");
+    let profile_path = root.join("production-profile.json");
+    fs::write(
+        &profile_path,
+        serde_json::to_vec_pretty(&valid_production_profile()).unwrap(),
+    )
+    .unwrap();
+    input["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": profile_path
+    });
+
+    let destination = root.join("must-not-stage-invalid-plant");
+    let error = render_bundle(
+        &write_input(&root, &input),
+        RenderMode::Stage {
+            destination: &destination,
+        },
+    )
+    .expect_err("valid JSON with an invalid plant domain must fail");
+    assert!(matches!(
+        error,
+        RenderError::OfflineNavigationGraph(OfflineNavigationGraphParseError::Plant(_))
+    ));
+    assert!(
+        !destination.exists(),
+        "plant admission must precede the first staging write"
+    );
+}
+
+#[test]
+fn production_rejects_generated_actuation_without_control_margin_before_staging() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    prepare_production_assets(&root, &mut input);
+    input["discovery"]["stm32"]["firmware_build_id"] = json!(196609);
+    input["discovery"]["stm32"]["hardware_profile_fingerprint_hex"] =
+        json!("4b494b4f2d3450574d2d50524f443121");
+    input["discovery"]["stm32"]["capabilities_bits"] = json!(255);
+    let mut profile = valid_production_profile();
+    profile["actuation"]["apply_ack_budget_ns"] = json!(45_000_000_u64);
+    let profile_path = root.join("production-profile-without-control-margin.json");
+    fs::write(
+        &profile_path,
+        serde_json::to_vec_pretty(&profile).expect("serialize production profile"),
+    )
+    .expect("write production profile");
+    input["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": profile_path
+    });
+
+    let destination = root.join("must-not-stage-invalid-actuation");
+    let error = render_bundle(
+        &write_input(&root, &input),
+        RenderMode::Stage {
+            destination: &destination,
+        },
+    )
+    .expect_err("generated actuation must leave strict control-period margin");
+    assert!(matches!(
+        error,
+        RenderError::OfflineNavigationGraph(OfflineNavigationGraphParseError::Actuation(_))
+    ));
+    assert!(
+        !destination.exists(),
+        "actuation admission must precede the first staging write"
+    );
+}
+
+#[test]
+fn production_rejects_mpc_pwm_outside_controller_envelope_before_staging() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    prepare_production_assets(&root, &mut input);
+    input["discovery"]["stm32"]["firmware_build_id"] = json!(196609);
+    input["discovery"]["stm32"]["hardware_profile_fingerprint_hex"] =
+        json!("4b494b4f2d3450574d2d50524f443121");
+    input["discovery"]["stm32"]["capabilities_bits"] = json!(255);
+
+    let plant_path = input["assets"]["plant"]["source_path"]
+        .as_str()
+        .expect("production plant source path");
+    let mut plant: Value =
+        serde_json::from_slice(&fs::read(plant_path).expect("read production plant"))
+            .expect("production plant is JSON");
+    plant["validity"]["left_pwm_min_percent"] = json!(-31);
+    plant["validity"]["left_pwm_max_percent"] = json!(31);
+    plant["validity"]["left_velocity_min_mps"] = json!(-0.32);
+    plant["validity"]["left_velocity_max_mps"] = json!(0.32);
+    fs::write(
+        plant_path,
+        serde_json::to_vec_pretty(&plant).expect("serialize widened production plant"),
+    )
+    .expect("write widened production plant");
+
+    let navigation_path = input["assets"]["navigation_shadow_source_path"]
+        .as_str()
+        .expect("production navigation source path");
+    let mut navigation: Value =
+        serde_json::from_slice(&fs::read(navigation_path).expect("read production navigation"))
+            .expect("production navigation is JSON");
+    navigation["plant_model"] = plant;
+    navigation["mpc"]["left_pwm_min_percent"] = json!(-31);
+    navigation["mpc"]["left_pwm_max_percent"] = json!(31);
+    fs::write(
+        navigation_path,
+        serde_json::to_vec_pretty(&navigation).expect("serialize widened production navigation"),
+    )
+    .expect("write widened production navigation");
+
+    let profile_path = root.join("production-profile.json");
+    fs::write(
+        &profile_path,
+        serde_json::to_vec_pretty(&valid_production_profile()).unwrap(),
+    )
+    .unwrap();
+    input["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": profile_path
+    });
+
+    let destination = root.join("must-not-stage-mpc-outside-controller-envelope");
+    let error = render_bundle(
+        &write_input(&root, &input),
+        RenderMode::Stage {
+            destination: &destination,
+        },
+    )
+    .expect_err("MPC PWM range must fit the exact controller contract");
+    assert!(matches!(
+        error,
+        RenderError::OfflineNavigationGraph(OfflineNavigationGraphParseError::ControllerBinding(
+            ProductionNavigationControllerBindingError::MpcPwmOutsideControllerEnvelope {
+                wheel: kiko_slam::navigation::mpc::WheelSide::Left,
+                configured_min_percent: -31,
+                configured_max_percent: 31,
+                controller_max_abs_percent: 30,
+            }
+        ))
+    ));
+    assert!(
+        !destination.exists(),
+        "controller PWM binding must precede the first staging write"
+    );
+}
+
+#[test]
+fn production_rejects_control_period_without_controller_rate_margin_before_staging() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    prepare_production_assets(&root, &mut input);
+    input["discovery"]["stm32"]["firmware_build_id"] = json!(196609);
+    input["discovery"]["stm32"]["hardware_profile_fingerprint_hex"] =
+        json!("4b494b4f2d3450574d2d50524f443121");
+    input["discovery"]["stm32"]["capabilities_bits"] = json!(255);
+    let mut profile = valid_production_profile();
+    profile["controller"]["maximum_host_command_rate_hz"] = json!(10);
+    let profile_path = root.join("production-profile-with-slow-controller-rate.json");
+    fs::write(
+        &profile_path,
+        serde_json::to_vec_pretty(&profile).expect("serialize production profile"),
+    )
+    .expect("write production profile");
+    input["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": profile_path
+    });
+
+    let destination = root.join("must-not-stage-controller-rate-without-margin");
+    let error = render_bundle(
+        &write_input(&root, &input),
+        RenderMode::Stage {
+            destination: &destination,
+        },
+    )
+    .expect_err("control cadence must strictly clear the controller interval and guard");
+    assert!(matches!(
+        error,
+        RenderError::OfflineNavigationGraph(OfflineNavigationGraphParseError::ControllerBinding(
+            ProductionNavigationControllerBindingError::ControlPeriodHasNoControllerRateMargin { .. }
+        ))
+    ));
+    assert!(
+        !destination.exists(),
+        "controller cadence binding must precede the first staging write"
+    );
+}
+
+#[test]
 fn candidate_controller_identity_cannot_be_relabelled_as_production() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
-    add_production_face_assets(&root, &mut input);
+    prepare_production_assets(&root, &mut input);
     let profile_path = root.join("candidate-relabelled-production.json");
     let mut profile = valid_production_profile();
     profile["controller"]["firmware_build_id"] = json!(135169);
@@ -1486,7 +1876,7 @@ fn candidate_controller_identity_cannot_be_relabelled_as_production() {
 fn production_profile_must_pass_the_authoritative_controller_parser() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
-    add_production_face_assets(&root, &mut input);
+    prepare_production_assets(&root, &mut input);
     input["discovery"]["stm32"]["firmware_build_id"] = json!(196609);
     input["discovery"]["stm32"]["hardware_profile_fingerprint_hex"] =
         json!("4b494b4f2d3450574d2d50524f443121");
@@ -1509,7 +1899,7 @@ fn production_profile_must_pass_the_authoritative_controller_parser() {
 fn production_warm_start_renders_the_exact_saved_map_and_dataset_pair() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
-    add_production_face_assets(&root, &mut input);
+    prepare_production_assets(&root, &mut input);
     input["discovery"]["stm32"]["firmware_build_id"] = json!(196609);
     input["discovery"]["stm32"]["hardware_profile_fingerprint_hex"] =
         json!("4b494b4f2d3450574d2d50524f443121");

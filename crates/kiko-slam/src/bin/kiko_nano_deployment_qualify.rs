@@ -27,7 +27,8 @@ use kiko_nano_deployment_gate::{
 };
 use kiko_slam::navigation::{
     NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1, NanoFaceCascadeAssetRole,
-    NanoLaunchAssetRole, load_nano_agent_launch_v3,
+    NanoLaunchAssetRole, OfflineProductionNavigationGraphV1,
+    ProductionNavigationControllerContractV1, load_nano_agent_launch_v3,
 };
 use robot_server::config::ControllerServerConfigV1;
 use serde::Deserialize;
@@ -336,6 +337,15 @@ fn run(cli: Cli) -> Result<(), QualifyError> {
         .map_err(|source| {
             QualifyError::context("bind calibration artifact to manifest OAK MXID", source)
         })?;
+    let launch_stereo = loaded_launch.launch().oak().rectified_stereo();
+    calibration
+        .require_launch_stereo_dimensions(launch_stereo.width_px(), launch_stereo.height_px())
+        .map_err(|source| {
+            QualifyError::context(
+                "bind calibration artifact to launch rectified-stereo dimensions",
+                source,
+            )
+        })?;
     bind_calibration_to_manifest(
         &deployment_root,
         loaded_launch.launch(),
@@ -356,14 +366,35 @@ fn run(cli: Cli) -> Result<(), QualifyError> {
         &controller,
         loaded_manifest.manifest(),
     )?;
+    let plant_asset = loaded_asset(&loaded_assets, NanoLaunchAssetRole::PlantArtifact);
     bind_plant_to_manifest(
         &deployment_root,
         loaded_launch.launch(),
-        loaded_asset(&loaded_assets, NanoLaunchAssetRole::PlantArtifact),
+        plant_asset,
         &policy,
         loaded_manifest.manifest(),
         &artifact_hashes,
     )?;
+    OfflineProductionNavigationGraphV1::parse(
+        &calibration,
+        plant_asset.bytes(),
+        loaded_asset(&loaded_assets, NanoLaunchAssetRole::NavigationShadowConfig).bytes(),
+        loaded_asset(&loaded_assets, NanoLaunchAssetRole::PhysicalActuationConfig).bytes(),
+        loaded_manifest.manifest().robot_id().as_str(),
+        ProductionNavigationControllerContractV1::new(
+            loaded_launch
+                .launch()
+                .controller_server()
+                .command_udp_endpoint(),
+            &controller,
+        ),
+    )
+    .map_err(|source| {
+        QualifyError::context(
+            "parse and cross-bind the offline production navigation graph",
+            source,
+        )
+    })?;
 
     let native_manifest_path =
         ArtifactRelativePath::parse(NATIVE_MANIFEST_RELATIVE_PATH.to_owned())

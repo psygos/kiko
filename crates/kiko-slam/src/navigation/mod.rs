@@ -90,6 +90,8 @@ mod nano_wheels_off_qualification_launch;
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 mod nano_wheels_off_qualification_native_runtime;
 mod odometry;
+#[cfg(all(feature = "production-navigation-binding", unix))]
+mod offline_deployment_graph;
 #[cfg(feature = "operator-console")]
 mod operator_console;
 #[cfg(feature = "operator-console")]
@@ -101,6 +103,8 @@ mod operator_console_http;
     unix
 ))]
 mod operator_console_runtime;
+#[cfg(all(feature = "production-navigation-binding", unix))]
+mod production_navigation_binding;
 mod reference;
 mod safety;
 mod shadow_command;
@@ -382,6 +386,11 @@ pub use odometry::{
     ReanchorReason, ScalarParameter, TimeAlignedOdomPose, TimeAlignment, TranslationIntegration,
     VisualCaptureProvenance,
 };
+#[cfg(all(feature = "production-navigation-binding", unix))]
+pub use offline_deployment_graph::{
+    OfflineNavigationGraphParseError, OfflineProductionNavigationGraphV1,
+    OfflineShadowNavigationGraphV1,
+};
 #[cfg(feature = "operator-console")]
 pub use operator_console::*;
 #[cfg(feature = "operator-console")]
@@ -393,6 +402,11 @@ pub use operator_console_http::*;
     unix
 ))]
 pub use operator_console_runtime::*;
+#[cfg(all(feature = "production-navigation-binding", unix))]
+pub use production_navigation_binding::{
+    ProductionNavigationControllerBindingError, ProductionNavigationControllerBindingV1,
+    ProductionNavigationControllerContractV1,
+};
 pub use reference::{
     EpochPathMismatchV1, FORWARD_MOST_NEAREST_SEGMENT_V1, MAX_PATH_REFERENCE_POINTS,
     MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S, MAX_SUPPORTED_PATH_LENGTH_M,

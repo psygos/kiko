@@ -201,6 +201,25 @@ impl NanoCalibrationArtifactV1 {
         Ok(())
     }
 
+    pub fn require_launch_stereo_dimensions(
+        &self,
+        width_px: u32,
+        height_px: u32,
+    ) -> Result<(), NanoCalibrationBindingError> {
+        let launch = FrameDimensions::try_new(width_px, height_px)
+            .map_err(NanoCalibrationBindingError::LaunchStereoDimensions)?;
+        let calibration = self.rectified_stereo.dimensions();
+        if calibration != launch {
+            return Err(
+                NanoCalibrationBindingError::LaunchStereoDimensionsMismatch {
+                    calibration,
+                    launch,
+                },
+            );
+        }
+        Ok(())
+    }
+
     pub fn require_observed_stereo(
         &self,
         observed: &Calibration,
@@ -438,6 +457,11 @@ impl std::error::Error for NanoCalibrationArtifactParseError {
 pub enum NanoCalibrationBindingError {
     ManifestOakMxidMismatch,
     ConnectedOakMxidMismatch,
+    LaunchStereoDimensions(FrameDimensionsError),
+    LaunchStereoDimensionsMismatch {
+        calibration: FrameDimensions,
+        launch: FrameDimensions,
+    },
     ObservedStereoInvalid(RectifiedStereoError),
     ObservedStereoMismatch,
     NavigationRawImuMismatch,
@@ -459,6 +483,7 @@ impl fmt::Display for NanoCalibrationBindingError {
 impl std::error::Error for NanoCalibrationBindingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::LaunchStereoDimensions(source) => Some(source),
             Self::ObservedStereoInvalid(source) => Some(source),
             _ => None,
         }
@@ -629,6 +654,25 @@ mod tests {
         artifact
             .require_connected_oak_mxid("19443010F1B43A2E00")
             .expect("connected MXID");
+        artifact
+            .require_launch_stereo_dimensions(640, 400)
+            .expect("exact launch dimensions");
+        assert!(matches!(
+            artifact.require_launch_stereo_dimensions(640, 401),
+            Err(
+                NanoCalibrationBindingError::LaunchStereoDimensionsMismatch {
+                    calibration,
+                    launch,
+                }
+            ) if calibration.width() == 640
+                && calibration.height() == 400
+                && launch.width() == 640
+                && launch.height() == 401
+        ));
+        assert!(matches!(
+            artifact.require_launch_stereo_dimensions(0, 400),
+            Err(NanoCalibrationBindingError::LaunchStereoDimensions(_))
+        ));
         artifact
             .require_observed_stereo(&observed_calibration())
             .expect("exact live stereo");

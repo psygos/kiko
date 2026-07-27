@@ -22,14 +22,15 @@ agent-runtime = [
 # primitive explicit without broadening generic agent-runtime/actuation builds.
 nano-calibration-prepare = ["agent-runtime", "actuation", "dep:rustix"]
 operator-console = ["dep:bytes", "dep:getrandom", "dep:rustix", "dep:tokio", "dep:warp"]
+production-navigation-binding = ["agent-runtime", "actuation", "dep:robot-server"]
 nano-agent = [
     "agent-runtime",
     "actuation",
+    "production-navigation-binding",
     "operator-console",
     "record",
     "nano-face-perception",
     "dep:kiko-nano-deployment-gate",
-    "dep:robot-server",
     "dep:rustix",
 ]
 # Host-side OpenCV perception seam. Production `nano-agent` includes this

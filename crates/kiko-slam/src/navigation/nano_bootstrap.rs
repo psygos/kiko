@@ -77,8 +77,9 @@ use super::{
     NanoObservedInventoryEvidenceError, NanoProductionAdmissionError,
     NanoProductionAdmissionTimeline, NanoProductionAdmissionTimelineError,
     NavigationActuationConfigV1, NavigationClockEpoch, PendingLiveMpcControlDriver,
-    PreparedNanoProductionRuntime, ShadowNavigationConfigParseError, ShadowNavigationConfigV1,
-    load_nano_agent_launch_v3,
+    PreparedNanoProductionRuntime, ProductionNavigationControllerBindingError,
+    ProductionNavigationControllerBindingV1, ProductionNavigationControllerContractV1,
+    ShadowNavigationConfigParseError, ShadowNavigationConfigV1, load_nano_agent_launch_v3,
 };
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
@@ -930,6 +931,11 @@ pub async fn bootstrap_nano_production(
         .map_err(NanoBootstrapError::before_hardware)?;
     calibration
         .require_manifest_oak_mxid(loaded_manifest.manifest().oak().mxid().as_str())
+        .map_err(NanoBootstrapPrimaryError::CalibrationBinding)
+        .map_err(NanoBootstrapError::before_hardware)?;
+    let launch_stereo = launch.launch().oak().rectified_stereo();
+    calibration
+        .require_launch_stereo_dimensions(launch_stereo.width_px(), launch_stereo.height_px())
         .map_err(NanoBootstrapPrimaryError::CalibrationBinding)
         .map_err(NanoBootstrapError::before_hardware)?;
     let selected_plant = select_plant_artifact(
@@ -1989,106 +1995,72 @@ fn bind_controller_contract_to_actuation(
     mpc: MpcConfigV1,
     control_period: ControlPeriodNs,
 ) -> Result<(), NanoBootstrapPrimaryError> {
-    let launch_endpoint = launch.controller_server().command_udp_endpoint();
-    let actuation_endpoint = actuation.command_endpoint().socket_addr();
-    if launch_endpoint != actuation_endpoint {
-        return Err(
-            NanoBootstrapPrimaryError::ActuationCommandEndpointMismatch {
-                launch: launch_endpoint,
-                actuation: actuation_endpoint,
-            },
-        );
-    }
-    if server.controller_uid() != actuation.controller_uid() {
-        return Err(NanoBootstrapPrimaryError::ActuationControllerUidMismatch);
-    }
-    if server.firmware_abi() != actuation.firmware_abi() {
-        return Err(
-            NanoBootstrapPrimaryError::ActuationControllerFirmwareAbiMismatch {
-                server: server.firmware_abi().get(),
-                actuation: actuation.firmware_abi().get(),
-            },
-        );
-    }
-    if server.firmware_build_id() != actuation.firmware_build_id() {
-        return Err(
-            NanoBootstrapPrimaryError::ActuationControllerFirmwareBuildMismatch {
-                server: server.firmware_build_id().get(),
-                actuation: actuation.firmware_build_id().get(),
-            },
-        );
-    }
-    if server.actuator_config_fingerprint() != actuation.actuator_config_fingerprint() {
-        return Err(NanoBootstrapPrimaryError::ActuationControllerFingerprintMismatch);
-    }
-    bind_mpc_pwm_to_controller_envelope(server.expected_max_abs_pwm_percent().get(), mpc)?;
-    bind_navigation_cadence_to_controller(
-        control_period.as_duration(),
-        server.minimum_host_command_interval(),
-        Duration::from_nanos(actuation.scheduling_guard_ns().get()),
-    )?;
-    Ok(())
+    let controller = ProductionNavigationControllerContractV1::new(
+        launch.controller_server().command_udp_endpoint(),
+        server,
+    );
+    ProductionNavigationControllerBindingV1::bind(controller, actuation, mpc, control_period)
+        .map(|_| ())
+        .map_err(map_production_navigation_controller_binding_error)
 }
 
-fn bind_navigation_cadence_to_controller(
-    control_period: Duration,
-    controller_minimum_interval: Duration,
-    scheduling_margin: Duration,
-) -> Result<(), NanoBootstrapPrimaryError> {
-    let required_exclusive_lower_bound = controller_minimum_interval
-        .checked_add(scheduling_margin)
-        .ok_or(NanoBootstrapPrimaryError::ActuationCadenceArithmeticOverflow)?;
-    if control_period <= required_exclusive_lower_bound {
-        return Err(
-            NanoBootstrapPrimaryError::ActuationControlPeriodHasNoControllerRateMargin {
-                control_period,
-                controller_minimum_interval,
-                scheduling_margin,
-                required_exclusive_lower_bound,
-            },
-        );
-    }
-    Ok(())
-}
-
-fn bind_mpc_pwm_to_controller_envelope(
-    controller_max_abs_percent: u8,
-    mpc: MpcConfigV1,
-) -> Result<(), NanoBootstrapPrimaryError> {
-    for (wheel, (configured_min, configured_max)) in [
-        (WheelSide::Left, mpc.left_pwm_bounds_percent()),
-        (WheelSide::Right, mpc.right_pwm_bounds_percent()),
-    ] {
-        bind_one_mpc_pwm_range(
+fn map_production_navigation_controller_binding_error(
+    source: ProductionNavigationControllerBindingError,
+) -> NanoBootstrapPrimaryError {
+    match source {
+        ProductionNavigationControllerBindingError::CommandEndpointMismatch {
+            controller,
+            actuation,
+        } => NanoBootstrapPrimaryError::ActuationCommandEndpointMismatch {
+            launch: controller,
+            actuation,
+        },
+        ProductionNavigationControllerBindingError::ControllerUidMismatch => {
+            NanoBootstrapPrimaryError::ActuationControllerUidMismatch
+        }
+        ProductionNavigationControllerBindingError::ControllerFirmwareAbiMismatch {
+            controller,
+            actuation,
+        } => NanoBootstrapPrimaryError::ActuationControllerFirmwareAbiMismatch {
+            server: controller,
+            actuation,
+        },
+        ProductionNavigationControllerBindingError::ControllerFirmwareBuildMismatch {
+            controller,
+            actuation,
+        } => NanoBootstrapPrimaryError::ActuationControllerFirmwareBuildMismatch {
+            server: controller,
+            actuation,
+        },
+        ProductionNavigationControllerBindingError::ControllerFingerprintMismatch => {
+            NanoBootstrapPrimaryError::ActuationControllerFingerprintMismatch
+        }
+        ProductionNavigationControllerBindingError::MpcPwmOutsideControllerEnvelope {
             wheel,
-            configured_min,
-            configured_max,
+            configured_min_percent,
+            configured_max_percent,
             controller_max_abs_percent,
-        )?;
+        } => NanoBootstrapPrimaryError::ActuationMpcPwmOutsideControllerEnvelope {
+            wheel,
+            configured_min_percent,
+            configured_max_percent,
+            controller_max_abs_percent,
+        },
+        ProductionNavigationControllerBindingError::CadenceArithmeticOverflow => {
+            NanoBootstrapPrimaryError::ActuationCadenceArithmeticOverflow
+        }
+        ProductionNavigationControllerBindingError::ControlPeriodHasNoControllerRateMargin {
+            control_period,
+            controller_minimum_interval,
+            scheduling_margin,
+            required_exclusive_lower_bound,
+        } => NanoBootstrapPrimaryError::ActuationControlPeriodHasNoControllerRateMargin {
+            control_period,
+            controller_minimum_interval,
+            scheduling_margin,
+            required_exclusive_lower_bound,
+        },
     }
-    Ok(())
-}
-
-fn bind_one_mpc_pwm_range(
-    wheel: WheelSide,
-    configured_min_percent: i8,
-    configured_max_percent: i8,
-    controller_max_abs_percent: u8,
-) -> Result<(), NanoBootstrapPrimaryError> {
-    let controller_max = i16::from(controller_max_abs_percent);
-    if i16::from(configured_min_percent) < -controller_max
-        || i16::from(configured_max_percent) > controller_max
-    {
-        return Err(
-            NanoBootstrapPrimaryError::ActuationMpcPwmOutsideControllerEnvelope {
-                wheel,
-                configured_min_percent,
-                configured_max_percent,
-                controller_max_abs_percent,
-            },
-        );
-    }
-    Ok(())
 }
 
 pub(super) fn require_running(running: &AtomicBool) -> Result<(), NanoBootstrapPrimaryError> {
@@ -2928,6 +2900,9 @@ mod tests {
         NanoFacePerceptionThreadExit,
     };
 
+    use super::super::production_navigation_binding::{
+        bind_navigation_cadence_to_controller, bind_one_mpc_pwm_range,
+    };
     use super::*;
 
     #[test]
@@ -3585,7 +3560,7 @@ mod tests {
             assert!(matches!(
                 bind_one_mpc_pwm_range(wheel, minimum, maximum, 30),
                 Err(
-                    NanoBootstrapPrimaryError::ActuationMpcPwmOutsideControllerEnvelope {
+                    ProductionNavigationControllerBindingError::MpcPwmOutsideControllerEnvelope {
                         wheel: actual_wheel,
                         configured_min_percent,
                         configured_max_percent,
@@ -3618,7 +3593,7 @@ mod tests {
                     scheduling_margin,
                 ),
                 Err(
-                    NanoBootstrapPrimaryError::ActuationControlPeriodHasNoControllerRateMargin {
+                    ProductionNavigationControllerBindingError::ControlPeriodHasNoControllerRateMargin {
                         control_period: actual,
                         required_exclusive_lower_bound,
                         ..

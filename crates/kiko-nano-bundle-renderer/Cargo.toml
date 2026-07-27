@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 clap = { version = "4.5.28", features = ["derive"] }
 kiko-expression-core = { path = "../kiko-expression-core" }
 kiko-expression-runtime = { path = "../kiko-expression-runtime" }
+kiko-slam = { path = "../kiko-slam", features = ["production-navigation-binding"] }
 libc = "0.2"
 robot-protocol = { path = "../../comms/robot-protocol" }
 robot-server = { path = "../../comms/robot-server" }

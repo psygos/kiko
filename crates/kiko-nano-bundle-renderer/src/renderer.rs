@@ -5,8 +5,13 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use kiko_slam::navigation::{
+    NanoCalibrationArtifactParseError, NanoCalibrationArtifactV1, NanoCalibrationBindingError,
+    OfflineNavigationGraphParseError, OfflineProductionNavigationGraphV1,
+    OfflineShadowNavigationGraphV1, ProductionNavigationControllerContractV1,
+};
 use robot_server::config::{ControllerServerConfigV1, ControllerServerConfigV2, ServerConfigError};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -35,43 +40,8 @@ const QUALIFICATION_GATE_A_PLANT_ARTIFACT_ID: &str =
     "qualification-shadow-only-synthetic-unvalidated-v2";
 const QUALIFICATION_GATE_A_PLANT_RELATIVE_PATH: &str =
     "artifacts/plant/qualification-shadow-only-synthetic-unvalidated-plant-v2.json";
-const QUALIFICATION_GATE_A_PLANT_MODEL_ID: &str =
-    "qualification-shadow-only-synthetic-unvalidated-v2";
-const QUALIFICATION_GATE_A_PLANT_MODEL_VERSION: u32 = 2;
-const QUALIFICATION_GATE_A_PLANT_SAMPLE_PERIOD_S: f64 = 0.05;
-const QUALIFICATION_GATE_A_PLANT_FIXTURE_ID: &str =
-    "qualification-shadow-only-synthetic-unvalidated-fixture-v2";
-const QUALIFICATION_GATE_A_PLANT_GENERATOR_ID: &str =
-    "synthetic-unvalidated-hand-authored-qualification-shadow-v2";
 const QUALIFICATION_GATE_A_PLANT_SHA256_HEX: &str =
     "aa96e9a3e75c540112d645a8dbefa54ba647574e90fc33e48b314b3c0094ded8";
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QualificationGateAPlantV2 {
-    schema_version: u32,
-    model_id: String,
-    model_version: u32,
-    sample_period_s: f64,
-    #[serde(rename = "wheelbase_m")]
-    _wheelbase_m: f64,
-    #[serde(rename = "left")]
-    _left: Value,
-    #[serde(rename = "right")]
-    _right: Value,
-    #[serde(rename = "validity")]
-    _validity: Value,
-    evidence: QualificationGateAPlantEvidenceV2,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum QualificationGateAPlantEvidenceV2 {
-    SyntheticFixture {
-        fixture_id: String,
-        generator_id: String,
-    },
-}
 
 #[derive(Clone, Copy, Debug)]
 pub enum RenderMode<'a> {
@@ -402,7 +372,13 @@ pub fn render_bundle(
     staged.push(render_evidence);
     staged.push(launch);
     ensure_unique_relative_paths(&staged)?;
-    validate_rendered_tree(&staged)?;
+    validate_rendered_tree(
+        &input,
+        &staged,
+        production_admission
+            .as_ref()
+            .map(|admission| &admission.profile),
+    )?;
 
     let plan = BundlePlanEvidence {
         schema_version: PLAN_SCHEMA_VERSION,
@@ -474,7 +450,7 @@ fn load_assets(input: &RenderInput) -> Result<LoadedAssets, RenderError> {
         input.assets.calibration.source_path.as_path(),
         MAX_SOURCE_ASSET_BYTES,
     )?;
-    reject_tokens_if_json(&calibration)?;
+    reject_unresolved_tokens("calibration", &calibration.bytes)?;
     let plant = LoadedSource::read(
         "plant",
         input.assets.plant.source_path.as_path(),
@@ -483,7 +459,7 @@ fn load_assets(input: &RenderInput) -> Result<LoadedAssets, RenderError> {
     if matches!(input.bundle, BundleSelection::WheelsOffQualification { .. }) {
         bind_qualification_gate_a_plant(input, &plant)?;
     } else {
-        reject_tokens_if_json(&plant)?;
+        reject_unresolved_tokens("plant", &plant.bytes)?;
     }
     let navigation_shadow = LoadedSource::read(
         "navigation_shadow",
@@ -491,7 +467,6 @@ fn load_assets(input: &RenderInput) -> Result<LoadedAssets, RenderError> {
         MAX_SOURCE_ASSET_BYTES,
     )?;
     reject_unresolved_tokens("navigation shadow", &navigation_shadow.bytes)?;
-    ensure_json_value(&navigation_shadow)?;
     let superpoint_model = LoadedSource::read(
         "superpoint_model",
         input.assets.superpoint_model.source_path.as_path(),
@@ -567,40 +542,6 @@ fn bind_qualification_gate_a_plant(
     }
 
     reject_unresolved_tokens("qualification Gate-A V2 plant", &plant.bytes)?;
-    let parsed: QualificationGateAPlantV2 = parse_exact_json(&plant.bytes, plant.path.as_path())?;
-    let QualificationGateAPlantEvidenceV2::SyntheticFixture {
-        fixture_id,
-        generator_id,
-    } = parsed.evidence;
-    for (field, matches) in [
-        ("schema_version", parsed.schema_version == 1),
-        (
-            "model_id",
-            parsed.model_id == QUALIFICATION_GATE_A_PLANT_MODEL_ID,
-        ),
-        (
-            "model_version",
-            parsed.model_version == QUALIFICATION_GATE_A_PLANT_MODEL_VERSION,
-        ),
-        (
-            "sample_period_s",
-            parsed.sample_period_s.to_bits()
-                == QUALIFICATION_GATE_A_PLANT_SAMPLE_PERIOD_S.to_bits(),
-        ),
-        (
-            "evidence.fixture_id",
-            fixture_id == QUALIFICATION_GATE_A_PLANT_FIXTURE_ID,
-        ),
-        (
-            "evidence.generator_id",
-            generator_id == QUALIFICATION_GATE_A_PLANT_GENERATOR_ID,
-        ),
-    ] {
-        if !matches {
-            return Err(RenderError::QualificationPlantBindingMismatch { field });
-        }
-    }
-
     let actual_sha256_hex = encode_hex(&plant.sha256);
     if actual_sha256_hex != QUALIFICATION_GATE_A_PLANT_SHA256_HEX {
         return Err(RenderError::QualificationPlantContentMismatch { actual_sha256_hex });
@@ -888,7 +829,7 @@ fn render_controller(
     production: Option<&ProductionControllerProfile>,
 ) -> Result<StagedFile, RenderError> {
     let stm32 = &input.discovery.stm32;
-    let rendered = match &input.bundle {
+    match &input.bundle {
         BundleSelection::WheelsOffQualification { .. } => StagedFile::rendered_json(
             "candidate_controller_contract",
             "controller-server-candidate-v2.json",
@@ -955,18 +896,7 @@ fn render_controller(
                 }),
             )
         }
-    }?;
-    match &input.bundle {
-        BundleSelection::WheelsOffQualification { .. } => {
-            ControllerServerConfigV2::parse_json(&rendered.bytes)
-                .map_err(RenderError::GeneratedControllerContract)?;
-        }
-        BundleSelection::Production { .. } => {
-            ControllerServerConfigV1::parse_json(&rendered.bytes)
-                .map_err(RenderError::GeneratedControllerContract)?;
-        }
     }
-    Ok(rendered)
 }
 
 fn render_candidate_policy() -> Result<StagedFile, RenderError> {
@@ -1648,7 +1578,11 @@ fn ensure_unique_relative_paths(staged: &[StagedFile]) -> Result<(), RenderError
     Ok(())
 }
 
-fn validate_rendered_tree(staged: &[StagedFile]) -> Result<(), RenderError> {
+fn validate_rendered_tree(
+    input: &RenderInput,
+    staged: &[StagedFile],
+    production: Option<&ProductionControllerProfile>,
+) -> Result<(), RenderError> {
     for file in staged {
         if file.relative_path.ends_with(".json") {
             reject_unresolved_tokens(&file.relative_path, &file.bytes)?;
@@ -1662,17 +1596,57 @@ fn validate_rendered_tree(staged: &[StagedFile]) -> Result<(), RenderError> {
     if launch.role != "launch" {
         return Err(RenderError::LaunchNotLast);
     }
-    Ok(())
-}
 
-fn reject_tokens_if_json(source: &LoadedSource) -> Result<(), RenderError> {
-    if source
-        .path
-        .extension()
-        .is_some_and(|extension| extension == "json")
-    {
-        reject_unresolved_tokens(&source.role, &source.bytes)?;
-        ensure_json_value(source)?;
+    let calibration = find_staged(
+        staged,
+        input.assets.calibration.destination_relative_path.as_str(),
+    )?;
+    let calibration = NanoCalibrationArtifactV1::parse_json(&calibration.bytes)
+        .map_err(RenderError::CalibrationArtifact)?;
+    calibration
+        .require_manifest_oak_mxid(input.discovery.oak.mxid.as_str())
+        .map_err(RenderError::CalibrationDeploymentBinding)?;
+    calibration
+        .require_launch_stereo_dimensions(
+            input.runtime.oak.stereo_width_px,
+            input.runtime.oak.stereo_height_px,
+        )
+        .map_err(RenderError::CalibrationDeploymentBinding)?;
+    let plant = find_staged(
+        staged,
+        input.assets.plant.destination_relative_path.as_str(),
+    )?;
+    let navigation = find_staged(staged, "navigation-shadow-v1.json")?;
+    match input.bundle {
+        BundleSelection::WheelsOffQualification { .. } => {
+            let controller = find_staged(staged, "controller-server-candidate-v2.json")?;
+            ControllerServerConfigV2::parse_json(&controller.bytes)
+                .map_err(RenderError::GeneratedControllerContract)?;
+            OfflineShadowNavigationGraphV1::parse(&calibration, &plant.bytes, &navigation.bytes)
+                .map_err(RenderError::OfflineNavigationGraph)?;
+        }
+        BundleSelection::Production { .. } => {
+            let production = production.ok_or(RenderError::MissingProductionControllerProfile)?;
+            let controller = find_staged(staged, "controller-server-v1.json")?;
+            let controller = ControllerServerConfigV1::parse_json(&controller.bytes)
+                .map_err(RenderError::GeneratedControllerContract)?;
+            let command_endpoint = std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                production.controller.command_udp_port,
+            ));
+            let controller =
+                ProductionNavigationControllerContractV1::new(command_endpoint, &controller);
+            let actuation = find_staged(staged, "navigation-actuation-v2.json")?;
+            OfflineProductionNavigationGraphV1::parse(
+                &calibration,
+                &plant.bytes,
+                &navigation.bytes,
+                &actuation.bytes,
+                input.robot_id.as_str(),
+                controller,
+            )
+            .map_err(RenderError::OfflineNavigationGraph)?;
+        }
     }
     Ok(())
 }
@@ -2002,6 +1976,9 @@ pub enum RenderError {
     },
     SerializeRenderedJson(serde_json::Error),
     GeneratedControllerContract(ServerConfigError),
+    CalibrationArtifact(NanoCalibrationArtifactParseError),
+    CalibrationDeploymentBinding(NanoCalibrationBindingError),
+    OfflineNavigationGraph(OfflineNavigationGraphParseError),
     NonCanonicalAbsolutePath {
         path: PathBuf,
     },
@@ -2131,6 +2108,18 @@ impl fmt::Display for RenderError {
             Self::GeneratedControllerContract(source) => write!(
                 formatter,
                 "generated controller contract was rejected by its authoritative parser: {source}"
+            ),
+            Self::CalibrationArtifact(source) => write!(
+                formatter,
+                "retained calibration artifact was rejected by its authoritative parser: {source}"
+            ),
+            Self::CalibrationDeploymentBinding(source) => write!(
+                formatter,
+                "retained calibration artifact does not match the rendered deployment: {source}"
+            ),
+            Self::OfflineNavigationGraph(source) => write!(
+                formatter,
+                "rendered navigation deployment graph was rejected before staging: {source}"
             ),
             Self::NonCanonicalAbsolutePath { path } => write!(
                 formatter,
@@ -2285,6 +2274,9 @@ impl std::error::Error for RenderError {
             Self::Input(source) => Some(source),
             Self::ParseJson { source, .. } | Self::SerializeRenderedJson(source) => Some(source),
             Self::GeneratedControllerContract(source) => Some(source),
+            Self::CalibrationArtifact(source) => Some(source),
+            Self::CalibrationDeploymentBinding(source) => Some(source),
+            Self::OfflineNavigationGraph(source) => Some(source),
             Self::ReadMetadata { source, .. }
             | Self::ReadSource { source, .. }
             | Self::ReadDestination { source, .. }
