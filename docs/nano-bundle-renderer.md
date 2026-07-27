@@ -23,9 +23,9 @@ anything.
 The schema version is selected with the bundle kind. Production remains
 render-input schema V1 and its illustrative source template is
 `configs/nano-agent-template/bundle-render-input-v1.json.template`.
-Wheels-off qualification requires render-input schema V2. Its field layout
+Wheels-off qualification requires render-input schema V3. Its field layout
 is the exact
-`configs/nano-wheels-off-qualification-template/bundle-render-input-v2.json.template`;
+`configs/nano-wheels-off-qualification-template/bundle-render-input-v3.json.template`;
 it fixes the qualification bundle kind, null face assets, cold-start
 selection, and reviewed SONAMEs while requiring the canonical absolute
 `qualification_executable_path`. Production instead requires the complete
@@ -33,11 +33,12 @@ two-cascade object and has no executable-path field. Unresolved `${...}`
 fields make either prepared file non-deployable. The strict renderer rejects
 cross-version and bundle/asset mismatches.
 
-Qualification render-input V1 and qualification launch V1 were already
-published. The executable and native-runtime bindings added later therefore
-belong to qualification render-input V2 and
-`nano-wheels-off-qualification-launch-v2.json`; they are not silent mutations
-of V1. Production render-input V1 and launch V3 are unchanged.
+Qualification render-input/launch V1 and V2 were already published. V2
+incorrectly selected the system ABI name `libusb-1.0.so.0` for the pinned
+DepthAI libusb role, so it is retired rather than silently reinterpreted.
+Qualification render-input V3 emits
+`nano-wheels-off-qualification-launch-v3.json`. Production render-input V1
+and launch V3 are unchanged.
 
 Prepare the JSON input from one retained discovery record and reviewed source
 files. The strict parser:
@@ -56,10 +57,13 @@ files. The strict parser:
   binary includes the production dispatch under `nano-agent`, so its ELF
   required native-runtime manifest cannot omit the detector libraries even
   though its qualification path rejects and never loads face-cascade assets.
-  Qualification pins all seven reviewed direct SONAMEs exactly:
-  `libdepthai-core.so`, `libdynamic_calibration.so`, `libusb-1.0.so.0`,
+  Qualification pins all seven reviewed native-role SONAMEs exactly:
+  `libdepthai-core.so`, `libdynamic_calibration.so`, `libusb-1.0.so`,
   `libonnxruntime.so.1`, `libopencv_core.so.4.5d`,
-  `libopencv_imgproc.so.4.5d`, and `libopencv_objdetect.so.4.5d`.
+  `libopencv_imgproc.so.4.5d`, and `libopencv_objdetect.so.4.5d`. The pinned
+  DepthAI v3.4.0 core directly needs `libusb-1.0.so`; a separate system
+  `libusb-1.0.so.0` may be pulled transitively by OpenCV/libdc1394 and belongs
+  to the observed OS ABI closure, not this pinned DepthAI role.
   Production continues to pin the three current Nano OpenCV SONAMEs exactly
   while retaining its existing V1 behavior for the other four role names;
 - requires all artifact output paths to remain beneath `artifacts/`;
@@ -114,7 +118,7 @@ The renderer constructs and writes:
 2. the native-runtime manifest, inventory, controller contract, motion
    contract when applicable, candidate policy when applicable, and agent
    policy;
-3. the exact render-input evidence copy—V2 for qualification and V1 for
+3. the exact render-input evidence copy—V3 for qualification and V1 for
    production—and the production-profile evidence copy when applicable;
 4. `evidence/render-evidence-v1.json`; and
 5. the bundle launch document, always last.

@@ -1145,7 +1145,7 @@ fn render_launch(
         .ok_or(RenderError::InternalJsonShape)?;
     match input.bundle {
         BundleSelection::WheelsOffQualification { .. } => {
-            object.insert("schema_version".to_owned(), json!(2));
+            object.insert("schema_version".to_owned(), json!(3));
             object.insert("robot_id".to_owned(), json!(input.robot_id));
             let executable = find_staged(staged, QUALIFICATION_EXECUTABLE_RELATIVE_PATH)?;
             object.insert(

@@ -17697,7 +17697,7 @@ mod tests {
             "--deployment-root",
             "/opt/kiko/deployment",
             "--launch-config",
-            "nano-wheels-off-qualification-launch-v2.json",
+            "nano-wheels-off-qualification-launch-v3.json",
             "--state-root",
             "/var/lib/kiko-nano-qualification",
         ])
@@ -17708,7 +17708,7 @@ mod tests {
         assert_eq!(args.deployment_root, Path::new("/opt/kiko/deployment"));
         assert_eq!(
             args.launch_config,
-            "nano-wheels-off-qualification-launch-v2.json"
+            "nano-wheels-off-qualification-launch-v3.json"
         );
         assert_eq!(
             args.state_root,
@@ -17722,7 +17722,7 @@ mod tests {
                 "--deployment-root",
                 "/opt/kiko/deployment",
                 "--launch-config",
-                "nano-wheels-off-qualification-launch-v2.json",
+                "nano-wheels-off-qualification-launch-v3.json",
                 "--state-root",
                 "/var/lib/kiko-nano-qualification",
                 "--wheels-removed",

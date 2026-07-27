@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "bundle": {
     "kind": "wheels_off_qualification",
     "qualification_executable_path": "${QUALIFICATION_EXECUTABLE_SOURCE_ABSOLUTE_PATH}"
@@ -74,7 +74,7 @@
     },
     {
       "role": "libusb1_0",
-      "soname": "libusb-1.0.so.0",
+      "soname": "libusb-1.0.so",
       "source_path": "${LIBUSB_1_0_SOURCE_ABSOLUTE_PATH}"
     },
     {

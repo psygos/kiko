@@ -2,9 +2,9 @@
 //! qualifier.
 //!
 //! This schema deliberately has no production physical-actuation document.
-//! It binds the common OAK/SLAM/occupancy/inference graph to a schema-V2
-//! candidate inventory, a candidate-only controller contract, and a
-//! candidate-only host policy. Production and qualification documents are
+//! The V3 launch binds the common OAK/SLAM/occupancy/inference graph to a
+//! schema-V2 candidate inventory, a candidate-only controller contract, and
+//! a candidate-only host policy. Production and qualification documents are
 //! different Rust types and reject each other's schemas.
 
 use std::fmt;
@@ -34,7 +34,7 @@ use super::{
     MAX_WHEELS_OFF_CANDIDATE_POLICY_JSON_BYTES,
 };
 
-pub const NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_V2: u32 = 2;
+pub const NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_V3: u32 = 3;
 pub const MAX_NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_JSON_BYTES: usize = 64 * 1_024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +118,7 @@ impl QualificationRobotId {
 
 /// Fully parsed qualification-only launch document.
 #[derive(Clone, Debug, PartialEq)]
-pub struct NanoWheelsOffQualificationLaunchV2 {
+pub struct NanoWheelsOffQualificationLaunchV3 {
     robot_id: QualificationRobotId,
     qualification_executable: NanoLaunchAssetBinding,
     native_runtime_manifest: NanoLaunchAssetBinding,
@@ -136,7 +136,7 @@ pub struct NanoWheelsOffQualificationLaunchV2 {
     storage: NanoLaunchStorage,
 }
 
-impl NanoWheelsOffQualificationLaunchV2 {
+impl NanoWheelsOffQualificationLaunchV3 {
     pub fn parse_json(json: &[u8]) -> Result<Self, NanoWheelsOffQualificationLaunchParseError> {
         if json.len() > MAX_NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_JSON_BYTES {
             return Err(NanoWheelsOffQualificationLaunchParseError::InputTooLarge {
@@ -145,16 +145,16 @@ impl NanoWheelsOffQualificationLaunchV2 {
             });
         }
         let mut deserializer = serde_json::Deserializer::from_slice(json);
-        let dto = NanoWheelsOffQualificationLaunchV2Dto::deserialize(&mut deserializer)
+        let dto = NanoWheelsOffQualificationLaunchV3Dto::deserialize(&mut deserializer)
             .map_err(NanoWheelsOffQualificationLaunchParseError::JsonDecode)?;
         deserializer
             .end()
             .map_err(NanoWheelsOffQualificationLaunchParseError::JsonTrailingData)?;
-        if dto.schema_version != NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_V2 {
+        if dto.schema_version != NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_V3 {
             return Err(
                 NanoWheelsOffQualificationLaunchParseError::UnsupportedSchema {
                     actual: dto.schema_version,
-                    supported: NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_V2,
+                    supported: NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_V3,
                 },
             );
         }
@@ -309,13 +309,13 @@ impl NanoWheelsOffQualificationLaunchV2 {
 }
 
 #[derive(Debug)]
-pub struct LoadedNanoWheelsOffQualificationLaunchV2 {
-    launch: NanoWheelsOffQualificationLaunchV2,
+pub struct LoadedNanoWheelsOffQualificationLaunchV3 {
+    launch: NanoWheelsOffQualificationLaunchV3,
     source: LoadedDeploymentAsset,
 }
 
-impl LoadedNanoWheelsOffQualificationLaunchV2 {
-    pub const fn launch(&self) -> &NanoWheelsOffQualificationLaunchV2 {
+impl LoadedNanoWheelsOffQualificationLaunchV3 {
+    pub const fn launch(&self) -> &NanoWheelsOffQualificationLaunchV3 {
         &self.launch
     }
 
@@ -327,15 +327,15 @@ impl LoadedNanoWheelsOffQualificationLaunchV2 {
         self.source.content_sha256()
     }
 
-    pub fn into_parts(self) -> (NanoWheelsOffQualificationLaunchV2, LoadedDeploymentAsset) {
+    pub fn into_parts(self) -> (NanoWheelsOffQualificationLaunchV3, LoadedDeploymentAsset) {
         (self.launch, self.source)
     }
 }
 
-pub fn load_nano_wheels_off_qualification_launch_v2(
+pub fn load_nano_wheels_off_qualification_launch_v3(
     deployment_root: &Path,
     launch_relative_path: ArtifactRelativePath,
-) -> Result<LoadedNanoWheelsOffQualificationLaunchV2, NanoWheelsOffQualificationLaunchLoadError> {
+) -> Result<LoadedNanoWheelsOffQualificationLaunchV3, NanoWheelsOffQualificationLaunchLoadError> {
     let byte_limit = DeploymentAssetByteLimit::try_new(
         u64::try_from(MAX_NANO_WHEELS_OFF_QUALIFICATION_LAUNCH_JSON_BYTES)
             .expect("launch JSON bound fits every supported host"),
@@ -343,7 +343,7 @@ pub fn load_nano_wheels_off_qualification_launch_v2(
     .expect("launch JSON bound is within the deployment-asset domain");
     let source = load_deployment_asset(deployment_root, launch_relative_path, byte_limit)
         .map_err(NanoWheelsOffQualificationLaunchLoadError::Load)?;
-    let launch = NanoWheelsOffQualificationLaunchV2::parse_json(source.bytes())
+    let launch = NanoWheelsOffQualificationLaunchV3::parse_json(source.bytes())
         .map_err(NanoWheelsOffQualificationLaunchLoadError::Parse)?;
     for role in NanoWheelsOffQualificationAssetRole::ALL {
         if launch.asset(role).relative_path() == source.relative_path() {
@@ -355,7 +355,7 @@ pub fn load_nano_wheels_off_qualification_launch_v2(
             );
         }
     }
-    Ok(LoadedNanoWheelsOffQualificationLaunchV2 { launch, source })
+    Ok(LoadedNanoWheelsOffQualificationLaunchV3 { launch, source })
 }
 
 #[derive(Debug)]
@@ -460,7 +460,7 @@ impl std::error::Error for NanoWheelsOffQualificationLaunchParseError {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NanoWheelsOffQualificationLaunchV2Dto {
+struct NanoWheelsOffQualificationLaunchV3Dto {
     schema_version: u32,
     robot_id: String,
     qualification_executable_asset: Option<CandidateAssetBindingDto>,
@@ -518,7 +518,7 @@ fn parse_candidate_asset(
 }
 
 fn ensure_distinct_assets(
-    launch: &NanoWheelsOffQualificationLaunchV2,
+    launch: &NanoWheelsOffQualificationLaunchV3,
 ) -> Result<(), NanoWheelsOffQualificationLaunchParseError> {
     for (first_index, first) in NanoWheelsOffQualificationAssetRole::ALL
         .into_iter()
@@ -560,7 +560,7 @@ mod tests {
 
     fn launch_document() -> Vec<u8> {
         serde_json::to_vec(&json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "robot_id": "kiko-candidate",
             "qualification_executable_asset":
                 asset("bin/kiko-nano-wheels-off-qualification"),
@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn qualification_and_production_launch_schemas_are_disjoint() {
         let qualification = launch_document();
-        NanoWheelsOffQualificationLaunchV2::parse_json(&qualification)
+        NanoWheelsOffQualificationLaunchV3::parse_json(&qualification)
             .expect("qualification schema");
         assert!(NanoAgentLaunchV3::parse_json(&qualification).is_err());
 
@@ -651,13 +651,28 @@ mod tests {
             .expect("launch fixture")
             .remove("native_runtime_manifest_asset");
         assert!(matches!(
-            NanoWheelsOffQualificationLaunchV2::parse_json(
+            NanoWheelsOffQualificationLaunchV3::parse_json(
                 &serde_json::to_vec(&wrong).expect("wrong-schema fixture")
             ),
             Err(
                 NanoWheelsOffQualificationLaunchParseError::UnsupportedSchema {
                     actual: 1,
-                    supported: 2
+                    supported: 3
+                }
+            )
+        ));
+
+        let mut retired_v2: Value =
+            serde_json::from_slice(&qualification).expect("qualification fixture");
+        retired_v2["schema_version"] = json!(2);
+        assert!(matches!(
+            NanoWheelsOffQualificationLaunchV3::parse_json(
+                &serde_json::to_vec(&retired_v2).expect("retired-schema fixture")
+            ),
+            Err(
+                NanoWheelsOffQualificationLaunchParseError::UnsupportedSchema {
+                    actual: 2,
+                    supported: 3
                 }
             )
         ));
@@ -669,7 +684,7 @@ mod tests {
             .expect("launch fixture")
             .remove("qualification_executable_asset");
         assert!(matches!(
-            NanoWheelsOffQualificationLaunchV2::parse_json(
+            NanoWheelsOffQualificationLaunchV3::parse_json(
                 &serde_json::to_vec(&missing).expect("missing-asset fixture")
             ),
             Err(
@@ -687,7 +702,7 @@ mod tests {
         duplicate["candidate_controller_policy_asset"] =
             duplicate["candidate_inventory_manifest_asset"].clone();
         assert!(matches!(
-            NanoWheelsOffQualificationLaunchV2::parse_json(
+            NanoWheelsOffQualificationLaunchV3::parse_json(
                 &serde_json::to_vec(&duplicate).expect("duplicate fixture")
             ),
             Err(
@@ -706,7 +721,7 @@ mod tests {
             serde_json::from_slice(&launch_document()).expect("qualification fixture");
         invalid["robot_id"] = json!("../../kiko");
         assert!(
-            NanoWheelsOffQualificationLaunchV2::parse_json(
+            NanoWheelsOffQualificationLaunchV3::parse_json(
                 &serde_json::to_vec(&invalid).expect("invalid robot fixture")
             )
             .is_err()
@@ -715,7 +730,7 @@ mod tests {
         let mut trailing = launch_document();
         trailing.extend_from_slice(b" {}");
         assert!(matches!(
-            NanoWheelsOffQualificationLaunchV2::parse_json(&trailing),
+            NanoWheelsOffQualificationLaunchV3::parse_json(&trailing),
             Err(NanoWheelsOffQualificationLaunchParseError::JsonTrailingData(_))
         ));
     }

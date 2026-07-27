@@ -2,7 +2,7 @@
 //! candidate controller.
 //!
 //! This is deliberately a library boundary rather than a second live-loop
-//! binary. It loads every launch-bound file once, binds the schema-V2
+//! binary. It loads every launch-bound file once, binds the schema-V3
 //! candidate contracts, probes the connected robot, acquires only an
 //! acknowledged zero, performs exact inner-V1 inventory comparison, and
 //! returns a linear stopped controller token for a later qualification owner.
@@ -40,7 +40,7 @@ use super::nano_bootstrap::{
 };
 use super::{
     AdmittedOakSuperSpeedEvidence, CandidateActuationSessionStartError, CandidateMpcBindingError,
-    CandidateRuntimeServiceIntervalError, LoadedNanoWheelsOffQualificationLaunchV2,
+    CandidateRuntimeServiceIntervalError, LoadedNanoWheelsOffQualificationLaunchV3,
     ManifestBoundNanoAgentPolicyConfigV3, NanoAccessoryManifestBindingError,
     NanoAgentPolicyConfigParseError, NanoAgentPolicyConfigV3, NanoBootstrapAccessoryEvidence,
     NanoBootstrapOakCloseDisposition, NanoBootstrapPrimaryError, NanoBootstrapRootError,
@@ -51,13 +51,13 @@ use super::{
     NanoWheelsOffNativeRuntimeBindingError, NanoWheelsOffNativeRuntimeParseError,
     NanoWheelsOffNativeRuntimeV1, NanoWheelsOffNativeRuntimeVerificationError,
     NanoWheelsOffQualificationAssetRole, NanoWheelsOffQualificationLaunchLoadError,
-    NanoWheelsOffQualificationLaunchV2, ParsedNanoLiveConfiguration,
+    NanoWheelsOffQualificationLaunchV3, ParsedNanoLiveConfiguration,
     ShadowNavigationConfigParseError, ShadowNavigationConfigV1,
     StoppedWheelsOffCandidateController, VerifiedNanoWheelsOffMappedImages,
     VerifiedNanoWheelsOffNativeRuntimeDependencies, WheelsOffCandidateActuationSession,
     WheelsOffCandidateControllerBinding, WheelsOffCandidateControllerBindingError,
     WheelsOffCandidateLimits, WheelsOffCandidatePolicyError,
-    WheelsOffCandidateRuntimeServiceInterval, load_nano_wheels_off_qualification_launch_v2,
+    WheelsOffCandidateRuntimeServiceInterval, load_nano_wheels_off_qualification_launch_v3,
     verify_linux_mapped_qualification_images,
 };
 use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
@@ -148,7 +148,7 @@ pub struct LoadedNanoWheelsOffQualificationAssets {
 impl LoadedNanoWheelsOffQualificationAssets {
     fn load(
         deployment_root: &Path,
-        launch: &NanoWheelsOffQualificationLaunchV2,
+        launch: &NanoWheelsOffQualificationLaunchV3,
     ) -> Result<Self, QualificationBootstrapPrimaryError> {
         let load = |role| {
             launch
@@ -396,7 +396,7 @@ impl QualificationPlantEvidence {
 #[must_use = "the OAK and stopped candidate-controller token need explicit lifecycle ownership"]
 pub struct PreparedNanoWheelsOffQualificationBootstrap {
     pub roots: NanoBootstrapRoots,
-    pub launch: LoadedNanoWheelsOffQualificationLaunchV2,
+    pub launch: LoadedNanoWheelsOffQualificationLaunchV3,
     pub assets: LoadedNanoWheelsOffQualificationAssets,
     pub manifest: LoadedExpectedManifestV2,
     pub policy: ManifestBoundNanoAgentPolicyConfigV3,
@@ -461,7 +461,7 @@ pub async fn bootstrap_nano_wheels_off_qualification(
         .map_err(QualificationBootstrapPrimaryError::common)
         .map_err(QualificationBootstrapError::before_hardware)?;
     let launch =
-        load_nano_wheels_off_qualification_launch_v2(roots.deployment_root(), launch_relative_path)
+        load_nano_wheels_off_qualification_launch_v3(roots.deployment_root(), launch_relative_path)
             .map_err(QualificationBootstrapPrimaryError::LaunchLoad)
             .map_err(QualificationBootstrapError::before_hardware)?;
     let assets =
@@ -886,7 +886,7 @@ struct ConnectedQualificationOak {
 
 fn prepare_oak(
     oak: &mut Device,
-    launch: &NanoWheelsOffQualificationLaunchV2,
+    launch: &NanoWheelsOffQualificationLaunchV3,
     calibration: &NanoCalibrationArtifactV1,
     navigation: ShadowNavigationConfigV1,
     candidate_runtime_service_interval: WheelsOffCandidateRuntimeServiceInterval,
@@ -930,7 +930,7 @@ fn prepare_oak(
 
 fn bind_policy_paths(
     roots: &NanoBootstrapRoots,
-    launch: &NanoWheelsOffQualificationLaunchV2,
+    launch: &NanoWheelsOffQualificationLaunchV3,
     configured_manifest: &Path,
     artifact_root: &Path,
 ) -> Result<(), QualificationBootstrapPrimaryError> {
@@ -967,7 +967,7 @@ fn require_exact_manifest_path(
 
 fn bind_calibration(
     roots: &NanoBootstrapRoots,
-    launch: &NanoWheelsOffQualificationLaunchV2,
+    launch: &NanoWheelsOffQualificationLaunchV3,
     loaded: &LoadedDeploymentAsset,
     policy: &ManifestBoundNanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -1070,7 +1070,7 @@ fn calibration_deployment_relative_artifact_path(
 
 fn select_plant(
     roots: &NanoBootstrapRoots,
-    launch: &NanoWheelsOffQualificationLaunchV2,
+    launch: &NanoWheelsOffQualificationLaunchV3,
     loaded: &LoadedDeploymentAsset,
     policy: &ManifestBoundNanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,

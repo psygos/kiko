@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "robot_id": "${ROBOT_ID}",
   "qualification_executable_asset": {
     "relative_path": "bin/kiko-nano-wheels-off-qualification",

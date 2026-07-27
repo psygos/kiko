@@ -77,7 +77,7 @@ impl NanoWheelsOffNativeLibraryRole {
         match self {
             Self::DepthAiCore => "libdepthai-core.so",
             Self::DynamicCalibration => "libdynamic_calibration.so",
-            Self::LibUsb1_0 => "libusb-1.0.so.0",
+            Self::LibUsb1_0 => "libusb-1.0.so",
             Self::OnnxRuntime => "libonnxruntime.so.1",
             Self::OpenCvCore => "libopencv_core.so.4.5d",
             Self::OpenCvImgproc => "libopencv_imgproc.so.4.5d",
@@ -812,7 +812,7 @@ mod tests {
         let libraries = [
             ("depthai_core", "libdepthai-core.so"),
             ("dynamic_calibration", "libdynamic_calibration.so"),
-            ("libusb_1_0", "libusb-1.0.so.0"),
+            ("libusb_1_0", "libusb-1.0.so"),
             ("onnxruntime", "libonnxruntime.so.1"),
             ("opencv_core", "libopencv_core.so.4.5d"),
             ("opencv_imgproc", "libopencv_imgproc.so.4.5d"),

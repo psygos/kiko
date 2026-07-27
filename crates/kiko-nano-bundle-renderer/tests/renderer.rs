@@ -10,7 +10,7 @@ use kiko_device_inventory::{
 use kiko_nano_bundle_renderer::{RenderMode, render_bundle};
 use kiko_slam::navigation::{
     NanoAgentLaunchV3, NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1,
-    NanoWheelsOffNativeRuntimeV1, NanoWheelsOffQualificationLaunchV2,
+    NanoWheelsOffNativeRuntimeV1, NanoWheelsOffQualificationLaunchV3,
     WheelsOffCandidateControllerBinding,
 };
 use robot_server::config::{ControllerServerConfig, ControllerServerConfigV1};
@@ -102,7 +102,7 @@ fn source_fixture() -> (TempDir, Value) {
     let lightglue = write_source(&root, "lightglue.onnx", b"lightglue-exact");
     let depthai = write_source(&root, "libdepthai-core.so", b"depthai-exact");
     let calibration_lib = write_source(&root, "libdynamic_calibration.so", b"calibration-exact");
-    let libusb = write_source(&root, "libusb-1.0.so.0", b"libusb-exact");
+    let libusb = write_source(&root, "libusb-1.0.so", b"libusb-exact");
     let onnx = write_source(&root, "libonnxruntime.so.1", b"onnxruntime-exact");
     let opencv_core = write_source(&root, "libopencv_core.so.4.5d", b"opencv-core-exact");
     let opencv_imgproc = write_source(&root, "libopencv_imgproc.so.4.5d", b"opencv-imgproc-exact");
@@ -117,7 +117,7 @@ fn source_fixture() -> (TempDir, Value) {
         b"qualification-executable-exact",
     );
     let input = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "bundle": {
             "kind": "wheels_off_qualification",
             "qualification_executable_path": qualification_executable
@@ -191,7 +191,7 @@ fn source_fixture() -> (TempDir, Value) {
             },
             {
                 "role": "libusb1_0",
-                "soname": "libusb-1.0.so.0",
+                "soname": "libusb-1.0.so",
                 "source_path": libusb
             },
             {
@@ -416,7 +416,7 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
     assert_eq!(plan.bundle_kind, "wheels_off_qualification");
     assert_eq!(
         plan.files.last().expect("last file").relative_path,
-        "nano-wheels-off-qualification-launch-v2.json"
+        "nano-wheels-off-qualification-launch-v3.json"
     );
     assert_eq!(
         plan.files
@@ -468,7 +468,7 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
     assert_eq!(recorded_order, planned_order);
     assert_eq!(
         recorded_order.last().expect("last recorded write"),
-        "nano-wheels-off-qualification-launch-v2.json"
+        "nano-wheels-off-qualification-launch-v3.json"
     );
     let inventory_bytes = fs::read(destination.join("device-inventory-candidate-v2.json"))
         .expect("candidate inventory");
@@ -524,9 +524,9 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
         inventory["calibration_artifacts"][0]["sha256"],
         Value::Array(expected_digest)
     );
-    let launch_bytes = fs::read(destination.join("nano-wheels-off-qualification-launch-v2.json"))
+    let launch_bytes = fs::read(destination.join("nano-wheels-off-qualification-launch-v3.json"))
         .expect("qualification launch");
-    NanoWheelsOffQualificationLaunchV2::parse_json(&launch_bytes)
+    NanoWheelsOffQualificationLaunchV3::parse_json(&launch_bytes)
         .expect("typed qualification launch");
     let launch: Value = serde_json::from_slice(&launch_bytes).expect("qualification launch JSON");
     assert_eq!(
@@ -563,10 +563,10 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
         launch["native_runtime_manifest_asset"]["sha256_hex"],
         sha256_hex(&native_runtime_manifest)
     );
-    let input_evidence = destination.join("evidence/render-input-v2.json");
+    let input_evidence = destination.join("evidence/render-input-v3.json");
     assert!(
         input_evidence.exists(),
-        "qualification retains its schema-V2 render input under a versioned evidence name"
+        "qualification retains its schema-V3 render input under a versioned evidence name"
     );
     let executable_source = render_evidence["sources"]
         .as_array()
@@ -630,11 +630,24 @@ fn render_input_versions_are_bundle_specific_and_fail_closed() {
         &write_input(&root, &legacy_qualification),
         RenderMode::DryRun,
     )
-    .expect_err("published qualification V1 cannot be reinterpreted as V2");
+    .expect_err("published qualification V1 cannot be reinterpreted as V3");
     assert!(
         error
             .to_string()
-            .contains("unsupported wheels_off_qualification render-input schema 1; expected 2")
+            .contains("unsupported wheels_off_qualification render-input schema 1; expected 3")
+    );
+
+    let mut retired_qualification_v2 = input.clone();
+    retired_qualification_v2["schema_version"] = json!(2);
+    let error = render_bundle(
+        &write_input(&root, &retired_qualification_v2),
+        RenderMode::DryRun,
+    )
+    .expect_err("published qualification V2 cannot be reinterpreted as V3");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported wheels_off_qualification render-input schema 2; expected 3")
     );
 
     let mut production = input;
@@ -775,7 +788,7 @@ fn production_derives_navigation_digest_and_loopback_port() {
     .expect("production render");
     assert_eq!(plan.bundle_kind, "production");
     assert!(destination.join("evidence/render-input-v1.json").exists());
-    assert!(!destination.join("evidence/render-input-v2.json").exists());
+    assert!(!destination.join("evidence/render-input-v3.json").exists());
     let production_input_permissions =
         fs::metadata(destination.join("evidence/render-input-v1.json"))
             .expect("production render-input evidence metadata")

@@ -55,12 +55,12 @@ surface. The raw-PWM qualification modules are compiled out of an ordinary
 production-only `--features nano-agent` build.
 
 The exact resulting executable is a mandatory renderer input. Start from
-`configs/nano-wheels-off-qualification-template/bundle-render-input-v2.json.template`.
+`configs/nano-wheels-off-qualification-template/bundle-render-input-v3.json.template`.
 The prepared qualification render-input boundary includes:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "bundle": {
     "kind": "wheels_off_qualification",
     "qualification_executable_path": "/absolute/path/to/target/release/kiko-slam"
@@ -68,10 +68,11 @@ The prepared qualification render-input boundary includes:
 }
 ```
 
-Qualification render-input V1 and launch V1 were already published before
-executable/native-runtime admission was added. Do not relabel either old
-document: the current renderer requires qualification input V2 and emits
-qualification launch V2. Production input V1 and launch V3 are unchanged.
+Qualification render-input/launch V1 and V2 were already published. Do not
+relabel either old document: V2 incorrectly selected the system ABI name
+`libusb-1.0.so.0` for the pinned DepthAI libusb role. The current renderer
+requires qualification input V3 and emits qualification launch V3. Production
+input V1 and launch V3 are unchanged.
 
 Do not install a qualification systemd unit. Do not add qualification to the
 production unit, qualified-boot drop-in, cron, Fable guardian, or any other
@@ -103,19 +104,19 @@ staging root. The canonical installed layout is:
 ├── candidate-controller-policy-v1.json
 ├── controller-server-candidate-v2.json
 ├── device-inventory-candidate-v2.json
-├── nano-wheels-off-qualification-launch-v2.json
+├── nano-wheels-off-qualification-launch-v3.json
 ├── navigation-shadow-v1.json
 ├── native-runtime-v1.json
 ├── artifacts/
 │   ├── calibration/<exact calibration asset>
 │   └── plant/<exact shadow-only plant asset>
 ├── evidence/
-│   ├── render-input-v2.json
+│   ├── render-input-v3.json
 │   └── render-evidence-v1.json
 ├── lib/
 │   ├── libdepthai-core.so
 │   ├── libdynamic_calibration.so
-│   ├── libusb-1.0.so.0
+│   ├── libusb-1.0.so
 │   ├── libonnxruntime.so.1
 │   ├── libopencv_core.so.4.5d
 │   ├── libopencv_imgproc.so.4.5d
@@ -150,7 +151,7 @@ configuration. Production separately cross-binds the artifact's three
 calibration IDs to the physical-actuation approval.
 
 Render the leaf assets and documents first. Render
-`nano-wheels-off-qualification-launch-v2.json` last. On the Nano, inspect the
+`nano-wheels-off-qualification-launch-v3.json` last. On the Nano, inspect the
 result before installation:
 
 ```bash
@@ -230,7 +231,7 @@ sudo /usr/bin/env LD_LIBRARY_PATH=/opt/kiko/qualification/lib \
   /opt/kiko/qualification/bin/kiko-nano-wheels-off-qualification \
   nano-wheels-off-qualification \
   --deployment-root /opt/kiko/qualification \
-  --launch-config nano-wheels-off-qualification-launch-v2.json \
+  --launch-config nano-wheels-off-qualification-launch-v3.json \
   --state-root /var/lib/kiko-nano-qualification
 ```
 

@@ -10,7 +10,7 @@ use robot_protocol::v2::ControllerCapabilities;
 use serde::{Deserialize, Serialize};
 
 pub const PRODUCTION_RENDER_INPUT_SCHEMA_VERSION: u32 = 1;
-pub const WHEELS_OFF_QUALIFICATION_RENDER_INPUT_SCHEMA_VERSION: u32 = 2;
+pub const WHEELS_OFF_QUALIFICATION_RENDER_INPUT_SCHEMA_VERSION: u32 = 3;
 pub const PRODUCTION_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const PRODUCTION_ADMISSION_SCOPE: &str =
     "production_motion_profile_after_physical_wheels_off_review_v1";
@@ -216,7 +216,7 @@ impl NativeLibraryRole {
         match self {
             Self::DepthaiCore => "libdepthai-core.so",
             Self::DynamicCalibration => "libdynamic_calibration.so",
-            Self::Libusb1_0 => "libusb-1.0.so.0",
+            Self::Libusb1_0 => "libusb-1.0.so",
             Self::Onnxruntime => "libonnxruntime.so.1",
             Self::OpencvCore => "libopencv_core.so.4.5d",
             Self::OpencvImgproc => "libopencv_imgproc.so.4.5d",
@@ -396,14 +396,14 @@ impl BundleSelection {
 
     pub(crate) const fn launch_relative_path(&self) -> &'static str {
         match self {
-            Self::WheelsOffQualification { .. } => "nano-wheels-off-qualification-launch-v2.json",
+            Self::WheelsOffQualification { .. } => "nano-wheels-off-qualification-launch-v3.json",
             Self::Production { .. } => "nano-agent-launch-v3.json",
         }
     }
 
     pub(crate) const fn render_input_evidence_path(&self) -> &'static str {
         match self {
-            Self::WheelsOffQualification { .. } => "evidence/render-input-v2.json",
+            Self::WheelsOffQualification { .. } => "evidence/render-input-v3.json",
             Self::Production { .. } => "evidence/render-input-v1.json",
         }
     }
