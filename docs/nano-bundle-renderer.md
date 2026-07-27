@@ -4,11 +4,11 @@ The canonical renderer is:
 
 ```bash
 cargo run --locked -p kiko-nano-bundle-renderer -- \
-  check --input /canonical/absolute/path/render-input-v1.json
+  check --input /canonical/absolute/path/render-input.json
 
 cargo run --locked -p kiko-nano-bundle-renderer -- \
   stage \
-  --input /canonical/absolute/path/render-input-v1.json \
+  --input /canonical/absolute/path/render-input.json \
   --destination /canonical/absolute/path/new-empty-staging-directory
 ```
 
@@ -20,12 +20,24 @@ anything.
 
 ## Boundary contract
 
-The render input is schema V1. Its illustrative source template is
-`configs/nano-agent-template/bundle-render-input-v1.json.template`; the
-unresolved `${...}` fields make that file deliberately non-deployable. Its
-whole-value `${FACE_PERCEPTION_ASSETS_JSON}` token must become `null` for a
-`wheels_off_qualification` input or the complete two-cascade object for a
-`production` input. The strict renderer rejects either bundle/asset mismatch.
+The schema version is selected with the bundle kind. Production remains
+render-input schema V1 and its illustrative source template is
+`configs/nano-agent-template/bundle-render-input-v1.json.template`.
+Wheels-off qualification requires render-input schema V2. Its field layout
+is the exact
+`configs/nano-wheels-off-qualification-template/bundle-render-input-v2.json.template`;
+it fixes the qualification bundle kind, null face assets, cold-start
+selection, and reviewed SONAMEs while requiring the canonical absolute
+`qualification_executable_path`. Production instead requires the complete
+two-cascade object and has no executable-path field. Unresolved `${...}`
+fields make either prepared file non-deployable. The strict renderer rejects
+cross-version and bundle/asset mismatches.
+
+Qualification render-input V1 and qualification launch V1 were already
+published. The executable and native-runtime bindings added later therefore
+belong to qualification render-input V2 and
+`nano-wheels-off-qualification-launch-v2.json`; they are not silent mutations
+of V1. Production render-input V1 and launch V3 are unchanged.
 
 Prepare the JSON input from one retained discovery record and reviewed source
 files. The strict parser:
@@ -39,26 +51,33 @@ files. The strict parser:
 - parses controller, eye, OAK, accessory, stream, resource, geometry, and
   numeric identities into bounded domain values;
 - requires the four legacy native roles—DepthAI core, dynamic calibration,
-  libusb 1.0, and ONNX Runtime—plus exact `opencv_core`, `opencv_imgproc`, and
+  libusb 1.0, and ONNX Runtime—plus `opencv_core`, `opencv_imgproc`, and
   `opencv_objdetect` roles for both bundle kinds. The attended wheels-off
   binary includes the production dispatch under `nano-agent`, so its ELF
-  closure cannot truthfully omit the directly linked detector libraries even
+  required native-runtime manifest cannot omit the detector libraries even
   though its qualification path rejects and never loads face-cascade assets.
-  The OpenCV roles are pinned to the current Nano's ELF SONAMEs
-  (`libopencv_core.so.4.5d`,
-  `libopencv_imgproc.so.4.5d`, and `libopencv_objdetect.so.4.5d`);
+  Qualification pins all seven reviewed direct SONAMEs exactly:
+  `libdepthai-core.so`, `libdynamic_calibration.so`, `libusb-1.0.so.0`,
+  `libonnxruntime.so.1`, `libopencv_core.so.4.5d`,
+  `libopencv_imgproc.so.4.5d`, and `libopencv_objdetect.so.4.5d`.
+  Production continues to pin the three current Nano OpenCV SONAMEs exactly
+  while retaining its existing V1 behavior for the other four role names;
 - requires all artifact output paths to remain beneath `artifacts/`;
-- rejects unresolved `${` tokens in every JSON boundary; and
+- rejects unresolved `${` tokens in every JSON boundary;
 - checks the exact provisional controller ABI, build, fingerprint, and
-  capability set before it can render a wheels-off candidate bundle.
+  capability set before it can render a wheels-off candidate bundle; and
+- retains the qualification executable at its fixed bundle path with mode
+  `0555`, then launch-binds its exact size and SHA-256 along with the strict
+  seven-role native-runtime manifest.
 
 The serial-by-id values and OAK MXID are observations supplied by discovery;
 rendering does not prove those devices remain connected. The renderer never
 resolves a by-id path to a transient `ttyACM*` name.
 
-The navigation-shadow document, canonical calibration artifact, plant
-artifact, models, production frontal/profile face cascades, and native
-libraries are exact leaf sources. The renderer retains their exact bytes.
+The qualification executable, navigation-shadow document, canonical
+calibration artifact, plant artifact, models, production frontal/profile face
+cascades, and native libraries are exact leaf sources. The renderer retains
+their exact bytes.
 Production requires both cascade sources as one typed set; wheels-off
 qualification rejects that unused set. The calibration input key is deliberately
 `assets.calibration`, not `camera_calibration`: the one artifact owns the
@@ -80,27 +99,32 @@ manual input.
 
 After each staging write the file is read back and compared byte-for-byte to
 the retained sequence. This readback does not create a second claimed digest.
-Every staged file is made read-only, then each staging directory is made
-read-only. A staging tree is still not a root-owned production installation.
+The qualification executable alone is set to mode `0555`. Every other staged
+file uses the renderer's established `set_readonly(true)` behavior, and each
+staging directory is made read-only. A staging tree is still not a root-owned
+production installation.
 
 ## Deterministic construction order
 
 The renderer constructs and writes:
 
-1. exact calibration, plant, navigation-shadow, model, production
-   face-cascade, and native-library leaves;
+1. the exact qualification executable when selected, plus calibration, plant,
+   navigation-shadow, model, production face-cascade, and native-library
+   leaves;
 2. the native-runtime manifest, inventory, controller contract, motion
    contract when applicable, candidate policy when applicable, and agent
    policy;
-3. exact render-input and production-profile evidence copies;
+3. the exact render-input evidence copy—V2 for qualification and V1 for
+   production—and the production-profile evidence copy when applicable;
 4. `evidence/render-evidence-v1.json`; and
 5. the bundle launch document, always last.
 
 The evidence manifest records the exact source paths, source byte counts and
-digests, every content-bound output except its own recursive identity, the
-launch identity, and the deterministic write order. It deliberately records
-that installation, ownership, device presence, hardware qualification,
-physical stop behavior, and performance were not established.
+digests—including the qualification executable source—every content-bound
+output except its own recursive identity, the launch identity, and the
+deterministic write order. It deliberately records that installation,
+ownership, device presence, hardware qualification, physical stop behavior,
+and performance were not established.
 
 `check` runs the complete parse/hash/render validation but creates no
 destination. This makes it suitable before any Nano handoff.
@@ -133,8 +157,8 @@ are supplied under their pinned SONAMEs. The renderer copies the regular
 source bytes into `lib/<SONAME>` and hashes them; do not supply or install
 symlink objects as deployment leaves.
 The typed SONAME field is a required filename/role declaration, not an ELF
-dynamic-section parser. The target-side final-ELF `readelf` and loader-trace
-gate remains mandatory.
+dynamic-section parser. Exact `DT_NEEDED`/loader-graph evidence from the final
+ELF remains a separate target-side `readelf` release gate.
 Supplying a syntactically valid profile is still not proof that its physical
 claims are true; later typed deployment admission and attended physical gates
 remain authoritative.

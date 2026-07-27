@@ -589,17 +589,6 @@
     return value == null ? "unknown" : value;
   }
 
-  function safeRerunUrl(raw) {
-    if (typeof raw !== "string") return null;
-    try {
-      const url = new URL(raw);
-      const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname);
-      return loopback && ["http:", "https:"].includes(url.protocol) ? url.href : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
   function exactQualificationPattern(pattern, left, right, maximum) {
     return pattern != null
       && Number.isInteger(pattern.left_timer_pwm_percent)
@@ -946,13 +935,14 @@
     $("localization").textContent = (map?.localization || "unknown").toUpperCase();
     $("localization").className =
       `pill ${map?.localization === "localized" ? "ready" : map ? "warn" : "unknown"}`;
-    const rerun = $("rerun-link");
-    const rerunUrl = safeRerunUrl(snapshot.rerun_diagnostics_url);
+    const rerun = $("rerun-diagnostics");
+    const rerunUrl = snapshot.rerun_diagnostics_url;
     if (rerunUrl) {
-      rerun.href = rerunUrl;
+      rerun.textContent =
+        `Rerun tunnel: rerun --connect ${rerunUrl.connectUri}`;
       rerun.classList.remove("hidden");
     } else {
-      rerun.removeAttribute("href");
+      rerun.textContent = "";
       rerun.classList.add("hidden");
     }
     if (snapshot.software_safety_stop_latched) {

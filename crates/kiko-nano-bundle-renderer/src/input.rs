@@ -9,7 +9,8 @@ use kiko_expression_runtime::{
 use robot_protocol::v2::ControllerCapabilities;
 use serde::{Deserialize, Serialize};
 
-pub const RENDER_INPUT_SCHEMA_VERSION: u32 = 1;
+pub const PRODUCTION_RENDER_INPUT_SCHEMA_VERSION: u32 = 1;
+pub const WHEELS_OFF_QUALIFICATION_RENDER_INPUT_SCHEMA_VERSION: u32 = 2;
 pub const PRODUCTION_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const PRODUCTION_ADMISSION_SCOPE: &str =
     "production_motion_profile_after_physical_wheels_off_review_v1";
@@ -53,10 +54,30 @@ pub(crate) struct RenderInputDto {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum BundleSelectionDto {
-    WheelsOffQualification,
+    WheelsOffQualification {
+        qualification_executable_path: Option<PathBuf>,
+    },
     Production {
         production_controller_profile_path: Option<PathBuf>,
     },
+}
+
+impl BundleSelectionDto {
+    const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::WheelsOffQualification { .. } => "wheels_off_qualification",
+            Self::Production { .. } => "production",
+        }
+    }
+
+    const fn render_input_schema_version(&self) -> u32 {
+        match self {
+            Self::WheelsOffQualification { .. } => {
+                WHEELS_OFF_QUALIFICATION_RENDER_INPUT_SCHEMA_VERSION
+            }
+            Self::Production { .. } => PRODUCTION_RENDER_INPUT_SCHEMA_VERSION,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +209,18 @@ impl NativeLibraryRole {
             Self::DepthaiCore | Self::DynamicCalibration | Self::Libusb1_0 | Self::Onnxruntime => {
                 None
             }
+        }
+    }
+
+    const fn qualification_exact_nano_soname(self) -> &'static str {
+        match self {
+            Self::DepthaiCore => "libdepthai-core.so",
+            Self::DynamicCalibration => "libdynamic_calibration.so",
+            Self::Libusb1_0 => "libusb-1.0.so.0",
+            Self::Onnxruntime => "libonnxruntime.so.1",
+            Self::OpencvCore => "libopencv_core.so.4.5d",
+            Self::OpencvImgproc => "libopencv_imgproc.so.4.5d",
+            Self::OpencvObjdetect => "libopencv_objdetect.so.4.5d",
         }
     }
 }
@@ -344,7 +377,9 @@ pub(crate) struct RenderInput {
 
 #[derive(Debug)]
 pub(crate) enum BundleSelection {
-    WheelsOffQualification,
+    WheelsOffQualification {
+        qualification_executable_path: AbsoluteSourcePath,
+    },
     Production {
         production_controller_profile_path: Option<AbsoluteSourcePath>,
         face_perception: FacePerceptionAssets,
@@ -354,21 +389,28 @@ pub(crate) enum BundleSelection {
 impl BundleSelection {
     pub(crate) const fn kind_name(&self) -> &'static str {
         match self {
-            Self::WheelsOffQualification => "wheels_off_qualification",
+            Self::WheelsOffQualification { .. } => "wheels_off_qualification",
             Self::Production { .. } => "production",
         }
     }
 
     pub(crate) const fn launch_relative_path(&self) -> &'static str {
         match self {
-            Self::WheelsOffQualification => "nano-wheels-off-qualification-launch-v1.json",
+            Self::WheelsOffQualification { .. } => "nano-wheels-off-qualification-launch-v2.json",
             Self::Production { .. } => "nano-agent-launch-v3.json",
+        }
+    }
+
+    pub(crate) const fn render_input_evidence_path(&self) -> &'static str {
+        match self {
+            Self::WheelsOffQualification { .. } => "evidence/render-input-v2.json",
+            Self::Production { .. } => "evidence/render-input-v1.json",
         }
     }
 
     pub(crate) const fn face_perception(&self) -> Option<&FacePerceptionAssets> {
         match self {
-            Self::WheelsOffQualification => None,
+            Self::WheelsOffQualification { .. } => None,
             Self::Production {
                 face_perception, ..
             } => Some(face_perception),
@@ -577,21 +619,38 @@ impl RelativeBundlePath {
 
 impl RenderInput {
     pub(crate) fn parse(dto: RenderInputDto) -> Result<Self, InputError> {
-        if dto.schema_version != RENDER_INPUT_SCHEMA_VERSION {
+        let expected_schema = dto.bundle.render_input_schema_version();
+        if dto.schema_version != expected_schema {
             return Err(InputError::UnsupportedRenderInputSchema {
                 actual: dto.schema_version,
+                expected: expected_schema,
+                bundle_kind: dto.bundle.kind_name(),
             });
         }
 
         let robot_id = parse_text("robot_id", dto.robot_id)?;
         let (assets, face_perception) = AssetSet::parse(dto.assets)?;
         let bundle = match (dto.bundle, face_perception) {
-            (BundleSelectionDto::WheelsOffQualification, None) => {
-                BundleSelection::WheelsOffQualification
-            }
-            (BundleSelectionDto::WheelsOffQualification, Some(_)) => {
+            (
+                BundleSelectionDto::WheelsOffQualification {
+                    qualification_executable_path: Some(qualification_executable_path),
+                },
+                None,
+            ) => BundleSelection::WheelsOffQualification {
+                qualification_executable_path: parse_absolute_source_path(
+                    "bundle.qualification_executable_path",
+                    qualification_executable_path,
+                )?,
+            },
+            (BundleSelectionDto::WheelsOffQualification { .. }, Some(_)) => {
                 return Err(InputError::FacePerceptionAssetsForbiddenInQualification);
             }
+            (
+                BundleSelectionDto::WheelsOffQualification {
+                    qualification_executable_path: None,
+                },
+                None,
+            ) => return Err(InputError::QualificationExecutablePathRequired),
             (
                 BundleSelectionDto::Production {
                     production_controller_profile_path,
@@ -610,12 +669,13 @@ impl RenderInput {
             }
         };
         let discovery = Discovery::parse(dto.discovery)?;
-        if matches!(bundle, BundleSelection::WheelsOffQualification) {
+        if matches!(bundle, BundleSelection::WheelsOffQualification { .. }) {
             discovery.stm32.require_candidate_identity()?;
         }
-        let native_libraries = parse_native_libraries(dto.native_libraries)?;
+        let qualification_bundle = matches!(bundle, BundleSelection::WheelsOffQualification { .. });
+        let native_libraries = parse_native_libraries(dto.native_libraries, qualification_bundle)?;
         let runtime = RuntimeEnvelope::parse(dto.runtime)?;
-        if matches!(bundle, BundleSelection::WheelsOffQualification)
+        if matches!(bundle, BundleSelection::WheelsOffQualification { .. })
             && runtime.storage.warm_start == WarmStartSelection::DatasetReplay
         {
             return Err(InputError::WarmStartForbiddenInQualification);
@@ -822,7 +882,10 @@ fn parse_file_source(field: &'static str, dto: FileSourceDto) -> Result<FileSour
     })
 }
 
-fn parse_native_libraries(dtos: Vec<NativeLibraryDto>) -> Result<Vec<NativeLibrary>, InputError> {
+fn parse_native_libraries(
+    dtos: Vec<NativeLibraryDto>,
+    qualification_bundle: bool,
+) -> Result<Vec<NativeLibrary>, InputError> {
     if dtos.len() != NativeLibraryRole::ALL.len() {
         return Err(InputError::IncompleteNativeLibrarySet);
     }
@@ -833,7 +896,12 @@ fn parse_native_libraries(dtos: Vec<NativeLibraryDto>) -> Result<Vec<NativeLibra
             return Err(InputError::DuplicateNativeLibraryRole { role: dto.role });
         }
         let soname = parse_soname(dto.soname)?;
-        if let Some(expected) = dto.role.exact_nano_soname()
+        let exact_soname = if qualification_bundle {
+            Some(dto.role.qualification_exact_nano_soname())
+        } else {
+            dto.role.exact_nano_soname()
+        };
+        if let Some(expected) = exact_soname
             && soname != expected
         {
             return Err(InputError::WrongNativeLibrarySoname {
@@ -1883,6 +1951,8 @@ fn validate_live_modes(policy: &ProductionLiveModePolicyDto) -> Result<(), Input
 pub enum InputError {
     UnsupportedRenderInputSchema {
         actual: u32,
+        expected: u32,
+        bundle_kind: &'static str,
     },
     UnsupportedProductionProfileSchema {
         actual: u32,
@@ -1947,14 +2017,19 @@ pub enum InputError {
     WarmStartForbiddenInQualification,
     ProductionFacePerceptionAssetsRequired,
     FacePerceptionAssetsForbiddenInQualification,
+    QualificationExecutablePathRequired,
 }
 
 impl fmt::Display for InputError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedRenderInputSchema { actual } => write!(
+            Self::UnsupportedRenderInputSchema {
+                actual,
+                expected,
+                bundle_kind,
+            } => write!(
                 formatter,
-                "unsupported render-input schema {actual}; expected {RENDER_INPUT_SCHEMA_VERSION}"
+                "unsupported {bundle_kind} render-input schema {actual}; expected {expected}"
             ),
             Self::UnsupportedProductionProfileSchema { actual } => write!(
                 formatter,
@@ -2077,6 +2152,9 @@ impl fmt::Display for InputError {
             ),
             Self::FacePerceptionAssetsForbiddenInQualification => formatter.write_str(
                 "wheels-off qualification does not accept unused face-perception assets",
+            ),
+            Self::QualificationExecutablePathRequired => formatter.write_str(
+                "wheels-off qualification requires bundle.qualification_executable_path",
             ),
         }
     }

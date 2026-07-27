@@ -116,13 +116,20 @@ native-runtime, and launch documents from domain types. Digest arrays and
 hexadecimal digests are derived from the same retained bytes, and the launch
 document is written last.
 
-The illustrative render-input template represents its bundle-dependent face
-asset field with one whole-value `${FACE_PERCEPTION_ASSETS_JSON}` token.
-Replace it in a deliberately prepared input with `null` for
-`wheels_off_qualification`; the strict renderer rejects cascade assets in
-that bundle. For `production`, replace it with the complete object below,
-using canonical absolute source paths. The strict renderer rejects production
+The illustrative `bundle-render-input-v1.json.template` is the production
+render-input schema-V1 source. Replace its whole-value
+`${FACE_PERCEPTION_ASSETS_JSON}` token with the complete object below, using
+canonical absolute source paths. The strict renderer rejects production
 without both distinct assets.
+
+The wheels-off renderer uses the separate exact schema-V2 source at
+`configs/nano-wheels-off-qualification-template/bundle-render-input-v2.json.template`.
+It fixes the qualification bundle kind, null face assets, cold-start
+selection, and reviewed SONAMEs while requiring
+`qualification_executable_path`, the canonical absolute path of the exact
+Linux-aarch64 executable retained into the qualification bundle. The strict
+renderer rejects cross-version or bundle-specific fields instead of silently
+reinterpreting them.
 
 ```json
 {
@@ -220,7 +227,10 @@ The operator console deliberately listens only on Nano loopback. From the
 operator computer, create an SSH tunnel and leave it open:
 
 ```bash
-ssh -N -L 9877:127.0.0.1:9877 makerspace@NANO_IP
+ssh -N \
+  -L 9877:127.0.0.1:9877 \
+  -L 9876:127.0.0.1:9876 \
+  makerspace@NANO_IP
 ```
 
 In a separate authenticated Nano shell, read the fresh capability owned by
@@ -235,6 +245,8 @@ capability. Do not put the capability in a command-line URL, shell history,
 browser storage, screenshot, or log. It is regenerated on each process start
 and removed only after the HTTP owner stops. The page and agent API share the
 same downstream owner; neither opens a second camera or motor transport.
+The second forwarding rule carries the launch-bound loopback Rerun stream on
+the same local port; it grants no control authority.
 The same page exposes the typed **Finalize map & stop** operation; it closes
 capture and ends the control process after selecting the exact restart inputs.
 It does not silently change the running bundle's warm-start policy. Review the

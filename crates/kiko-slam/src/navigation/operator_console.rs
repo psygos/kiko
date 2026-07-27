@@ -13,8 +13,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -68,7 +68,11 @@ where
 }
 
 pub const OPERATOR_CONSOLE_SCHEMA_V1: u32 = 1;
+/// Legacy snapshot schema. Its optional diagnostics field was never populated
+/// by the server and the bundled client treated a value as a browser URL.
 pub const OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V2: u32 = 2;
+/// Snapshot schema whose diagnostics field is a canonical Rerun proxy URI.
+pub const OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V3: u32 = 3;
 pub const MAX_OPERATOR_CONSOLE_REQUEST_BYTES: usize = 8 * 1_024;
 pub const MAX_OPERATOR_CONSOLE_SESSIONS: usize = 32;
 pub const MAX_OPERATOR_CONSOLE_QUEUE_CAPACITY: usize = 256;
@@ -112,6 +116,57 @@ impl fmt::Display for OperatorConsoleBindError {
 }
 
 impl std::error::Error for OperatorConsoleBindError {}
+
+/// Rerun proxy URI exposed to an operator through a same-port SSH loopback
+/// forward.
+///
+/// The Nano listener address is parsed once by launch admission. This type
+/// retains only its nonzero port and deliberately renders the operator-side
+/// endpoint as `127.0.0.1`; it never advertises the Nano address or a public
+/// listener. The URI is diagnostic metadata and grants no control authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsoleRerunDiagnosticsUrl {
+    forwarded_port: NonZeroU16,
+}
+
+impl ConsoleRerunDiagnosticsUrl {
+    /// Construct from the nonzero port already admitted by the Nano launch
+    /// parser. The listener address is fixed here, so a diagnostics endpoint
+    /// cannot retain an address which disagrees with the documented tunnel.
+    pub const fn from_admitted_forwarded_port(forwarded_port: NonZeroU16) -> Self {
+        Self { forwarded_port }
+    }
+
+    pub const fn forwarded_port(self) -> NonZeroU16 {
+        self.forwarded_port
+    }
+
+    pub fn serve_loopback_bind(self) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            self.forwarded_port.get(),
+        ))
+    }
+}
+
+impl fmt::Display for ConsoleRerunDiagnosticsUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "rerun+http://127.0.0.1:{}/proxy",
+            self.forwarded_port
+        )
+    }
+}
+
+impl Serialize for ConsoleRerunDiagnosticsUrl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
 
 /// Exact nanoseconds in the runtime's injected host-monotonic epoch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -2587,13 +2642,16 @@ pub struct OperatorConsoleSnapshot {
     pub software_safety_stop_latched: bool,
     pub software_safety_signal_state: ConsoleSafetySignalState,
     pub physical_emergency_stop_state: ConsolePhysicalEmergencyStopState,
-    pub rerun_diagnostics_url: Option<String>,
+    /// Configured operator-side Rerun proxy URI. Presence proves only that a
+    /// loopback serve target was admitted, not that the diagnostic worker is
+    /// healthy, and never conveys motion or safety authority.
+    pub rerun_diagnostics_url: Option<ConsoleRerunDiagnosticsUrl>,
 }
 
 impl OperatorConsoleSnapshot {
     pub fn unknown(revision: ConsoleSnapshotRevision) -> Self {
         Self {
-            schema_version: OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V2,
+            schema_version: OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V3,
             revision,
             telemetry_observed_at_host_monotonic_ns: None,
             runtime: None,
@@ -3877,6 +3935,52 @@ mod tests {
     }
 
     #[test]
+    fn rerun_diagnostics_url_is_an_exact_operator_side_loopback_proxy() {
+        for port in [1, 9_876, u16::MAX] {
+            let url = ConsoleRerunDiagnosticsUrl::from_admitted_forwarded_port(
+                NonZeroU16::new(port).unwrap(),
+            );
+            assert_eq!(url.forwarded_port().get(), port);
+            assert_eq!(
+                url.serve_loopback_bind(),
+                format!("127.0.0.1:{port}").parse().unwrap()
+            );
+            assert_eq!(
+                url.to_string(),
+                format!("rerun+http://127.0.0.1:{port}/proxy"),
+                "the displayed endpoint is the same-port operator-side SSH forward"
+            );
+            assert_eq!(
+                serde_json::to_value(url).unwrap(),
+                serde_json::json!(format!("rerun+http://127.0.0.1:{port}/proxy"))
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_exposes_rerun_only_when_a_serve_target_is_supplied() {
+        let mut snapshot =
+            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap());
+        assert_eq!(snapshot.schema_version, OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V3);
+        assert_ne!(
+            snapshot.schema_version, OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V2,
+            "a canonical Rerun proxy URI must not silently reuse V2 browser-URL semantics"
+        );
+        let absent = serde_json::to_value(&snapshot).unwrap();
+        assert!(absent["rerun_diagnostics_url"].is_null());
+
+        snapshot.rerun_diagnostics_url =
+            Some(ConsoleRerunDiagnosticsUrl::from_admitted_forwarded_port(
+                NonZeroU16::new(9_876).unwrap(),
+            ));
+        let configured = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(
+            configured["rerun_diagnostics_url"],
+            serde_json::json!("rerun+http://127.0.0.1:9876/proxy")
+        );
+    }
+
+    #[test]
     fn independent_source_sequences_share_one_private_downstream_sequence() {
         let (handle, receiver) = fixture();
         let user = handle
@@ -4566,7 +4670,7 @@ mod tests {
         let json = serde_json::to_value(overlaid.as_ref()).unwrap();
         assert_eq!(
             json["schema_version"],
-            serde_json::Value::from(OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V2)
+            serde_json::Value::from(OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V3)
         );
         assert!(
             json.get("telemetry_observed_at_host_monotonic_ns")
@@ -4574,7 +4678,7 @@ mod tests {
         );
         assert!(
             json.get("observed_at_host_monotonic_ns").is_none(),
-            "schema v2 must not expose a false aggregate timestamp"
+            "the current schema must not expose a false aggregate timestamp"
         );
     }
 

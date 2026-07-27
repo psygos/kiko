@@ -17,6 +17,7 @@ struct DeviceConfig;
 struct DeviceInfo;
 struct DepthAiBuildMetadata;
 struct ConnectedDeviceIdentity;
+struct EepromCalibrationEvidence;
 struct Timestamp;
 struct ImageFrame;
 struct DepthFrame;
@@ -34,6 +35,7 @@ enum class FrameStatus : uint8_t;
 enum class ImuStatus : uint8_t;
 enum class ImuAccuracy : uint8_t;
 enum class DepthAlignment : uint8_t;
+enum class CameraSocket : uint8_t;
 
 class OakDevice {
 public:
@@ -53,6 +55,7 @@ public:
     ImuBatchResult get_imu_batch();
 
     float get_stereo_baseline_m() const;
+    EepromCalibrationEvidence get_eeprom_calibration_evidence() const;
 
     ConnectedDeviceIdentity get_connected_device_identity() const;
 

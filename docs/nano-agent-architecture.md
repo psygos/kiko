@@ -13,8 +13,11 @@ The deployed system has these ownership boundaries:
   STM32 serial device and its typed KRP2 V2 loopback service. It reports exact
   applied results and joins that owner during shutdown; legacy packets cannot
   reach the V2 actuator. The former standalone `robot-server` systemd unit and
-  split wheels-off executable have been removed; an older installed copy must
-  not run beside production or qualification.
+  legacy split wheels-off service have been removed; an older installed copy
+  must not run beside production or qualification. The current
+  `kiko-slam nano-wheels-off-qualification` artifact is a manually invoked,
+  feature-isolated qualifier, not a concurrent service: it owns the same
+  resources and must never run beside `kiko-slam nano-agent`.
 - the Kiko agent is the sole owner of the exact configured OAK MXID. It fans
   borrowed or bounded observations to SLAM, local occupancy, expression, and
   Rerun without allowing a second camera pipeline to compete for frames.
@@ -290,6 +293,15 @@ rollout, control-tick timing, exact applied-controller evidence, Haar face
 rectangles, and the selected face target. RGB is copied only after strict BGR8
 layout admission into a capacity-one, drop-oldest diagnostic queue; that copy
 cannot feed SLAM, expression, control, or safety.
+
+When the admitted launch graph configures `serve_loopback`, the console
+snapshot includes the corresponding operator-side same-port SSH-forward URI,
+for example `rerun+http://127.0.0.1:9876/proxy`. The browser displays the exact
+`rerun --connect` command rather than pretending the gRPC proxy is a web page.
+An absent URI means no loopback serve target was configured. A present URI
+describes configuration only: it is not Rerun-worker health evidence, a
+capability, or motion/safety authority, and it is usable only while the
+documented loopback tunnel is open.
 
 A face result can overlay only the RGB image with the exact same stream epoch,
 device capture sequence, host delivery sequence, timestamp/reference, and

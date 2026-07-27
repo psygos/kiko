@@ -26,6 +26,14 @@ The qualifier is the sole OAK, accessory, in-process UDP, and STM32 owner only
 after exact acquisition succeeds. An ownership conflict is a failed
 qualification, not a reason to kill other workloads.
 
+Follow the exact
+[Fable handoff](nano-qualified-deployment.md#exact-fable-handoff) before
+acquisition. The audited `makerspace` owner had two separate crontab entries
+that preserved its guardian; killing only `kiko_face_follow.py` lets that
+guardian respawn it in about eight seconds. Preserve all unrelated crontab
+entries and processes, disable only the two identified owner entries, and
+terminate only the exact guardian/child PIDs in the documented order.
+
 The candidate contract deliberately says physical stop semantics are
 `unverified`. The operator's reachable power cut remains the independent stop.
 The one-way software safety stop, deadman, lease, watchdog, applied-zero
@@ -46,26 +54,34 @@ This feature includes the common live Nano stack and the qualification
 surface. The raw-PWM qualification modules are compiled out of an ordinary
 production-only `--features nano-agent` build.
 
-Install the binary separately from the immutable qualification inputs:
+The exact resulting executable is a mandatory renderer input. Start from
+`configs/nano-wheels-off-qualification-template/bundle-render-input-v2.json.template`.
+The prepared qualification render-input boundary includes:
 
-```bash
-sudo install -d -o root -g root -m 0755 /opt/kiko/bin
-sudo install -o root -g root -m 0755 \
-  target/release/kiko-slam \
-  /opt/kiko/bin/kiko-nano-wheels-off-qualification
-sudo install -d -o root -g root -m 0755 /opt/kiko/qualification
-sudo install -d -o root -g root -m 0750 /var/lib/kiko-nano-qualification
-sudo install -d -o root -g root -m 0700 /run/kiko
+```json
+{
+  "schema_version": 2,
+  "bundle": {
+    "kind": "wheels_off_qualification",
+    "qualification_executable_path": "/absolute/path/to/target/release/kiko-slam"
+  }
+}
 ```
+
+Qualification render-input V1 and launch V1 were already published before
+executable/native-runtime admission was added. Do not relabel either old
+document: the current renderer requires qualification input V2 and emits
+qualification launch V2. Production input V1 and launch V3 are unchanged.
 
 Do not install a qualification systemd unit. Do not add qualification to the
 production unit, qualified-boot drop-in, cron, Fable guardian, or any other
 automatic startup path.
 
 Never replace `/opt/kiko/bin/kiko-slam` with this feature-expanded binary.
-Production and qualification executable bytes have independent names and
-hashes. Updating either one requires rerendering the bundle that binds that
-exact executable.
+The renderer retains it as
+`/opt/kiko/qualification/bin/kiko-nano-wheels-off-qualification`; production
+and qualification executable bytes therefore have independent paths and
+hashes. Updating either one requires rerendering its exact bundle.
 
 `/run/kiko` is created explicitly because this attended command has no systemd
 `RuntimeDirectory` owner. Before reuse, inspect that exact directory for a
@@ -81,24 +97,26 @@ staging root. The canonical installed layout is:
 
 ```text
 /opt/kiko/qualification/
+├── bin/
+│   └── kiko-nano-wheels-off-qualification
 ├── agent-policy-v3.json
 ├── candidate-controller-policy-v1.json
 ├── controller-server-candidate-v2.json
 ├── device-inventory-candidate-v2.json
-├── nano-wheels-off-qualification-launch-v1.json
+├── nano-wheels-off-qualification-launch-v2.json
 ├── navigation-shadow-v1.json
 ├── native-runtime-v1.json
 ├── artifacts/
 │   ├── calibration/<exact calibration asset>
 │   └── plant/<exact shadow-only plant asset>
 ├── evidence/
-│   ├── render-input-v1.json
+│   ├── render-input-v2.json
 │   └── render-evidence-v1.json
 ├── lib/
-│   ├── <exact DepthAI core library>
-│   ├── <exact dynamic-calibration library>
-│   ├── <exact libusb 1.0 library>
-│   ├── <exact ONNX Runtime library>
+│   ├── libdepthai-core.so
+│   ├── libdynamic_calibration.so
+│   ├── libusb-1.0.so.0
+│   ├── libonnxruntime.so.1
 │   ├── libopencv_core.so.4.5d
 │   ├── libopencv_imgproc.so.4.5d
 │   └── libopencv_objdetect.so.4.5d
@@ -118,8 +136,8 @@ guessing them:
   approval IDs;
 - exact 32-byte calibration and plant SHA arrays;
 - exact byte counts and lowercase SHA-256 values for every file in the
-  renderer's typed bundle plan, including the seven directly linked native
-  roles and `native-runtime-v1.json`; and
+  renderer's typed bundle plan, including the qualification executable, the
+  seven required native-runtime roles, and `native-runtime-v1.json`; and
 - reviewed OAK, occupancy, inference, Rerun, and storage resource limits.
 
 The current physical connection assumptions may seed device discovery, but
@@ -132,7 +150,7 @@ configuration. Production separately cross-binds the artifact's three
 calibration IDs to the physical-actuation approval.
 
 Render the leaf assets and documents first. Render
-`nano-wheels-off-qualification-launch-v1.json` last. On the Nano, inspect the
+`nano-wheels-off-qualification-launch-v2.json` last. On the Nano, inspect the
 result before installation:
 
 ```bash
@@ -150,9 +168,9 @@ find STAGING_ROOT -type f -print0 |
 
 `STAGING_ROOT` above is an instruction placeholder, not a literal path. The
 reviewed deployment tool should retain its render-input record and the final
-hash listing as evidence. `maximum_bytes` should be the exact installed byte
-count or a smaller explicitly reviewed ceiling; it must never be copied from a
-sample artifact.
+hash listing as evidence. The renderer sets `maximum_bytes` to the exact
+installed byte count. A smaller value cannot admit that file, and a larger
+ceiling must never be copied from a sample artifact.
 
 Publish only after review, with the qualifier stopped. The destination must be
 new and empty; never merge a staging bundle over old bytes. On an update,
@@ -160,10 +178,17 @@ archive the stopped old root, create a fresh `/opt/kiko/qualification`, and
 then run:
 
 ```bash
+sudo install -d -o root -g root -m 0755 /opt/kiko/qualification
 sudo cp -a STAGING_ROOT/. /opt/kiko/qualification/
 sudo chown -R root:root /opt/kiko/qualification
 sudo find /opt/kiko/qualification -type d -exec chmod 0755 '{}' +
-sudo find /opt/kiko/qualification -type f -exec chmod 0444 '{}' +
+sudo find /opt/kiko/qualification -type f \
+  ! -path /opt/kiko/qualification/bin/kiko-nano-wheels-off-qualification \
+  -exec chmod 0444 '{}' +
+sudo chmod 0555 \
+  /opt/kiko/qualification/bin/kiko-nano-wheels-off-qualification
+sudo install -d -o root -g root -m 0750 /var/lib/kiko-nano-qualification
+sudo install -d -o root -g root -m 0700 /run/kiko
 ```
 
 Do not edit the installed tree in place. A changed byte requires a new staging
@@ -201,10 +226,11 @@ Recheck:
 Run from an attended TTY:
 
 ```bash
-sudo /opt/kiko/bin/kiko-nano-wheels-off-qualification \
+sudo /usr/bin/env LD_LIBRARY_PATH=/opt/kiko/qualification/lib \
+  /opt/kiko/qualification/bin/kiko-nano-wheels-off-qualification \
   nano-wheels-off-qualification \
   --deployment-root /opt/kiko/qualification \
-  --launch-config nano-wheels-off-qualification-launch-v1.json \
+  --launch-config nano-wheels-off-qualification-launch-v2.json \
   --state-root /var/lib/kiko-nano-qualification
 ```
 
@@ -217,11 +243,33 @@ HEAD SUPPORTED
 POWER CUT REACHABLE
 ```
 
-The process then loads and cross-binds all assets, probes exact OAK/head/eye
-identity, requires OAK SuperSpeed readback, starts and acquires the exact
-candidate STM32 session, observes exact inventory, applies zero, confirms
-zero, disarms, prepares storage/models/SLAM, and starts the natural head hold.
-The candidate controller remains stopped through fallible preparation.
+Before opening a device, the Linux-only process proves that `/proc/self/exe`
+is the exact launch-bound executable by byte identity and filesystem
+device/inode, parses the launch-bound native-runtime manifest, requires all
+seven native-runtime roles, stream-verifies every exact executable/library
+identity without retaining a second executable or native-library copy,
+initializes ONNX Runtime through its launch-bound exact path, and requires the
+executable plus all seven expected native-library device/inode identities each
+to have a file-backed executable mapping in `/proc/self/maps`.
+It also parses and cross-binds the canonical calibration, plant, and navigation
+artifacts to the candidate controller. The admitted MPC is limited to at most
+30% absolute PWM and 5% PWM slew per step, and its control/service interval
+must not exceed 54,999,999 ns. These checks finish before device enumeration,
+serial probes, or OAK connection. A plant declaring `synthetic_fixture`
+evidence remains explicitly synthetic and is not physical-identification
+evidence. The process then probes exact
+OAK/head/eye identity, requires OAK SuperSpeed readback, starts and acquires
+the exact candidate STM32 session, observes exact inventory, applies zero,
+confirms zero, disarms, prepares storage/models/SLAM, and starts the natural
+head hold. The candidate controller remains stopped through fallible
+preparation.
+
+This admission proves the launch-bound executable and seven required
+native-runtime files each have a file-backed executable mapping with those
+exact device/inode identities. It does not parse ELF dynamic sections or prove
+a hermetic transitive OS-library closure. Retain exact
+`DT_NEEDED`/loader-graph evidence from the final ELF as a separate target-side
+`readelf` release gate.
 
 Immediately before the short raw-PWM window, the process requires one fresh
 exact reply:
@@ -249,7 +297,12 @@ ssh -N \
 ```
 
 Port `9876` is the launch-bound Rerun gRPC stream. Connect a compatible local
-Rerun viewer through that forwarded port; do not expose the Nano listener.
+Rerun viewer through that forwarded port; do not expose the Nano listener. The
+console displays
+`rerun --connect rerun+http://127.0.0.1:9876/proxy` only when the admitted
+launch graph configures the loopback Rerun server. This is the operator side of
+the same-port SSH forward, not a Nano network address. Its presence describes
+configuration, not diagnostic-worker health or control authority.
 
 In a separate authenticated Nano shell, read the per-process capability:
 

@@ -87,6 +87,16 @@ impl BootJournalScan {
     pub const fn record_capacity(self) -> usize {
         self.record_capacity
     }
+
+    /// Derive the boot identity represented by the last committed record.
+    ///
+    /// Host evidence tooling uses the same arithmetic as the firmware instead
+    /// of reconstructing an identity from weakly typed JSON or shell values.
+    pub fn last_boot_id(self) -> Result<Option<ControllerBootId>, BootJournalError> {
+        self.last_counter
+            .map(|counter| derive_boot_id(self.provisioning_seed, counter))
+            .transpose()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

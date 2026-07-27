@@ -88,6 +88,8 @@ mod nano_warm_start;
 mod nano_wheels_off_qualification_bootstrap;
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 mod nano_wheels_off_qualification_launch;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+mod nano_wheels_off_qualification_native_runtime;
 mod odometry;
 #[cfg(feature = "operator-console")]
 mod operator_console;
@@ -354,6 +356,8 @@ pub use nano_warm_start::*;
 pub use nano_wheels_off_qualification_bootstrap::*;
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 pub use nano_wheels_off_qualification_launch::*;
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+pub use nano_wheels_off_qualification_native_runtime::*;
 pub use odometry::{
     BaseAcceleration, BaseAngularVelocity, CalibratedQuantity, CalibrationMatrix,
     CalibrationVector, DurationParameter, ImuCalibrationProvenance, ImuUpdate, OdomPlanarTwist,
@@ -405,12 +409,12 @@ pub use wheels_off_candidate_actuation::{
     CandidateActuationSessionError, CandidateActuationSessionStartError,
     CandidateCadenceOverflowStop, CandidateMpcBindingError, CandidatePwmAdmissionError,
     CandidatePwmRequest, CandidateRuntimeServiceIntervalError,
-    MAX_WHEELS_OFF_CANDIDATE_POLICY_JSON_BYTES, OperatorClaimedWheelsOffAttestation,
-    StoppedWheelsOffCandidateController, WHEELS_OFF_CANDIDATE_POLICY_V1,
-    WheelsOffCandidateActuationSession, WheelsOffCandidateAttestationError,
-    WheelsOffCandidateControllerBinding, WheelsOffCandidateControllerBindingError,
-    WheelsOffCandidateLimits, WheelsOffCandidatePolicyError,
-    WheelsOffCandidateRuntimeServiceInterval,
+    MAX_WHEELS_OFF_CANDIDATE_POLICY_JSON_BYTES, MAX_WHEELS_OFF_CANDIDATE_RUNTIME_SERVICE_INTERVAL,
+    OperatorClaimedWheelsOffAttestation, StoppedWheelsOffCandidateController,
+    WHEELS_OFF_CANDIDATE_POLICY_V1, WheelsOffCandidateActuationSession,
+    WheelsOffCandidateAttestationError, WheelsOffCandidateControllerBinding,
+    WheelsOffCandidateControllerBindingError, WheelsOffCandidateLimits,
+    WheelsOffCandidatePolicyError, WheelsOffCandidateRuntimeServiceInterval,
 };
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 pub use wheels_off_qualification_console::*;

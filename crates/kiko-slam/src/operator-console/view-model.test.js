@@ -5,7 +5,7 @@ const model = require("./view-model.js");
 
 function snapshot() {
   return {
-    schema_version: 2,
+    schema_version: 3,
     revision: "9",
     telemetry_observed_at_host_monotonic_ns: "1000",
     runtime: { kind: "active", mode: "frontier_explore" },
@@ -74,6 +74,45 @@ function snapshot() {
 }
 
 assert.equal(model.parseConsoleSnapshot(snapshot()).revision, "9");
+
+{
+  const legacy = snapshot();
+  legacy.schema_version = 2;
+  assert.throws(
+    () => model.parseConsoleSnapshot(legacy),
+    /unsupported snapshot schema/,
+    "V2 diagnostics were browser URLs; V3 must not reinterpret that wire field",
+  );
+}
+
+{
+  const value = snapshot();
+  value.rerun_diagnostics_url = "rerun+http://127.0.0.1:9876/proxy";
+  const parsed = model.parseConsoleSnapshot(value);
+  assert.deepEqual(parsed.rerun_diagnostics_url, {
+    connectUri: "rerun+http://127.0.0.1:9876/proxy",
+    forwardedPort: 9876,
+  });
+  assert(Object.isFrozen(parsed.rerun_diagnostics_url));
+}
+
+for (const invalid of [
+  "http://127.0.0.1:9876/proxy",
+  "rerun+https://127.0.0.1:9876/proxy",
+  "rerun+http://192.168.50.2:9876/proxy",
+  "rerun+http://localhost:9876/proxy",
+  "rerun+http://127.0.0.1:9876/",
+  "rerun+http://127.0.0.1:9876/proxy?token=secret",
+  "rerun+http://user@127.0.0.1:9876/proxy",
+  "rerun+http://127.0.0.1:0/proxy",
+]) {
+  const value = snapshot();
+  value.rerun_diagnostics_url = invalid;
+  assert.throws(
+    () => model.parseConsoleSnapshot(value),
+    /rerun_diagnostics_url/,
+  );
+}
 
 {
   const invalid = snapshot();

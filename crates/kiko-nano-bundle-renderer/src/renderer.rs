@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use robot_server::config::{ControllerServerConfigV1, ControllerServerConfigV2, ServerConfigError};
@@ -18,6 +18,7 @@ use crate::input::{
 const MAX_RENDER_INPUT_BYTES: u64 = 1_048_576;
 const MAX_PRODUCTION_PROFILE_BYTES: u64 = 262_144;
 const MAX_SOURCE_ASSET_BYTES: u64 = 512 * 1_024 * 1_024;
+const MAX_QUALIFICATION_EXECUTABLE_BYTES: u64 = 128 * 1_024 * 1_024;
 const MAX_OPENCV_HAAR_CASCADE_BYTES: u64 = 4 * 1_024 * 1_024;
 // Production V3 currently emits 23 deterministic leaves including source
 // evidence, the render manifest, and launch. Wheels-off emits fewer.
@@ -25,9 +26,9 @@ const STAGED_BUNDLE_FILE_CAPACITY: usize = 23;
 const EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const PLAN_SCHEMA_VERSION: u32 = 1;
 const EVIDENCE_SCOPE: &str = "offline_staging_only_not_installation_or_hardware_qualification_v1";
-const RENDER_INPUT_EVIDENCE_PATH: &str = "evidence/render-input-v1.json";
 const PRODUCTION_PROFILE_EVIDENCE_PATH: &str = "evidence/production-controller-profile-v1.json";
 const RENDER_EVIDENCE_PATH: &str = "evidence/render-evidence-v1.json";
+const QUALIFICATION_EXECUTABLE_RELATIVE_PATH: &str = "bin/kiko-nano-wheels-off-qualification";
 
 #[derive(Clone, Copy, Debug)]
 pub enum RenderMode<'a> {
@@ -174,6 +175,7 @@ struct StagedFile {
     bytes: Vec<u8>,
     byte_len: u64,
     sha256: [u8; 32],
+    executable: bool,
 }
 
 impl StagedFile {
@@ -188,6 +190,22 @@ impl StagedFile {
             bytes: source.bytes,
             byte_len: source.byte_len,
             sha256: source.sha256,
+            executable: false,
+        }
+    }
+
+    fn retained_executable(
+        role: impl Into<String>,
+        relative_path: impl Into<String>,
+        source: LoadedSource,
+    ) -> Self {
+        Self {
+            role: role.into(),
+            relative_path: relative_path.into(),
+            bytes: source.bytes,
+            byte_len: source.byte_len,
+            sha256: source.sha256,
+            executable: true,
         }
     }
 
@@ -202,6 +220,7 @@ impl StagedFile {
             bytes: source.bytes.clone(),
             byte_len: source.byte_len,
             sha256: source.sha256,
+            executable: false,
         }
     }
 
@@ -234,6 +253,7 @@ impl StagedFile {
             bytes,
             byte_len,
             sha256,
+            executable: false,
         })
     }
 
@@ -248,6 +268,7 @@ impl StagedFile {
 }
 
 struct LoadedAssets {
+    qualification_executable: Option<LoadedSource>,
     calibration: LoadedSource,
     plant: LoadedSource,
     navigation_shadow: LoadedSource,
@@ -290,7 +311,7 @@ pub fn render_bundle(
 
     let input_evidence = StagedFile::retained_clone(
         "render_input_evidence",
-        RENDER_INPUT_EVIDENCE_PATH,
+        input.bundle.render_input_evidence_path(),
         &input_source,
     );
     staged.push(input_evidence);
@@ -364,6 +385,16 @@ fn load_production_admission(
 }
 
 fn load_assets(input: &RenderInput) -> Result<LoadedAssets, RenderError> {
+    let qualification_executable = match &input.bundle {
+        BundleSelection::WheelsOffQualification {
+            qualification_executable_path,
+        } => Some(LoadedSource::read(
+            "qualification_executable",
+            qualification_executable_path.as_path(),
+            MAX_QUALIFICATION_EXECUTABLE_BYTES,
+        )?),
+        BundleSelection::Production { .. } => None,
+    };
     let calibration = LoadedSource::read(
         "calibration",
         input.assets.calibration.source_path.as_path(),
@@ -425,6 +456,7 @@ fn load_assets(input: &RenderInput) -> Result<LoadedAssets, RenderError> {
         }
     }
     Ok(LoadedAssets {
+        qualification_executable,
         calibration,
         plant,
         navigation_shadow,
@@ -442,6 +474,13 @@ fn render_non_launch_files(
 ) -> Result<Vec<StagedFile>, RenderError> {
     let mut staged = Vec::with_capacity(STAGED_BUNDLE_FILE_CAPACITY);
 
+    if let Some(executable) = loaded.qualification_executable.take() {
+        staged.push(StagedFile::retained_executable(
+            "qualification_executable",
+            QUALIFICATION_EXECUTABLE_RELATIVE_PATH,
+            executable,
+        ));
+    }
     staged.push(StagedFile::retained(
         "calibration",
         input.assets.calibration.destination_relative_path.as_str(),
@@ -514,7 +553,7 @@ fn render_non_launch_files(
     staged.push(inventory);
     let controller = render_controller(input, production)?;
     staged.push(controller);
-    if matches!(input.bundle, BundleSelection::WheelsOffQualification) {
+    if matches!(input.bundle, BundleSelection::WheelsOffQualification { .. }) {
         staged.push(render_candidate_policy()?);
     } else {
         let profile = production.ok_or(RenderError::MissingProductionControllerProfile)?;
@@ -566,7 +605,7 @@ fn render_inventory(
     let discovery = &input.discovery;
     let mut value = json!({
         "schema_version": match input.bundle {
-            BundleSelection::WheelsOffQualification => 2,
+            BundleSelection::WheelsOffQualification { .. } => 2,
             BundleSelection::Production { .. } => 1,
         },
         "robot_id": input.robot_id,
@@ -620,7 +659,7 @@ fn render_inventory(
         }],
     });
     let (role, relative_path) = match input.bundle {
-        BundleSelection::WheelsOffQualification => {
+        BundleSelection::WheelsOffQualification { .. } => {
             let stm32 = value
                 .get_mut("stm32")
                 .and_then(Value::as_object_mut)
@@ -647,7 +686,7 @@ fn render_controller(
 ) -> Result<StagedFile, RenderError> {
     let stm32 = &input.discovery.stm32;
     let rendered = match &input.bundle {
-        BundleSelection::WheelsOffQualification => StagedFile::rendered_json(
+        BundleSelection::WheelsOffQualification { .. } => StagedFile::rendered_json(
             "candidate_controller_contract",
             "controller-server-candidate-v2.json",
             &json!({
@@ -715,7 +754,7 @@ fn render_controller(
         }
     }?;
     match &input.bundle {
-        BundleSelection::WheelsOffQualification => {
+        BundleSelection::WheelsOffQualification { .. } => {
             ControllerServerConfigV2::parse_json(&rendered.bytes)
                 .map_err(RenderError::GeneratedControllerContract)?;
         }
@@ -813,7 +852,7 @@ fn render_agent_policy(
     production: Option<&ProductionControllerProfile>,
 ) -> Result<StagedFile, RenderError> {
     let (deployment_root, state_root, live_mode_policy) = match &input.bundle {
-        BundleSelection::WheelsOffQualification => (
+        BundleSelection::WheelsOffQualification { .. } => (
             "/opt/kiko/qualification",
             "/var/lib/kiko-nano-qualification",
             json!({
@@ -844,7 +883,7 @@ fn render_agent_policy(
         }),
     };
     let runtime_response_timeout_ms = match &input.bundle {
-        BundleSelection::WheelsOffQualification => 500,
+        BundleSelection::WheelsOffQualification { .. } => 500,
         // Production SaveMap always creates a restart-ready terminal
         // checkpoint, including the first cold mapping session.
         BundleSelection::Production { .. } => 30_000,
@@ -874,7 +913,7 @@ fn render_agent_policy(
                 "manifest_path": format!(
                     "{deployment_root}/{}",
                     match input.bundle {
-                        BundleSelection::WheelsOffQualification =>
+                        BundleSelection::WheelsOffQualification { .. } =>
                             "device-inventory-candidate-v2.json",
                         BundleSelection::Production { .. } =>
                             "device-inventory-v1.json",
@@ -1004,7 +1043,7 @@ fn render_launch(
             .as_str(),
     )?;
     let controller_path = match input.bundle {
-        BundleSelection::WheelsOffQualification => "controller-server-candidate-v2.json",
+        BundleSelection::WheelsOffQualification { .. } => "controller-server-candidate-v2.json",
         BundleSelection::Production { .. } => "controller-server-v1.json",
     };
     let controller = find_staged(staged, controller_path)?;
@@ -1105,9 +1144,19 @@ fn render_launch(
         .cloned()
         .ok_or(RenderError::InternalJsonShape)?;
     match input.bundle {
-        BundleSelection::WheelsOffQualification => {
-            object.insert("schema_version".to_owned(), json!(1));
+        BundleSelection::WheelsOffQualification { .. } => {
+            object.insert("schema_version".to_owned(), json!(2));
             object.insert("robot_id".to_owned(), json!(input.robot_id));
+            let executable = find_staged(staged, QUALIFICATION_EXECUTABLE_RELATIVE_PATH)?;
+            object.insert(
+                "qualification_executable_asset".to_owned(),
+                binding(executable),
+            );
+            let native_runtime = find_staged(staged, "native-runtime-v1.json")?;
+            object.insert(
+                "native_runtime_manifest_asset".to_owned(),
+                binding(native_runtime),
+            );
             let inventory = find_staged(staged, "device-inventory-candidate-v2.json")?;
             object.insert(
                 "candidate_inventory_manifest_asset".to_owned(),
@@ -1169,8 +1218,9 @@ fn render_evidence_manifest(
     staged: &[StagedFile],
     launch: &StagedFile,
 ) -> Result<StagedFile, RenderError> {
+    let render_input_evidence_path = input.bundle.render_input_evidence_path();
     let mut sources = vec![
-        render_input_source.evidence(Some(RENDER_INPUT_EVIDENCE_PATH)),
+        render_input_source.evidence(Some(render_input_evidence_path)),
         SourceEvidence::from_staged_source(
             "calibration",
             input.assets.calibration.source_path.as_path(),
@@ -1210,6 +1260,17 @@ fn render_evidence_manifest(
             staged,
         )?,
     ];
+    if let BundleSelection::WheelsOffQualification {
+        qualification_executable_path,
+    } = &input.bundle
+    {
+        sources.push(SourceEvidence::from_staged_source(
+            "qualification_executable",
+            qualification_executable_path.as_path(),
+            QUALIFICATION_EXECUTABLE_RELATIVE_PATH,
+            staged,
+        )?);
+    }
     if let Some(face) = input.bundle.face_perception() {
         sources.push(SourceEvidence::from_staged_source(
             "frontal_face_cascade",
@@ -1571,7 +1632,11 @@ fn write_staging_tree(destination: &Path, staged: &[StagedFile]) -> Result<(), R
                 source,
             })?
             .permissions();
-        permissions.set_readonly(true);
+        if file.executable {
+            permissions.set_mode(0o555);
+        } else {
+            permissions.set_readonly(true);
+        }
         fs::set_permissions(&full_path, permissions).map_err(|source| {
             RenderError::SetReadOnly {
                 path: full_path,

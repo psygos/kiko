@@ -6,7 +6,10 @@ configuration, or permission to attach the wheels.
 
 The qualification contracts are deliberately different from production:
 
-- `nano-wheels-off-qualification-launch-v1.json.template` is launch schema V1;
+- `bundle-render-input-v2.json.template` is the qualification-only renderer
+  boundary with its bundle kind, null face assets, warm-start policy, and all
+  seven exact native-runtime SONAMEs fixed;
+- `nano-wheels-off-qualification-launch-v2.json.template` is launch schema V2;
 - `device-inventory-candidate-v2.json.template` is candidate inventory schema
   V2;
 - `candidate-controller-policy-v1.json` is candidate host-policy schema V1;
@@ -48,21 +51,26 @@ production manual velocity actuation remain disabled.
 
 Render into a staging directory, never directly into the live deployment:
 
-1. prepare the shared illustrative render input at
-   `../nano-agent-template/bundle-render-input-v1.json.template` with
-   `bundle.kind` equal to `wheels_off_qualification` and the whole-value
-   `FACE_PERCEPTION_ASSETS_JSON` token equal to `null`; qualification rejects
-   production cascade assets;
+1. prepare `bundle-render-input-v2.json.template`, setting
+   `bundle.qualification_executable_path` to the absolute path of the reviewed
+   Linux-aarch64 qualification executable; its qualification bundle kind,
+   null face assets, schema version, and cold-start selection are fixed rather
+   than caller placeholders;
 2. install the exact canonical calibration artifact, shadow-only plant,
-   navigation-shadow configuration, model bytes, and all seven required direct
-   native-library roles: DepthAI core, dynamic calibration, libusb 1.0, ONNX
-   Runtime, OpenCV core, OpenCV imgproc, and OpenCV objdetect.
+   navigation-shadow configuration, model bytes, and all seven required roles
+   in the closed qualification native-runtime manifest under their reviewed
+   exact SONAMEs:
+   `libdepthai-core.so`, `libdynamic_calibration.so`, `libusb-1.0.so.0`,
+   `libonnxruntime.so.1`, `libopencv_core.so.4.5d`,
+   `libopencv_imgproc.so.4.5d`, and `libopencv_objdetect.so.4.5d`.
    The shared source schema is
    `../nano-agent-template/calibration-artifact-v1.json.template`; it binds
    one canonical OAK MXID to exact rectified stereo geometry, raw IMU
    calibration, tracking-camera-to-base transform, and three later production
    approval IDs;
-3. compute each installed leaf's exact byte count and lowercase SHA-256;
+3. retain the executable at
+   `bin/kiko-nano-wheels-off-qualification`, retain it as mode `0555`, and
+   compute each installed leaf's exact byte count and lowercase SHA-256;
 4. render `native-runtime-v1.json` from the seven exact native leaves;
 5. render candidate inventory V2 from exact observed identities and the
    calibration/plant digests expressed as 32 decimal bytes;
@@ -70,7 +78,9 @@ Render into a staging directory, never directly into the live deployment:
 7. copy the candidate controller policy without editing it;
 8. compute the byte count and lowercase SHA-256 of every rendered JSON input;
 9. render the evidence manifest and launch document last from those exact
-   values; and
+   values, including exact bindings for the executable and native-runtime
+   manifest. Retain the qualification render input as
+   `evidence/render-input-v2.json`; and
 10. reject the staging tree if any `${` token remains or any rendered JSON
    fails `jq -e .`.
 
@@ -78,6 +88,12 @@ The deployment renderer must produce both the 64-character lowercase
 hexadecimal digest used by launch bindings and the exact 32-element decimal
 byte array used by inventory artifact entries from the same digest. Do not
 transcribe either representation manually.
+
+Qualification render-input V1 and qualification launch V1 were already
+published contracts. They must not be relabelled with the executable and
+native-runtime fields added later. The current renderer therefore rejects
+qualification render-input V1 and emits launch V2; production render-input
+schema V1 and production launch V3 remain unchanged.
 
 The launch storage placeholders are also mandatory in qualification. Dataset
 logical bytes, regular-file count, and ingress-record count are independent

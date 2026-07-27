@@ -34,6 +34,8 @@ use super::mpc::{MpcConfigV1, WheelSide};
 
 pub const WHEELS_OFF_CANDIDATE_POLICY_V1: u32 = 1;
 pub const MAX_WHEELS_OFF_CANDIDATE_POLICY_JSON_BYTES: usize = 4 * 1_024;
+pub const MAX_WHEELS_OFF_CANDIDATE_RUNTIME_SERVICE_INTERVAL: Duration =
+    Duration::from_nanos(54_999_999);
 const MAX_WHEELS_OFF_CANDIDATE_ATTESTATION_AGE: Duration = Duration::from_secs(30);
 const MAX_WHEELS_OFF_CANDIDATE_MANUAL_DEADMAN: Duration = Duration::from_secs(1);
 
@@ -335,6 +337,14 @@ impl WheelsOffCandidateControllerBinding {
             .ok_or(WheelsOffCandidateControllerBindingError::DurationArithmeticOverflow)?;
         let maximum_runtime_service_interval =
             maximum_lease_service_interval.min(self.manual_deadman);
+        if maximum_runtime_service_interval > MAX_WHEELS_OFF_CANDIDATE_RUNTIME_SERVICE_INTERVAL {
+            return Err(
+                WheelsOffCandidateControllerBindingError::RuntimeServiceEnvelopeAboveQualificationMaximum {
+                    actual: maximum_runtime_service_interval,
+                    maximum: MAX_WHEELS_OFF_CANDIDATE_RUNTIME_SERVICE_INTERVAL,
+                },
+            );
+        }
 
         let client = ClientConfig::try_new_for_session(
             self.endpoint,
@@ -1318,6 +1328,10 @@ pub enum WheelsOffCandidateControllerBindingError {
         lease: Duration,
         required_exclusive_lower_bound: Duration,
     },
+    RuntimeServiceEnvelopeAboveQualificationMaximum {
+        actual: Duration,
+        maximum: Duration,
+    },
 }
 
 impl fmt::Display for WheelsOffCandidateControllerBindingError {
@@ -1743,6 +1757,31 @@ mod tests {
                 actual,
             }) if admitted == Duration::from_millis(50)
                 && actual == Duration::from_millis(40)
+        ));
+    }
+
+    #[test]
+    fn candidate_policy_cannot_widen_the_fixed_qualification_service_envelope() {
+        let mut wider: serde_json::Value =
+            serde_json::from_slice(&policy()).expect("policy fixture");
+        wider["command_lease_ms"] = json!(101);
+        let parsed = WheelsOffCandidateControllerBinding::parse_json(
+            &serde_json::to_vec(&wider).expect("wider policy fixture"),
+        )
+        .expect("individual policy fields remain valid");
+        assert!(matches!(
+            parsed.admit(
+                &inventory(),
+                &server(),
+                "127.0.0.1:8080".parse().expect("loopback endpoint"),
+            ),
+            Err(
+                WheelsOffCandidateControllerBindingError::RuntimeServiceEnvelopeAboveQualificationMaximum {
+                    actual,
+                    maximum,
+                }
+            ) if actual == Duration::from_nanos(55_999_999)
+                && maximum == MAX_WHEELS_OFF_CANDIDATE_RUNTIME_SERVICE_INTERVAL
         ));
     }
 

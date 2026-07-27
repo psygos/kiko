@@ -123,7 +123,10 @@ dt { color:var(--muted); } dd { margin:0; text-align:right; overflow-wrap:anywhe
 dd.ready { color:var(--mint); }
 dd.warn { color:var(--amber); }
 dd.fault { color:var(--red); }
-.diagnostic-link { display:block; margin-top:12px; color:var(--cyan); text-decoration:none; font-size:.76rem; }
+.diagnostic-link {
+  display:block; margin:12px 0 0; color:var(--cyan);
+  overflow-wrap:anywhere; font:500 .68rem/1.45 ui-monospace,monospace;
+}
 .safety { padding:2px; }
 #software-stop { width:100%; min-height:92px; border:2px solid var(--red); background:linear-gradient(160deg,#872c31,#4d181d); box-shadow:0 12px 35px rgba(255,70,80,.16); }
 #software-stop strong,#software-stop span { display:block; }

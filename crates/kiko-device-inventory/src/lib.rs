@@ -44,7 +44,8 @@ pub use artifact_io::{
 pub use asset_io::{
     DeploymentAssetByteLimit, DeploymentAssetByteLimitError, DeploymentAssetContentSha256,
     DeploymentAssetLoadError, LoadedDeploymentAsset, MAX_DEPLOYMENT_ASSET_BYTES,
-    load_deployment_asset,
+    StreamedDeploymentAssetIdentity, UnixFileIdentity, load_deployment_asset,
+    stream_deployment_asset_identity,
 };
 pub use bounded::{
     ArtifactId, BoundedTextError, BuildProvenance, ControlEndpointIdentity,

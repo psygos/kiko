@@ -1199,6 +1199,7 @@ mod tests {
             right: intrinsics,
             baseline_m: 0.075,
             rectified: false,
+            oak_eeprom: None,
         };
 
         assert!(matches!(
@@ -1219,6 +1220,7 @@ mod tests {
             right: right.clone(),
             baseline_m,
             rectified: true,
+            oak_eeprom: None,
         };
         let stereo = RectifiedStereo::from_calibration(&calibration).expect("rectified stereo");
 
@@ -1284,6 +1286,7 @@ mod tests {
             right: invalid_right,
             baseline_m: f32::NAN,
             rectified: true,
+            oak_eeprom: None,
         };
         assert!(matches!(
             RectifiedStereo::from_calibration(&calibration),
@@ -1355,6 +1358,7 @@ mod tests {
             right: left,
             baseline_m: 0.075,
             rectified: true,
+            oak_eeprom: None,
         };
 
         calibration.right.width = 0;
@@ -1390,6 +1394,7 @@ mod tests {
             right,
             baseline_m: 0.075,
             rectified: true,
+            oak_eeprom: None,
         };
         assert!(matches!(
             RectifiedStereo::from_calibration(&calibration),
@@ -1419,6 +1424,7 @@ mod tests {
             right,
             baseline_m: 0.075,
             rectified: true,
+            oak_eeprom: None,
         };
         let config = RectifiedStereoConfig::try_new(1.0, 0.0).expect("config");
 
@@ -1557,6 +1563,7 @@ mod tests {
             right: make_camera_intrinsics(640, 480, 420.0, 410.0, 300.0, 238.0),
             baseline_m: 0.075,
             rectified: true,
+            oak_eeprom: None,
         };
         let stereo = RectifiedStereo::from_calibration_with_config(
             &calibration,

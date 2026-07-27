@@ -2,6 +2,8 @@ use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+#[cfg(feature = "nano-wheels-off-qualification")]
+pub use inference::pin_ort_runtime_from_path;
 pub use inference::{
     EigenPlaces, InferenceBackend, InferenceError, LightGlue, OrtRuntimePinError,
     OrtRuntimePinOperation, PinnedOrtRuntime, PlaceDescriptorExtractor, SuperPoint,

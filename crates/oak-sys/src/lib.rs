@@ -80,6 +80,15 @@ mod ffi {
         Rgb,
     }
 
+    /// Raw camera socket returned by the EEPROM stereo-role queries.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CameraSocket {
+        CameraA,
+        CameraB,
+        CameraC,
+        Unrecognized,
+    }
+
     #[derive(Debug, Clone)]
     pub struct DeviceConfig {
         pub maximum_usb_speed: UsbSpeed,
@@ -226,6 +235,19 @@ mod ffi {
         pub product_name: String,
     }
 
+    /// Weak carrier for exact coefficients read from the already-opened
+    /// device's EEPROM calibration through the pinned DepthAI API.
+    #[derive(Debug, Clone)]
+    pub struct EepromCalibrationEvidence {
+        pub stereo_left_camera_socket: CameraSocket,
+        pub stereo_right_camera_socket: CameraSocket,
+        /// Row-major output of
+        /// `getImuToCameraExtrinsics(CAM_B, false, METER)`.
+        pub imu_to_camera_b_m: Vec<f32>,
+        /// Exact row-major output of getStereoLeftRectificationRotation().
+        pub stereo_left_rectification_rotation_raw: Vec<f32>,
+    }
+
     #[cfg(not(oak_sys_check_only))]
     unsafe extern "C++" {
         include!("oak_device.hpp");
@@ -250,6 +272,7 @@ mod ffi {
         fn try_get_depth(self: Pin<&mut OakDevice>, timeout_ms: u32) -> Result<DepthFrameResult>;
         fn get_imu_batch(self: Pin<&mut OakDevice>) -> Result<ImuBatchResult>;
         fn get_stereo_baseline_m(self: &OakDevice) -> Result<f32>;
+        fn get_eeprom_calibration_evidence(self: &OakDevice) -> Result<EepromCalibrationEvidence>;
         fn close(self: Pin<&mut OakDevice>) -> Result<()>;
     }
 }
@@ -1014,11 +1037,98 @@ pub enum ConnectionError {
 /// Errors when reading fixed stereo calibration.
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum CalibrationError {
-    #[error("DepthAI stereo-baseline query failed: {message}")]
+    #[error("DepthAI calibration query failed: {message}")]
     Native { message: String },
 
     #[error("DepthAI returned an invalid stereo baseline in metres: {value}")]
     InvalidBaseline { value: f32 },
+
+    #[error("DepthAI returned {actual} coefficients for {matrix}; expected exactly {expected}")]
+    InvalidMatrixLength {
+        matrix: EepromCalibrationMatrix,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error("DepthAI returned a non-finite {matrix} coefficient at [{row}][{column}]: {value}")]
+    NonFiniteMatrixCoefficient {
+        matrix: EepromCalibrationMatrix,
+        row: usize,
+        column: usize,
+        value: f32,
+    },
+
+    #[error("DepthAI EEPROM stereo-{side} camera socket is {actual}, expected {expected}")]
+    UnexpectedStereoCameraSocket {
+        side: EepromStereoSide,
+        expected: OakCameraSocket,
+        actual: OakCameraSocket,
+    },
+}
+
+/// Exact EEPROM matrix whose weak native coefficients failed admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EepromCalibrationMatrix {
+    ImuToCameraBMeters,
+    StereoLeftRectificationRotationRaw,
+}
+
+impl std::fmt::Display for EepromCalibrationMatrix {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ImuToCameraBMeters => "IMU-to-CAM_B matrix in metres",
+            Self::StereoLeftRectificationRotationRaw => {
+                "raw stereo-left rectification rotation matrix"
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EepromStereoSide {
+    Left,
+    Right,
+}
+
+impl std::fmt::Display for EepromStereoSide {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        })
+    }
+}
+
+/// Named OAK camera socket retained from EEPROM stereo-role evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OakCameraSocket {
+    CameraA,
+    CameraB,
+    CameraC,
+    Unrecognized,
+}
+
+impl std::fmt::Display for OakCameraSocket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CameraA => "CAM_A",
+            Self::CameraB => "CAM_B",
+            Self::CameraC => "CAM_C",
+            Self::Unrecognized => "unrecognized",
+        })
+    }
+}
+
+impl From<ffi::CameraSocket> for OakCameraSocket {
+    fn from(value: ffi::CameraSocket) -> Self {
+        match value {
+            ffi::CameraSocket::CameraA => Self::CameraA,
+            ffi::CameraSocket::CameraB => Self::CameraB,
+            ffi::CameraSocket::CameraC => Self::CameraC,
+            ffi::CameraSocket::Unrecognized => Self::Unrecognized,
+            _ => Self::Unrecognized,
+        }
+    }
 }
 
 /// Errors reported by an explicit device close.
@@ -1953,6 +2063,82 @@ impl Intrinsics {
     }
 }
 
+/// Same-owner calibration evidence read from OAK EEPROM.
+///
+/// Coefficients are preserved exactly after fixed-shape and finite-value
+/// admission. No matrix is inverted, orthonormalized, composed with another
+/// transform, or relabelled as a Kiko robot-base calibration.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OakEepromCalibrationEvidence {
+    stereo_left_camera_socket: OakCameraSocket,
+    stereo_right_camera_socket: OakCameraSocket,
+    imu_to_camera_b_m: [[f32; 4]; 4],
+    stereo_left_rectification_rotation_raw: [[f32; 3]; 3],
+}
+
+impl OakEepromCalibrationEvidence {
+    /// Parse fixed-size matrix carriers into finite same-device calibration
+    /// evidence without changing any coefficient.
+    pub fn try_new(
+        stereo_left_camera_socket: OakCameraSocket,
+        stereo_right_camera_socket: OakCameraSocket,
+        imu_to_camera_b_m: [[f32; 4]; 4],
+        stereo_left_rectification_rotation_raw: [[f32; 3]; 3],
+    ) -> Result<Self, CalibrationError> {
+        require_stereo_camera_socket(
+            EepromStereoSide::Left,
+            OakCameraSocket::CameraB,
+            stereo_left_camera_socket,
+        )?;
+        require_stereo_camera_socket(
+            EepromStereoSide::Right,
+            OakCameraSocket::CameraC,
+            stereo_right_camera_socket,
+        )?;
+        require_finite_calibration_matrix(
+            EepromCalibrationMatrix::ImuToCameraBMeters,
+            &imu_to_camera_b_m,
+        )?;
+        require_finite_calibration_matrix(
+            EepromCalibrationMatrix::StereoLeftRectificationRotationRaw,
+            &stereo_left_rectification_rotation_raw,
+        )?;
+        Ok(Self {
+            stereo_left_camera_socket,
+            stereo_right_camera_socket,
+            imu_to_camera_b_m,
+            stereo_left_rectification_rotation_raw,
+        })
+    }
+
+    pub const fn stereo_left_camera_socket(self) -> OakCameraSocket {
+        self.stereo_left_camera_socket
+    }
+
+    pub const fn stereo_right_camera_socket(self) -> OakCameraSocket {
+        self.stereo_right_camera_socket
+    }
+
+    /// Exact homogeneous matrix returned by DepthAI
+    /// `getImuToCameraExtrinsics(CAM_B, false, METER)`.
+    ///
+    /// DepthAI documents the translation column in metres. This carrier makes
+    /// no stronger camera-frame convention claim than that API call.
+    pub const fn imu_to_camera_b_m(self) -> [[f32; 4]; 4] {
+        self.imu_to_camera_b_m
+    }
+
+    /// Exact coefficient matrix returned by DepthAI
+    /// `getStereoLeftRectificationRotation()`.
+    ///
+    /// The pinned API identifies the stereo-left source socket separately as
+    /// CAM_B but does not document this matrix's transform direction. This
+    /// raw output therefore carries no source-to-destination transform claim.
+    pub const fn stereo_left_rectification_rotation_raw(self) -> [[f32; 3]; 3] {
+        self.stereo_left_rectification_rotation_raw
+    }
+}
+
 /// Information about an available device
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -2284,6 +2470,20 @@ impl Device {
         parse_stereo_baseline_m(value)
     }
 
+    /// Read exact EEPROM calibration evidence from this pipeline's
+    /// already-opened device.
+    pub fn eeprom_calibration_evidence(
+        &self,
+    ) -> Result<OakEepromCalibrationEvidence, CalibrationError> {
+        let raw = self
+            .inner
+            .get_eeprom_calibration_evidence()
+            .map_err(|error| CalibrationError::Native {
+                message: error.what().to_owned(),
+            })?;
+        parse_eeprom_calibration_evidence(raw)
+    }
+
     /// Gracefully disconnect and report any native shutdown failure.
     pub fn close(mut self) -> Result<(), CloseError> {
         self.inner.pin_mut().close().map_err(|error| CloseError {
@@ -2363,6 +2563,14 @@ impl Device {
         })
     }
 
+    pub fn eeprom_calibration_evidence(
+        &self,
+    ) -> Result<OakEepromCalibrationEvidence, CalibrationError> {
+        Err(CalibrationError::Native {
+            message: "native runtime disabled by OAK_SYS_CHECK_ONLY=1".to_owned(),
+        })
+    }
+
     pub fn close(self) -> Result<(), CloseError> {
         Err(CloseError {
             message: "native runtime disabled by OAK_SYS_CHECK_ONLY=1".to_owned(),
@@ -2380,6 +2588,81 @@ fn parse_stereo_baseline_m(value: f32) -> Result<f32, CalibrationError> {
         return Err(CalibrationError::InvalidBaseline { value });
     }
     Ok(value)
+}
+
+#[cfg(any(test, not(oak_sys_check_only)))]
+fn parse_calibration_matrix_shape<const ROWS: usize, const COLUMNS: usize>(
+    matrix: EepromCalibrationMatrix,
+    coefficients: Vec<f32>,
+) -> Result<[[f32; COLUMNS]; ROWS], CalibrationError> {
+    let expected = ROWS * COLUMNS;
+    if coefficients.len() != expected {
+        return Err(CalibrationError::InvalidMatrixLength {
+            matrix,
+            expected,
+            actual: coefficients.len(),
+        });
+    }
+    Ok(std::array::from_fn(|row| {
+        std::array::from_fn(|column| coefficients[row * COLUMNS + column])
+    }))
+}
+
+fn require_stereo_camera_socket(
+    side: EepromStereoSide,
+    expected: OakCameraSocket,
+    actual: OakCameraSocket,
+) -> Result<(), CalibrationError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(CalibrationError::UnexpectedStereoCameraSocket {
+            side,
+            expected,
+            actual,
+        })
+    }
+}
+
+fn require_finite_calibration_matrix<const ROWS: usize, const COLUMNS: usize>(
+    matrix: EepromCalibrationMatrix,
+    coefficients: &[[f32; COLUMNS]; ROWS],
+) -> Result<(), CalibrationError> {
+    for (row, values) in coefficients.iter().enumerate() {
+        for (column, value) in values.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(CalibrationError::NonFiniteMatrixCoefficient {
+                    matrix,
+                    row,
+                    column,
+                    value,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(test, not(oak_sys_check_only)))]
+fn parse_eeprom_calibration_evidence(
+    raw: ffi::EepromCalibrationEvidence,
+) -> Result<OakEepromCalibrationEvidence, CalibrationError> {
+    // Preserve deterministic boundary precedence: fixed shapes first, then
+    // socket identities and coefficient domains in evidence order.
+    let imu_to_camera_b_m = parse_calibration_matrix_shape(
+        EepromCalibrationMatrix::ImuToCameraBMeters,
+        raw.imu_to_camera_b_m,
+    )?;
+    let stereo_left_rectification_rotation_raw = parse_calibration_matrix_shape(
+        EepromCalibrationMatrix::StereoLeftRectificationRotationRaw,
+        raw.stereo_left_rectification_rotation_raw,
+    )?;
+    OakEepromCalibrationEvidence::try_new(
+        raw.stereo_left_camera_socket.into(),
+        raw.stereo_right_camera_socket.into(),
+        imu_to_camera_b_m,
+        stereo_left_rectification_rotation_raw,
+    )
 }
 
 #[cfg(any(test, not(oak_sys_check_only)))]
@@ -2720,6 +3003,19 @@ mod tests {
             discovery_transport_name: "usb".to_owned(),
             eeprom_device_name: "kiko-oak".to_owned(),
             product_name: "OAK-D".to_owned(),
+        }
+    }
+
+    fn raw_eeprom_calibration_evidence() -> ffi::EepromCalibrationEvidence {
+        ffi::EepromCalibrationEvidence {
+            stereo_left_camera_socket: ffi::CameraSocket::CameraB,
+            stereo_right_camera_socket: ffi::CameraSocket::CameraC,
+            imu_to_camera_b_m: vec![
+                1.0, 0.0, 0.0, 0.01, 0.0, 1.0, 0.0, -0.02, 0.0, 0.0, 1.0, 0.03, 0.0, 0.0, 0.0, 1.0,
+            ],
+            stereo_left_rectification_rotation_raw: vec![
+                1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+            ],
         }
     }
 
@@ -3392,6 +3688,94 @@ mod tests {
             ));
         }
         assert_eq!(parse_stereo_baseline_m(0.075), Ok(0.075));
+    }
+
+    #[test]
+    fn eeprom_calibration_parser_preserves_documented_direction_and_raw_output() {
+        let raw = raw_eeprom_calibration_evidence();
+        let expected_imu = raw.imu_to_camera_b_m.clone();
+        let expected_rectification = raw.stereo_left_rectification_rotation_raw.clone();
+        let parsed = parse_eeprom_calibration_evidence(raw).expect("valid EEPROM calibration");
+
+        assert_eq!(parsed.stereo_left_camera_socket(), OakCameraSocket::CameraB);
+        assert_eq!(
+            parsed.stereo_right_camera_socket(),
+            OakCameraSocket::CameraC
+        );
+        assert_eq!(
+            parsed.imu_to_camera_b_m().concat(),
+            expected_imu,
+            "the parser must not invert or compose the EEPROM transform"
+        );
+        assert_eq!(
+            parsed.stereo_left_rectification_rotation_raw().concat(),
+            expected_rectification,
+            "the parser must not alter or direction-label the raw EEPROM rectification output"
+        );
+    }
+
+    #[test]
+    fn eeprom_calibration_parser_rejects_wrong_shapes_before_coefficients() {
+        let mut raw = raw_eeprom_calibration_evidence();
+        raw.imu_to_camera_b_m.pop();
+        raw.stereo_left_rectification_rotation_raw[0] = f32::NAN;
+
+        assert_eq!(
+            parse_eeprom_calibration_evidence(raw),
+            Err(CalibrationError::InvalidMatrixLength {
+                matrix: EepromCalibrationMatrix::ImuToCameraBMeters,
+                expected: 16,
+                actual: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn eeprom_calibration_parser_identifies_nonfinite_matrix_coefficient() {
+        let mut raw = raw_eeprom_calibration_evidence();
+        raw.stereo_left_rectification_rotation_raw[5] = f32::INFINITY;
+
+        assert!(matches!(
+            parse_eeprom_calibration_evidence(raw),
+            Err(CalibrationError::NonFiniteMatrixCoefficient {
+                matrix: EepromCalibrationMatrix::StereoLeftRectificationRotationRaw,
+                row: 1,
+                column: 2,
+                value,
+            }) if value == f32::INFINITY
+        ));
+    }
+
+    #[test]
+    fn eeprom_calibration_parser_requires_exact_stereo_socket_roles() {
+        for (side, left, right, expected, actual) in [
+            (
+                EepromStereoSide::Left,
+                ffi::CameraSocket::CameraA,
+                ffi::CameraSocket::CameraC,
+                OakCameraSocket::CameraB,
+                OakCameraSocket::CameraA,
+            ),
+            (
+                EepromStereoSide::Right,
+                ffi::CameraSocket::CameraB,
+                ffi::CameraSocket::CameraB,
+                OakCameraSocket::CameraC,
+                OakCameraSocket::CameraB,
+            ),
+        ] {
+            let mut raw = raw_eeprom_calibration_evidence();
+            raw.stereo_left_camera_socket = left;
+            raw.stereo_right_camera_socket = right;
+            assert_eq!(
+                parse_eeprom_calibration_evidence(raw),
+                Err(CalibrationError::UnexpectedStereoCameraSocket {
+                    side,
+                    expected,
+                    actual,
+                })
+            );
+        }
     }
 
     #[test]

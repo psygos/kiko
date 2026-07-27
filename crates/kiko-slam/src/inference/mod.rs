@@ -353,6 +353,11 @@ pub enum OrtRuntimePinError {
     AlreadyInitializedFromPath {
         path: PathBuf,
     },
+    AlreadyInitializedFromRetainedBytes,
+    RuntimePathMismatch {
+        pinned_path: PathBuf,
+        supplied_path: PathBuf,
+    },
     RuntimeIdentityMismatch {
         pinned_bytes: usize,
         supplied_bytes: usize,
@@ -383,6 +388,18 @@ impl std::fmt::Display for OrtRuntimePinError {
                 formatter,
                 "ONNX Runtime was already initialized from {}",
                 path.display()
+            ),
+            Self::AlreadyInitializedFromRetainedBytes => formatter.write_str(
+                "ONNX Runtime was already initialized from retained in-memory bytes",
+            ),
+            Self::RuntimePathMismatch {
+                pinned_path,
+                supplied_path,
+            } => write!(
+                formatter,
+                "a different ONNX Runtime path is already pinned (pinned={}, supplied={})",
+                pinned_path.display(),
+                supplied_path.display()
             ),
             Self::RuntimeIdentityMismatch {
                 pinned_bytes,
@@ -415,6 +432,8 @@ impl std::error::Error for OrtRuntimePinError {
             Self::UnsupportedPlatform { .. }
             | Self::InitializationStatePoisoned
             | Self::AlreadyInitializedFromPath { .. }
+            | Self::AlreadyInitializedFromRetainedBytes
+            | Self::RuntimePathMismatch { .. }
             | Self::RuntimeIdentityMismatch { .. }
             | Self::MissingMemfdSeals { .. }
             | Self::EnvironmentAlreadyInitialized
@@ -561,6 +580,52 @@ pub fn pin_ort_runtime_from_memory(
     drop(preflight);
     *state = Some(OrtRuntimeState::Retained(runtime));
 
+    Ok(PinnedOrtRuntime { _private: () })
+}
+
+/// Initialize ONNX Runtime from one explicit shared-library path.
+///
+/// This token proves only which path was given to the process-wide ORT
+/// initializer. Callers that require loader identity must separately compare
+/// the opened file's device/inode with `/proc/self/maps`; this function does
+/// not make that claim.
+#[cfg(feature = "nano-wheels-off-qualification")]
+pub fn pin_ort_runtime_from_path(runtime_path: &Path) -> Result<PinnedOrtRuntime, InferenceError> {
+    let runtime_path = runtime_path.to_path_buf();
+    let mut state = lock_ort_runtime_state()?;
+    match state.as_ref() {
+        Some(OrtRuntimeState::Path(pinned_path)) if pinned_path == &runtime_path => {
+            return Ok(PinnedOrtRuntime { _private: () });
+        }
+        Some(OrtRuntimeState::Path(pinned_path)) => {
+            return Err(OrtRuntimePinError::RuntimePathMismatch {
+                pinned_path: pinned_path.clone(),
+                supplied_path: runtime_path,
+            }
+            .into());
+        }
+        #[cfg(target_os = "linux")]
+        Some(OrtRuntimeState::Retained(_)) => {
+            return Err(OrtRuntimePinError::AlreadyInitializedFromRetainedBytes.into());
+        }
+        Some(OrtRuntimeState::Indeterminate) => {
+            return Err(OrtRuntimePinError::InitializationIndeterminate.into());
+        }
+        None => {}
+    }
+
+    let preflight = preflight_ort_runtime(&runtime_path)?;
+    let environment =
+        ort::init_from(&runtime_path).map_err(|source| InferenceError::RuntimeLoadFailed {
+            path: runtime_path.clone(),
+            source,
+        })?;
+    if !environment.commit() {
+        *state = Some(OrtRuntimeState::Indeterminate);
+        return Err(OrtRuntimePinError::EnvironmentAlreadyInitialized.into());
+    }
+    drop(preflight);
+    *state = Some(OrtRuntimeState::Path(runtime_path));
     Ok(PinnedOrtRuntime { _private: () })
 }
 

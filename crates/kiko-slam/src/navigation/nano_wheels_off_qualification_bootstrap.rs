@@ -8,6 +8,10 @@
 //! returns a linear stopped controller token for a later qualification owner.
 
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -15,7 +19,8 @@ use std::time::{Duration, Instant};
 use kiko_device_inventory::{
     ArtifactHashError, ArtifactId, ArtifactKind, ArtifactRelativePath, ArtifactRelativePathError,
     ExactInventoryAdmission, InventoryMismatchReport, LoadedDeploymentAsset,
-    LoadedExpectedManifestV2, ManifestArtifactHashes, ManifestLoadError, admit_exact_inventory,
+    LoadedExpectedManifestV2, ManifestArtifactHashes, ManifestLoadError,
+    StreamedDeploymentAssetIdentity, UnixFileIdentity, admit_exact_inventory,
     hash_manifest_artifacts_reusing_loaded_asset, load_expected_manifest_v2_from_slice,
 };
 use kiko_eye_runtime::{IdentityProbeError, probe_serial_eye_identity};
@@ -26,6 +31,7 @@ use robot_server::config::{ControllerServerConfigV2, ServerConfigError};
 use robot_server::{
     V2ControllerOwner, V2ControllerOwnerStartError, V2ControllerOwnerTerminationError,
 };
+use sha2::{Digest, Sha256};
 
 use super::actuation::LiveActuationError;
 use super::nano_bootstrap::{
@@ -34,21 +40,27 @@ use super::nano_bootstrap::{
 };
 use super::{
     AdmittedOakSuperSpeedEvidence, CandidateActuationSessionStartError, CandidateMpcBindingError,
-    CandidateRuntimeServiceIntervalError, LoadedNanoWheelsOffQualificationLaunchV1,
+    CandidateRuntimeServiceIntervalError, LoadedNanoWheelsOffQualificationLaunchV2,
     ManifestBoundNanoAgentPolicyConfigV3, NanoAccessoryManifestBindingError,
     NanoAgentPolicyConfigParseError, NanoAgentPolicyConfigV3, NanoBootstrapAccessoryEvidence,
     NanoBootstrapOakCloseDisposition, NanoBootstrapPrimaryError, NanoBootstrapRootError,
     NanoBootstrapRoots, NanoBootstrapStereoEvidence, NanoCalibrationArtifactParseError,
     NanoCalibrationArtifactV1, NanoCalibrationBindingError, NanoLaunchBoundAssetLoadError,
     NanoObservedInventoryBuildError, NanoObservedInventoryBuilder,
-    NanoObservedInventoryEvidenceError, NanoWheelsOffQualificationAssetRole,
-    NanoWheelsOffQualificationLaunchLoadError, NanoWheelsOffQualificationLaunchV1,
-    ParsedNanoLiveConfiguration, ShadowNavigationConfigParseError, ShadowNavigationConfigV1,
-    StoppedWheelsOffCandidateController, WheelsOffCandidateActuationSession,
+    NanoObservedInventoryEvidenceError, NanoWheelsOffMappedImageError,
+    NanoWheelsOffNativeRuntimeBindingError, NanoWheelsOffNativeRuntimeParseError,
+    NanoWheelsOffNativeRuntimeV1, NanoWheelsOffNativeRuntimeVerificationError,
+    NanoWheelsOffQualificationAssetRole, NanoWheelsOffQualificationLaunchLoadError,
+    NanoWheelsOffQualificationLaunchV2, ParsedNanoLiveConfiguration,
+    ShadowNavigationConfigParseError, ShadowNavigationConfigV1,
+    StoppedWheelsOffCandidateController, VerifiedNanoWheelsOffMappedImages,
+    VerifiedNanoWheelsOffNativeRuntimeDependencies, WheelsOffCandidateActuationSession,
     WheelsOffCandidateControllerBinding, WheelsOffCandidateControllerBindingError,
     WheelsOffCandidateLimits, WheelsOffCandidatePolicyError,
-    WheelsOffCandidateRuntimeServiceInterval, load_nano_wheels_off_qualification_launch_v1,
+    WheelsOffCandidateRuntimeServiceInterval, load_nano_wheels_off_qualification_launch_v2,
+    verify_linux_mapped_qualification_images,
 };
+use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
 use crate::live_runtime::LiveOccupancyHostPolicy;
 
 /// One process-lifetime request for the qualification-only static/hardware
@@ -111,9 +123,14 @@ impl std::error::Error for QualificationBootstrapRequestError {
     }
 }
 
-/// Exact retained bytes for all qualification launch roles.
+/// Retained bytes for consumed inputs plus streaming identities for the
+/// executable and required native-runtime libraries consumed by the OS loader.
 #[derive(Debug)]
 pub struct LoadedNanoWheelsOffQualificationAssets {
+    pub qualification_executable: StreamedDeploymentAssetIdentity,
+    pub native_runtime_manifest: LoadedDeploymentAsset,
+    pub native_runtime: NanoWheelsOffNativeRuntimeV1,
+    pub native_runtime_dependency_identities: VerifiedNanoWheelsOffNativeRuntimeDependencies,
     pub agent_policy: LoadedDeploymentAsset,
     pub navigation_shadow_config: LoadedDeploymentAsset,
     pub candidate_inventory_manifest: LoadedDeploymentAsset,
@@ -121,7 +138,9 @@ pub struct LoadedNanoWheelsOffQualificationAssets {
     pub controller_server_contract: LoadedDeploymentAsset,
     pub calibration_artifact: LoadedDeploymentAsset,
     pub plant_artifact: LoadedDeploymentAsset,
-    pub onnx_runtime_library: LoadedDeploymentAsset,
+    pub onnx_runtime_library: StreamedDeploymentAssetIdentity,
+    pub pinned_onnx_runtime: crate::PinnedOrtRuntime,
+    pub mapped_images: VerifiedNanoWheelsOffMappedImages,
     pub superpoint_model: LoadedDeploymentAsset,
     pub lightglue_model: LoadedDeploymentAsset,
 }
@@ -129,7 +148,7 @@ pub struct LoadedNanoWheelsOffQualificationAssets {
 impl LoadedNanoWheelsOffQualificationAssets {
     fn load(
         deployment_root: &Path,
-        launch: &NanoWheelsOffQualificationLaunchV1,
+        launch: &NanoWheelsOffQualificationLaunchV2,
     ) -> Result<Self, QualificationBootstrapPrimaryError> {
         let load = |role| {
             launch
@@ -139,7 +158,62 @@ impl LoadedNanoWheelsOffQualificationAssets {
                     |source| QualificationBootstrapPrimaryError::BoundAssetLoad { role, source },
                 )
         };
+        let qualification_executable = launch
+            .qualification_executable()
+            .verify_exact_streaming(deployment_root)
+            .map_err(
+                |source| QualificationBootstrapPrimaryError::BoundAssetLoad {
+                    role: NanoWheelsOffQualificationAssetRole::QualificationExecutable,
+                    source,
+                },
+            )?;
+        require_running_qualification_executable(&qualification_executable)
+            .map_err(QualificationBootstrapPrimaryError::QualificationExecutable)?;
+        let native_runtime_manifest =
+            load(NanoWheelsOffQualificationAssetRole::NativeRuntimeManifest)?;
+        let native_runtime =
+            NanoWheelsOffNativeRuntimeV1::parse_json(native_runtime_manifest.bytes())
+                .map_err(QualificationBootstrapPrimaryError::NativeRuntimeManifest)?;
+        let onnx_runtime_library = launch
+            .inference()
+            .onnx_runtime_library()
+            .verify_exact_streaming(deployment_root)
+            .map_err(
+                |source| QualificationBootstrapPrimaryError::BoundAssetLoad {
+                    role: NanoWheelsOffQualificationAssetRole::OnnxRuntimeLibrary,
+                    source,
+                },
+            )?;
+        native_runtime
+            .bind_onnx_runtime_launch(launch.inference().onnx_runtime_library())
+            .map_err(QualificationBootstrapPrimaryError::NativeRuntimeBinding)?;
+        native_runtime
+            .reject_non_onnx_launch_aliases(
+                NanoWheelsOffQualificationAssetRole::ALL
+                    .into_iter()
+                    .filter(|role| *role != NanoWheelsOffQualificationAssetRole::OnnxRuntimeLibrary)
+                    .map(|role| launch.asset(role).relative_path()),
+            )
+            .map_err(QualificationBootstrapPrimaryError::NativeRuntimeBinding)?;
+        let native_runtime_dependency_identities = native_runtime
+            .verify_dependencies_reusing_onnx(deployment_root, &onnx_runtime_library)
+            .map_err(QualificationBootstrapPrimaryError::NativeRuntimeVerification)?;
+        let onnx_runtime_path =
+            deployment_root.join(onnx_runtime_library.relative_path().as_path());
+        let pinned_onnx_runtime = crate::pin_ort_runtime_from_path(&onnx_runtime_path)
+            .map_err(QualificationBootstrapPrimaryError::OnnxRuntimeInitialization)?;
+        let mapped_images = verify_linux_mapped_qualification_images(
+            &qualification_executable,
+            &native_runtime_dependency_identities,
+            &onnx_runtime_library,
+        )
+        .map_err(QualificationBootstrapPrimaryError::MappedImages)?;
+
         Ok(Self {
+            qualification_executable,
+            native_runtime_manifest,
+            native_runtime,
+            native_runtime_dependency_identities,
             agent_policy: load(NanoWheelsOffQualificationAssetRole::AgentPolicy)?,
             navigation_shadow_config: load(
                 NanoWheelsOffQualificationAssetRole::NavigationShadowConfig,
@@ -155,11 +229,138 @@ impl LoadedNanoWheelsOffQualificationAssets {
             )?,
             calibration_artifact: load(NanoWheelsOffQualificationAssetRole::CalibrationArtifact)?,
             plant_artifact: load(NanoWheelsOffQualificationAssetRole::PlantArtifact)?,
-            onnx_runtime_library: load(NanoWheelsOffQualificationAssetRole::OnnxRuntimeLibrary)?,
+            onnx_runtime_library,
+            pinned_onnx_runtime,
+            mapped_images,
             superpoint_model: load(NanoWheelsOffQualificationAssetRole::SuperpointModel)?,
             lightglue_model: load(NanoWheelsOffQualificationAssetRole::LightglueModel)?,
         })
     }
+}
+
+fn require_running_qualification_executable(
+    expected: &StreamedDeploymentAssetIdentity,
+) -> Result<(), QualificationExecutableIdentityError> {
+    let (observed_bytes, observed_sha256, observed_file_identity) = running_executable_identity()?;
+    require_executable_identity(
+        expected.byte_len(),
+        *expected.content_sha256().as_bytes(),
+        expected.file_identity(),
+        observed_bytes,
+        observed_sha256,
+        observed_file_identity,
+    )
+}
+
+fn require_executable_identity(
+    expected_bytes: u64,
+    expected_sha256: [u8; 32],
+    expected_file_identity: UnixFileIdentity,
+    observed_bytes: u64,
+    observed_sha256: [u8; 32],
+    observed_file_identity: UnixFileIdentity,
+) -> Result<(), QualificationExecutableIdentityError> {
+    if observed_bytes != expected_bytes {
+        return Err(QualificationExecutableIdentityError::SizeMismatch {
+            expected_bytes,
+            observed_bytes,
+        });
+    }
+    if observed_sha256 != expected_sha256 {
+        return Err(QualificationExecutableIdentityError::ContentMismatch {
+            expected_sha256,
+            observed_sha256,
+        });
+    }
+    if observed_file_identity != expected_file_identity {
+        return Err(QualificationExecutableIdentityError::FileIdentityMismatch {
+            expected: expected_file_identity,
+            observed: observed_file_identity,
+        });
+    }
+    Ok(())
+}
+
+fn running_executable_identity()
+-> Result<(u64, [u8; 32], UnixFileIdentity), QualificationExecutableIdentityError> {
+    if !cfg!(target_os = "linux") {
+        return Err(QualificationExecutableIdentityError::UnsupportedPlatform {
+            target_os: std::env::consts::OS,
+        });
+    }
+    let executable_path = PathBuf::from("/proc/self/exe");
+
+    let mut executable = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&executable_path)
+        .map_err(|source| QualificationExecutableIdentityError::Open {
+            path: executable_path.clone(),
+            source,
+        })?;
+    let initial_metadata =
+        executable
+            .metadata()
+            .map_err(|source| QualificationExecutableIdentityError::Metadata {
+                path: executable_path.clone(),
+                source,
+            })?;
+    if !initial_metadata.is_file() {
+        return Err(QualificationExecutableIdentityError::NotRegularFile {
+            path: executable_path,
+        });
+    }
+
+    let mut observed_bytes = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1_024];
+    loop {
+        let read = executable.read(&mut buffer).map_err(|source| {
+            QualificationExecutableIdentityError::Read {
+                path: executable_path.clone(),
+                observed_bytes,
+                source,
+            }
+        })?;
+        if read == 0 {
+            break;
+        }
+        let read_bytes = u64::try_from(read)
+            .map_err(|_| QualificationExecutableIdentityError::ReadSizeNotRepresentable)?;
+        observed_bytes = observed_bytes
+            .checked_add(read_bytes)
+            .ok_or(QualificationExecutableIdentityError::ObservedSizeOverflow)?;
+        hasher.update(&buffer[..read]);
+    }
+    let final_metadata =
+        executable
+            .metadata()
+            .map_err(|source| QualificationExecutableIdentityError::Metadata {
+                path: executable_path.clone(),
+                source,
+            })?;
+    if initial_metadata.len() != final_metadata.len() || observed_bytes != initial_metadata.len() {
+        return Err(
+            QualificationExecutableIdentityError::LengthChangedDuringRead {
+                path: executable_path,
+                initial_bytes: initial_metadata.len(),
+                final_bytes: final_metadata.len(),
+                observed_bytes,
+            },
+        );
+    }
+    let initial_identity = UnixFileIdentity::from_metadata(&initial_metadata);
+    let final_identity = UnixFileIdentity::from_metadata(&final_metadata);
+    if initial_identity != final_identity {
+        return Err(
+            QualificationExecutableIdentityError::IdentityChangedDuringRead {
+                path: executable_path,
+                initial: initial_identity,
+                final_identity,
+            },
+        );
+    }
+    Ok((observed_bytes, hasher.finalize().into(), initial_identity))
 }
 
 /// Exact plant selection jointly proven by launch, policy, manifest, and the
@@ -195,7 +396,7 @@ impl QualificationPlantEvidence {
 #[must_use = "the OAK and stopped candidate-controller token need explicit lifecycle ownership"]
 pub struct PreparedNanoWheelsOffQualificationBootstrap {
     pub roots: NanoBootstrapRoots,
-    pub launch: LoadedNanoWheelsOffQualificationLaunchV1,
+    pub launch: LoadedNanoWheelsOffQualificationLaunchV2,
     pub assets: LoadedNanoWheelsOffQualificationAssets,
     pub manifest: LoadedExpectedManifestV2,
     pub policy: ManifestBoundNanoAgentPolicyConfigV3,
@@ -253,11 +454,14 @@ pub async fn bootstrap_nano_wheels_off_qualification(
         running,
     } = request;
 
+    require_linux_qualification_runtime()
+        .map_err(QualificationBootstrapPrimaryError::QualificationExecutable)
+        .map_err(QualificationBootstrapError::before_hardware)?;
     require_running(running)
         .map_err(QualificationBootstrapPrimaryError::common)
         .map_err(QualificationBootstrapError::before_hardware)?;
     let launch =
-        load_nano_wheels_off_qualification_launch_v1(roots.deployment_root(), launch_relative_path)
+        load_nano_wheels_off_qualification_launch_v2(roots.deployment_root(), launch_relative_path)
             .map_err(QualificationBootstrapPrimaryError::LaunchLoad)
             .map_err(QualificationBootstrapError::before_hardware)?;
     let assets =
@@ -356,6 +560,44 @@ pub async fn bootstrap_nano_wheels_off_qualification(
         .map_err(QualificationBootstrapPrimaryError::CandidateBinding)
         .map_err(QualificationBootstrapError::before_hardware)?;
     let candidate_limits = candidate_admission.limits();
+    let expected_rectified_stereo = calibration.rectified_stereo();
+    let launch_rectified_stereo = launch.launch().oak().rectified_stereo();
+    if expected_rectified_stereo.width() != launch_rectified_stereo.width_px()
+        || expected_rectified_stereo.height() != launch_rectified_stereo.height_px()
+    {
+        return Err(QualificationBootstrapError::before_hardware(
+            QualificationBootstrapPrimaryError::CalibrationLaunchStereoDimensionsMismatch {
+                calibration_width_px: expected_rectified_stereo.width(),
+                calibration_height_px: expected_rectified_stereo.height(),
+                launch_width_px: launch_rectified_stereo.width_px(),
+                launch_height_px: launch_rectified_stereo.height_px(),
+            },
+        ));
+    }
+    let expected_depth_camera = DepthCameraModel::new(
+        expected_rectified_stereo.left(),
+        expected_rectified_stereo.dimensions(),
+        DepthToTrackingCamera::identity(),
+    );
+    let navigation = ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+        assets.navigation_shadow_config.bytes(),
+        expected_depth_camera,
+        plant_artifact_model,
+    )
+    .map_err(QualificationBootstrapPrimaryError::ShadowNavigation)
+    .map_err(QualificationBootstrapError::before_hardware)?;
+    calibration
+        .require_navigation(&navigation)
+        .map_err(QualificationBootstrapPrimaryError::CalibrationBinding)
+        .map_err(QualificationBootstrapError::before_hardware)?;
+    candidate_admission
+        .admit_shadow_mpc(navigation.mpc_solver().config())
+        .map_err(QualificationBootstrapPrimaryError::CandidateMpc)
+        .map_err(QualificationBootstrapError::before_hardware)?;
+    let candidate_runtime_service_interval = candidate_limits
+        .admit_runtime_service_interval(navigation.control_period().as_duration())
+        .map_err(QualificationBootstrapPrimaryError::CandidateRuntimeServiceInterval)
+        .map_err(QualificationBootstrapError::before_hardware)?;
 
     // Match production cold-boot behavior exactly: retry only read-only
     // enumeration of the already parsed identities. The head/eye probes, OAK
@@ -403,10 +645,9 @@ pub async fn bootstrap_nano_wheels_off_qualification(
     let connected = match prepare_oak(
         &mut oak,
         launch.launch(),
-        assets.navigation_shadow_config.bytes(),
         &calibration,
-        plant_artifact_model,
-        &candidate_admission,
+        navigation,
+        candidate_runtime_service_interval,
         running,
     ) {
         Ok(connected) => connected,
@@ -620,6 +861,19 @@ pub async fn bootstrap_nano_wheels_off_qualification(
     })
 }
 
+fn require_linux_qualification_runtime() -> Result<(), QualificationExecutableIdentityError> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(QualificationExecutableIdentityError::UnsupportedPlatform {
+            target_os: std::env::consts::OS,
+        })
+    }
+}
+
 struct ConnectedQualificationOak {
     opened_identity: ConnectedDeviceIdentity,
     usb_transport: oak_sys::UsbTransportAdmissionEvidence,
@@ -632,11 +886,10 @@ struct ConnectedQualificationOak {
 
 fn prepare_oak(
     oak: &mut Device,
-    launch: &NanoWheelsOffQualificationLaunchV1,
-    navigation_bytes: &[u8],
+    launch: &NanoWheelsOffQualificationLaunchV2,
     calibration: &NanoCalibrationArtifactV1,
-    plant_artifact_model: super::mpc::PlantModelV1,
-    candidate: &super::AdmittedWheelsOffCandidateController,
+    navigation: ShadowNavigationConfigV1,
+    candidate_runtime_service_interval: WheelsOffCandidateRuntimeServiceInterval,
     running: &AtomicBool,
 ) -> Result<ConnectedQualificationOak, QualificationBootstrapPrimaryError> {
     let opened_identity = oak
@@ -664,22 +917,6 @@ fn prepare_oak(
     calibration
         .require_observed_stereo(&stereo.calibration)
         .map_err(QualificationBootstrapPrimaryError::CalibrationBinding)?;
-    let navigation = ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
-        navigation_bytes,
-        stereo.runtime_depth_camera,
-        plant_artifact_model,
-    )
-    .map_err(QualificationBootstrapPrimaryError::ShadowNavigation)?;
-    calibration
-        .require_navigation(&navigation)
-        .map_err(QualificationBootstrapPrimaryError::CalibrationBinding)?;
-    candidate
-        .admit_shadow_mpc(navigation.mpc_solver().config())
-        .map_err(QualificationBootstrapPrimaryError::CandidateMpc)?;
-    let candidate_runtime_service_interval = candidate
-        .limits()
-        .admit_runtime_service_interval(navigation.control_period().as_duration())
-        .map_err(QualificationBootstrapPrimaryError::CandidateRuntimeServiceInterval)?;
     Ok(ConnectedQualificationOak {
         opened_identity,
         usb_transport,
@@ -693,7 +930,7 @@ fn prepare_oak(
 
 fn bind_policy_paths(
     roots: &NanoBootstrapRoots,
-    launch: &NanoWheelsOffQualificationLaunchV1,
+    launch: &NanoWheelsOffQualificationLaunchV2,
     configured_manifest: &Path,
     artifact_root: &Path,
 ) -> Result<(), QualificationBootstrapPrimaryError> {
@@ -730,7 +967,7 @@ fn require_exact_manifest_path(
 
 fn bind_calibration(
     roots: &NanoBootstrapRoots,
-    launch: &NanoWheelsOffQualificationLaunchV1,
+    launch: &NanoWheelsOffQualificationLaunchV2,
     loaded: &LoadedDeploymentAsset,
     policy: &ManifestBoundNanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -833,7 +1070,7 @@ fn calibration_deployment_relative_artifact_path(
 
 fn select_plant(
     roots: &NanoBootstrapRoots,
-    launch: &NanoWheelsOffQualificationLaunchV1,
+    launch: &NanoWheelsOffQualificationLaunchV2,
     loaded: &LoadedDeploymentAsset,
     policy: &ManifestBoundNanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -1129,6 +1366,82 @@ impl fmt::Display for QualificationControllerOwnerDisposition {
 }
 
 #[derive(Debug)]
+pub enum QualificationExecutableIdentityError {
+    UnsupportedPlatform {
+        target_os: &'static str,
+    },
+    Open {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Metadata {
+        path: PathBuf,
+        source: io::Error,
+    },
+    NotRegularFile {
+        path: PathBuf,
+    },
+    Read {
+        path: PathBuf,
+        observed_bytes: u64,
+        source: io::Error,
+    },
+    ReadSizeNotRepresentable,
+    ObservedSizeOverflow,
+    LengthChangedDuringRead {
+        path: PathBuf,
+        initial_bytes: u64,
+        final_bytes: u64,
+        observed_bytes: u64,
+    },
+    IdentityChangedDuringRead {
+        path: PathBuf,
+        initial: UnixFileIdentity,
+        final_identity: UnixFileIdentity,
+    },
+    SizeMismatch {
+        expected_bytes: u64,
+        observed_bytes: u64,
+    },
+    ContentMismatch {
+        expected_sha256: [u8; 32],
+        observed_sha256: [u8; 32],
+    },
+    FileIdentityMismatch {
+        expected: UnixFileIdentity,
+        observed: UnixFileIdentity,
+    },
+}
+
+impl fmt::Display for QualificationExecutableIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "running wheels-off qualification executable identity mismatch: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for QualificationExecutableIdentityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Open { source, .. }
+            | Self::Metadata { source, .. }
+            | Self::Read { source, .. } => Some(source),
+            Self::UnsupportedPlatform { .. }
+            | Self::NotRegularFile { .. }
+            | Self::ReadSizeNotRepresentable
+            | Self::ObservedSizeOverflow
+            | Self::LengthChangedDuringRead { .. }
+            | Self::IdentityChangedDuringRead { .. }
+            | Self::SizeMismatch { .. }
+            | Self::ContentMismatch { .. }
+            | Self::FileIdentityMismatch { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum QualificationBootstrapPrimaryError {
     CommonBootstrap(Box<NanoBootstrapPrimaryError>),
     LaunchLoad(NanoWheelsOffQualificationLaunchLoadError),
@@ -1136,6 +1449,12 @@ pub enum QualificationBootstrapPrimaryError {
         role: NanoWheelsOffQualificationAssetRole,
         source: NanoLaunchBoundAssetLoadError,
     },
+    QualificationExecutable(QualificationExecutableIdentityError),
+    NativeRuntimeManifest(NanoWheelsOffNativeRuntimeParseError),
+    NativeRuntimeBinding(NanoWheelsOffNativeRuntimeBindingError),
+    NativeRuntimeVerification(NanoWheelsOffNativeRuntimeVerificationError),
+    OnnxRuntimeInitialization(crate::InferenceError),
+    MappedImages(NanoWheelsOffMappedImageError),
     AgentPolicy(NanoAgentPolicyConfigParseError),
     ManifestPathMismatch {
         launch: PathBuf,
@@ -1154,6 +1473,12 @@ pub enum QualificationBootstrapPrimaryError {
     ArtifactHash(ArtifactHashError),
     CalibrationArtifact(NanoCalibrationArtifactParseError),
     CalibrationBinding(NanoCalibrationBindingError),
+    CalibrationLaunchStereoDimensionsMismatch {
+        calibration_width_px: u32,
+        calibration_height_px: u32,
+        launch_width_px: u32,
+        launch_height_px: u32,
+    },
     CalibrationNotInManifest {
         artifact_id: String,
     },
@@ -1249,6 +1574,12 @@ impl std::error::Error for QualificationBootstrapPrimaryError {
             Self::CommonBootstrap(source) => Some(source),
             Self::LaunchLoad(source) => Some(source),
             Self::BoundAssetLoad { source, .. } => Some(source),
+            Self::QualificationExecutable(source) => Some(source),
+            Self::NativeRuntimeManifest(source) => Some(source),
+            Self::NativeRuntimeBinding(source) => Some(source),
+            Self::NativeRuntimeVerification(source) => Some(source),
+            Self::OnnxRuntimeInitialization(source) => Some(source),
+            Self::MappedImages(source) => Some(source),
             Self::AgentPolicy(source) => Some(source),
             Self::Manifest(source) => Some(source),
             Self::AccessoryManifestBinding(source) => Some(source),
@@ -1275,6 +1606,7 @@ impl std::error::Error for QualificationBootstrapPrimaryError {
             | Self::ArtifactRootOutsideDeployment { .. }
             | Self::RobotIdMismatch { .. }
             | Self::CalibrationNotInManifest { .. }
+            | Self::CalibrationLaunchStereoDimensionsMismatch { .. }
             | Self::CalibrationPolicyBindingMissing { .. }
             | Self::CalibrationHashMissing { .. }
             | Self::CalibrationDigestMismatch { .. }
@@ -1296,6 +1628,73 @@ impl std::error::Error for QualificationBootstrapPrimaryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_executable_identity_is_stable_and_mismatch_is_typed() {
+        let (byte_len, sha256, file_identity) =
+            running_executable_identity().expect("current test executable identity");
+        require_executable_identity(
+            byte_len,
+            sha256,
+            file_identity,
+            byte_len,
+            sha256,
+            file_identity,
+        )
+        .expect("same exact executable identity");
+        assert!(matches!(
+            require_executable_identity(
+                byte_len + 1,
+                sha256,
+                file_identity,
+                byte_len,
+                sha256,
+                file_identity,
+            ),
+            Err(QualificationExecutableIdentityError::SizeMismatch { .. })
+        ));
+        let mut other_sha256 = sha256;
+        other_sha256[0] ^= 1;
+        assert!(matches!(
+            require_executable_identity(
+                byte_len,
+                other_sha256,
+                file_identity,
+                byte_len,
+                sha256,
+                file_identity,
+            ),
+            Err(QualificationExecutableIdentityError::ContentMismatch { .. })
+        ));
+        let other_identity = UnixFileIdentity::from_metadata(
+            &std::fs::metadata("/proc/self/maps").expect("maps metadata"),
+        );
+        assert!(matches!(
+            require_executable_identity(
+                byte_len,
+                sha256,
+                other_identity,
+                byte_len,
+                sha256,
+                file_identity,
+            ),
+            Err(QualificationExecutableIdentityError::FileIdentityMismatch { .. })
+        ));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn qualification_runtime_explicitly_rejects_non_linux_hosts() {
+        assert!(matches!(
+            require_linux_qualification_runtime(),
+            Err(QualificationExecutableIdentityError::UnsupportedPlatform { .. })
+        ));
+        assert!(matches!(
+            running_executable_identity(),
+            Err(QualificationExecutableIdentityError::UnsupportedPlatform { .. })
+        ));
+    }
 
     #[test]
     fn policy_manifest_path_must_equal_the_launch_bound_asset() {

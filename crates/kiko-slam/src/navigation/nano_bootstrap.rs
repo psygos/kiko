@@ -1546,6 +1546,7 @@ fn bootstrap_stereo_while(
         },
         baseline_m,
         rectified: true,
+        oak_eeprom: None,
     };
     let rectified = RectifiedStereo::from_calibration(&calibration)
         .map_err(NanoBootstrapPrimaryError::Stereo)?;

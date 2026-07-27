@@ -614,6 +614,7 @@ mod tests {
             },
             baseline_m: 0.075,
             rectified: true,
+            oak_eeprom: None,
         }
     }
 

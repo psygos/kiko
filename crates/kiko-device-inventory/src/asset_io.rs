@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -69,6 +70,35 @@ impl DeploymentAssetContentSha256 {
     }
 }
 
+/// Stable Unix identity of one already opened regular file.
+///
+/// This is process-local loader evidence, not content identity: callers must
+/// still compare the independently bound length and SHA-256. Device/inode
+/// identity lets Linux runtime admission prove that the file already mapped by
+/// the loader is the same file descriptor object that was content-verified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnixFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl UnixFileIdentity {
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+}
+
 /// One bounded retained byte sequence opened without following symlinks.
 ///
 /// The content identity covers these retained bytes only. It does not prove
@@ -82,6 +112,39 @@ pub struct LoadedDeploymentAsset {
     relative_path: ArtifactRelativePath,
     bytes: Vec<u8>,
     content_sha256: DeploymentAssetContentSha256,
+    file_identity: UnixFileIdentity,
+}
+
+/// Content identity produced by one bounded streaming read.
+///
+/// Unlike [`LoadedDeploymentAsset`], this evidence retains no file bytes. It
+/// is intended for large executable and native-library admission where the
+/// consumer needs exact path/length/digest evidence but will not consume the
+/// content from Rust memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamedDeploymentAssetIdentity {
+    relative_path: ArtifactRelativePath,
+    byte_len: u64,
+    content_sha256: DeploymentAssetContentSha256,
+    file_identity: UnixFileIdentity,
+}
+
+impl StreamedDeploymentAssetIdentity {
+    pub const fn relative_path(&self) -> &ArtifactRelativePath {
+        &self.relative_path
+    }
+
+    pub const fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    pub const fn content_sha256(&self) -> DeploymentAssetContentSha256 {
+        self.content_sha256
+    }
+
+    pub const fn file_identity(&self) -> UnixFileIdentity {
+        self.file_identity
+    }
 }
 
 impl fmt::Debug for LoadedDeploymentAsset {
@@ -91,6 +154,7 @@ impl fmt::Debug for LoadedDeploymentAsset {
             .field("relative_path", &self.relative_path)
             .field("byte_len", &self.bytes.len())
             .field("content_sha256", &self.content_sha256)
+            .field("file_identity", &self.file_identity)
             .finish()
     }
 }
@@ -112,6 +176,10 @@ impl LoadedDeploymentAsset {
         self.content_sha256
     }
 
+    pub const fn file_identity(&self) -> UnixFileIdentity {
+        self.file_identity
+    }
+
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
@@ -131,6 +199,67 @@ pub fn load_deployment_asset(
     relative_path: ArtifactRelativePath,
     byte_limit: DeploymentAssetByteLimit,
 ) -> Result<LoadedDeploymentAsset, DeploymentAssetLoadError> {
+    let (mut file, declared_bytes, declared_bytes_usize, file_identity) =
+        open_bounded_deployment_asset(root, &relative_path, byte_limit)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(declared_bytes_usize)
+        .map_err(|source| DeploymentAssetLoadError::Allocation {
+            relative_path: relative_path.clone(),
+            requested_bytes: declared_bytes_usize,
+            source,
+        })?;
+    let (bytes_read, content_sha256) = read_declared_content(
+        &mut file,
+        &relative_path,
+        declared_bytes,
+        declared_bytes_usize,
+        |chunk| bytes.extend_from_slice(chunk),
+    )?;
+    verify_final_length(&file, &relative_path, declared_bytes, bytes_read)?;
+    debug_assert_eq!(bytes.len(), declared_bytes_usize);
+
+    Ok(LoadedDeploymentAsset {
+        relative_path,
+        bytes,
+        content_sha256,
+        file_identity,
+    })
+}
+
+/// Open and hash one bounded regular file without retaining its bytes.
+///
+/// Root and path confinement are identical to [`load_deployment_asset`].
+/// The returned identity is not publisher authentication; callers must compare
+/// its digest with an independently bound expectation.
+pub fn stream_deployment_asset_identity(
+    root: &Path,
+    relative_path: ArtifactRelativePath,
+    byte_limit: DeploymentAssetByteLimit,
+) -> Result<StreamedDeploymentAssetIdentity, DeploymentAssetLoadError> {
+    let (mut file, declared_bytes, declared_bytes_usize, file_identity) =
+        open_bounded_deployment_asset(root, &relative_path, byte_limit)?;
+    let (bytes_read, content_sha256) = read_declared_content(
+        &mut file,
+        &relative_path,
+        declared_bytes,
+        declared_bytes_usize,
+        |_| {},
+    )?;
+    verify_final_length(&file, &relative_path, declared_bytes, bytes_read)?;
+    Ok(StreamedDeploymentAssetIdentity {
+        relative_path,
+        byte_len: declared_bytes,
+        content_sha256,
+        file_identity,
+    })
+}
+
+fn open_bounded_deployment_asset(
+    root: &Path,
+    relative_path: &ArtifactRelativePath,
+    byte_limit: DeploymentAssetByteLimit,
+) -> Result<(File, u64, usize, UnixFileIdentity), DeploymentAssetLoadError> {
     validate_root(root)?;
     let root_descriptor =
         open_absolute_nofollow(root, OpenedPathKind::Directory).map_err(|source| {
@@ -146,7 +275,7 @@ pub fn load_deployment_asset(
                 source,
             }
         })?;
-    let mut file = File::from(descriptor);
+    let file = File::from(descriptor);
     let initial_metadata =
         file.metadata()
             .map_err(|source| DeploymentAssetLoadError::Metadata {
@@ -154,92 +283,93 @@ pub fn load_deployment_asset(
                 source,
             })?;
     if !initial_metadata.is_file() {
-        return Err(DeploymentAssetLoadError::NotRegularFile { relative_path });
+        return Err(DeploymentAssetLoadError::NotRegularFile {
+            relative_path: relative_path.clone(),
+        });
     }
     let declared_bytes = initial_metadata.len();
     if declared_bytes > byte_limit.get() {
         return Err(DeploymentAssetLoadError::TooLarge {
-            relative_path,
+            relative_path: relative_path.clone(),
             actual_bytes: declared_bytes,
             maximum_bytes: byte_limit.get(),
         });
     }
-    let initial_capacity = usize::try_from(declared_bytes).map_err(|_| {
+    let declared_bytes_usize = usize::try_from(declared_bytes).map_err(|_| {
         DeploymentAssetLoadError::SizeNotRepresentable {
             relative_path: relative_path.clone(),
             declared_bytes,
         }
     })?;
-    let (bytes, content_sha256) =
-        read_declared_content(&mut file, &relative_path, declared_bytes, initial_capacity)?;
+    let file_identity = UnixFileIdentity::from_metadata(&initial_metadata);
+    Ok((file, declared_bytes, declared_bytes_usize, file_identity))
+}
 
+fn verify_final_length(
+    file: &File,
+    relative_path: &ArtifactRelativePath,
+    declared_bytes: u64,
+    bytes_read: usize,
+) -> Result<(), DeploymentAssetLoadError> {
     let final_metadata = file
         .metadata()
         .map_err(|source| DeploymentAssetLoadError::Metadata {
             relative_path: relative_path.clone(),
             source,
         })?;
-    let bytes_read = u64::try_from(bytes.len()).map_err(|_| {
+    let bytes_read_u64 = u64::try_from(bytes_read).map_err(|_| {
         DeploymentAssetLoadError::ObservedLengthNotRepresentable {
             relative_path: relative_path.clone(),
-            observed_bytes: bytes.len(),
+            observed_bytes: bytes_read,
         }
     })?;
-    if final_metadata.len() != declared_bytes || bytes_read != declared_bytes {
+    if final_metadata.len() != declared_bytes || bytes_read_u64 != declared_bytes {
         return Err(DeploymentAssetLoadError::FileLengthChanged {
-            relative_path,
+            relative_path: relative_path.clone(),
             initial_metadata_bytes: declared_bytes,
             final_metadata_bytes: final_metadata.len(),
-            bytes_read,
+            bytes_read: bytes_read_u64,
         });
     }
-
-    Ok(LoadedDeploymentAsset {
-        relative_path,
-        bytes,
-        content_sha256,
-    })
+    Ok(())
 }
 
-fn read_declared_content<R: Read>(
+fn read_declared_content<R, F>(
     reader: &mut R,
     relative_path: &ArtifactRelativePath,
     declared_bytes: u64,
-    initial_capacity: usize,
-) -> Result<(Vec<u8>, DeploymentAssetContentSha256), DeploymentAssetLoadError> {
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(initial_capacity)
-        .map_err(|source| DeploymentAssetLoadError::Allocation {
-            relative_path: relative_path.clone(),
-            requested_bytes: initial_capacity,
-            source,
-        })?;
-
+    declared_bytes_usize: usize,
+    mut consume: F,
+) -> Result<(usize, DeploymentAssetContentSha256), DeploymentAssetLoadError>
+where
+    R: Read,
+    F: FnMut(&[u8]),
+{
+    let mut observed_bytes = 0_usize;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 8 * 1_024];
     loop {
         // Read at most the declared remainder plus one probe byte. Growth can
         // therefore do no caller-sized allocation or hashing work before it
         // fails, even when the configured global limit is much larger.
-        let remaining = initial_capacity.saturating_sub(bytes.len());
+        let remaining = declared_bytes_usize.saturating_sub(observed_bytes);
         let read_limit = remaining.saturating_add(1).min(buffer.len());
         let read = reader.read(&mut buffer[..read_limit]).map_err(|source| {
             DeploymentAssetLoadError::Read {
                 relative_path: relative_path.clone(),
-                bytes_read: bytes.len(),
+                bytes_read: observed_bytes,
                 source,
             }
         })?;
         if read == 0 {
             break;
         }
-        let next_len = bytes.len().checked_add(read).ok_or_else(|| {
+        let next_len = observed_bytes.checked_add(read).ok_or_else(|| {
             DeploymentAssetLoadError::ObservedLengthOverflow {
                 relative_path: relative_path.clone(),
             }
         })?;
-        if next_len > initial_capacity {
+        if next_len > declared_bytes_usize {
             return Err(DeploymentAssetLoadError::FileGrewDuringRead {
                 relative_path: relative_path.clone(),
                 initial_metadata_bytes: declared_bytes,
@@ -247,10 +377,11 @@ fn read_declared_content<R: Read>(
             });
         }
         hasher.update(&buffer[..read]);
-        bytes.extend_from_slice(&buffer[..read]);
+        consume(&buffer[..read]);
+        observed_bytes = next_len;
     }
     Ok((
-        bytes,
+        observed_bytes,
         DeploymentAssetContentSha256(hasher.finalize().into()),
     ))
 }
@@ -440,6 +571,30 @@ mod tests {
     }
 
     #[test]
+    fn streaming_identity_matches_retained_identity_without_content_storage() {
+        let root = TestDirectory::new();
+        let contents = vec![0xa5; 8 * 1_024 + 1];
+        fs::write(root.0.join("native.so"), &contents).expect("asset fixture");
+        let content_bytes = u64::try_from(contents.len()).expect("fixture length");
+        let retained = load_deployment_asset(&root.0, path("native.so"), limit(content_bytes))
+            .expect("retained asset");
+        let streamed =
+            stream_deployment_asset_identity(&root.0, path("native.so"), limit(content_bytes))
+                .expect("streamed identity");
+        assert_eq!(streamed.relative_path().as_str(), "native.so");
+        assert_eq!(
+            streamed.byte_len(),
+            u64::try_from(retained.byte_len()).expect("retained length")
+        );
+        assert_eq!(streamed.content_sha256(), retained.content_sha256());
+        assert_eq!(streamed.file_identity(), retained.file_identity());
+        assert!(matches!(
+            stream_deployment_asset_identity(&root.0, path("native.so"), limit(content_bytes - 1)),
+            Err(DeploymentAssetLoadError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
     fn empty_and_chunk_boundary_content_hash_exactly_the_returned_bytes() {
         let root = TestDirectory::new();
         for (name, contents) in [
@@ -465,7 +620,7 @@ mod tests {
         let relative_path = path("asset");
         let mut reader = Cursor::new(b"abcd");
         assert!(matches!(
-            read_declared_content(&mut reader, &relative_path, 3, 3),
+            read_declared_content(&mut reader, &relative_path, 3, 3, |_| {}),
             Err(DeploymentAssetLoadError::FileGrewDuringRead {
                 initial_metadata_bytes: 3,
                 observed_bytes: 4,

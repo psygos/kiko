@@ -61,7 +61,9 @@ use kiko_slam::HostMonotonicTimestamp;
 use kiko_slam::dataset::{
     Backpressure, Calibration, CameraIntrinsics, DatasetWriteError, DatasetWriter,
     DatasetWriterConfig, DatasetWriterHandle, DepthMeta, ImuExtrinsicProvenance, ImuMeta,
-    ImuStreamMetadata, Meta, MonoMeta, PairedDatasetWriter, WriteOutcome,
+    ImuStreamMetadata, Meta, MonoMeta, OakCalibrationCameraSocket,
+    OakEepromCalibrationEvidence as DatasetOakEepromCalibrationEvidence, PairedDatasetWriter,
+    WriteOutcome,
 };
 #[cfg(all(feature = "nano-agent", unix))]
 use kiko_slam::dataset::{DatasetStorageLimits, MAX_PRODUCTION_DATASET_MANIFEST_BYTES};
@@ -116,8 +118,8 @@ use kiko_slam::navigation::{
     ConsoleLocalization, ConsoleManualCommandEnvelope, ConsoleManualCommandEnvelopeError,
     ConsoleMapSnapshot, ConsoleNavigationSnapshot, ConsoleOccupancyGrid, ConsolePathError,
     ConsolePoint2, ConsolePose2, ConsoleReceiptProjectionError, ConsoleRequestedActuation,
-    ConsoleSnapshotRevision, ConsoleSourceKind, ConsoleStopCertainty, ConsoleSubsystemHealth,
-    ConsoleTerminalReason, ConsoleTerminalState, LiveMotionAuthorityState,
+    ConsoleRerunDiagnosticsUrl, ConsoleSnapshotRevision, ConsoleSourceKind, ConsoleStopCertainty,
+    ConsoleSubsystemHealth, ConsoleTerminalReason, ConsoleTerminalState, LiveMotionAuthorityState,
     LiveMotionAuthorityStateError, NanoAccessoryComponentHealth, NanoAccessoryHealthStatusError,
     NanoOperatorConsoleFrontend, NanoOperatorConsoleFrontendShutdownEvidence,
     NanoOperatorConsoleFrontendStartError, OperatorConsoleIngressDisposition,
@@ -178,8 +180,8 @@ use oak_sys::{
     ConnectedDeviceIdentityError, DepthAiBuildMetadataError, DepthAlignment, DepthConfig,
     DepthError, DepthFrame as OakDepthFrame, Device, DeviceConfig, ImageError,
     ImageFrame as OakImageFrame, ImuConfig, ImuError, Intrinsics as OakIntrinsics, MonoConfig,
-    QueueConfig, StreamId as OakStreamId, UsbTransportEvidenceError, UsbTransportPolicy,
-    UsbTransportSpeed,
+    OakCameraSocket, OakEepromCalibrationEvidence, QueueConfig, StreamId as OakStreamId,
+    UsbTransportEvidenceError, UsbTransportPolicy, UsbTransportSpeed,
 };
 #[cfg(all(feature = "record", feature = "actuation"))]
 use robot_command_client::AppliedCommandReceipt;
@@ -2624,6 +2626,7 @@ fn require_bootstrap_frame_contract(
 fn bootstrap_stereo(
     device: &mut Device,
     config: &MonoConfig,
+    require_oak_eeprom_evidence: bool,
     running: &AtomicBool,
     pairer: &mut StereoPairer,
 ) -> Result<StereoBootstrap, StereoBootstrapError> {
@@ -2673,10 +2676,15 @@ fn bootstrap_stereo(
     let baseline_m = device
         .stereo_baseline_m()
         .map_err(|source| StereoBootstrapError::Calibration { source })?;
+    let oak_eeprom = require_oak_eeprom_evidence
+        .then(|| device.eeprom_calibration_evidence())
+        .transpose()
+        .map_err(|source| StereoBootstrapError::Calibration { source })?;
     let calibration = build_calibration(
         left_intrinsics,
         right_intrinsics,
         baseline_m,
+        oak_eeprom,
         config.rectified,
     );
 
@@ -3246,7 +3254,13 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         let StereoBootstrap {
             calibration,
             rectified_left_intrinsics,
-        } = bootstrap_stereo(&mut device, &mono_config, running.as_ref(), &mut pairer)?;
+        } = bootstrap_stereo(
+            &mut device,
+            &mono_config,
+            imu_config.is_some(),
+            running.as_ref(),
+            &mut pairer,
+        )?;
 
         let meta = build_meta(
             &mono_config,
@@ -5679,6 +5693,8 @@ struct LiveProductionMotionInput {
     control: NanoAgentControlConfig,
     coordinator_actuation_config: NavigationActuationConfigV1,
     accessory_health: NanoAccessoryHealthObserver,
+    #[cfg(all(feature = "nano-agent", feature = "operator-console"))]
+    rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
 }
 
 #[cfg(all(
@@ -5692,6 +5708,7 @@ impl LiveProductionMotionInput {
     fn from_admitted(
         prepared: PreparedNanoProductionRuntime,
         accessory_health: NanoAccessoryHealthObserver,
+        rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
     ) -> Self {
         let control = prepared.startup().policy.control().clone();
         let coordinator_actuation_config = prepared.actuation().config().clone();
@@ -5700,7 +5717,13 @@ impl LiveProductionMotionInput {
             control,
             coordinator_actuation_config,
             accessory_health,
+            rerun_diagnostics_url,
         }
+    }
+
+    #[cfg(all(feature = "nano-agent", feature = "operator-console"))]
+    const fn rerun_diagnostics_url(&self) -> ConsoleRerunDiagnosticsUrl {
+        self.rerun_diagnostics_url
     }
 
     fn take_for_owner(
@@ -5736,6 +5759,7 @@ struct LiveWheelsOffQualificationMotionInput {
     frontend_config: kiko_slam::navigation::WheelsOffQualificationFrontendConfig,
     initial_health: ConsoleSubsystemHealth,
     accessory_health: NanoAccessoryHealthObserver,
+    rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
@@ -5752,6 +5776,7 @@ impl LiveWheelsOffQualificationMotionInput {
         frontend_config: kiko_slam::navigation::WheelsOffQualificationFrontendConfig,
         initial_health: ConsoleSubsystemHealth,
         accessory_health: NanoAccessoryHealthObserver,
+        rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
     ) -> Self {
         Self {
             stopped_controller: Some(stopped_controller),
@@ -5765,6 +5790,7 @@ impl LiveWheelsOffQualificationMotionInput {
             frontend_config,
             initial_health,
             accessory_health,
+            rerun_diagnostics_url,
         }
     }
 
@@ -5793,6 +5819,7 @@ impl LiveWheelsOffQualificationMotionInput {
         kiko_slam::navigation::WheelsOffQualificationFrontendConfig,
         ConsoleSubsystemHealth,
         NanoAccessoryHealthObserver,
+        ConsoleRerunDiagnosticsUrl,
     ) {
         (
             self.stopped_controller
@@ -5813,6 +5840,7 @@ impl LiveWheelsOffQualificationMotionInput {
             self.frontend_config.clone(),
             self.initial_health,
             self.accessory_health.clone(),
+            self.rerun_diagnostics_url,
         )
     }
 }
@@ -6060,6 +6088,7 @@ struct LiveConsoleNavigationObservation {
     last_applied: Option<ConsoleAppliedReceipt>,
     stop_certainty: Option<ConsoleStopCertainty>,
     successful_solver_duration_ns: Option<u64>,
+    rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
 }
 
 #[cfg(all(
@@ -7480,6 +7509,8 @@ fn start_production_motion_runtime(
     control: NanoAgentControlConfig,
     coordinator_actuation_config: NavigationActuationConfigV1,
     accessory_health: NanoAccessoryHealthObserver,
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
     running: Arc<AtomicBool>,
 ) -> Result<LiveProductionMotionRuntime, LiveProductionMotionStartFailure> {
     let PreparedNanoProductionRuntimeParts {
@@ -7636,6 +7667,7 @@ fn start_production_motion_runtime(
             ConsoleSnapshotRevision::parse(1)
                 .expect("the static initial console revision is nonzero"),
         );
+        initial_snapshot.rerun_diagnostics_url = Some(rerun_diagnostics_url);
         initial_snapshot.manual_command_envelope = manual_command_envelope;
         initial_snapshot.runtime = Some(
             owner
@@ -7715,6 +7747,7 @@ fn start_production_motion_runtime(
                 last_applied: None,
                 stop_certainty: None,
                 successful_solver_duration_ns: None,
+                rerun_diagnostics_url,
             },
         }
     };
@@ -7874,6 +7907,7 @@ fn start_wheels_off_qualification_motion_runtime(
         frontend_config,
         initial_health,
         accessory_health,
+        rerun_diagnostics_url,
     ) = input.take_for_owner();
     let boot_id = initial_stop.observed_boot_id().get();
     let stop_request_id = initial_stop.request_id().get();
@@ -7896,6 +7930,7 @@ fn start_wheels_off_qualification_motion_runtime(
     initial_base.health = initial_health;
     initial_base.last_applied = Some(last_applied);
     initial_base.stop_certainty = Some(stop_certainty);
+    initial_base.rerun_diagnostics_url = Some(rerun_diagnostics_url);
     let (console, receiver) = kiko_slam::navigation::wheels_off_qualification_console(profile);
     let telemetry = match kiko_slam::navigation::WheelsOffQualificationTelemetryStore::parse(
         profile,
@@ -7973,6 +8008,7 @@ fn start_wheels_off_qualification_motion_runtime(
             last_applied: Some(last_applied),
             stop_certainty: Some(stop_certainty),
             successful_solver_duration_ns: None,
+            rerun_diagnostics_url,
         },
         initial_health,
         accessory_health,
@@ -8543,6 +8579,7 @@ fn publish_production_console_snapshot(
     snapshot.last_requested_actuation = observation.last_requested_actuation;
     snapshot.last_applied = observation.last_applied;
     snapshot.stop_certainty = observation.stop_certainty;
+    snapshot.rerun_diagnostics_url = Some(observation.rerun_diagnostics_url);
     snapshot.health = refresh_console_accessory_health(snapshot.health, accessory_health)
         .map_err(LiveProductionConsoleProjectionError::AccessoryHealth)?;
     if matches!(snapshot.runtime, Some(AgentRuntimeStateV1::Faulted)) {
@@ -8800,6 +8837,7 @@ fn publish_wheels_off_qualification_snapshot(
     snapshot.last_requested_actuation = runtime.observation.last_requested_actuation;
     snapshot.last_applied = runtime.observation.last_applied;
     snapshot.stop_certainty = runtime.observation.stop_certainty;
+    snapshot.rerun_diagnostics_url = Some(runtime.observation.rerun_diagnostics_url);
     snapshot.health =
         refresh_console_accessory_health(runtime.initial_health, &runtime.accessory_health)
             .map_err(
@@ -9328,6 +9366,8 @@ fn run_live_navigation_worker(
         #[cfg(all(feature = "agent-runtime", unix))]
         LiveNavigationWorkerMotion::Production(input) => {
             let mut input = *input;
+            #[cfg(all(feature = "nano-agent", feature = "operator-console"))]
+            let rerun_diagnostics_url = input.rerun_diagnostics_url();
             let (prepared, control, coordinator_actuation_config, accessory_health) =
                 input.take_for_owner();
             match start_production_motion_runtime(
@@ -9338,6 +9378,8 @@ fn run_live_navigation_worker(
                 control,
                 coordinator_actuation_config,
                 accessory_health,
+                #[cfg(all(feature = "nano-agent", feature = "operator-console"))]
+                rerun_diagnostics_url,
                 Arc::clone(&running),
             ) {
                 Ok(production) => LiveNavigationRuntime::Production(Box::new(production)),
@@ -12219,8 +12261,16 @@ struct NanoLiveSoftwarePreparation {
     rerun_decimation: VizDecimation,
     rerun_finish_timeout: Duration,
     rerun_target: LiveRerunTarget,
+    rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
     production_state: NanoProductionStateOwners,
     warm_start_replay: Option<Box<NanoDatasetReplayRequired>>,
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+enum NanoOrtRuntimeInput<'config> {
+    RetainedBytes(&'config [u8]),
+    #[cfg(feature = "nano-wheels-off-qualification")]
+    Pinned(kiko_slam::PinnedOrtRuntime),
 }
 
 #[cfg(all(feature = "nano-agent", unix))]
@@ -12231,7 +12281,7 @@ struct NanoCommonLiveSoftwareInput<'config> {
     occupancy: &'config NanoLaunchOccupancy,
     inference_policy: &'config NanoLaunchInference,
     rerun: NanoLaunchRerun,
-    onnx_runtime_library: &'config [u8],
+    onnx_runtime: NanoOrtRuntimeInput<'config>,
     superpoint_model: &'config [u8],
     lightglue_model: &'config [u8],
     stereo: NanoBootstrapStereoEvidence,
@@ -12307,7 +12357,13 @@ fn prepare_nano_common_live_software(
     };
 
     require_accessory_healthy()?;
-    let runtime = kiko_slam::pin_ort_runtime_from_memory(input.onnx_runtime_library)?;
+    let runtime = match input.onnx_runtime {
+        NanoOrtRuntimeInput::RetainedBytes(runtime_bytes) => {
+            kiko_slam::pin_ort_runtime_from_memory(runtime_bytes)?
+        }
+        #[cfg(feature = "nano-wheels-off-qualification")]
+        NanoOrtRuntimeInput::Pinned(runtime) => runtime,
+    };
     let superpoint_backend = input.inference_policy.superpoint_backend().runtime();
     let lightglue_backend = input.inference_policy.lightglue_backend().runtime();
     require_accessory_healthy()?;
@@ -12358,6 +12414,7 @@ fn prepare_nano_common_live_software(
             bind: input.rerun.bind(),
             memory_limit_bytes: input.rerun.memory_limit_bytes(),
         },
+        rerun_diagnostics_url: input.rerun.diagnostics_url(),
         production_state,
         warm_start_replay,
     })
@@ -12772,7 +12829,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
             occupancy: launch.launch().occupancy(),
             inference_policy: launch.launch().inference(),
             rerun: launch.launch().rerun(),
-            onnx_runtime_library: assets.onnx_runtime_library.bytes(),
+            onnx_runtime: NanoOrtRuntimeInput::Pinned(assets.pinned_onnx_runtime),
             superpoint_model: assets.superpoint_model.bytes(),
             lightglue_model: assets.lightglue_model.bytes(),
             stereo,
@@ -12878,6 +12935,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
                 frontend_config,
                 initial_health,
                 accessory_health,
+                software.rerun_diagnostics_url,
             ),
         )),
         accessory: Some(accessory),
@@ -12925,7 +12983,7 @@ fn prepare_nano_live_session(
             occupancy: launch.launch().occupancy(),
             inference_policy: launch.launch().inference(),
             rerun: launch.launch().rerun(),
-            onnx_runtime_library: assets.onnx_runtime_library.bytes(),
+            onnx_runtime: NanoOrtRuntimeInput::RetainedBytes(assets.onnx_runtime_library.bytes()),
             superpoint_model: assets.superpoint_model.bytes(),
             lightglue_model: assets.lightglue_model.bytes(),
             stereo,
@@ -12975,7 +13033,11 @@ fn prepare_nano_live_session(
         rerun_target: software.rerun_target,
         oak_provenance,
         motion: PreparedLiveMotionSelection::Production(Box::new(
-            LiveProductionMotionInput::from_admitted(runtime, accessory_health),
+            LiveProductionMotionInput::from_admitted(
+                runtime,
+                accessory_health,
+                software.rerun_diagnostics_url,
+            ),
         )),
         accessory: Some(accessory),
         production_state: Some(software.production_state),
@@ -13251,6 +13313,10 @@ fn prepare_compatibility_live_session(
         mono_config.rectified,
     )
     .require_for(navigation_request.request())?;
+    // EEPROM IMU-to-camera evidence is persisted by an enabled navigation
+    // dataset. A compatibility live session with navigation disabled neither
+    // consumes nor persists it, so it must not gain a new EEPROM failure mode.
+    let require_oak_eeprom_evidence = imu_config.is_some() && navigation_request.is_enabled();
     // This command does not reconnect. One invocation is therefore one
     // explicitly delimited device-clock session.
     let device_session = DeviceSessionId::try_new(1)?;
@@ -13293,7 +13359,13 @@ fn prepare_compatibility_live_session(
     let StereoBootstrap {
         calibration,
         rectified_left_intrinsics,
-    } = bootstrap_stereo(&mut device, &mono_config, running, &mut pairer)?;
+    } = bootstrap_stereo(
+        &mut device,
+        &mono_config,
+        require_oak_eeprom_evidence,
+        running,
+        &mut pairer,
+    )?;
     let rectified = RectifiedStereo::from_calibration(&calibration)?;
     let runtime_depth_camera = DepthCameraModel::new(
         rectified.left(),
@@ -15258,6 +15330,7 @@ fn build_calibration(
     left: OakIntrinsics,
     right: OakIntrinsics,
     baseline_m: f32,
+    oak_eeprom: Option<OakEepromCalibrationEvidence>,
     rectified: bool,
 ) -> Calibration {
     Calibration {
@@ -15279,6 +15352,29 @@ fn build_calibration(
         },
         baseline_m,
         rectified,
+        oak_eeprom: oak_eeprom.map(|evidence| DatasetOakEepromCalibrationEvidence {
+            stereo_left_camera_socket: dataset_oak_camera_socket(
+                evidence.stereo_left_camera_socket(),
+            ),
+            stereo_right_camera_socket: dataset_oak_camera_socket(
+                evidence.stereo_right_camera_socket(),
+            ),
+            imu_to_camera_b_m: evidence.imu_to_camera_b_m(),
+            stereo_left_rectification_rotation_raw: evidence
+                .stereo_left_rectification_rotation_raw(),
+        }),
+    }
+}
+
+#[cfg(feature = "record")]
+fn dataset_oak_camera_socket(socket: OakCameraSocket) -> OakCalibrationCameraSocket {
+    match socket {
+        OakCameraSocket::CameraA => OakCalibrationCameraSocket::CameraA,
+        OakCameraSocket::CameraB => OakCalibrationCameraSocket::CameraB,
+        OakCameraSocket::CameraC => OakCalibrationCameraSocket::CameraC,
+        OakCameraSocket::Unrecognized => {
+            unreachable!("admitted EEPROM evidence cannot retain an unrecognized camera socket")
+        }
     }
 }
 
@@ -15477,6 +15573,11 @@ mod tests {
     };
     use clap::{Parser as _, error::ErrorKind};
     use kiko_slam::dataset::{DatasetError, DepthOpticalFrame, DepthProjectionContract};
+    #[cfg(feature = "record")]
+    use kiko_slam::dataset::{
+        OakCalibrationCameraSocket,
+        OakEepromCalibrationEvidence as DatasetOakEepromCalibrationEvidence,
+    };
     use kiko_slam::dense::{occupancy::OccupancyError, occupancy_runtime::OccupancyRuntimeError};
     #[cfg(all(
         feature = "record",
@@ -16403,7 +16504,9 @@ mod tests {
         require_rectified_left_depth_projection,
     };
     #[cfg(feature = "record")]
-    use oak_sys::{DepthAlignment, Intrinsics as OakIntrinsics};
+    use oak_sys::{
+        DepthAlignment, Intrinsics as OakIntrinsics, OakCameraSocket, OakEepromCalibrationEvidence,
+    };
     #[cfg(feature = "record")]
     fn oak_intrinsics(fx: f32, width: u32, height: u32) -> OakIntrinsics {
         OakIntrinsics::try_from_projection_matrix(
@@ -16416,6 +16519,22 @@ mod tests {
             height,
         )
         .expect("valid test projection")
+    }
+
+    #[cfg(feature = "record")]
+    fn oak_eeprom_calibration() -> OakEepromCalibrationEvidence {
+        OakEepromCalibrationEvidence::try_new(
+            OakCameraSocket::CameraB,
+            OakCameraSocket::CameraC,
+            [
+                [1.0, 0.0, 0.0, 0.01],
+                [0.0, 1.0, 0.0, -0.02],
+                [0.0, 0.0, 1.0, 0.03],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        )
+        .expect("valid test EEPROM calibration")
     }
 
     #[test]
@@ -16567,7 +16686,13 @@ mod tests {
     fn calibration_is_derived_only_from_delivered_projection_types() {
         let left = oak_intrinsics(400.0, 640, 480);
         let right = oak_intrinsics(402.0, 640, 480);
-        let calibration = build_calibration(left, right, 0.075, true);
+        let oak_eeprom = oak_eeprom_calibration();
+        let stereo_only = build_calibration(left, right, 0.075, None, true);
+        assert!(
+            stereo_only.oak_eeprom.is_none(),
+            "stereo-only recording must not require or invent IMU EEPROM evidence"
+        );
+        let calibration = build_calibration(left, right, 0.075, Some(oak_eeprom), true);
 
         assert_eq!(calibration.left.fx, left.fx());
         assert_eq!(calibration.left.fy, left.fy());
@@ -16580,6 +16705,16 @@ mod tests {
         assert_eq!(calibration.right.fx, right.fx());
         assert_eq!(calibration.baseline_m, 0.075);
         assert!(calibration.rectified);
+        assert_eq!(
+            calibration.oak_eeprom,
+            Some(DatasetOakEepromCalibrationEvidence {
+                stereo_left_camera_socket: OakCalibrationCameraSocket::CameraB,
+                stereo_right_camera_socket: OakCalibrationCameraSocket::CameraC,
+                imu_to_camera_b_m: oak_eeprom.imu_to_camera_b_m(),
+                stereo_left_rectification_rotation_raw: oak_eeprom
+                    .stereo_left_rectification_rotation_raw(),
+            })
+        );
     }
 
     #[cfg(feature = "record")]
@@ -17562,7 +17697,7 @@ mod tests {
             "--deployment-root",
             "/opt/kiko/deployment",
             "--launch-config",
-            "nano-wheels-off-qualification-launch-v1.json",
+            "nano-wheels-off-qualification-launch-v2.json",
             "--state-root",
             "/var/lib/kiko-nano-qualification",
         ])
@@ -17573,7 +17708,7 @@ mod tests {
         assert_eq!(args.deployment_root, Path::new("/opt/kiko/deployment"));
         assert_eq!(
             args.launch_config,
-            "nano-wheels-off-qualification-launch-v1.json"
+            "nano-wheels-off-qualification-launch-v2.json"
         );
         assert_eq!(
             args.state_root,
@@ -17587,7 +17722,7 @@ mod tests {
                 "--deployment-root",
                 "/opt/kiko/deployment",
                 "--launch-config",
-                "nano-wheels-off-qualification-launch-v1.json",
+                "nano-wheels-off-qualification-launch-v2.json",
                 "--state-root",
                 "/var/lib/kiko-nano-qualification",
                 "--wheels-removed",

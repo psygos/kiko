@@ -354,7 +354,7 @@ fn bump_projection_revision(
 fn validate_observational_base(
     snapshot: &OperatorConsoleSnapshot,
 ) -> Result<(), WheelsOffQualificationTelemetryError> {
-    if snapshot.schema_version != super::OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V2 {
+    if snapshot.schema_version != super::OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V3 {
         return Err(WheelsOffQualificationTelemetryError::UnsupportedBaseSchema(
             snapshot.schema_version,
         ));
@@ -462,7 +462,7 @@ struct QualificationSnapshotProjection<'a> {
     software_safety_stop_latched: bool,
     software_safety_signal_state: ConsoleSafetySignalState,
     physical_emergency_stop_state: ConsolePhysicalEmergencyStopState,
-    rerun_diagnostics_url: &'a Option<String>,
+    rerun_diagnostics_url: &'a Option<super::ConsoleRerunDiagnosticsUrl>,
     control_profile: WheelsOffQualificationControlProfile,
     wheels_off_qualification: &'a WheelsOffQualificationSnapshot,
 }
@@ -1684,6 +1684,28 @@ mod tests {
             session_capability.parse().unwrap(),
         );
         request
+    }
+
+    #[test]
+    fn telemetry_projection_preserves_typed_rerun_configuration() {
+        let profile = profile();
+        let (console, _receiver) = super::super::wheels_off_qualification_console(profile);
+        let mut base = OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap());
+        base.rerun_diagnostics_url = Some(
+            super::super::ConsoleRerunDiagnosticsUrl::from_admitted_forwarded_port(
+                std::num::NonZeroU16::new(9_876).unwrap(),
+            ),
+        );
+        let telemetry =
+            WheelsOffQualificationTelemetryStore::parse(profile, base, console.snapshot()).unwrap();
+        let bytes = telemetry.serialized_projection(console.snapshot()).unwrap();
+        let projection: serde_json::Value = serde_json::from_slice(bytes.as_ref()).unwrap();
+        assert_eq!(
+            projection["rerun_diagnostics_url"],
+            serde_json::json!("rerun+http://127.0.0.1:9876/proxy")
+        );
+        assert!(projection["requested_owner"].is_null());
+        assert!(projection["actual_authority"].is_null());
     }
 
     #[tokio::test(flavor = "current_thread")]

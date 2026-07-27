@@ -10,7 +10,8 @@ use kiko_device_inventory::{
 use kiko_nano_bundle_renderer::{RenderMode, render_bundle};
 use kiko_slam::navigation::{
     NanoAgentLaunchV3, NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1,
-    NanoWheelsOffQualificationLaunchV1, WheelsOffCandidateControllerBinding,
+    NanoWheelsOffNativeRuntimeV1, NanoWheelsOffQualificationLaunchV2,
+    WheelsOffCandidateControllerBinding,
 };
 use robot_server::config::{ControllerServerConfig, ControllerServerConfigV1};
 use serde_json::{Value, json};
@@ -28,6 +29,7 @@ fn canonical_root(temporary: &TempDir) -> PathBuf {
 }
 
 fn add_production_face_assets(root: &Path, input: &mut Value) {
+    input["schema_version"] = json!(1);
     let frontal = write_source(root, "frontal.xml", b"frontal-cascade-exact");
     let profile = write_source(root, "profile.xml", b"profile-cascade-exact");
     input["assets"]["face_perception"] = json!({
@@ -99,9 +101,9 @@ fn source_fixture() -> (TempDir, Value) {
     let superpoint = write_source(&root, "superpoint.onnx", b"superpoint-exact");
     let lightglue = write_source(&root, "lightglue.onnx", b"lightglue-exact");
     let depthai = write_source(&root, "libdepthai-core.so", b"depthai-exact");
-    let calibration_lib = write_source(&root, "libdynamic-calibration.so", b"calibration-exact");
-    let libusb = write_source(&root, "libusb-1.0.so", b"libusb-exact");
-    let onnx = write_source(&root, "libonnxruntime.so", b"onnxruntime-exact");
+    let calibration_lib = write_source(&root, "libdynamic_calibration.so", b"calibration-exact");
+    let libusb = write_source(&root, "libusb-1.0.so.0", b"libusb-exact");
+    let onnx = write_source(&root, "libonnxruntime.so.1", b"onnxruntime-exact");
     let opencv_core = write_source(&root, "libopencv_core.so.4.5d", b"opencv-core-exact");
     let opencv_imgproc = write_source(&root, "libopencv_imgproc.so.4.5d", b"opencv-imgproc-exact");
     let opencv_objdetect = write_source(
@@ -109,9 +111,17 @@ fn source_fixture() -> (TempDir, Value) {
         "libopencv_objdetect.so.4.5d",
         b"opencv-objdetect-exact",
     );
+    let qualification_executable = write_source(
+        &root,
+        "kiko-nano-wheels-off-qualification",
+        b"qualification-executable-exact",
+    );
     let input = json!({
-        "schema_version": 1,
-        "bundle": { "kind": "wheels_off_qualification" },
+        "schema_version": 2,
+        "bundle": {
+            "kind": "wheels_off_qualification",
+            "qualification_executable_path": qualification_executable
+        },
         "robot_id": "kiko-test",
         "discovery": {
             "oak": {
@@ -176,17 +186,17 @@ fn source_fixture() -> (TempDir, Value) {
             },
             {
                 "role": "dynamic_calibration",
-                "soname": "libdynamic-calibration.so",
+                "soname": "libdynamic_calibration.so",
                 "source_path": calibration_lib
             },
             {
                 "role": "libusb1_0",
-                "soname": "libusb-1.0.so",
+                "soname": "libusb-1.0.so.0",
                 "source_path": libusb
             },
             {
                 "role": "onnxruntime",
-                "soname": "libonnxruntime.so",
+                "soname": "libonnxruntime.so.1",
                 "source_path": onnx
             },
             {
@@ -406,7 +416,7 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
     assert_eq!(plan.bundle_kind, "wheels_off_qualification");
     assert_eq!(
         plan.files.last().expect("last file").relative_path,
-        "nano-wheels-off-qualification-launch-v1.json"
+        "nano-wheels-off-qualification-launch-v2.json"
     );
     assert_eq!(
         plan.files
@@ -416,8 +426,8 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
         "evidence/render-evidence-v1.json"
     );
     for expected in &plan.files {
-        let bytes =
-            fs::read(destination.join(&expected.relative_path)).expect("read staged exact file");
+        let staged_path = destination.join(&expected.relative_path);
+        let bytes = fs::read(&staged_path).expect("read staged exact file");
         assert_eq!(u64::try_from(bytes.len()).unwrap(), expected.byte_len);
         assert_eq!(sha256_hex(&bytes), expected.sha256_hex);
         assert!(
@@ -425,6 +435,20 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
             "{} retained unresolved token",
             expected.relative_path
         );
+        let permissions = fs::metadata(&staged_path)
+            .expect("staged file metadata")
+            .permissions();
+        if expected.relative_path == "bin/kiko-nano-wheels-off-qualification" {
+            assert_eq!(permissions.mode() & 0o777, 0o555);
+        } else {
+            assert!(permissions.readonly());
+            assert_eq!(
+                permissions.mode() & 0o111,
+                0,
+                "only the qualification executable may be executable: {}",
+                expected.relative_path
+            );
+        }
     }
     let render_evidence: Value = serde_json::from_slice(
         &fs::read(destination.join("evidence/render-evidence-v1.json")).expect("render evidence"),
@@ -444,7 +468,7 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
     assert_eq!(recorded_order, planned_order);
     assert_eq!(
         recorded_order.last().expect("last recorded write"),
-        "nano-wheels-off-qualification-launch-v1.json"
+        "nano-wheels-off-qualification-launch-v2.json"
     );
     let inventory_bytes = fs::read(destination.join("device-inventory-candidate-v2.json"))
         .expect("candidate inventory");
@@ -500,9 +524,9 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
         inventory["calibration_artifacts"][0]["sha256"],
         Value::Array(expected_digest)
     );
-    let launch_bytes = fs::read(destination.join("nano-wheels-off-qualification-launch-v1.json"))
+    let launch_bytes = fs::read(destination.join("nano-wheels-off-qualification-launch-v2.json"))
         .expect("qualification launch");
-    NanoWheelsOffQualificationLaunchV1::parse_json(&launch_bytes)
+    NanoWheelsOffQualificationLaunchV2::parse_json(&launch_bytes)
         .expect("typed qualification launch");
     let launch: Value = serde_json::from_slice(&launch_bytes).expect("qualification launch JSON");
     assert_eq!(
@@ -517,8 +541,146 @@ fn launch_is_written_last_and_every_file_matches_plan_digest() {
         launch["calibration_artifact"]["asset"]["sha256_hex"],
         sha256_hex(&calibration)
     );
+    let executable = fs::read(destination.join("bin/kiko-nano-wheels-off-qualification"))
+        .expect("qualification executable");
+    assert_eq!(
+        launch["qualification_executable_asset"]["relative_path"],
+        "bin/kiko-nano-wheels-off-qualification"
+    );
+    assert_eq!(
+        launch["qualification_executable_asset"]["sha256_hex"],
+        sha256_hex(&executable)
+    );
+    assert_eq!(
+        launch["native_runtime_manifest_asset"]["relative_path"],
+        "native-runtime-v1.json"
+    );
+    let native_runtime_manifest =
+        fs::read(destination.join("native-runtime-v1.json")).expect("native runtime manifest");
+    NanoWheelsOffNativeRuntimeV1::parse_json(&native_runtime_manifest)
+        .expect("renderer and qualification bootstrap share one native-runtime contract");
+    assert_eq!(
+        launch["native_runtime_manifest_asset"]["sha256_hex"],
+        sha256_hex(&native_runtime_manifest)
+    );
+    let input_evidence = destination.join("evidence/render-input-v2.json");
+    assert!(
+        input_evidence.exists(),
+        "qualification retains its schema-V2 render input under a versioned evidence name"
+    );
+    let executable_source = render_evidence["sources"]
+        .as_array()
+        .expect("source evidence")
+        .iter()
+        .find(|source| source["role"] == "qualification_executable")
+        .expect("qualification executable source evidence");
+    assert_eq!(
+        executable_source["source_path"],
+        input["bundle"]["qualification_executable_path"]
+    );
+    assert_eq!(
+        executable_source["destination_relative_path"],
+        "bin/kiko-nano-wheels-off-qualification"
+    );
+    assert_eq!(
+        executable_source["byte_len"],
+        u64::try_from(executable.len()).expect("executable length")
+    );
+    assert_eq!(executable_source["sha256_hex"], sha256_hex(&executable));
     assert!(fs::metadata(&destination).unwrap().permissions().readonly());
     restore_writable(&destination);
+}
+
+#[test]
+fn bundle_variants_own_disjoint_executable_inputs() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    let qualification_executable_path = input["bundle"]["qualification_executable_path"].clone();
+
+    input["bundle"] = json!({ "kind": "wheels_off_qualification" });
+    assert!(
+        render_bundle(&write_input(&root, &input), RenderMode::DryRun).is_err(),
+        "qualification must bind its exact executable"
+    );
+
+    input["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": null,
+        "qualification_executable_path": qualification_executable_path
+    });
+    input["schema_version"] = json!(1);
+    assert!(
+        render_bundle(&write_input(&root, &input), RenderMode::DryRun).is_err(),
+        "production must reject qualification-only executable input"
+    );
+}
+
+#[test]
+fn render_input_versions_are_bundle_specific_and_fail_closed() {
+    let (temporary, input) = source_fixture();
+    let root = canonical_root(&temporary);
+
+    let mut legacy_qualification = input.clone();
+    legacy_qualification["schema_version"] = json!(1);
+    legacy_qualification["bundle"]
+        .as_object_mut()
+        .expect("qualification bundle")
+        .remove("qualification_executable_path");
+    let error = render_bundle(
+        &write_input(&root, &legacy_qualification),
+        RenderMode::DryRun,
+    )
+    .expect_err("published qualification V1 cannot be reinterpreted as V2");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported wheels_off_qualification render-input schema 1; expected 2")
+    );
+
+    let mut production = input;
+    add_production_face_assets(&root, &mut production);
+    production["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": null
+    });
+    let error = render_bundle(&write_input(&root, &production), RenderMode::DryRun)
+        .expect_err("production V1 reaches the independent profile gate");
+    assert!(
+        error
+            .to_string()
+            .contains("fail-closed without a separate admitted"),
+        "production render-input schema V1 remains admitted"
+    );
+
+    production["schema_version"] = json!(2);
+    let error = render_bundle(&write_input(&root, &production), RenderMode::DryRun)
+        .expect_err("production must not silently adopt qualification schema V2");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported production render-input schema 2; expected 1")
+    );
+}
+
+#[test]
+fn qualification_requires_every_reviewed_exact_nano_soname() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    let onnx = input["native_libraries"]
+        .as_array_mut()
+        .expect("native libraries")
+        .iter_mut()
+        .find(|library| library["role"] == "onnxruntime")
+        .expect("ONNX Runtime role");
+    onnx["soname"] = json!("libonnxruntime.so");
+
+    let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
+        .expect_err("loader-compatible but unreviewed qualification SONAME must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("requires Nano SONAME \"libonnxruntime.so.1\"")
+    );
 }
 
 #[test]
@@ -547,6 +709,7 @@ fn production_without_exact_face_assets_is_fail_closed() {
         "kind": "production",
         "production_controller_profile_path": null
     });
+    input["schema_version"] = json!(1);
     let input_path = write_input(&root, &input);
     let error =
         render_bundle(&input_path, RenderMode::DryRun).expect_err("face assets are mandatory");
@@ -611,6 +774,18 @@ fn production_derives_navigation_digest_and_loopback_port() {
     )
     .expect("production render");
     assert_eq!(plan.bundle_kind, "production");
+    assert!(destination.join("evidence/render-input-v1.json").exists());
+    assert!(!destination.join("evidence/render-input-v2.json").exists());
+    let production_input_permissions =
+        fs::metadata(destination.join("evidence/render-input-v1.json"))
+            .expect("production render-input evidence metadata")
+            .permissions();
+    assert!(production_input_permissions.readonly());
+    assert_eq!(
+        production_input_permissions.mode() & 0o111,
+        0,
+        "production and other non-executable leaves retain readonly, non-executable permissions"
+    );
     assert_eq!(
         plan.files.last().unwrap().relative_path,
         "nano-agent-launch-v3.json"

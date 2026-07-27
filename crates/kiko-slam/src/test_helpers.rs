@@ -116,6 +116,7 @@ pub(crate) fn make_rectified_stereo(
         right,
         baseline_m,
         rectified: true,
+        oak_eeprom: None,
     };
     Ok(RectifiedStereo::from_calibration_with_config(
         &calibration,

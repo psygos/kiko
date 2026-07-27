@@ -43,6 +43,11 @@ name = "kiko-boot-journal-image"
 path = "src/boot_journal_image.rs"
 required-features = ["boot-journal-tool"]
 
+[[bin]]
+name = "kiko-boot-journal-inspect"
+path = "src/boot_journal_inspect.rs"
+required-features = ["boot-journal-tool"]
+
 [dependencies]
 robot-protocol = { path = "../comms/robot-protocol" }
 

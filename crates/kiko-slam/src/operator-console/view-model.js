@@ -295,9 +295,43 @@
     return receipt;
   }
 
+  function parseRerunDiagnosticsUrl(value) {
+    if (value == null) return null;
+    if (typeof value !== "string") {
+      throw new Error("rerun_diagnostics_url must be a string or null");
+    }
+    let url;
+    try {
+      url = new URL(value);
+    } catch (_) {
+      throw new Error("rerun_diagnostics_url must be an exact Rerun proxy URI");
+    }
+    const port = Number(url.port);
+    const canonical = `rerun+http://${url.host}/proxy`;
+    if (url.protocol !== "rerun+http:"
+      || url.hostname !== "127.0.0.1"
+      || !Number.isInteger(port)
+      || port < 1
+      || port > 65_535
+      || url.username !== ""
+      || url.password !== ""
+      || url.pathname !== "/proxy"
+      || url.search !== ""
+      || url.hash !== ""
+      || value !== canonical) {
+      throw new Error(
+        "rerun_diagnostics_url must be a canonical unencrypted 127.0.0.1 proxy URI",
+      );
+    }
+    return Object.freeze({
+      connectUri: canonical,
+      forwardedPort: port,
+    });
+  }
+
   function parseConsoleSnapshot(raw) {
     const snapshot = object(raw, "snapshot");
-    if (snapshot.schema_version !== 2) {
+    if (snapshot.schema_version !== 3) {
       throw new Error("unsupported snapshot schema");
     }
     exactString(snapshot.revision, DECIMAL_ID, "snapshot.revision");
@@ -331,7 +365,12 @@
     if (snapshot.stop_certainty != null) {
       enumValue(snapshot.stop_certainty, STOP_CERTAINTY, "stop_certainty");
     }
-    return snapshot;
+    return {
+      ...snapshot,
+      rerun_diagnostics_url: parseRerunDiagnosticsUrl(
+        snapshot.rerun_diagnostics_url,
+      ),
+    };
   }
 
   function words(value) {
@@ -496,6 +535,7 @@
 
   const api = Object.freeze({
     parseConsoleSnapshot,
+    parseRerunDiagnosticsUrl,
     formatNsMilliseconds,
     connectionView,
     authorityView,

@@ -382,6 +382,7 @@ fn bootstrap_stereo(
         },
         baseline_m,
         rectified: true,
+        oak_eeprom: None,
     };
     Ok((left, right, observed))
 }

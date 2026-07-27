@@ -127,6 +127,13 @@ UsbSpeed from_depthai_usb_speed(dai::UsbSpeed speed) {
     }
 }
 
+CameraSocket from_depthai_camera_socket(dai::CameraBoardSocket socket) noexcept {
+    if (socket == dai::CameraBoardSocket::CAM_A) return CameraSocket::CameraA;
+    if (socket == dai::CameraBoardSocket::CAM_B) return CameraSocket::CameraB;
+    if (socket == dai::CameraBoardSocket::CAM_C) return CameraSocket::CameraC;
+    return CameraSocket::Unrecognized;
+}
+
 template <typename T>
 T next_sequence(std::atomic<T>& sequence) {
     auto current = sequence.load(std::memory_order_relaxed);
@@ -143,6 +150,37 @@ T next_sequence(std::atomic<T>& sequence) {
             return current;
         }
     }
+}
+
+template <std::size_t Rows, std::size_t Columns>
+rust::Vec<float> flatten_calibration_matrix(
+    const std::vector<std::vector<float>>& matrix,
+    const char* matrix_name
+) {
+    if (matrix.size() != Rows) {
+        throw std::runtime_error(
+            std::string("DepthAI ") + matrix_name + " has "
+            + std::to_string(matrix.size()) + " rows; expected "
+            + std::to_string(Rows)
+        );
+    }
+
+    rust::Vec<float> flattened;
+    flattened.reserve(Rows * Columns);
+    for (std::size_t row = 0; row < Rows; ++row) {
+        if (matrix[row].size() != Columns) {
+            throw std::runtime_error(
+                std::string("DepthAI ") + matrix_name + " row "
+                + std::to_string(row) + " has "
+                + std::to_string(matrix[row].size()) + " columns; expected "
+                + std::to_string(Columns)
+            );
+        }
+        for (std::size_t column = 0; column < Columns; ++column) {
+            flattened.push_back(matrix[row][column]);
+        }
+    }
+    return flattened;
 }
 
 }  // namespace
@@ -598,6 +636,39 @@ float OakDevice::get_stereo_baseline_m() const {
         false,
         dai::LengthUnit::METER
     );
+}
+
+EepromCalibrationEvidence OakDevice::get_eeprom_calibration_evidence() const {
+    const auto device = pipeline_->getDefaultDevice();
+    if (!device) {
+        throw std::runtime_error(
+            "cannot read EEPROM calibration without the connected OAK device"
+        );
+    }
+    // Unlike readCalibration(), readCalibration2() propagates EEPROM access
+    // failures instead of substituting an empty/default handler.
+    const auto eeprom_calibration = device->readCalibration2();
+    EepromCalibrationEvidence evidence{};
+    evidence.stereo_left_camera_socket = from_depthai_camera_socket(
+        eeprom_calibration.getStereoLeftCameraId()
+    );
+    evidence.stereo_right_camera_socket = from_depthai_camera_socket(
+        eeprom_calibration.getStereoRightCameraId()
+    );
+    evidence.imu_to_camera_b_m = flatten_calibration_matrix<4, 4>(
+        eeprom_calibration.getImuToCameraExtrinsics(
+            dai::CameraBoardSocket::CAM_B,
+            false,
+            dai::LengthUnit::METER
+        ),
+        "IMU-to-CAM_B extrinsics"
+    );
+    evidence.stereo_left_rectification_rotation_raw =
+        flatten_calibration_matrix<3, 3>(
+            eeprom_calibration.getStereoLeftRectificationRotation(),
+            "stereo-left rectification rotation"
+        );
+    return evidence;
 }
 
 ConnectedDeviceIdentity OakDevice::get_connected_device_identity() const {

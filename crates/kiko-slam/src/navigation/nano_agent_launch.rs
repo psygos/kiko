@@ -8,14 +8,15 @@
 //! liveness, calibration quality, plant validity, or safe physical motion.
 
 use std::fmt;
-use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::Path;
 
 use kiko_device_inventory::{
     ArtifactRelativePath, ArtifactRelativePathError, DeploymentAssetByteLimit,
     DeploymentAssetByteLimitError, DeploymentAssetContentSha256, DeploymentAssetLoadError,
-    LoadedDeploymentAsset, MAX_DEPLOYMENT_ASSET_BYTES, load_deployment_asset,
+    LoadedDeploymentAsset, MAX_DEPLOYMENT_ASSET_BYTES, StreamedDeploymentAssetIdentity,
+    load_deployment_asset, stream_deployment_asset_identity,
 };
 use oak_sys::{
     DepthAlignment, DepthConfig, DeviceConfig, DeviceConfigError, ImuConfig, MonoConfig,
@@ -24,9 +25,10 @@ use oak_sys::{
 use serde::Deserialize;
 
 use super::{
-    MAX_NANO_AGENT_POLICY_CONFIG_JSON_BYTES, MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES,
-    MAX_NANO_OCCUPANCY_CELLS, MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES,
-    MAX_NAVIGATION_INGRESS_RECORDS, MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
+    ConsoleRerunDiagnosticsUrl, MAX_NANO_AGENT_POLICY_CONFIG_JSON_BYTES,
+    MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES, MAX_NANO_OCCUPANCY_CELLS,
+    MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES, MAX_NAVIGATION_INGRESS_RECORDS,
+    MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
 };
 use crate::InferenceBackend;
 use crate::dense::occupancy::OccupancyGridGeometry;
@@ -189,6 +191,32 @@ impl NanoLaunchAssetBinding {
             });
         }
         Ok(loaded)
+    }
+
+    /// Stream and compare one exact bound asset without retaining its bytes.
+    ///
+    /// Use this for executable and native-library evidence that is consumed by
+    /// the OS loader rather than by Rust. Assets parsed or consumed from memory
+    /// must continue to use [`Self::load_exact`].
+    pub fn verify_exact_streaming(
+        &self,
+        deployment_root: &Path,
+    ) -> Result<StreamedDeploymentAssetIdentity, NanoLaunchBoundAssetLoadError> {
+        let identity = stream_deployment_asset_identity(
+            deployment_root,
+            self.relative_path.clone(),
+            self.byte_limit,
+        )
+        .map_err(NanoLaunchBoundAssetLoadError::Load)?;
+        let observed = *identity.content_sha256().as_bytes();
+        if observed != self.expected_sha256 {
+            return Err(NanoLaunchBoundAssetLoadError::ContentMismatch {
+                relative_path: self.relative_path.clone(),
+                expected_sha256: self.expected_sha256,
+                observed_sha256: observed,
+            });
+        }
+        Ok(identity)
     }
 }
 
@@ -528,15 +556,19 @@ impl NanoLaunchInference {
 /// input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NanoLaunchRerun {
-    bind: SocketAddr,
+    diagnostics_url: ConsoleRerunDiagnosticsUrl,
     decimation: NonZeroU32,
     memory_limit_bytes: NonZeroU64,
     flush_timeout_ms: NonZeroU64,
 }
 
 impl NanoLaunchRerun {
-    pub const fn bind(self) -> SocketAddr {
-        self.bind
+    pub fn bind(self) -> SocketAddr {
+        self.diagnostics_url.serve_loopback_bind()
+    }
+
+    pub const fn diagnostics_url(self) -> ConsoleRerunDiagnosticsUrl {
+        self.diagnostics_url
     }
 
     pub const fn decimation(self) -> u32 {
@@ -1104,6 +1136,9 @@ pub enum NanoAgentLaunchParseError {
     },
     NonLoopbackSocket {
         field: &'static str,
+        address: SocketAddr,
+    },
+    NonCanonicalRerunSocket {
         address: SocketAddr,
     },
     ZeroSocketPort {
@@ -1753,7 +1788,7 @@ pub(crate) fn parse_rerun(
         return Err(NanoAgentLaunchParseError::UnsupportedRerunKind);
     }
     Ok(NanoLaunchRerun {
-        bind: parse_loopback_socket("rerun.bind", dto.bind)?,
+        diagnostics_url: parse_rerun_diagnostics_url(dto.bind)?,
         decimation: bounded_nonzero_u32("rerun.decimation", dto.decimation, MAX_RERUN_DECIMATION)?,
         memory_limit_bytes: bounded_nonzero_u64(
             "rerun.memory_limit_bytes",
@@ -2023,6 +2058,28 @@ fn ensure_distinct_v3_input_assets(
         }
     }
     Ok(())
+}
+
+fn parse_rerun_diagnostics_url(
+    value: String,
+) -> Result<ConsoleRerunDiagnosticsUrl, NanoAgentLaunchParseError> {
+    let address =
+        value
+            .parse::<SocketAddr>()
+            .map_err(|source| NanoAgentLaunchParseError::InvalidSocket {
+                field: "rerun.bind",
+                source,
+            })?;
+    if address.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+        return Err(NanoAgentLaunchParseError::NonCanonicalRerunSocket { address });
+    }
+    let forwarded_port =
+        NonZeroU16::new(address.port()).ok_or(NanoAgentLaunchParseError::ZeroSocketPort {
+            field: "rerun.bind",
+        })?;
+    Ok(ConsoleRerunDiagnosticsUrl::from_admitted_forwarded_port(
+        forwarded_port,
+    ))
 }
 
 fn parse_loopback_socket(
@@ -2589,15 +2646,21 @@ mod tests {
             })
         ));
 
-        let mut public_rerun = valid_value();
-        public_rerun["rerun"]["bind"] = json!("[::]:9876");
-        assert!(matches!(
-            parse(&public_rerun),
-            Err(NanoAgentLaunchParseError::NonLoopbackSocket {
-                field: "rerun.bind",
-                ..
-            })
-        ));
+        for address in ["[::]:9876", "[::1]:9876", "127.0.0.2:9876"] {
+            let mut noncanonical_rerun = valid_value();
+            noncanonical_rerun["rerun"]["bind"] = json!(address);
+            assert!(matches!(
+                parse(&noncanonical_rerun),
+                Err(NanoAgentLaunchParseError::NonCanonicalRerunSocket { .. })
+            ));
+        }
+
+        let parsed = parse(&valid_value()).expect("canonical launch");
+        assert_eq!(parsed.rerun().bind(), "127.0.0.1:9876".parse().unwrap());
+        assert_eq!(
+            parsed.rerun().diagnostics_url().to_string(),
+            "rerun+http://127.0.0.1:9876/proxy"
+        );
 
         let mut fps = valid_value();
         fps["oak"]["rgb"]["fps"] = json!(MAX_OAK_FRAME_RATE_HZ + 1);
@@ -2813,6 +2876,19 @@ mod tests {
             binding.load_exact(&directory),
             Err(NanoLaunchBoundAssetLoadError::ContentMismatch { .. })
         ));
+        assert!(matches!(
+            binding.verify_exact_streaming(&directory),
+            Err(NanoLaunchBoundAssetLoadError::ContentMismatch { .. })
+        ));
+        let exact = NanoLaunchAssetBinding {
+            expected_sha256: Sha256::digest(b"actual").into(),
+            ..binding
+        };
+        let identity = exact
+            .verify_exact_streaming(&directory)
+            .expect("streaming exact binding");
+        assert_eq!(identity.byte_len(), 6);
+        assert_eq!(identity.relative_path().as_str(), "config/policy.json");
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 

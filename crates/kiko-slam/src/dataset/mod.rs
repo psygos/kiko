@@ -639,6 +639,38 @@ pub struct Calibration {
     pub baseline_m: f32,
     #[serde(default)]
     pub rectified: bool,
+    /// Optional raw OAK EEPROM matrices captured by the same device owner as
+    /// the recorded streams. These are evidence only: they are not composed
+    /// into, or labelled as, a robot-base calibration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oak_eeprom: Option<OakEepromCalibrationEvidence>,
+}
+
+/// Exact finite coefficients admitted by `oak-sys` from the pinned DepthAI
+/// EEPROM APIs. Direction is named only where the API documents it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct OakEepromCalibrationEvidence {
+    /// EEPROM camera socket assigned to the stereo-left role.
+    pub stereo_left_camera_socket: OakCalibrationCameraSocket,
+    /// EEPROM camera socket assigned to the stereo-right role.
+    pub stereo_right_camera_socket: OakCalibrationCameraSocket,
+    /// Exact `getImuToCameraExtrinsics(CAM_B, false, METER)` output. The final
+    /// column's translation components are metres.
+    pub imu_to_camera_b_m: [[f32; 4]; 4],
+    /// Exact `getStereoLeftRectificationRotation()` output. The pinned
+    /// DepthAI API does not document its transform direction, so this is not
+    /// a source-to-destination transform claim.
+    pub stereo_left_rectification_rotation_raw: [[f32; 3]; 3],
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OakCalibrationCameraSocket {
+    #[serde(rename = "CAM_A")]
+    CameraA,
+    #[serde(rename = "CAM_B")]
+    CameraB,
+    #[serde(rename = "CAM_C")]
+    CameraC,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -5115,7 +5147,61 @@ mod tests {
             right: intrinsics,
             baseline_m: 0.1,
             rectified: true,
+            oak_eeprom: None,
         }
+    }
+
+    #[test]
+    fn oak_eeprom_calibration_evidence_is_optional_and_round_trips_exactly() {
+        let legacy = calibration();
+        let legacy_json = serde_json::to_value(&legacy).expect("serialize legacy calibration");
+        assert!(
+            legacy_json.get("oak_eeprom").is_none(),
+            "absent evidence must not be serialized as an inferred calibration"
+        );
+        let parsed_legacy: Calibration =
+            serde_json::from_value(legacy_json).expect("parse legacy calibration");
+        assert!(parsed_legacy.oak_eeprom.is_none());
+
+        let evidence = OakEepromCalibrationEvidence {
+            stereo_left_camera_socket: OakCalibrationCameraSocket::CameraB,
+            stereo_right_camera_socket: OakCalibrationCameraSocket::CameraC,
+            imu_to_camera_b_m: [
+                [1.0, 0.0, 0.0, 0.01],
+                [0.0, 1.0, 0.0, -0.02],
+                [0.0, 0.0, 1.0, 0.03],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            stereo_left_rectification_rotation_raw: [
+                [1.0, f32::from_bits(1), -0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        };
+        let mut with_evidence = calibration();
+        with_evidence.oak_eeprom = Some(evidence.clone());
+        let document =
+            serde_json::to_value(&with_evidence).expect("serialize EEPROM evidence document");
+        assert_eq!(document["oak_eeprom"]["stereo_left_camera_socket"], "CAM_B");
+        assert_eq!(
+            document["oak_eeprom"]["stereo_right_camera_socket"],
+            "CAM_C"
+        );
+        assert!(
+            document["oak_eeprom"]
+                .get("stereo_left_rectification_rotation_raw")
+                .is_some()
+        );
+        assert!(
+            document["oak_eeprom"]
+                .get("camera_b_to_rectified_left_rotation")
+                .is_none(),
+            "the persisted raw method output must not assert an undocumented direction"
+        );
+        let encoded = serde_json::to_vec(&with_evidence).expect("serialize EEPROM evidence");
+        let decoded: Calibration = serde_json::from_slice(&encoded).expect("parse EEPROM evidence");
+
+        assert_eq!(decoded.oak_eeprom, Some(evidence));
     }
 
     fn meta_with_depth(width: u32, height: u32) -> Meta {
