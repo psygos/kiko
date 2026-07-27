@@ -146,6 +146,15 @@ pub fn build_position_read(id: ServoId) -> CommandFrame {
     build_command(id, INSTRUCTION_READ, &[PRESENT_POSITION_REGISTER, 2])
 }
 
+/// Read the exact two-byte goal-position register without changing it.
+///
+/// Installed Kiko servos do not acknowledge goal writes at their configured
+/// response level. A caller which needs stronger evidence than host-write
+/// completion must issue this read and parse the result as a goal observation.
+pub fn build_goal_position_read(id: ServoId) -> CommandFrame {
+    build_command(id, INSTRUCTION_READ, &[GOAL_POSITION_REGISTER, 2])
+}
+
 pub fn build_full_telemetry_read(id: ServoId) -> CommandFrame {
     build_command(
         id,
@@ -354,6 +363,10 @@ mod tests {
         assert_eq!(
             build_position_read(id(3)).as_bytes(),
             &[0xff, 0xff, 3, 4, 2, 56, 2, 0xbc]
+        );
+        assert_eq!(
+            build_goal_position_read(id(3)).as_bytes(),
+            &[0xff, 0xff, 3, 4, 2, 42, 2, 0xca]
         );
         assert_eq!(
             build_full_telemetry_read(id(4)).as_bytes(),

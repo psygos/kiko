@@ -92,6 +92,43 @@ impl PresentPosition {
     }
 }
 
+/// Exact goal-position register response for one exact servo ID.
+///
+/// This is register readback, not proof that the mechanism reached the goal.
+/// Physical position remains available only through [`PresentPosition`] or
+/// [`FullTelemetry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GoalPositionObservation {
+    id: ServoId,
+    ticks: PositionTicks,
+}
+
+impl GoalPositionObservation {
+    pub fn parse(bytes: &[u8], expected_id: ServoId) -> Result<Self, TelemetryParseError> {
+        let parameters = parse_status_response(bytes, expected_id, 2)?;
+        let raw = u16::from_le_bytes([parameters[0], parameters[1]]);
+        let ticks = PositionTicks::try_new(raw).map_err(|source| {
+            TelemetryParseError::PositionOutOfRange {
+                id: expected_id,
+                raw,
+                source,
+            }
+        })?;
+        Ok(Self {
+            id: expected_id,
+            ticks,
+        })
+    }
+
+    pub const fn id(self) -> ServoId {
+        self.id
+    }
+
+    pub const fn ticks(self) -> PositionTicks {
+        self.ticks
+    }
+}
+
 /// One checksum-valid 15-byte STS register window (`56..=70`).
 ///
 /// Position and the moving flag have stable domain semantics. Other values
@@ -418,6 +455,21 @@ mod tests {
         assert!(telemetry.is_moving());
         assert_eq!(telemetry.registers_67_68_raw(), 0xadde);
         assert_eq!(telemetry.current_raw(), 0xbeef);
+    }
+
+    #[test]
+    fn goal_position_is_distinct_typed_register_readback() {
+        let servo = id(3);
+        let observation =
+            GoalPositionObservation::parse(&status(servo, &2_943_u16.to_le_bytes()), servo)
+                .expect("goal-position response");
+
+        assert_eq!(observation.id(), servo);
+        assert_eq!(observation.ticks().get(), 2_943);
+        assert!(matches!(
+            GoalPositionObservation::parse(&status(servo, &4_096_u16.to_le_bytes()), servo),
+            Err(TelemetryParseError::PositionOutOfRange { raw: 4_096, .. })
+        ));
     }
 
     #[test]

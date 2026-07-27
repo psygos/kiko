@@ -16,8 +16,9 @@ mod telemetry;
 pub use packet::{
     CommandFrame, FrameBuildError, GoalSpeedTicksPerSecond, PositionTicks, ResponseParseError,
     ServoId, ServoStatus, TorqueLimitPermille, TorqueSwitch, build_full_telemetry_read,
-    build_goal_with_speed_write, build_ping, build_position_read, build_torque_limit_write,
-    build_torque_switch_read, build_torque_switch_write, parse_status_response,
+    build_goal_position_read, build_goal_with_speed_write, build_ping, build_position_read,
+    build_torque_limit_write, build_torque_switch_read, build_torque_switch_write,
+    parse_status_response,
 };
 pub use pose::{
     AngleRadians, ExactHeadTargetPose, ExactHeadTargetPoseError, HeadJoint, HeadPose,
@@ -26,8 +27,9 @@ pub use pose::{
     build_natural_hold_frames,
 };
 pub use telemetry::{
-    FullTelemetry, ObservedTorqueSwitch, PositionAgreementError, PositionAgreementTicks,
-    PresentPosition, TelemetryParseError, TorqueSwitchObservation, ValidatedPresentPosition,
+    FullTelemetry, GoalPositionObservation, ObservedTorqueSwitch, PositionAgreementError,
+    PositionAgreementTicks, PresentPosition, TelemetryParseError, TorqueSwitchObservation,
+    ValidatedPresentPosition,
 };
 
 /// Proven electrical configuration of the Waveshare adapter used by the demo
