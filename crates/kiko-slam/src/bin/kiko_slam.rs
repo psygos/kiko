@@ -11487,6 +11487,57 @@ enum PreparedLiveMotionSelection {
     WheelsOffQualification(Box<LiveWheelsOffQualificationMotionInput>),
 }
 
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "nano-agent",
+    unix
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NanoLiveMotionKind {
+    Compatibility,
+    Production,
+    #[cfg(feature = "nano-wheels-off-qualification")]
+    WheelsOffQualification,
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "nano-agent",
+    unix
+))]
+impl NanoLiveMotionKind {
+    const fn requires_navigation_stop_before_accessory_release(self) -> bool {
+        #[cfg(feature = "nano-wheels-off-qualification")]
+        {
+            matches!(self, Self::WheelsOffQualification)
+        }
+        #[cfg(not(feature = "nano-wheels-off-qualification"))]
+        {
+            let _ = self;
+            false
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "nano-agent",
+    unix
+))]
+impl PreparedLiveMotionSelection {
+    const fn nano_live_motion_kind(&self) -> NanoLiveMotionKind {
+        match self {
+            Self::Compatibility => NanoLiveMotionKind::Compatibility,
+            Self::Production(_) => NanoLiveMotionKind::Production,
+            #[cfg(feature = "nano-wheels-off-qualification")]
+            Self::WheelsOffQualification(_) => NanoLiveMotionKind::WheelsOffQualification,
+        }
+    }
+}
+
 #[cfg(feature = "record")]
 enum LiveOccupancyWorkerStartup {
     Fresh(OccupancyRuntimeConfig),
@@ -13742,6 +13793,10 @@ fn run_prepared_live_session(
         #[cfg(feature = "actuation")]
         #[cfg(all(feature = "nano-agent", unix))]
         let selected_motion = nano_setup_guard.take_motion();
+        #[cfg(all(feature = "actuation", feature = "nano-agent", unix))]
+        let navigation_stop_precedes_accessory_release = selected_motion
+            .nano_live_motion_kind()
+            .requires_navigation_stop_before_accessory_release();
         #[cfg(all(feature = "actuation", not(all(feature = "nano-agent", unix))))]
         let selected_motion = motion;
         #[cfg(feature = "actuation")]
@@ -14588,7 +14643,7 @@ fn run_prepared_live_session(
         )?;
 
         #[cfg(all(feature = "nano-agent", unix))]
-        let (navigation_handle, accessory) = post_navigation_setup_guard.into_parts();
+        let (mut navigation_handle, accessory) = post_navigation_setup_guard.into_parts();
         #[cfg(all(feature = "nano-agent", unix))]
         let mut accessory_failures = Vec::new();
         #[cfg(all(feature = "nano-agent", unix))]
@@ -14958,9 +15013,26 @@ fn run_prepared_live_session(
             }
         }
 
+        let mut navigation_descriptor = None;
+        #[cfg(all(feature = "nano-agent", unix))]
+        if navigation_stop_precedes_accessory_release && let Some(handle) = navigation_handle.take()
+        {
+            match handle.join() {
+                Ok(Ok(success)) => navigation_descriptor = Some(success.descriptor),
+                Ok(Err(error)) => live_failures.push(LiveWorkerFailure::Navigation(error)),
+                Err(payload) => live_failures.push(LiveWorkerFailure::NavigationPanic {
+                    detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+                }),
+            }
+        }
+
         // Accessory terminal evidence is authoritative for a restart-ready
         // checkpoint too. Collect it before deciding whether the drained
-        // dataset may be published.
+        // dataset may be published. Wheels-off qualification cannot request a
+        // warm checkpoint, so its navigation owner has already joined above:
+        // the controller-shutdown outcome is therefore collected before
+        // release of supervised natural head hold. Production retains its
+        // checkpoint handshake.
         #[cfg(all(feature = "nano-agent", unix))]
         if let Some(worker) = accessory_worker.take() {
             match worker.shutdown() {
@@ -15109,7 +15181,6 @@ fn run_prepared_live_session(
             }
         }
 
-        let mut navigation_descriptor = None;
         if let Some(handle) = navigation_handle {
             match handle.join() {
                 Ok(Ok(success)) => navigation_descriptor = Some(success.descriptor),
@@ -15538,7 +15609,7 @@ mod tests {
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     use super::{
         AttendedWheelsOffAttestationError, MAX_QUALIFICATION_ATTESTATION_LINE_BYTES,
-        read_bounded_tty_line,
+        NanoLiveMotionKind, read_bounded_tty_line,
     };
     use super::{
         BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, LiveDecisionVizKind,
@@ -17691,6 +17762,21 @@ mod tests {
         assert_eq!(args.deployment_root, Path::new("/opt/kiko/deployment"));
         assert_eq!(args.launch_config, "nano-agent-launch-v3.json");
         assert_eq!(args.state_root, Path::new("/var/lib/kiko-nano-agent"));
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn qualification_keeps_accessory_hold_until_navigation_stop() {
+        assert!(
+            NanoLiveMotionKind::WheelsOffQualification
+                .requires_navigation_stop_before_accessory_release()
+        );
+        assert!(
+            !NanoLiveMotionKind::Compatibility.requires_navigation_stop_before_accessory_release()
+        );
+        assert!(
+            !NanoLiveMotionKind::Production.requires_navigation_stop_before_accessory_release()
+        );
     }
 
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
