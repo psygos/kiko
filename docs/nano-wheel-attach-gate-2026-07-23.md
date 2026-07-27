@@ -135,6 +135,60 @@ present and the child still held the head endpoint. The OAK remained on the
 480M USB2 tree while the 10000M USB3 tree had no OAK below it. No process was
 stopped and no camera was opened. Gate A therefore remains closed.
 
+### 2026-07-27 exact V3 runtime and STM32 candidate reproduction
+
+The native executable and runtime evidence are bound to exact build revision
+`3f262f1a9b377448c903ed61305b28498b2b2c7f`. The qualification renderer and
+launch contract are V3. V1 and V2 qualification documents fail closed because
+V2 incorrectly treated the system ABI name `libusb-1.0.so.0` as the pinned
+DepthAI dependency. Pinned DepthAI v3.4.0 directly needs the staged
+`libusb-1.0.so`; the system `.so.0` observed through OpenCV/libdc1394 is a
+separate OS ABI dependency.
+
+At that exact revision, the native Linux-aarch64 qualification executable was
+built against the clean DepthAI v3.4.0 source at commit
+`ba7a920a2568ea6eaaaebf3f92bbdb40924187ae`. It is 28,513,456 bytes with
+SHA-256
+`259846acdaf33f50a774e4128f350c10c596d48d83cff724a047e9db96bcaa93`.
+The staged runtime evidence is retained at
+`/home/makerspace/kiko-native-evidence/3f262f1-20260727T013755Z`; its
+`EVIDENCE-SHA256SUMS` file has SHA-256
+`6d7536940c4c4b78d43ff2cd6c4caf1541744f2fc9dab37c3ed89b3873f9337c`.
+Target loader evidence found no unresolved entry and resolved the six
+ELF-loaded staged roles from that directory. ONNX Runtime `1.24.2` was
+separately loaded from its exact staged path and its C API 24 was available.
+Its source tree was observed at exact commit
+`058787ceead760166e3c50a0a4cba8a833a6f53f`, but this lane did not
+independently rebuild that ONNX Runtime binary.
+
+The exact native OAK suite passed 35 tests with one explicit ignored
+hardware-free cascade smoke. That smoke was then selected explicitly and
+passed using the exact front/profile cascade bytes; it opened no OAK. The
+evidence manifest predates those later test invocations and therefore does
+not claim to contain their output. Build and test durations are not
+performance measurements.
+
+Two distinct clean Nano checkouts at the same Kiko revision also produced
+byte-identical operator-supervised STM32 candidate artifacts. The natural
+48,820-byte binary ends exclusively at `0x0800beb4`; final `PT_LOAD`
+inspection, including the flash-backed `.data` segment, leaves 344,396 bytes
+before the sector-7 boundary at `0x08060000`. Both padded 384 KiB main images
+have SHA-256
+`8b8fa6f2b7498ac9c7e5ad86d5e44d98a6fe8fb4d50035fb9ec9f6828b564424`.
+Both journal-inspector suites passed 6/6 and the exact candidate feature set
+passed strict Clippy. Full identities and the no-improvisation flash procedure
+are recorded in
+`docs/nano-stm32-attended-flash-2026-07-24.md`.
+
+No device was opened, no Fable process was handed off, and no candidate was
+flashed during this exact-revision pass. No canonical physical
+tracking-camera-to-base calibration asset was found on the Nano; the supplied
+head-center gaze geometry is not that transform. The checked-in
+qualification-shadow plant is explicitly synthetic and unvalidated; it
+neither supplies nor weakens this calibration requirement. Consequently an
+immutable sentinel-free qualification bundle cannot yet be rendered
+truthfully, and Gate A remains closed.
+
 ## Gate A: required before asking to attach wheels
 
 Passing this gate authorizes physical wheel attachment for an attended
@@ -146,8 +200,8 @@ remain disarmed.
 - [ ] Freeze an immutable, reviewable source revision and
       wheels-off/commissioning bundle.
 - [x] Build that exact source natively on the Nano with its pinned native
-      dependencies; record source and binary identities. Revision `9c9f3a9`
-      and the release ELF identity are recorded in the acceptance report.
+      dependencies; record source and binary identities. Revision `3f262f1`
+      and the exact release/runtime identities are recorded above.
 - [ ] Perform a coordinated handoff from every existing Fable device owner.
       Never start a second OAK, head, or eye owner and never use a broad
       process kill.
