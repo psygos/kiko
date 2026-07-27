@@ -2,9 +2,10 @@ use std::fmt;
 use std::time::Duration;
 
 use kiko_head_protocol::{
-    ExactHeadTargetPose, FullTelemetry, HeadJoint, HeadPose, HeadPoseError, PositionAgreementError,
-    PositionAgreementTicks, PositionTicks, PresentPosition, TelemetryParseError, TorqueSwitch,
-    ValidatedPresentPosition, build_full_telemetry_read, build_goal_with_speed_write,
+    ExactHeadTargetPose, FullTelemetry, GoalPositionObservation, GoalSpeedTicksPerSecond,
+    HeadJoint, HeadPose, HeadPoseError, PositionAgreementError, PositionAgreementTicks,
+    PositionTicks, PresentPosition, TelemetryParseError, TorqueSwitch, ValidatedPresentPosition,
+    build_full_telemetry_read, build_goal_position_read, build_goal_with_speed_write,
     build_natural_hold_frames, build_position_read, build_torque_switch_write,
 };
 use tokio::runtime::{Handle, TryCurrentError};
@@ -13,7 +14,7 @@ use tokio::task::{JoinError, JoinHandle};
 
 use crate::config::{
     ConfiguredHeadPoseBounds, HeadPoseBoundsAdmissionError, HeadPoseWithinConfiguredBounds,
-    HeadReturnPlan, HeadRuntimeConfig, ReturnToTargetConfig,
+    HeadReturnPlan, HeadRuntimeConfig, OperationTimeout, ReturnToTargetConfig,
 };
 use crate::framing::{FrameReadError, read_response_frame};
 use crate::motion::{
@@ -97,7 +98,9 @@ pub enum ArmingFreshnessCheck {
 pub enum WritePurpose {
     PositionReadRequest,
     TelemetryReadRequest,
+    GoalPositionReadRequest,
     ObservedGoal,
+    GoalWithSpeed,
     TorqueLimit,
     TorqueEnable,
     TorqueDisable,
@@ -150,6 +153,281 @@ impl<T> ResponseEvidence<T> {
 
     pub const fn received_at(&self) -> MonotonicTime {
         self.received_at
+    }
+}
+
+/// Exact evidence that all four commanded goal registers matched one typed
+/// target after the corresponding goal-with-speed writes completed.
+///
+/// The readbacks establish commanded-register state only. They do not prove
+/// that any servo or mechanism reached the target; present-position telemetry
+/// is required for a physical-pose claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedHeadGoalRegisterEvidence {
+    started_at: MonotonicTime,
+    completed_at: MonotonicTime,
+    transaction_timeout: OperationTimeout,
+    target: ExactHeadTargetPose,
+    speed: GoalSpeedTicksPerSecond,
+    writes: [WriteEvidence; 4],
+    readbacks: [ResponseEvidence<GoalPositionObservation>; 4],
+}
+
+impl VerifiedHeadGoalRegisterEvidence {
+    pub const fn started_at(&self) -> MonotonicTime {
+        self.started_at
+    }
+
+    pub const fn completed_at(&self) -> MonotonicTime {
+        self.completed_at
+    }
+
+    /// Maximum elapsed monotonic time admitted for the complete write/readback
+    /// transaction. Every transport timeout is capped by its remaining budget.
+    pub const fn transaction_timeout(&self) -> OperationTimeout {
+        self.transaction_timeout
+    }
+
+    pub const fn target(&self) -> ExactHeadTargetPose {
+        self.target
+    }
+
+    pub const fn speed(&self) -> GoalSpeedTicksPerSecond {
+        self.speed
+    }
+
+    /// Host-completion evidence in the canonical [`HeadJoint::ALL`] order.
+    pub const fn writes(&self) -> &[WriteEvidence; 4] {
+        &self.writes
+    }
+
+    /// Exact typed register observations in the canonical
+    /// [`HeadJoint::ALL`] order.
+    pub const fn readbacks(&self) -> &[ResponseEvidence<GoalPositionObservation>; 4] {
+        &self.readbacks
+    }
+}
+
+/// A causality, budget, or cancellation boundary in the all-writes-then-reads
+/// goal-register transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HeadGoalRegisterBoundary {
+    BeforeGoalWrite { joint: HeadJoint },
+    GoalWriteFailed { joint: HeadJoint },
+    GoalWriteCompleted { joint: HeadJoint },
+    BeforeGoalReadback { joint: HeadJoint },
+    GoalReadRequestFailed { joint: HeadJoint },
+    GoalReadRequestCompleted { joint: HeadJoint },
+    BeforeGoalResponse { joint: HeadJoint },
+    GoalResponseReadFailed { joint: HeadJoint },
+    GoalResponseReceived { joint: HeadJoint },
+    TransactionCompleted,
+}
+
+impl HeadGoalRegisterBoundary {
+    pub const fn joint(self) -> Option<HeadJoint> {
+        match self {
+            Self::BeforeGoalWrite { joint }
+            | Self::GoalWriteFailed { joint }
+            | Self::GoalWriteCompleted { joint }
+            | Self::BeforeGoalReadback { joint }
+            | Self::GoalReadRequestFailed { joint }
+            | Self::GoalReadRequestCompleted { joint }
+            | Self::BeforeGoalResponse { joint }
+            | Self::GoalResponseReadFailed { joint }
+            | Self::GoalResponseReceived { joint } => Some(joint),
+            Self::TransactionCompleted => None,
+        }
+    }
+}
+
+/// Exact operation evidence retained at a transaction timing or cancellation
+/// boundary.
+///
+/// The variants make impossible combinations unrepresentable: a completed
+/// write cannot simultaneously be an interrupted write, and a complete typed
+/// response cannot simultaneously be an invalid or interrupted response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadGoalRegisterBoundaryEvidence {
+    None,
+    CompletedWrite(WriteEvidence),
+    InterruptedWrite(FrameWriteError),
+    CompletedResponse(ResponseEvidence<GoalPositionObservation>),
+    InvalidResponse {
+        request_write: WriteEvidence,
+        discarded_noise_bytes: u16,
+        received_at: MonotonicTime,
+        source: TelemetryParseError,
+    },
+    InterruptedResponse {
+        request_write: WriteEvidence,
+        source: FrameReadError,
+    },
+}
+
+/// The precise operation which prevented a four-joint goal-register
+/// transaction from completing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadGoalRegisterFailure {
+    GoalWrite {
+        source: FrameWriteError,
+    },
+    ReadRequestWrite {
+        source: FrameWriteError,
+    },
+    ReadResponseFrame {
+        joint: HeadJoint,
+        request_write: WriteEvidence,
+        source: FrameReadError,
+    },
+    ReadResponseParse {
+        joint: HeadJoint,
+        request_write: WriteEvidence,
+        discarded_noise_bytes: u16,
+        received_at: MonotonicTime,
+        source: TelemetryParseError,
+    },
+    Mismatch {
+        joint: HeadJoint,
+        expected: PositionTicks,
+        actual: PositionTicks,
+        response: ResponseEvidence<GoalPositionObservation>,
+    },
+    ClockRegression {
+        boundary: HeadGoalRegisterBoundary,
+        previous: MonotonicTime,
+        observed: MonotonicTime,
+        boundary_evidence: HeadGoalRegisterBoundaryEvidence,
+    },
+    DeadlineExceeded {
+        boundary: HeadGoalRegisterBoundary,
+        observed_at: MonotonicTime,
+        elapsed: Duration,
+        maximum: Duration,
+        boundary_evidence: HeadGoalRegisterBoundaryEvidence,
+    },
+    Cancelled {
+        cause: CancellationCause,
+        boundary: HeadGoalRegisterBoundary,
+        boundary_evidence: HeadGoalRegisterBoundaryEvidence,
+    },
+}
+
+impl HeadGoalRegisterFailure {
+    pub const fn joint(&self) -> Option<HeadJoint> {
+        match self {
+            Self::GoalWrite { source } | Self::ReadRequestWrite { source } => Some(source.joint),
+            Self::ReadResponseFrame { joint, .. }
+            | Self::ReadResponseParse { joint, .. }
+            | Self::Mismatch { joint, .. } => Some(*joint),
+            Self::ClockRegression { boundary, .. }
+            | Self::DeadlineExceeded { boundary, .. }
+            | Self::Cancelled { boundary, .. } => boundary.joint(),
+        }
+    }
+}
+
+impl fmt::Display for HeadGoalRegisterFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "four-joint goal-register operation failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for HeadGoalRegisterFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::GoalWrite { source, .. } | Self::ReadRequestWrite { source, .. } => Some(source),
+            Self::ReadResponseFrame { source, .. } => Some(source),
+            Self::ReadResponseParse { source, .. } => Some(source),
+            Self::ClockRegression {
+                boundary_evidence, ..
+            }
+            | Self::DeadlineExceeded {
+                boundary_evidence, ..
+            } => match boundary_evidence {
+                HeadGoalRegisterBoundaryEvidence::InterruptedWrite(source) => Some(source),
+                HeadGoalRegisterBoundaryEvidence::InvalidResponse { source, .. } => Some(source),
+                HeadGoalRegisterBoundaryEvidence::InterruptedResponse { source, .. } => {
+                    Some(source)
+                }
+                HeadGoalRegisterBoundaryEvidence::None
+                | HeadGoalRegisterBoundaryEvidence::CompletedWrite(_)
+                | HeadGoalRegisterBoundaryEvidence::CompletedResponse(_) => None,
+            },
+            Self::Mismatch { .. } | Self::Cancelled { .. } => None,
+        }
+    }
+}
+
+/// Lossless prefix evidence for a failed four-joint goal transaction.
+///
+/// A `Some` write completed before the failure. A `Some` readback parsed and
+/// exactly matched the corresponding target before the failure. The failing
+/// observation, when one exists, remains in [`HeadGoalRegisterFailure`]. A
+/// terminal actor command drained after that primary failure is retained
+/// separately instead of replacing it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadGoalRegisterError {
+    started_at: MonotonicTime,
+    transaction_timeout: OperationTimeout,
+    target: ExactHeadTargetPose,
+    speed: GoalSpeedTicksPerSecond,
+    completed_writes: [Option<WriteEvidence>; 4],
+    accepted_readbacks: [Option<ResponseEvidence<GoalPositionObservation>>; 4],
+    failure: HeadGoalRegisterFailure,
+    observed_terminal_cancellation: Option<CancellationCause>,
+}
+
+impl HeadGoalRegisterError {
+    pub const fn started_at(&self) -> MonotonicTime {
+        self.started_at
+    }
+
+    pub const fn transaction_timeout(&self) -> OperationTimeout {
+        self.transaction_timeout
+    }
+
+    pub const fn target(&self) -> ExactHeadTargetPose {
+        self.target
+    }
+
+    pub const fn speed(&self) -> GoalSpeedTicksPerSecond {
+        self.speed
+    }
+
+    pub const fn completed_writes(&self) -> &[Option<WriteEvidence>; 4] {
+        &self.completed_writes
+    }
+
+    pub const fn accepted_readbacks(
+        &self,
+    ) -> &[Option<ResponseEvidence<GoalPositionObservation>>; 4] {
+        &self.accepted_readbacks
+    }
+
+    pub const fn failure(&self) -> &HeadGoalRegisterFailure {
+        &self.failure
+    }
+
+    /// A terminal actor command observed while preserving an already-existing
+    /// I/O, parse, mismatch, or timing failure as the primary cause.
+    pub const fn observed_terminal_cancellation(&self) -> Option<CancellationCause> {
+        self.observed_terminal_cancellation
+    }
+}
+
+impl fmt::Display for HeadGoalRegisterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.failure.fmt(formatter)
+    }
+}
+
+impl std::error::Error for HeadGoalRegisterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.failure)
     }
 }
 
@@ -1878,6 +2156,133 @@ enum ReturnFrameWriteFailure {
     },
 }
 
+#[derive(Clone, Copy)]
+struct HeadGoalRegisterBudget {
+    started_at: MonotonicTime,
+    last_observed_at: MonotonicTime,
+    maximum: Duration,
+}
+
+impl HeadGoalRegisterBudget {
+    const fn new(started_at: MonotonicTime, timeout: OperationTimeout) -> Self {
+        Self {
+            started_at,
+            last_observed_at: started_at,
+            maximum: timeout.get(),
+        }
+    }
+
+    fn remaining(
+        &mut self,
+        boundary: HeadGoalRegisterBoundary,
+        observed_at: MonotonicTime,
+    ) -> Result<Duration, HeadGoalRegisterTimingFailure> {
+        let elapsed = self.observe(boundary, observed_at)?;
+        Ok(self
+            .maximum
+            .checked_sub(elapsed)
+            .expect("admitted transaction time is strictly before its deadline"))
+    }
+
+    fn observe(
+        &mut self,
+        boundary: HeadGoalRegisterBoundary,
+        observed_at: MonotonicTime,
+    ) -> Result<Duration, HeadGoalRegisterTimingFailure> {
+        if observed_at < self.last_observed_at {
+            return Err(HeadGoalRegisterTimingFailure::ClockRegression {
+                boundary,
+                previous: self.last_observed_at,
+                observed: observed_at,
+            });
+        }
+        let elapsed = observed_at
+            .checked_duration_since(self.started_at)
+            .expect("cross-operation monotonicity includes transaction start");
+        if elapsed >= self.maximum {
+            return Err(HeadGoalRegisterTimingFailure::DeadlineExceeded {
+                boundary,
+                observed_at,
+                elapsed,
+                maximum: self.maximum,
+            });
+        }
+        self.last_observed_at = observed_at;
+        Ok(elapsed)
+    }
+}
+
+enum HeadGoalRegisterTimingFailure {
+    ClockRegression {
+        boundary: HeadGoalRegisterBoundary,
+        previous: MonotonicTime,
+        observed: MonotonicTime,
+    },
+    DeadlineExceeded {
+        boundary: HeadGoalRegisterBoundary,
+        observed_at: MonotonicTime,
+        elapsed: Duration,
+        maximum: Duration,
+    },
+}
+
+impl HeadGoalRegisterTimingFailure {
+    fn into_failure(
+        self,
+        boundary_evidence: HeadGoalRegisterBoundaryEvidence,
+    ) -> HeadGoalRegisterFailure {
+        match self {
+            Self::ClockRegression {
+                boundary,
+                previous,
+                observed,
+            } => HeadGoalRegisterFailure::ClockRegression {
+                boundary,
+                previous,
+                observed,
+                boundary_evidence,
+            },
+            Self::DeadlineExceeded {
+                boundary,
+                observed_at,
+                elapsed,
+                maximum,
+            } => HeadGoalRegisterFailure::DeadlineExceeded {
+                boundary,
+                observed_at,
+                elapsed,
+                maximum,
+                boundary_evidence,
+            },
+        }
+    }
+}
+
+enum HeadGoalRegisterFrameWriteFailure {
+    Frame {
+        source: FrameWriteError,
+        observed_cancellation: Option<CancellationCause>,
+    },
+    Timing {
+        source: HeadGoalRegisterTimingFailure,
+        boundary_evidence: HeadGoalRegisterBoundaryEvidence,
+        observed_cancellation: Option<CancellationCause>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct HeadGoalRegisterWriteBoundaries {
+    before: HeadGoalRegisterBoundary,
+    failed: HeadGoalRegisterBoundary,
+    completed: HeadGoalRegisterBoundary,
+}
+
+struct HeadGoalRegisterWriteContext<'a> {
+    budget: &'a mut HeadGoalRegisterBudget,
+    commands: &'a mut mpsc::Receiver<HeadCommand>,
+    control: &'a mut ControlState,
+}
+
 enum ReturnTelemetrySetFailure {
     Command(Box<HeadReturnError>),
     Read {
@@ -2983,6 +3388,547 @@ where
         })
     }
 
+    /// Write one complete canonical goal set, then prove that the four goal
+    /// registers contain those exact values.
+    ///
+    /// This primitive deliberately has no scheduling or proposal semantics.
+    /// Its caller remains responsible for admitting a target and deciding what
+    /// to do with a partial hardware transaction. `transaction_timeout` is one
+    /// elapsed-time budget for the entire primitive, not a fresh timeout per
+    /// joint. The live actor command receiver is checked before each goal write
+    /// and each request/response read operation; an in-flight transport call is
+    /// bounded by the smaller of its configured timeout and the remaining
+    /// transaction budget.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn write_goals_with_register_readback(
+        &mut self,
+        target: ExactHeadTargetPose,
+        speed: GoalSpeedTicksPerSecond,
+        transaction_timeout: OperationTimeout,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<VerifiedHeadGoalRegisterEvidence, HeadGoalRegisterError> {
+        let started_at = self.clock.now();
+        let mut budget = HeadGoalRegisterBudget::new(started_at, transaction_timeout);
+        let mut completed_writes: [Option<WriteEvidence>; 4] = std::array::from_fn(|_| None);
+        let mut accepted_readbacks: [Option<ResponseEvidence<GoalPositionObservation>>; 4] =
+            std::array::from_fn(|_| None);
+
+        for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+            let before = HeadGoalRegisterBoundary::BeforeGoalWrite { joint };
+            if let Err(cause) = self.check_goal_register_control(commands, control) {
+                return Err(HeadGoalRegisterError {
+                    started_at,
+                    transaction_timeout,
+                    target,
+                    speed,
+                    completed_writes,
+                    accepted_readbacks,
+                    failure: HeadGoalRegisterFailure::Cancelled {
+                        cause,
+                        boundary: before,
+                        boundary_evidence: HeadGoalRegisterBoundaryEvidence::None,
+                    },
+                    observed_terminal_cancellation: None,
+                });
+            }
+            let frame =
+                build_goal_with_speed_write(joint.servo_id(), target.position(joint), speed);
+            match self
+                .write_goal_register_frame_with_budget(
+                    joint,
+                    WritePurpose::GoalWithSpeed,
+                    frame.as_bytes(),
+                    HeadGoalRegisterWriteBoundaries {
+                        before,
+                        failed: HeadGoalRegisterBoundary::GoalWriteFailed { joint },
+                        completed: HeadGoalRegisterBoundary::GoalWriteCompleted { joint },
+                    },
+                    HeadGoalRegisterWriteContext {
+                        budget: &mut budget,
+                        commands,
+                        control,
+                    },
+                )
+                .await
+            {
+                Ok(evidence) => completed_writes[index] = Some(evidence),
+                Err(HeadGoalRegisterFrameWriteFailure::Frame {
+                    source,
+                    observed_cancellation,
+                }) => {
+                    return Err(HeadGoalRegisterError {
+                        started_at,
+                        transaction_timeout,
+                        target,
+                        speed,
+                        completed_writes,
+                        accepted_readbacks,
+                        failure: HeadGoalRegisterFailure::GoalWrite { source },
+                        observed_terminal_cancellation: observed_cancellation,
+                    });
+                }
+                Err(HeadGoalRegisterFrameWriteFailure::Timing {
+                    source,
+                    boundary_evidence,
+                    observed_cancellation,
+                }) => {
+                    // A successful transport write belongs to the completed
+                    // hardware prefix even when its timestamp invalidates the
+                    // transaction's causality or deadline admission.
+                    if let HeadGoalRegisterBoundaryEvidence::CompletedWrite(evidence) =
+                        &boundary_evidence
+                    {
+                        completed_writes[index] = Some(evidence.clone());
+                    }
+                    return Err(HeadGoalRegisterError {
+                        started_at,
+                        transaction_timeout,
+                        target,
+                        speed,
+                        completed_writes,
+                        accepted_readbacks,
+                        failure: source.into_failure(boundary_evidence),
+                        observed_terminal_cancellation: observed_cancellation,
+                    });
+                }
+            }
+        }
+
+        for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+            let before = HeadGoalRegisterBoundary::BeforeGoalReadback { joint };
+            if let Err(cause) = self.check_goal_register_control(commands, control) {
+                return Err(HeadGoalRegisterError {
+                    started_at,
+                    transaction_timeout,
+                    target,
+                    speed,
+                    completed_writes,
+                    accepted_readbacks,
+                    failure: HeadGoalRegisterFailure::Cancelled {
+                        cause,
+                        boundary: before,
+                        boundary_evidence: HeadGoalRegisterBoundaryEvidence::None,
+                    },
+                    observed_terminal_cancellation: None,
+                });
+            }
+            let request = build_goal_position_read(joint.servo_id());
+            let request_write = match self
+                .write_goal_register_frame_with_budget(
+                    joint,
+                    WritePurpose::GoalPositionReadRequest,
+                    request.as_bytes(),
+                    HeadGoalRegisterWriteBoundaries {
+                        before,
+                        failed: HeadGoalRegisterBoundary::GoalReadRequestFailed { joint },
+                        completed: HeadGoalRegisterBoundary::GoalReadRequestCompleted { joint },
+                    },
+                    HeadGoalRegisterWriteContext {
+                        budget: &mut budget,
+                        commands,
+                        control,
+                    },
+                )
+                .await
+            {
+                Ok(evidence) => evidence,
+                Err(HeadGoalRegisterFrameWriteFailure::Frame {
+                    source,
+                    observed_cancellation,
+                }) => {
+                    return Err(HeadGoalRegisterError {
+                        started_at,
+                        transaction_timeout,
+                        target,
+                        speed,
+                        completed_writes,
+                        accepted_readbacks,
+                        failure: HeadGoalRegisterFailure::ReadRequestWrite { source },
+                        observed_terminal_cancellation: observed_cancellation,
+                    });
+                }
+                Err(HeadGoalRegisterFrameWriteFailure::Timing {
+                    source,
+                    boundary_evidence,
+                    observed_cancellation,
+                }) => {
+                    return Err(HeadGoalRegisterError {
+                        started_at,
+                        transaction_timeout,
+                        target,
+                        speed,
+                        completed_writes,
+                        accepted_readbacks,
+                        failure: source.into_failure(boundary_evidence),
+                        observed_terminal_cancellation: observed_cancellation,
+                    });
+                }
+            };
+            let before_response = HeadGoalRegisterBoundary::BeforeGoalResponse { joint };
+            if let Err(cause) = self.check_goal_register_control(commands, control) {
+                return Err(HeadGoalRegisterError {
+                    started_at,
+                    transaction_timeout,
+                    target,
+                    speed,
+                    completed_writes,
+                    accepted_readbacks,
+                    failure: HeadGoalRegisterFailure::Cancelled {
+                        cause,
+                        boundary: before_response,
+                        boundary_evidence: HeadGoalRegisterBoundaryEvidence::CompletedWrite(
+                            request_write,
+                        ),
+                    },
+                    observed_terminal_cancellation: None,
+                });
+            }
+            let response_remaining = match budget.remaining(before_response, self.clock.now()) {
+                Ok(remaining) => remaining,
+                Err(source) => {
+                    let observed_terminal_cancellation =
+                        self.check_goal_register_control(commands, control).err();
+                    return Err(HeadGoalRegisterError {
+                        started_at,
+                        transaction_timeout,
+                        target,
+                        speed,
+                        completed_writes,
+                        accepted_readbacks,
+                        failure: source.into_failure(
+                            HeadGoalRegisterBoundaryEvidence::CompletedWrite(request_write),
+                        ),
+                        observed_terminal_cancellation,
+                    });
+                }
+            };
+            let frame = match read_response_frame(
+                &mut self.transport,
+                &self.clock,
+                self.config.response_timeout().capped_by(response_remaining),
+                self.config.noise_budget_bytes(),
+            )
+            .await
+            {
+                Ok(frame) => frame,
+                Err(source) => {
+                    let observed_at = self.clock.now();
+                    let timing_failure = budget
+                        .observe(
+                            HeadGoalRegisterBoundary::GoalResponseReadFailed { joint },
+                            observed_at,
+                        )
+                        .err();
+                    let observed_terminal_cancellation =
+                        self.check_goal_register_control(commands, control).err();
+                    let failure = match timing_failure {
+                        Some(timing) => timing.into_failure(
+                            HeadGoalRegisterBoundaryEvidence::InterruptedResponse {
+                                request_write,
+                                source,
+                            },
+                        ),
+                        None => HeadGoalRegisterFailure::ReadResponseFrame {
+                            joint,
+                            request_write,
+                            source,
+                        },
+                    };
+                    return Err(HeadGoalRegisterError {
+                        started_at,
+                        transaction_timeout,
+                        target,
+                        speed,
+                        completed_writes,
+                        accepted_readbacks,
+                        failure,
+                        observed_terminal_cancellation,
+                    });
+                }
+            };
+            let received_at = self.clock.now();
+            let parsed = GoalPositionObservation::parse(frame.as_bytes(), joint.servo_id());
+            if let Err(source) = budget.observe(
+                HeadGoalRegisterBoundary::GoalResponseReceived { joint },
+                received_at,
+            ) {
+                let boundary_evidence = match parsed {
+                    Ok(value) => {
+                        HeadGoalRegisterBoundaryEvidence::CompletedResponse(ResponseEvidence {
+                            value,
+                            request_write,
+                            discarded_noise_bytes: frame.discarded_noise_bytes(),
+                            received_at,
+                        })
+                    }
+                    Err(source) => HeadGoalRegisterBoundaryEvidence::InvalidResponse {
+                        request_write,
+                        discarded_noise_bytes: frame.discarded_noise_bytes(),
+                        received_at,
+                        source,
+                    },
+                };
+                let observed_terminal_cancellation =
+                    self.check_goal_register_control(commands, control).err();
+                return Err(HeadGoalRegisterError {
+                    started_at,
+                    transaction_timeout,
+                    target,
+                    speed,
+                    completed_writes,
+                    accepted_readbacks,
+                    failure: source.into_failure(boundary_evidence),
+                    observed_terminal_cancellation,
+                });
+            }
+            let value = match parsed {
+                Ok(value) => value,
+                Err(source) => {
+                    let observed_terminal_cancellation =
+                        self.check_goal_register_control(commands, control).err();
+                    return Err(HeadGoalRegisterError {
+                        started_at,
+                        transaction_timeout,
+                        target,
+                        speed,
+                        completed_writes,
+                        accepted_readbacks,
+                        failure: HeadGoalRegisterFailure::ReadResponseParse {
+                            joint,
+                            request_write,
+                            discarded_noise_bytes: frame.discarded_noise_bytes(),
+                            received_at,
+                            source,
+                        },
+                        observed_terminal_cancellation,
+                    });
+                }
+            };
+            let response = ResponseEvidence {
+                value,
+                request_write,
+                discarded_noise_bytes: frame.discarded_noise_bytes(),
+                received_at,
+            };
+            let expected = target.position(joint);
+            let actual = response.value().ticks();
+            if actual != expected {
+                let observed_terminal_cancellation =
+                    self.check_goal_register_control(commands, control).err();
+                return Err(HeadGoalRegisterError {
+                    started_at,
+                    transaction_timeout,
+                    target,
+                    speed,
+                    completed_writes,
+                    accepted_readbacks,
+                    failure: HeadGoalRegisterFailure::Mismatch {
+                        joint,
+                        expected,
+                        actual,
+                        response,
+                    },
+                    observed_terminal_cancellation,
+                });
+            }
+            accepted_readbacks[index] = Some(response);
+            if index + 1 == HeadJoint::ALL.len()
+                && let Err(cause) = self.check_goal_register_control(commands, control)
+            {
+                let final_response = accepted_readbacks[index]
+                    .as_ref()
+                    .expect("the fourth matching response was just retained")
+                    .clone();
+                return Err(HeadGoalRegisterError {
+                    started_at,
+                    transaction_timeout,
+                    target,
+                    speed,
+                    completed_writes,
+                    accepted_readbacks,
+                    failure: HeadGoalRegisterFailure::Cancelled {
+                        cause,
+                        boundary: HeadGoalRegisterBoundary::TransactionCompleted,
+                        boundary_evidence: HeadGoalRegisterBoundaryEvidence::CompletedResponse(
+                            final_response,
+                        ),
+                    },
+                    observed_terminal_cancellation: None,
+                });
+            }
+        }
+
+        let completed_at = self.clock.now();
+        if let Err(source) =
+            budget.observe(HeadGoalRegisterBoundary::TransactionCompleted, completed_at)
+        {
+            let observed_terminal_cancellation =
+                self.check_goal_register_control(commands, control).err();
+            return Err(HeadGoalRegisterError {
+                started_at,
+                transaction_timeout,
+                target,
+                speed,
+                completed_writes,
+                accepted_readbacks,
+                failure: source.into_failure(HeadGoalRegisterBoundaryEvidence::None),
+                observed_terminal_cancellation,
+            });
+        }
+        Ok(VerifiedHeadGoalRegisterEvidence {
+            started_at,
+            completed_at,
+            transaction_timeout,
+            target,
+            speed,
+            writes: completed_writes.map(|evidence| {
+                evidence.expect("all canonical goal writes completed before success")
+            }),
+            readbacks: accepted_readbacks.map(|evidence| {
+                evidence.expect("all canonical goal readbacks matched before success")
+            }),
+        })
+    }
+
+    async fn write_goal_register_frame_with_budget(
+        &mut self,
+        joint: HeadJoint,
+        purpose: WritePurpose,
+        bytes: &[u8],
+        boundaries: HeadGoalRegisterWriteBoundaries,
+        context: HeadGoalRegisterWriteContext<'_>,
+    ) -> Result<WriteEvidence, HeadGoalRegisterFrameWriteFailure> {
+        let mut recovered_failures = Vec::new();
+        let mut interrupted_retry: Option<FrameWriteError> = None;
+        let maximum_attempts = self.config.write_attempts().get();
+        let mut attempt = 1_u8;
+        loop {
+            let remaining = match context
+                .budget
+                .remaining(boundaries.before, self.clock.now())
+            {
+                Ok(remaining) => remaining,
+                Err(source) => {
+                    let observed_cancellation = self
+                        .check_goal_register_control(context.commands, context.control)
+                        .err();
+                    return Err(HeadGoalRegisterFrameWriteFailure::Timing {
+                        source,
+                        boundary_evidence: interrupted_retry.map_or(
+                            HeadGoalRegisterBoundaryEvidence::None,
+                            HeadGoalRegisterBoundaryEvidence::InterruptedWrite,
+                        ),
+                        observed_cancellation,
+                    });
+                }
+            };
+            let timeout = self.config.write_timeout().get().min(remaining);
+            match self.transport.write_all(bytes, timeout).await {
+                Ok(()) => {
+                    let completed_at = self.clock.now();
+                    let evidence = WriteEvidence {
+                        attempts_used: attempt,
+                        recovered_failures,
+                        completed_at,
+                    };
+                    return match context.budget.observe(boundaries.completed, completed_at) {
+                        Ok(_) => Ok(evidence),
+                        Err(source) => {
+                            let observed_cancellation = self
+                                .check_goal_register_control(context.commands, context.control)
+                                .err();
+                            Err(HeadGoalRegisterFrameWriteFailure::Timing {
+                                source,
+                                boundary_evidence: HeadGoalRegisterBoundaryEvidence::CompletedWrite(
+                                    evidence,
+                                ),
+                                observed_cancellation,
+                            })
+                        }
+                    };
+                }
+                Err(source) => {
+                    let frame_error = FrameWriteError {
+                        joint,
+                        purpose,
+                        attempts_used: attempt,
+                        recovered_failures: recovered_failures.clone(),
+                        source: source.clone(),
+                    };
+                    let timing_failure = context
+                        .budget
+                        .observe(boundaries.failed, self.clock.now())
+                        .err();
+                    let observed_cancellation = self
+                        .check_goal_register_control(context.commands, context.control)
+                        .err();
+                    if let Some(source) = timing_failure {
+                        return Err(HeadGoalRegisterFrameWriteFailure::Timing {
+                            source,
+                            boundary_evidence: HeadGoalRegisterBoundaryEvidence::InterruptedWrite(
+                                frame_error,
+                            ),
+                            observed_cancellation,
+                        });
+                    }
+                    if observed_cancellation.is_some() {
+                        return Err(HeadGoalRegisterFrameWriteFailure::Frame {
+                            source: frame_error,
+                            observed_cancellation,
+                        });
+                    }
+                    if attempt < maximum_attempts && source.is_retryable_without_progress() {
+                        interrupted_retry = Some(frame_error);
+                        recovered_failures.push(source);
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(HeadGoalRegisterFrameWriteFailure::Frame {
+                        source: frame_error,
+                        observed_cancellation: None,
+                    });
+                }
+            }
+        }
+    }
+
+    fn check_goal_register_control(
+        &self,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<(), CancellationCause> {
+        loop {
+            match commands.try_recv() {
+                Ok(HeadCommand::Shutdown { response }) => {
+                    control.termination = Some(ActorTermination::RequestedShutdown);
+                    control.shutdown_response = Some(HeadShutdownResponse::Disable(response));
+                    return Err(CancellationCause::RequestedShutdown);
+                }
+                Ok(HeadCommand::ReleaseOwnershipPreservingHold { response }) => {
+                    control.termination = Some(ActorTermination::RequestedHoldPreservingRelease);
+                    control.shutdown_response = Some(HeadShutdownResponse::Preserve(response));
+                    return Err(CancellationCause::RequestedHoldPreservingRelease);
+                }
+                Ok(HeadCommand::CheckHealth { response }) => {
+                    let _requester_present = response
+                        .send(Err(HeadHealthCheckError::CommandAlreadyInProgress))
+                        .is_ok();
+                }
+                Ok(HeadCommand::ReturnToTarget { response }) => {
+                    let _requester_present = response
+                        .send(Err(HeadReturnError::CommandAlreadyInProgress))
+                        .is_ok();
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    control.termination = Some(ActorTermination::HandleDropped);
+                    return Err(CancellationCause::HandleDropped);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+            }
+        }
+    }
+
     async fn write_stage(
         &mut self,
         frames: &[kiko_head_protocol::CommandFrame; 4],
@@ -3551,6 +4497,11 @@ mod tests {
             release: Arc<tokio::sync::Notify>,
             source: TransportFailure,
         },
+        GatedBytes {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            bytes: Vec<u8>,
+        },
     }
 
     #[derive(Default)]
@@ -3558,8 +4509,11 @@ mod tests {
         writes: Vec<Vec<u8>>,
         write_timeouts: Vec<Duration>,
         write_failures: BTreeMap<usize, TransportFailure>,
+        write_clock_overrides_ms: BTreeMap<usize, u64>,
+        write_gates: BTreeMap<usize, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         read_calls: usize,
         read_timeouts: Vec<Duration>,
+        read_clock_overrides_ms: BTreeMap<usize, u64>,
     }
 
     struct FakeTransport {
@@ -3591,11 +4545,25 @@ mod tests {
             timeout: Duration,
         ) -> Result<(), TransportFailure> {
             self.clock.advance_one_millisecond();
-            let mut shared = self.shared.lock().expect("fake transport mutex");
-            let call = shared.writes.len();
-            shared.writes.push(bytes.to_vec());
-            shared.write_timeouts.push(timeout);
-            match shared.write_failures.remove(&call) {
+            let (failure, clock_override_ms, gate) = {
+                let mut shared = self.shared.lock().expect("fake transport mutex");
+                let call = shared.writes.len();
+                shared.writes.push(bytes.to_vec());
+                shared.write_timeouts.push(timeout);
+                (
+                    shared.write_failures.remove(&call),
+                    shared.write_clock_overrides_ms.remove(&call),
+                    shared.write_gates.remove(&call),
+                )
+            };
+            if let Some((entered, release)) = gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+            if let Some(milliseconds) = clock_override_ms {
+                self.clock.set_milliseconds(milliseconds);
+            }
+            match failure {
                 Some(source) => Err(source),
                 None => Ok(()),
             }
@@ -3607,10 +4575,15 @@ mod tests {
             timeout: Duration,
         ) -> Result<usize, TransportFailure> {
             self.clock.advance_one_millisecond();
-            {
+            let clock_override_ms = {
                 let mut shared = self.shared.lock().expect("fake transport mutex");
+                let call = shared.read_calls;
                 shared.read_calls += 1;
                 shared.read_timeouts.push(timeout);
+                shared.read_clock_overrides_ms.remove(&call)
+            };
+            if let Some(milliseconds) = clock_override_ms {
+                self.clock.set_milliseconds(milliseconds);
             }
             loop {
                 if !self.pending.is_empty() {
@@ -3639,6 +4612,15 @@ mod tests {
                         entered.notify_one();
                         release.notified().await;
                         return Err(source);
+                    }
+                    Some(ReadAction::GatedBytes {
+                        entered,
+                        release,
+                        bytes,
+                    }) => {
+                        entered.notify_one();
+                        release.notified().await;
+                        self.pending.extend(bytes);
                     }
                 }
             }
@@ -3685,6 +4667,10 @@ mod tests {
     }
 
     fn position_response(joint: HeadJoint, position: u16) -> Vec<u8> {
+        status(joint.servo_id(), &position.to_le_bytes())
+    }
+
+    fn goal_position_response(joint: HeadJoint, position: u16) -> Vec<u8> {
         status(joint.servo_id(), &position.to_le_bytes())
     }
 
@@ -3920,6 +4906,29 @@ mod tests {
         (error, exit, shared)
     }
 
+    fn goal_register_actor(
+        reads: Vec<ReadAction>,
+    ) -> (HeadActor<FakeTransport, TestClock>, Arc<Mutex<FakeShared>>) {
+        let clock = TestClock::default();
+        let (transport, shared) = FakeTransport::new(clock.clone(), reads);
+        (
+            HeadActor {
+                transport,
+                clock,
+                config: valid_config(1),
+                configured_pose_bounds: valid_pose_bounds(),
+                startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
+                return_plan: None,
+            },
+            shared,
+        )
+    }
+
+    fn goal_register_target() -> ExactHeadTargetPose {
+        ExactHeadTargetPose::try_from_ticks([2_127, 2_558, 2_925, 2_930])
+            .expect("exact test target")
+    }
+
     fn health_observation_error(error: HeadHealthRequestError) -> Box<HeadHealthObservationError> {
         match error {
             HeadHealthRequestError::Check {
@@ -3927,6 +4936,895 @@ mod tests {
             } => observation,
             other => panic!("expected health observation error, got {other:#?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_proves_all_four_commanded_registers_in_canonical_order() {
+        let target = goal_register_target();
+        let reads = HeadJoint::ALL
+            .into_iter()
+            .map(|joint| {
+                ReadAction::Bytes(goal_position_response(joint, target.position(joint).get()))
+            })
+            .collect();
+        let (mut actor, shared) = goal_register_actor(reads);
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let evidence = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect("exact register transaction");
+        drop(commands);
+
+        assert_eq!(evidence.target(), target);
+        assert_eq!(evidence.speed(), speed);
+        assert_eq!(evidence.transaction_timeout(), transaction_timeout);
+        assert!(evidence.completed_at() > evidence.started_at());
+        assert_eq!(evidence.writes().len(), HeadJoint::ALL.len());
+        assert_eq!(
+            std::array::from_fn(|index| evidence.readbacks()[index].value().ticks().get()),
+            target.positions().map(PositionTicks::get)
+        );
+        assert_eq!(
+            std::array::from_fn(|index| evidence.readbacks()[index].value().id()),
+            HeadJoint::ALL.map(HeadJoint::servo_id)
+        );
+
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.writes.len(), 8);
+        for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+            assert_eq!(
+                shared.writes[index],
+                build_goal_with_speed_write(joint.servo_id(), target.position(joint), speed)
+                    .as_bytes()
+            );
+            assert_eq!(
+                shared.writes[index + 4],
+                build_goal_position_read(joint.servo_id()).as_bytes()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_retains_exact_completed_write_prefix() {
+        let target = goal_register_target();
+        let (mut actor, shared) = goal_register_actor(Vec::new());
+        shared
+            .lock()
+            .expect("fake state")
+            .write_failures
+            .insert(2, TransportFailure::timed_out(TransportOperation::Write, 3));
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect_err("yaw goal write fails after two completed writes");
+        drop(commands);
+
+        assert_eq!(error.target(), target);
+        assert_eq!(error.speed(), speed);
+        assert_eq!(error.transaction_timeout(), transaction_timeout);
+        assert!(error.completed_writes()[0].is_some());
+        assert!(error.completed_writes()[1].is_some());
+        assert!(error.completed_writes()[2..].iter().all(Option::is_none));
+        assert!(error.accepted_readbacks().iter().all(Option::is_none));
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::GoalWrite {
+                source: FrameWriteError { source, .. },
+            } if source.bytes_transferred() == 3
+        ));
+        assert_eq!(error.failure().joint(), Some(HeadJoint::Yaw));
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_retains_readback_prefix_and_failed_request_evidence() {
+        let target = goal_register_target();
+        let reads = vec![
+            ReadAction::Bytes(goal_position_response(
+                HeadJoint::Bow,
+                target.position(HeadJoint::Bow).get(),
+            )),
+            ReadAction::Failure(TransportFailure::timed_out(TransportOperation::Read, 0)),
+        ];
+        let (mut actor, shared) = goal_register_actor(reads);
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect_err("curl response read fails");
+        drop(commands);
+
+        assert!(error.completed_writes().iter().all(Option::is_some));
+        assert!(error.accepted_readbacks()[0].is_some());
+        assert!(error.accepted_readbacks()[1..].iter().all(Option::is_none));
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::ReadResponseFrame {
+                joint: HeadJoint::Curl,
+                request_write,
+                source: FrameReadError::Transport { source, .. },
+            } if request_write.attempts_used() == 1
+                && source.kind() == TransportFailureKind::TimedOut
+        ));
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_retains_typed_mismatch_outside_accepted_prefix() {
+        let target = goal_register_target();
+        let mismatched_curl = target.position(HeadJoint::Curl).get() + 1;
+        let reads = vec![
+            ReadAction::Bytes(goal_position_response(
+                HeadJoint::Bow,
+                target.position(HeadJoint::Bow).get(),
+            )),
+            ReadAction::Bytes(goal_position_response(HeadJoint::Curl, mismatched_curl)),
+        ];
+        let (mut actor, shared) = goal_register_actor(reads);
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect_err("curl goal register differs from target");
+        drop(commands);
+
+        assert!(error.completed_writes().iter().all(Option::is_some));
+        assert!(error.accepted_readbacks()[0].is_some());
+        assert!(error.accepted_readbacks()[1..].iter().all(Option::is_none));
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::Mismatch {
+                joint: HeadJoint::Curl,
+                expected,
+                actual,
+                response,
+            } if *expected == target.position(HeadJoint::Curl)
+                && actual.get() == mismatched_curl
+                && response.value().ticks() == *actual
+        ));
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_rejects_cross_write_clock_regression_with_exact_prefix() {
+        let target = goal_register_target();
+        let (mut actor, shared) = goal_register_actor(Vec::new());
+        shared
+            .lock()
+            .expect("fake state")
+            .write_clock_overrides_ms
+            .insert(1, 0);
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect_err("curl completion regresses behind the bow write");
+        drop(commands);
+
+        assert!(error.completed_writes()[0].is_some());
+        assert!(error.completed_writes()[1].is_some());
+        assert!(error.completed_writes()[2..].iter().all(Option::is_none));
+        assert!(error.accepted_readbacks().iter().all(Option::is_none));
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::ClockRegression {
+                boundary: HeadGoalRegisterBoundary::GoalWriteCompleted {
+                    joint: HeadJoint::Curl
+                },
+                previous,
+                observed,
+                boundary_evidence:
+                    HeadGoalRegisterBoundaryEvidence::CompletedWrite(completed_write),
+            } if observed < previous
+                && completed_write.attempts_used() == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_checks_response_time_against_prior_request_write() {
+        let target = goal_register_target();
+        let reads = vec![ReadAction::Bytes(goal_position_response(
+            HeadJoint::Bow,
+            target.position(HeadJoint::Bow).get(),
+        ))];
+        let (mut actor, shared) = goal_register_actor(reads);
+        // One framed status response consumes four fake read calls. Regress
+        // only after the final call so framing succeeds and the actor must
+        // enforce causality across the request-write/response boundary.
+        shared
+            .lock()
+            .expect("fake state")
+            .read_clock_overrides_ms
+            .insert(3, 4);
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect_err("response timestamp regresses behind its request write");
+        drop(commands);
+
+        assert!(error.completed_writes().iter().all(Option::is_some));
+        assert!(error.accepted_readbacks().iter().all(Option::is_none));
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::ClockRegression {
+                boundary: HeadGoalRegisterBoundary::GoalResponseReceived {
+                    joint: HeadJoint::Bow
+                },
+                previous,
+                observed,
+                boundary_evidence:
+                    HeadGoalRegisterBoundaryEvidence::CompletedResponse(response),
+            } if observed < previous && response.request_write().attempts_used() == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_deadline_includes_a_just_completed_write_in_its_prefix() {
+        let target = goal_register_target();
+        let (mut actor, shared) = goal_register_actor(Vec::new());
+        shared
+            .lock()
+            .expect("fake state")
+            .write_clock_overrides_ms
+            .insert(0, 100);
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect_err("completion at the exact deadline is not admitted");
+        drop(commands);
+
+        assert!(error.completed_writes()[0].is_some());
+        assert!(error.completed_writes()[1..].iter().all(Option::is_none));
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::DeadlineExceeded {
+                boundary: HeadGoalRegisterBoundary::GoalWriteCompleted {
+                    joint: HeadJoint::Bow
+                },
+                elapsed,
+                maximum,
+                boundary_evidence:
+                    HeadGoalRegisterBoundaryEvidence::CompletedWrite(completed_write),
+                ..
+            } if *elapsed == transaction_timeout.get()
+                && elapsed == maximum
+                && completed_write.attempts_used() == 1
+        ));
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_honours_queued_shutdown_between_operations() {
+        let target = goal_register_target();
+        let (mut actor, shared) = goal_register_actor(Vec::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        shared
+            .lock()
+            .expect("fake state")
+            .write_gates
+            .insert(0, (Arc::clone(&entered), Arc::clone(&release)));
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let transaction = actor.write_goals_with_register_readback(
+            target,
+            speed,
+            transaction_timeout,
+            &mut receiver,
+            &mut control,
+        );
+        let queue_shutdown = async move {
+            entered.notified().await;
+            let (response, response_receiver) = oneshot::channel();
+            commands
+                .send(HeadCommand::Shutdown { response })
+                .await
+                .expect("queue shutdown during the first write");
+            drop(response_receiver);
+            release.notify_one();
+        };
+        let (result, ()) = tokio::join!(transaction, queue_shutdown);
+        let error = result.expect_err("shutdown stops before the second write");
+
+        assert!(error.completed_writes()[0].is_some());
+        assert!(error.completed_writes()[1..].iter().all(Option::is_none));
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::Cancelled {
+                cause: CancellationCause::RequestedShutdown,
+                boundary: HeadGoalRegisterBoundary::BeforeGoalWrite {
+                    joint: HeadJoint::Curl
+                },
+                boundary_evidence: HeadGoalRegisterBoundaryEvidence::None,
+            }
+        ));
+        assert_eq!(
+            control.termination,
+            Some(ActorTermination::RequestedShutdown)
+        );
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_honours_shutdown_before_response_and_retains_request() {
+        let target = goal_register_target();
+        let reads = vec![ReadAction::Bytes(goal_position_response(
+            HeadJoint::Bow,
+            target.position(HeadJoint::Bow).get(),
+        ))];
+        let (mut actor, shared) = goal_register_actor(reads);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        shared
+            .lock()
+            .expect("fake state")
+            .write_gates
+            .insert(4, (Arc::clone(&entered), Arc::clone(&release)));
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let transaction = actor.write_goals_with_register_readback(
+            target,
+            speed,
+            transaction_timeout,
+            &mut receiver,
+            &mut control,
+        );
+        let queue_shutdown = async move {
+            entered.notified().await;
+            let (response, response_receiver) = oneshot::channel();
+            commands
+                .send(HeadCommand::Shutdown { response })
+                .await
+                .expect("queue shutdown while the first read request is in flight");
+            drop(response_receiver);
+            release.notify_one();
+        };
+        let (result, ()) = tokio::join!(transaction, queue_shutdown);
+        let error = result.expect_err("shutdown prevents the response read");
+
+        assert!(error.completed_writes().iter().all(Option::is_some));
+        assert!(error.accepted_readbacks().iter().all(Option::is_none));
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::Cancelled {
+                cause: CancellationCause::RequestedShutdown,
+                boundary: HeadGoalRegisterBoundary::BeforeGoalResponse {
+                    joint: HeadJoint::Bow
+                },
+                boundary_evidence:
+                    HeadGoalRegisterBoundaryEvidence::CompletedWrite(request_write),
+            } if request_write.attempts_used() == 1
+        ));
+        assert_eq!(
+            control.termination,
+            Some(ActorTermination::RequestedShutdown)
+        );
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.writes.len(), 5);
+        assert_eq!(shared.read_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_retains_failed_goal_write_at_deadline_boundary() {
+        let target = goal_register_target();
+        let (mut actor, shared) = goal_register_actor(Vec::new());
+        actor.config = valid_config(2);
+        {
+            let mut shared = shared.lock().expect("fake state");
+            shared
+                .write_failures
+                .insert(0, TransportFailure::timed_out(TransportOperation::Write, 3));
+            shared.write_clock_overrides_ms.insert(0, 100);
+        }
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect_err("a failed write at the deadline cannot be retried");
+        drop(commands);
+
+        assert!(error.completed_writes().iter().all(Option::is_none));
+        assert_eq!(error.observed_terminal_cancellation(), None);
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::DeadlineExceeded {
+                boundary: HeadGoalRegisterBoundary::GoalWriteFailed {
+                    joint: HeadJoint::Bow
+                },
+                elapsed,
+                maximum,
+                boundary_evidence:
+                    HeadGoalRegisterBoundaryEvidence::InterruptedWrite(FrameWriteError {
+                        joint: HeadJoint::Bow,
+                        purpose: WritePurpose::GoalWithSpeed,
+                        attempts_used: 1,
+                        source,
+                        ..
+                    }),
+                ..
+            } if elapsed == maximum
+                && source.kind() == TransportFailureKind::TimedOut
+                && source.bytes_transferred() == 3
+        ));
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_retains_failed_read_request_at_deadline_boundary() {
+        let target = goal_register_target();
+        let (mut actor, shared) = goal_register_actor(Vec::new());
+        actor.config = valid_config(2);
+        {
+            let mut shared = shared.lock().expect("fake state");
+            shared
+                .write_failures
+                .insert(4, TransportFailure::timed_out(TransportOperation::Write, 0));
+            shared.write_clock_overrides_ms.insert(4, 100);
+        }
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect_err("a failed read request at the deadline cannot be retried");
+        drop(commands);
+
+        assert!(error.completed_writes().iter().all(Option::is_some));
+        assert!(error.accepted_readbacks().iter().all(Option::is_none));
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::DeadlineExceeded {
+                boundary: HeadGoalRegisterBoundary::GoalReadRequestFailed {
+                    joint: HeadJoint::Bow
+                },
+                boundary_evidence:
+                    HeadGoalRegisterBoundaryEvidence::InterruptedWrite(FrameWriteError {
+                        joint: HeadJoint::Bow,
+                        purpose: WritePurpose::GoalPositionReadRequest,
+                        attempts_used: 1,
+                        source,
+                        ..
+                    }),
+                ..
+            } if source.kind() == TransportFailureKind::TimedOut
+        ));
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_retains_failed_response_at_deadline_boundary() {
+        let target = goal_register_target();
+        let reads = vec![ReadAction::Failure(TransportFailure::timed_out(
+            TransportOperation::Read,
+            0,
+        ))];
+        let (mut actor, shared) = goal_register_actor(reads);
+        shared
+            .lock()
+            .expect("fake state")
+            .read_clock_overrides_ms
+            .insert(0, 100);
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect_err("a response read failure at the deadline retains both facts");
+        drop(commands);
+
+        assert!(error.completed_writes().iter().all(Option::is_some));
+        assert!(error.accepted_readbacks().iter().all(Option::is_none));
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::DeadlineExceeded {
+                boundary: HeadGoalRegisterBoundary::GoalResponseReadFailed {
+                    joint: HeadJoint::Bow
+                },
+                boundary_evidence:
+                    HeadGoalRegisterBoundaryEvidence::InterruptedResponse {
+                        request_write,
+                        source: FrameReadError::Transport { source, .. },
+                    },
+                ..
+            } if request_write.attempts_used() == 1
+                && source.kind() == TransportFailureKind::TimedOut
+        ));
+        assert_eq!(shared.lock().expect("fake state").read_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_retains_invalid_response_when_receive_clock_regresses() {
+        let target = goal_register_target();
+        let reads = vec![ReadAction::Bytes(goal_position_response(
+            HeadJoint::Curl,
+            target.position(HeadJoint::Bow).get(),
+        ))];
+        let (mut actor, shared) = goal_register_actor(reads);
+        shared
+            .lock()
+            .expect("fake state")
+            .read_clock_overrides_ms
+            .insert(3, 4);
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect_err("invalid complete response is retained with timing failure");
+        drop(commands);
+
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::ClockRegression {
+                boundary: HeadGoalRegisterBoundary::GoalResponseReceived {
+                    joint: HeadJoint::Bow
+                },
+                previous,
+                observed,
+                boundary_evidence:
+                    HeadGoalRegisterBoundaryEvidence::InvalidResponse {
+                        request_write,
+                        discarded_noise_bytes: 0,
+                        received_at,
+                        source: TelemetryParseError::Response(_),
+                    },
+            } if observed < previous
+                && received_at == observed
+                && request_write.attempts_used() == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_preserves_timing_failure_and_concurrent_shutdown() {
+        let target = goal_register_target();
+        let (mut actor, shared) = goal_register_actor(Vec::new());
+        actor.config = valid_config(2);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut shared = shared.lock().expect("fake state");
+            shared
+                .write_failures
+                .insert(0, TransportFailure::timed_out(TransportOperation::Write, 0));
+            shared.write_clock_overrides_ms.insert(0, 100);
+            shared
+                .write_gates
+                .insert(0, (Arc::clone(&entered), Arc::clone(&release)));
+        }
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let transaction = actor.write_goals_with_register_readback(
+            target,
+            speed,
+            transaction_timeout,
+            &mut receiver,
+            &mut control,
+        );
+        let queue_shutdown = async move {
+            entered.notified().await;
+            let (response, response_receiver) = oneshot::channel();
+            commands
+                .send(HeadCommand::Shutdown { response })
+                .await
+                .expect("queue shutdown during the failing write");
+            drop(response_receiver);
+            release.notify_one();
+        };
+        let (result, ()) = tokio::join!(transaction, queue_shutdown);
+        let error = result.expect_err("timing failure remains primary");
+
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::DeadlineExceeded {
+                boundary: HeadGoalRegisterBoundary::GoalWriteFailed {
+                    joint: HeadJoint::Bow
+                },
+                boundary_evidence: HeadGoalRegisterBoundaryEvidence::InterruptedWrite(
+                    FrameWriteError {
+                        purpose: WritePurpose::GoalWithSpeed,
+                        ..
+                    }
+                ),
+                ..
+            }
+        ));
+        assert_eq!(
+            error.observed_terminal_cancellation(),
+            Some(CancellationCause::RequestedShutdown)
+        );
+        assert_eq!(
+            control.termination,
+            Some(ActorTermination::RequestedShutdown)
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_preserves_response_io_failure_and_concurrent_shutdown() {
+        let target = goal_register_target();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let reads = vec![ReadAction::GatedFailure {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            source: TransportFailure::timed_out(TransportOperation::Read, 2),
+        }];
+        let (mut actor, _) = goal_register_actor(reads);
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let transaction = actor.write_goals_with_register_readback(
+            target,
+            speed,
+            transaction_timeout,
+            &mut receiver,
+            &mut control,
+        );
+        let queue_shutdown = async move {
+            entered.notified().await;
+            let (response, response_receiver) = oneshot::channel();
+            commands
+                .send(HeadCommand::Shutdown { response })
+                .await
+                .expect("queue shutdown during the failing response read");
+            drop(response_receiver);
+            release.notify_one();
+        };
+        let (result, ()) = tokio::join!(transaction, queue_shutdown);
+        let error = result.expect_err("I/O failure remains primary");
+
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::ReadResponseFrame {
+                joint: HeadJoint::Bow,
+                source: FrameReadError::Transport { source, .. },
+                ..
+            } if source.kind() == TransportFailureKind::TimedOut
+                && source.bytes_transferred() == 2
+        ));
+        assert_eq!(
+            error.observed_terminal_cancellation(),
+            Some(CancellationCause::RequestedShutdown)
+        );
+        assert_eq!(
+            control.termination,
+            Some(ActorTermination::RequestedShutdown)
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_observes_failed_write_before_retry_completion() {
+        let target = goal_register_target();
+        let (mut actor, shared) = goal_register_actor(Vec::new());
+        actor.config = valid_config(2);
+        {
+            let mut shared = shared.lock().expect("fake state");
+            shared
+                .write_failures
+                .insert(0, TransportFailure::timed_out(TransportOperation::Write, 0));
+            shared.write_clock_overrides_ms.insert(0, 20);
+            shared.write_clock_overrides_ms.insert(1, 10);
+        }
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_goals_with_register_readback(
+                target,
+                speed,
+                transaction_timeout,
+                &mut receiver,
+                &mut control,
+            )
+            .await
+            .expect_err("retry completion regresses behind the observed failed attempt");
+        drop(commands);
+
+        assert!(error.completed_writes()[0].is_some());
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::ClockRegression {
+                boundary: HeadGoalRegisterBoundary::GoalWriteCompleted {
+                    joint: HeadJoint::Bow
+                },
+                previous,
+                observed,
+                boundary_evidence:
+                    HeadGoalRegisterBoundaryEvidence::CompletedWrite(completed_write),
+            } if previous.duration_since_origin() == Duration::from_millis(20)
+                && observed.duration_since_origin() == Duration::from_millis(10)
+                && completed_write.attempts_used() == 2
+                && completed_write.recovered_failures().count() == 1
+        ));
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn goal_register_transaction_drains_shutdown_after_fourth_response_before_completion() {
+        let target = goal_register_target();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let reads = HeadJoint::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, joint)| {
+                let bytes = goal_position_response(joint, target.position(joint).get());
+                if index + 1 == HeadJoint::ALL.len() {
+                    ReadAction::GatedBytes {
+                        entered: Arc::clone(&entered),
+                        release: Arc::clone(&release),
+                        bytes,
+                    }
+                } else {
+                    ReadAction::Bytes(bytes)
+                }
+            })
+            .collect();
+        let (mut actor, shared) = goal_register_actor(reads);
+        let speed = actor.config.goal_speed();
+        let transaction_timeout = actor.config.response_timeout();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let transaction = actor.write_goals_with_register_readback(
+            target,
+            speed,
+            transaction_timeout,
+            &mut receiver,
+            &mut control,
+        );
+        let queue_shutdown = async move {
+            entered.notified().await;
+            let (response, response_receiver) = oneshot::channel();
+            commands
+                .send(HeadCommand::Shutdown { response })
+                .await
+                .expect("queue shutdown while the fourth response is in flight");
+            drop(response_receiver);
+            release.notify_one();
+        };
+        let (result, ()) = tokio::join!(transaction, queue_shutdown);
+        let error = result.expect_err("shutdown is drained before transaction completion");
+
+        assert!(error.completed_writes().iter().all(Option::is_some));
+        assert!(error.accepted_readbacks().iter().all(Option::is_some));
+        assert!(matches!(
+            error.failure(),
+            HeadGoalRegisterFailure::Cancelled {
+                cause: CancellationCause::RequestedShutdown,
+                boundary: HeadGoalRegisterBoundary::TransactionCompleted,
+                boundary_evidence:
+                    HeadGoalRegisterBoundaryEvidence::CompletedResponse(response),
+            } if response.value().id() == HeadJoint::Roll.servo_id()
+        ));
+        assert_eq!(error.observed_terminal_cancellation(), None);
+        assert_eq!(
+            control.termination,
+            Some(ActorTermination::RequestedShutdown)
+        );
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 8);
     }
 
     #[tokio::test]
