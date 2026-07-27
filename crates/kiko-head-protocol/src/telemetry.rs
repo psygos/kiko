@@ -193,6 +193,20 @@ impl FullTelemetry {
         self.position
     }
 
+    /// Project the already-parsed physical position without reparsing a second
+    /// wire representation.
+    ///
+    /// The full response has already proved the exact servo identity and
+    /// position domain. This projection deliberately carries no implication
+    /// that the remaining raw telemetry registers were admitted by a runtime
+    /// safety policy.
+    pub const fn present_position(self) -> PresentPosition {
+        PresentPosition {
+            id: self.id,
+            ticks: self.position,
+        }
+    }
+
     pub const fn speed_raw(self) -> u16 {
         self.speed_raw
     }
@@ -446,6 +460,8 @@ mod tests {
         ];
         let telemetry = FullTelemetry::parse(&status(servo, &data), servo).expect("telemetry");
         assert_eq!(telemetry.position().get(), 0x0234);
+        assert_eq!(telemetry.present_position().id(), servo);
+        assert_eq!(telemetry.present_position().ticks(), telemetry.position());
         assert_eq!(telemetry.speed_raw(), 0x5678);
         assert_eq!(telemetry.load_raw(), 0x9abc);
         assert_eq!(telemetry.voltage_raw(), 119);

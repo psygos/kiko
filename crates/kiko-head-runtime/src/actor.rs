@@ -4,9 +4,9 @@ use std::time::Duration;
 use kiko_head_protocol::{
     ExactHeadTargetPose, FullTelemetry, GoalPositionObservation, GoalSpeedTicksPerSecond,
     HeadJoint, HeadPose, HeadPoseError, PositionAgreementError, PositionAgreementTicks,
-    PositionTicks, PresentPosition, TelemetryParseError, TorqueSwitch, ValidatedPresentPosition,
+    PositionTicks, TelemetryParseError, TorqueSwitch, ValidatedPresentPosition,
     build_full_telemetry_read, build_goal_position_read, build_goal_with_speed_write,
-    build_natural_hold_frames, build_position_read, build_torque_switch_write,
+    build_natural_hold_frames, build_torque_switch_write,
 };
 use tokio::runtime::{Handle, TryCurrentError};
 use tokio::sync::{mpsc, oneshot};
@@ -14,7 +14,8 @@ use tokio::task::{JoinError, JoinHandle};
 
 use crate::config::{
     ConfiguredHeadPoseBounds, HeadPoseBoundsAdmissionError, HeadPoseWithinConfiguredBounds,
-    HeadReturnPlan, HeadRuntimeConfig, OperationTimeout, ReturnToTargetConfig,
+    HeadReturnPlan, HeadRuntimeConfig, HeadTelemetrySafetyViolation, OperationTimeout,
+    ReturnToTargetConfig,
 };
 use crate::framing::{FrameReadError, read_response_frame};
 use crate::motion::{
@@ -73,6 +74,7 @@ pub enum RuntimeStage {
     ObserveSecond,
     WriteObservedGoal,
     WriteTorqueLimit,
+    RefreshBeforeEnable,
     EnableTorque,
     VerifyFirstStoppedPosition,
     VerifySecondStoppedPosition,
@@ -96,7 +98,6 @@ pub enum ArmingFreshnessCheck {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WritePurpose {
-    PositionReadRequest,
     TelemetryReadRequest,
     GoalPositionReadRequest,
     ObservedGoal,
@@ -434,8 +435,8 @@ impl std::error::Error for HeadGoalRegisterError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionObservationEvidence {
     joint: HeadJoint,
-    first: ResponseEvidence<PresentPosition>,
-    second: ResponseEvidence<PresentPosition>,
+    first: ResponseEvidence<FullTelemetry>,
+    second: ResponseEvidence<FullTelemetry>,
     validated: ValidatedPresentPosition,
 }
 
@@ -444,11 +445,14 @@ impl PositionObservationEvidence {
         self.joint
     }
 
-    pub const fn first(&self) -> &ResponseEvidence<PresentPosition> {
+    /// First full pre-torque observation. Raw registers are retained after
+    /// admission against the parsed startup safety envelope.
+    pub const fn first(&self) -> &ResponseEvidence<FullTelemetry> {
         &self.first
     }
 
-    pub const fn second(&self) -> &ResponseEvidence<PresentPosition> {
+    /// Second full pre-torque observation.
+    pub const fn second(&self) -> &ResponseEvidence<FullTelemetry> {
         &self.second
     }
 
@@ -537,6 +541,7 @@ pub struct VerifiedNaturalHoldEvidence {
     observations: [PositionObservationEvidence; 4],
     observed_goal_writes: [WriteEvidence; 4],
     torque_limit_writes: [WriteEvidence; 4],
+    pre_enable_telemetry: [ResponseEvidence<FullTelemetry>; 4],
     torque_enable_writes: [WriteEvidence; 4],
     readbacks: [ReadbackEvidence; 4],
 }
@@ -582,6 +587,12 @@ impl VerifiedNaturalHoldEvidence {
 
     pub const fn torque_limit_writes(&self) -> &[WriteEvidence; 4] {
         &self.torque_limit_writes
+    }
+
+    /// Fresh, complete, stopped raw telemetry observed after configuration
+    /// writes and before the first torque-enable write.
+    pub const fn pre_enable_telemetry(&self) -> &[ResponseEvidence<FullTelemetry>; 4] {
+        &self.pre_enable_telemetry
     }
 
     pub const fn torque_enable_writes(&self) -> &[WriteEvidence; 4] {
@@ -774,6 +785,11 @@ pub enum HeadHealthFailure {
         raw: u8,
         response: ResponseEvidence<FullTelemetry>,
     },
+    TelemetrySafety {
+        joint: HeadJoint,
+        source: HeadTelemetrySafetyViolation,
+        response: ResponseEvidence<FullTelemetry>,
+    },
     Moving {
         joint: HeadJoint,
         position: PositionTicks,
@@ -802,6 +818,7 @@ impl std::error::Error for HeadHealthFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::TelemetryRead { source, .. } => Some(source),
+            Self::TelemetrySafety { source, .. } => Some(source),
             Self::Cancelled { .. }
             | Self::ClockRegression { .. }
             | Self::DeviceStatus { .. }
@@ -854,6 +871,7 @@ pub enum HeadHealthCheckError {
     CommandBeforeStartup,
     CommandAlreadyInProgress,
     Observation(Box<HeadHealthObservationError>),
+    TelemetrySafetyFaultLatched(Box<HeadHealthObservationError>),
 }
 
 impl fmt::Display for HeadHealthCheckError {
@@ -865,7 +883,9 @@ impl fmt::Display for HeadHealthCheckError {
 impl std::error::Error for HeadHealthCheckError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Observation(source) => Some(source.as_ref()),
+            Self::Observation(source) | Self::TelemetrySafetyFaultLatched(source) => {
+                Some(source.as_ref())
+            }
             Self::CommandBeforeStartup | Self::CommandAlreadyInProgress => None,
         }
     }
@@ -1020,6 +1040,9 @@ pub enum HeadReturnError {
     CommandBeforeStartup,
     CommandAlreadyInProgress,
     CommandAlreadyAttempted,
+    TelemetrySafetyFaultLatched {
+        source: Box<HeadHealthObservationError>,
+    },
     Cancelled {
         cause: CancellationCause,
         stage: RuntimeStage,
@@ -1029,6 +1052,13 @@ pub enum HeadReturnError {
     TelemetryRead {
         joint: HeadJoint,
         source: RequestError,
+        waypoint_writes: Vec<HeadWaypointEvidence>,
+    },
+    /// Complete raw response evidence for a telemetry set which could not be
+    /// admitted into the return-motion domain.
+    TelemetrySetAdmission {
+        source: HeadMotionError,
+        responses: Box<[ResponseEvidence<FullTelemetry>; 4]>,
         waypoint_writes: Vec<HeadWaypointEvidence>,
     },
     /// No new untrusted goal was written; the actor retains the last complete
@@ -1074,7 +1104,9 @@ impl std::error::Error for HeadReturnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::TelemetryRead { source, .. } => Some(source),
-            Self::KinematicFaultExistingGoalRetained { source, .. }
+            Self::TelemetrySafetyFaultLatched { source } => Some(source.as_ref()),
+            Self::TelemetrySetAdmission { source, .. }
+            | Self::KinematicFaultExistingGoalRetained { source, .. }
             | Self::KinematicFaultRecoveryWritten { source, .. }
             | Self::KinematicFaultRecoveryWriteFailed { source, .. }
             | Self::Motion { source, .. } => Some(source),
@@ -1107,6 +1139,9 @@ impl HeadReturnError {
             | Self::TelemetryRead {
                 waypoint_writes, ..
             }
+            | Self::TelemetrySetAdmission {
+                waypoint_writes, ..
+            }
             | Self::KinematicFaultExistingGoalRetained {
                 waypoint_writes, ..
             }
@@ -1124,7 +1159,8 @@ impl HeadReturnError {
             } => waypoint_writes,
             Self::CommandBeforeStartup
             | Self::CommandAlreadyInProgress
-            | Self::CommandAlreadyAttempted => &[],
+            | Self::CommandAlreadyAttempted
+            | Self::TelemetrySafetyFaultLatched { .. } => &[],
         }
     }
 
@@ -1144,6 +1180,13 @@ impl HeadReturnError {
             Self::TelemetryRead { joint, source, .. } => Self::TelemetryRead {
                 joint,
                 source,
+                waypoint_writes,
+            },
+            Self::TelemetrySetAdmission {
+                source, responses, ..
+            } => Self::TelemetrySetAdmission {
+                source,
+                responses,
                 waypoint_writes,
             },
             Self::Motion { source, .. } => Self::Motion {
@@ -1229,6 +1272,53 @@ pub enum HeadRuntimeError {
         joint: HeadJoint,
         source: PositionAgreementError,
     },
+    PreTorqueDeviceStatus {
+        joint: HeadJoint,
+        sample: VerificationSample,
+        position: PositionTicks,
+        raw: u8,
+        response: Box<ResponseEvidence<FullTelemetry>>,
+    },
+    PreTorqueTelemetrySafety {
+        joint: HeadJoint,
+        sample: VerificationSample,
+        source: HeadTelemetrySafetyViolation,
+        response: Box<ResponseEvidence<FullTelemetry>>,
+    },
+    PreTorqueMoving {
+        joint: HeadJoint,
+        sample: VerificationSample,
+        position: PositionTicks,
+        response: Box<ResponseEvidence<FullTelemetry>>,
+    },
+    PreEnableTelemetryRead {
+        joint: HeadJoint,
+        source: RequestError,
+    },
+    PreEnableDeviceStatus {
+        joint: HeadJoint,
+        position: PositionTicks,
+        raw: u8,
+        response: Box<ResponseEvidence<FullTelemetry>>,
+    },
+    PreEnableTelemetrySafety {
+        joint: HeadJoint,
+        source: HeadTelemetrySafetyViolation,
+        response: Box<ResponseEvidence<FullTelemetry>>,
+    },
+    PreEnableMoving {
+        joint: HeadJoint,
+        position: PositionTicks,
+        response: Box<ResponseEvidence<FullTelemetry>>,
+    },
+    PreEnablePositionMismatch {
+        joint: HeadJoint,
+        target: PositionTicks,
+        actual: PositionTicks,
+        absolute_difference_ticks: u16,
+        tolerance: PositionAgreementTicks,
+        response: Box<ResponseEvidence<FullTelemetry>>,
+    },
     PoseAdmission {
         source: HeadPoseError,
     },
@@ -1261,6 +1351,12 @@ pub enum HeadRuntimeError {
         sample: VerificationSample,
         position: PositionTicks,
         raw: u8,
+    },
+    ReadbackTelemetrySafety {
+        joint: HeadJoint,
+        sample: VerificationSample,
+        source: HeadTelemetrySafetyViolation,
+        response: Box<ResponseEvidence<FullTelemetry>>,
     },
     ReadbackUnstable {
         joint: HeadJoint,
@@ -1302,14 +1398,22 @@ impl std::error::Error for HeadRuntimeError {
             Self::PreObservationTorqueDisable { report } => report
                 .first_failure()
                 .map(|source| source as &(dyn std::error::Error + 'static)),
-            Self::PositionObservation { source, .. } | Self::VerificationRead { source, .. } => {
-                Some(source)
-            }
+            Self::PositionObservation { source, .. }
+            | Self::PreEnableTelemetryRead { source, .. }
+            | Self::VerificationRead { source, .. } => Some(source),
             Self::PositionAgreement { source, .. } => Some(source),
+            Self::PreTorqueTelemetrySafety { source, .. }
+            | Self::PreEnableTelemetrySafety { source, .. }
+            | Self::ReadbackTelemetrySafety { source, .. } => Some(source),
             Self::PoseAdmission { source } => Some(source),
             Self::ConfiguredPoseAdmission { source } => Some(source),
             Self::Write { source, .. } => Some(source),
             Self::Cancelled { .. }
+            | Self::PreTorqueDeviceStatus { .. }
+            | Self::PreTorqueMoving { .. }
+            | Self::PreEnableDeviceStatus { .. }
+            | Self::PreEnableMoving { .. }
+            | Self::PreEnablePositionMismatch { .. }
             | Self::ReadbackMismatch { .. }
             | Self::ReadbackMoving { .. }
             | Self::ReadbackDeviceStatus { .. }
@@ -2294,7 +2398,10 @@ enum ReturnTelemetrySetFailure {
         source: HeadMotionError,
         io: Option<RequestError>,
     },
-    Admission(HeadMotionError),
+    Admission {
+        source: HeadMotionError,
+        responses: Box<[ResponseEvidence<FullTelemetry>; 4]>,
+    },
 }
 
 impl<T, C> HeadActor<T, C>
@@ -2408,6 +2515,7 @@ where
         head_return: &mut Option<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
     ) -> ActorTermination {
         let mut hold_target = HeadHoldTarget::StartupObserved(start_pose);
+        let mut telemetry_safety_fault: Option<Box<HeadHealthObservationError>> = None;
         loop {
             match commands.recv().await {
                 Some(HeadCommand::Shutdown { response }) => {
@@ -2419,16 +2527,41 @@ where
                     return ActorTermination::RequestedHoldPreservingRelease;
                 }
                 Some(HeadCommand::CheckHealth { response }) => {
-                    let result = self
-                        .observe_natural_hold_health(hold_target, commands, control)
-                        .await
-                        .map_err(|source| HeadHealthCheckError::Observation(Box::new(source)));
+                    let result = if let Some(source) = telemetry_safety_fault.as_ref() {
+                        Err(HeadHealthCheckError::TelemetrySafetyFaultLatched(
+                            source.clone(),
+                        ))
+                    } else {
+                        match self
+                            .observe_natural_hold_health(hold_target, commands, control)
+                            .await
+                        {
+                            Ok(evidence) => Ok(evidence),
+                            Err(source) => {
+                                if matches!(
+                                    source.failure(),
+                                    HeadHealthFailure::TelemetrySafety { .. }
+                                ) {
+                                    telemetry_safety_fault = Some(Box::new(source.clone()));
+                                }
+                                Err(HeadHealthCheckError::Observation(Box::new(source)))
+                            }
+                        }
+                    };
                     let _requester_present = response.send(result).is_ok();
                     if let Some(termination) = control.termination.clone() {
                         return termination;
                     }
                 }
                 Some(HeadCommand::ReturnToTarget { response }) => {
+                    if let Some(source) = telemetry_safety_fault.as_ref() {
+                        let _requester_present = response
+                            .send(Err(HeadReturnError::TelemetrySafetyFaultLatched {
+                                source: source.clone(),
+                            }))
+                            .is_ok();
+                        continue;
+                    }
                     if head_return.is_some() {
                         let _requester_present = response
                             .send(Err(HeadReturnError::CommandAlreadyAttempted))
@@ -2566,10 +2699,53 @@ where
                 control,
             )
             .await?;
+        let pre_enable_telemetry = [
+            self.observe_pre_enable_joint(
+                HeadJoint::Bow,
+                observed_pose.position(HeadJoint::Bow),
+                commands,
+                control,
+            )
+            .await?,
+            self.observe_pre_enable_joint(
+                HeadJoint::Curl,
+                observed_pose.position(HeadJoint::Curl),
+                commands,
+                control,
+            )
+            .await?,
+            self.observe_pre_enable_joint(
+                HeadJoint::Yaw,
+                observed_pose.position(HeadJoint::Yaw),
+                commands,
+                control,
+            )
+            .await?,
+            self.observe_pre_enable_joint(
+                HeadJoint::Roll,
+                observed_pose.position(HeadJoint::Roll),
+                commands,
+                control,
+            )
+            .await?,
+        ];
+        let oldest_pre_enable_telemetry_at = pre_enable_telemetry
+            .iter()
+            .map(ResponseEvidence::received_at)
+            .min()
+            .expect("the exact pre-enable set always has four observations");
+        let pre_enable_maximum_age = self.config.pre_enable_telemetry_maximum_age();
+        self.ensure_observation_freshness_with_maximum(
+            oldest_pre_enable_telemetry_at,
+            HeadJoint::Bow,
+            ArmingFreshnessCheck::BeforeEnableWrite,
+            pre_enable_maximum_age,
+        )?;
         let torque_enable_writes = self
             .write_enable_stage(
                 frames.torque_enable_writes(),
-                oldest_observation_at,
+                oldest_pre_enable_telemetry_at,
+                pre_enable_maximum_age,
                 commands,
                 control,
             )
@@ -2619,6 +2795,7 @@ where
             observations,
             observed_goal_writes,
             torque_limit_writes,
+            pre_enable_telemetry,
             torque_enable_writes,
             readbacks,
         })
@@ -2868,8 +3045,12 @@ where
             received_at,
             self.clock.now(),
             plan.telemetry_set_max_age(),
+            self.config.telemetry_safety_limits(),
         )
-        .map_err(ReturnTelemetrySetFailure::Admission)
+        .map_err(|source| ReturnTelemetrySetFailure::Admission {
+            source,
+            responses: Box::new(responses),
+        })
     }
 
     async fn read_return_joint(
@@ -3208,6 +3389,21 @@ where
                     },
                 });
             }
+            if let Err(source) = self
+                .config
+                .telemetry_safety_limits()
+                .admit_energized(telemetry.voltage_raw(), telemetry.temperature_raw())
+            {
+                return Err(HeadHealthObservationError {
+                    started_at,
+                    accepted_prefix,
+                    failure: HeadHealthFailure::TelemetrySafety {
+                        joint,
+                        source,
+                        response,
+                    },
+                });
+            }
             if telemetry.is_moving() {
                 return Err(HeadHealthObservationError {
                     started_at,
@@ -3327,25 +3523,30 @@ where
         commands: &mut mpsc::Receiver<HeadCommand>,
         control: &mut ControlState,
     ) -> Result<PositionObservationEvidence, HeadRuntimeError> {
+        let request = build_full_telemetry_read(joint.servo_id());
         self.check_control(commands, control, RuntimeStage::ObserveFirst, joint)?;
-        let first = self.read_position(joint).await.map_err(|source| {
-            HeadRuntimeError::PositionObservation {
+        let first = self
+            .read_telemetry(joint, &request)
+            .await
+            .map_err(|source| HeadRuntimeError::PositionObservation {
                 joint,
                 stage: RuntimeStage::ObserveFirst,
                 source,
-            }
-        })?;
+            })?;
+        self.admit_pre_torque_observation(joint, VerificationSample::First, &first)?;
         self.check_control(commands, control, RuntimeStage::ObserveSecond, joint)?;
-        let second = self.read_position(joint).await.map_err(|source| {
-            HeadRuntimeError::PositionObservation {
+        let second = self
+            .read_telemetry(joint, &request)
+            .await
+            .map_err(|source| HeadRuntimeError::PositionObservation {
                 joint,
                 stage: RuntimeStage::ObserveSecond,
                 source,
-            }
-        })?;
+            })?;
+        self.admit_pre_torque_observation(joint, VerificationSample::Second, &second)?;
         let validated = ValidatedPresentPosition::try_from_pair(
-            *first.value(),
-            *second.value(),
+            first.value().present_position(),
+            second.value().present_position(),
             self.config.redundant_read_tolerance(),
         )
         .map_err(|source| HeadRuntimeError::PositionAgreement { joint, source })?;
@@ -3357,35 +3558,91 @@ where
         })
     }
 
-    async fn read_position(
+    fn admit_pre_torque_observation(
+        &self,
+        joint: HeadJoint,
+        sample: VerificationSample,
+        response: &ResponseEvidence<FullTelemetry>,
+    ) -> Result<(), HeadRuntimeError> {
+        let telemetry = response.value();
+        if telemetry.device_status_raw() != 0 {
+            return Err(HeadRuntimeError::PreTorqueDeviceStatus {
+                joint,
+                sample,
+                position: telemetry.position(),
+                raw: telemetry.device_status_raw(),
+                response: Box::new(response.clone()),
+            });
+        }
+        self.config
+            .telemetry_safety_limits()
+            .admit_pre_torque(telemetry.voltage_raw(), telemetry.temperature_raw())
+            .map_err(|source| HeadRuntimeError::PreTorqueTelemetrySafety {
+                joint,
+                sample,
+                source,
+                response: Box::new(response.clone()),
+            })?;
+        if telemetry.is_moving() {
+            return Err(HeadRuntimeError::PreTorqueMoving {
+                joint,
+                sample,
+                position: telemetry.position(),
+                response: Box::new(response.clone()),
+            });
+        }
+        Ok(())
+    }
+
+    async fn observe_pre_enable_joint(
         &mut self,
         joint: HeadJoint,
-    ) -> Result<ResponseEvidence<PresentPosition>, RequestError> {
-        let id = joint.servo_id();
-        let request_write = self
-            .write_frame(
-                joint,
-                WritePurpose::PositionReadRequest,
-                build_position_read(id).as_bytes(),
-            )
+        target: PositionTicks,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<ResponseEvidence<FullTelemetry>, HeadRuntimeError> {
+        self.check_control(commands, control, RuntimeStage::RefreshBeforeEnable, joint)?;
+        let request = build_full_telemetry_read(joint.servo_id());
+        let response = self
+            .read_telemetry(joint, &request)
             .await
-            .map_err(RequestError::RequestWrite)?;
-        let frame = read_response_frame(
-            &mut self.transport,
-            &self.clock,
-            self.config.response_timeout(),
-            self.config.noise_budget_bytes(),
-        )
-        .await
-        .map_err(RequestError::ResponseFrame)?;
-        let value =
-            PresentPosition::parse(frame.as_bytes(), id).map_err(RequestError::Telemetry)?;
-        Ok(ResponseEvidence {
-            value,
-            request_write,
-            discarded_noise_bytes: frame.discarded_noise_bytes(),
-            received_at: self.clock.now(),
-        })
+            .map_err(|source| HeadRuntimeError::PreEnableTelemetryRead { joint, source })?;
+        let telemetry = response.value();
+        if telemetry.device_status_raw() != 0 {
+            return Err(HeadRuntimeError::PreEnableDeviceStatus {
+                joint,
+                position: telemetry.position(),
+                raw: telemetry.device_status_raw(),
+                response: Box::new(response),
+            });
+        }
+        self.config
+            .telemetry_safety_limits()
+            .admit_pre_torque(telemetry.voltage_raw(), telemetry.temperature_raw())
+            .map_err(|source| HeadRuntimeError::PreEnableTelemetrySafety {
+                joint,
+                source,
+                response: Box::new(response.clone()),
+            })?;
+        if telemetry.is_moving() {
+            return Err(HeadRuntimeError::PreEnableMoving {
+                joint,
+                position: telemetry.position(),
+                response: Box::new(response),
+            });
+        }
+        let absolute_difference_ticks = target.get().abs_diff(telemetry.position().get());
+        if absolute_difference_ticks > self.config.readback_tolerance().get() {
+            return Err(HeadRuntimeError::PreEnablePositionMismatch {
+                joint,
+                target,
+                actual: telemetry.position(),
+                absolute_difference_ticks,
+                tolerance: self.config.readback_tolerance(),
+                response: Box::new(response),
+            });
+        }
+        Ok(response)
     }
 
     /// Write one complete canonical goal set, then prove that the four goal
@@ -3984,6 +4241,7 @@ where
         &mut self,
         frames: &[kiko_head_protocol::CommandFrame; 4],
         oldest_observation_at: MonotonicTime,
+        maximum_age: Duration,
         commands: &mut mpsc::Receiver<HeadCommand>,
         control: &mut ControlState,
     ) -> Result<[WriteEvidence; 4], HeadRuntimeError> {
@@ -3992,6 +4250,7 @@ where
                 HeadJoint::Bow,
                 &frames[0],
                 oldest_observation_at,
+                maximum_age,
                 commands,
                 control,
             )
@@ -4001,6 +4260,7 @@ where
                 HeadJoint::Curl,
                 &frames[1],
                 oldest_observation_at,
+                maximum_age,
                 commands,
                 control,
             )
@@ -4010,6 +4270,7 @@ where
                 HeadJoint::Yaw,
                 &frames[2],
                 oldest_observation_at,
+                maximum_age,
                 commands,
                 control,
             )
@@ -4019,6 +4280,7 @@ where
                 HeadJoint::Roll,
                 &frames[3],
                 oldest_observation_at,
+                maximum_age,
                 commands,
                 control,
             )
@@ -4031,11 +4293,12 @@ where
         joint: HeadJoint,
         frame: &kiko_head_protocol::CommandFrame,
         oldest_observation_at: MonotonicTime,
+        maximum_age: Duration,
         commands: &mut mpsc::Receiver<HeadCommand>,
         control: &mut ControlState,
     ) -> Result<WriteEvidence, HeadRuntimeError> {
         self.check_control(commands, control, RuntimeStage::EnableTorque, joint)?;
-        self.ensure_arming_write_budget(oldest_observation_at, joint)?;
+        self.ensure_arming_write_budget(oldest_observation_at, joint, maximum_age)?;
         let evidence = self
             .write_frame(joint, WritePurpose::TorqueEnable, frame.as_bytes())
             .await
@@ -4043,10 +4306,11 @@ where
                 stage: RuntimeStage::EnableTorque,
                 source,
             })?;
-        self.ensure_observation_freshness(
+        self.ensure_observation_freshness_with_maximum(
             oldest_observation_at,
             joint,
             ArmingFreshnessCheck::AfterEnableWrite,
+            maximum_age,
         )?;
         Ok(evidence)
     }
@@ -4057,8 +4321,22 @@ where
         joint: HeadJoint,
         check: ArmingFreshnessCheck,
     ) -> Result<(), HeadRuntimeError> {
+        self.ensure_observation_freshness_with_maximum(
+            oldest_observation_at,
+            joint,
+            check,
+            self.config.arming_freshness().get(),
+        )
+    }
+
+    fn ensure_observation_freshness_with_maximum(
+        &self,
+        oldest_observation_at: MonotonicTime,
+        joint: HeadJoint,
+        check: ArmingFreshnessCheck,
+        maximum_age: Duration,
+    ) -> Result<(), HeadRuntimeError> {
         let (checked_at, age) = self.observation_age(oldest_observation_at)?;
-        let maximum_age = self.config.arming_freshness().get();
         if age > maximum_age {
             return Err(HeadRuntimeError::ObservationStaleBeforeArming {
                 joint,
@@ -4076,9 +4354,9 @@ where
         &self,
         oldest_observation_at: MonotonicTime,
         joint: HeadJoint,
+        maximum_age: Duration,
     ) -> Result<(), HeadRuntimeError> {
         let (checked_at, age) = self.observation_age(oldest_observation_at)?;
-        let maximum_age = self.config.arming_freshness().get();
         if age > maximum_age {
             return Err(HeadRuntimeError::ObservationStaleBeforeArming {
                 joint,
@@ -4159,7 +4437,7 @@ where
             .await
             .map_err(|source| HeadRuntimeError::VerificationRead { joint, source })?;
         let first_target_difference_ticks =
-            self.admit_stopped_readback(joint, VerificationSample::First, target, first.value())?;
+            self.admit_stopped_readback(joint, VerificationSample::First, target, &first)?;
 
         self.check_control(
             commands,
@@ -4172,7 +4450,7 @@ where
             .await
             .map_err(|source| HeadRuntimeError::VerificationRead { joint, source })?;
         let second_target_difference_ticks =
-            self.admit_stopped_readback(joint, VerificationSample::Second, target, second.value())?;
+            self.admit_stopped_readback(joint, VerificationSample::Second, target, &second)?;
         let stable_difference_ticks = first
             .value()
             .position()
@@ -4235,8 +4513,9 @@ where
         joint: HeadJoint,
         sample: VerificationSample,
         target: PositionTicks,
-        telemetry: &FullTelemetry,
+        response: &ResponseEvidence<FullTelemetry>,
     ) -> Result<u16, HeadRuntimeError> {
+        let telemetry = response.value();
         if telemetry.device_status_raw() != 0 {
             return Err(HeadRuntimeError::ReadbackDeviceStatus {
                 joint,
@@ -4245,6 +4524,15 @@ where
                 raw: telemetry.device_status_raw(),
             });
         }
+        self.config
+            .telemetry_safety_limits()
+            .admit_energized(telemetry.voltage_raw(), telemetry.temperature_raw())
+            .map_err(|source| HeadRuntimeError::ReadbackTelemetrySafety {
+                joint,
+                sample,
+                source,
+                response: Box::new(response.clone()),
+            })?;
         if telemetry.is_moving() {
             return Err(HeadRuntimeError::ReadbackMoving {
                 joint,
@@ -4420,15 +4708,13 @@ fn map_return_telemetry_failure(
             source,
             waypoint_writes,
         },
-        ReturnTelemetrySetFailure::Admission(source)
-            if source.permits_existing_goal_retention() =>
-        {
-            retain_existing_goal_error(source, commanded_positions, None, None, waypoint_writes)
+        ReturnTelemetrySetFailure::Admission { source, responses } => {
+            HeadReturnError::TelemetrySetAdmission {
+                source,
+                responses,
+                waypoint_writes,
+            }
         }
-        ReturnTelemetrySetFailure::Admission(source) => HeadReturnError::Motion {
-            source,
-            waypoint_writes,
-        },
     }
 }
 
@@ -4666,10 +4952,6 @@ mod tests {
         bytes
     }
 
-    fn position_response(joint: HeadJoint, position: u16) -> Vec<u8> {
-        status(joint.servo_id(), &position.to_le_bytes())
-    }
-
     fn goal_position_response(joint: HeadJoint, position: u16) -> Vec<u8> {
         status(joint.servo_id(), &position.to_le_bytes())
     }
@@ -4688,7 +4970,28 @@ mod tests {
         moving: bool,
         device_status_raw: u8,
     ) -> Vec<u8> {
-        telemetry_response_with_raw(joint, position, moving, device_status_raw, [0; 13])
+        telemetry_response_with_voltage_temperature(
+            joint,
+            position,
+            moving,
+            device_status_raw,
+            120,
+            30,
+        )
+    }
+
+    fn telemetry_response_with_voltage_temperature(
+        joint: HeadJoint,
+        position: u16,
+        moving: bool,
+        device_status_raw: u8,
+        voltage_raw: u8,
+        temperature_raw: u8,
+    ) -> Vec<u8> {
+        let mut remaining_raw = [0_u8; 13];
+        remaining_raw[4] = voltage_raw;
+        remaining_raw[5] = temperature_raw;
+        telemetry_response_with_raw(joint, position, moving, device_status_raw, remaining_raw)
     }
 
     fn telemetry_response_with_raw(
@@ -4716,10 +5019,13 @@ mod tests {
 
     fn successful_reads() -> Vec<ReadAction> {
         let positions = [2_127_u16, 2_558, 2_925, 2_930];
-        let mut reads = Vec::with_capacity(16);
+        let mut reads = Vec::with_capacity(20);
         for (joint, position) in HeadJoint::ALL.into_iter().zip(positions) {
-            reads.push(ReadAction::Bytes(position_response(joint, position - 2)));
-            reads.push(ReadAction::Bytes(position_response(joint, position)));
+            reads.push(ReadAction::Bytes(telemetry_response(joint, position - 2)));
+            reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
+        }
+        for (joint, position) in HeadJoint::ALL.into_iter().zip(positions) {
+            reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
         }
         for (joint, position) in HeadJoint::ALL.into_iter().zip(positions) {
             reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
@@ -5866,7 +6172,7 @@ mod tests {
         assert_eq!(exit.torque_disable(), &disable);
 
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.writes.len(), 36);
+        assert_eq!(shared.writes.len(), 40);
         assert!(
             shared.writes[..4]
                 .iter()
@@ -5880,7 +6186,7 @@ mod tests {
             vec![1, 2, 3, 4]
         );
         for write in &shared.writes[4..12] {
-            assert_eq!(&write[4..=6], &[2, 56, 2]);
+            assert_eq!(&write[4..=6], &[2, 56, 15]);
         }
         assert_eq!(
             shared.writes[4..12]
@@ -5900,15 +6206,20 @@ mod tests {
         assert!(
             shared.writes[20..24]
                 .iter()
+                .all(|write| write[4..=6] == [2, 56, 15])
+        );
+        assert!(
+            shared.writes[24..28]
+                .iter()
                 .all(|write| write[5..=6] == [40, 1])
         );
         assert!(
-            shared.writes[24..32]
+            shared.writes[28..36]
                 .iter()
                 .all(|write| write[4..=6] == [2, 56, 15])
         );
         assert!(
-            shared.writes[32..]
+            shared.writes[36..]
                 .iter()
                 .all(|write| write[5..=6] == [40, 0])
         );
@@ -5935,6 +6246,13 @@ mod tests {
             evidence.observed_pose().positions().map(PositionTicks::get),
             positions
         );
+        assert_eq!(
+            evidence
+                .pre_enable_telemetry()
+                .each_ref()
+                .map(|response| response.value().position().get()),
+            positions
+        );
 
         let release = handle
             .release_ownership_preserving_hold()
@@ -5949,12 +6267,12 @@ mod tests {
         assert_eq!(exit.hold_preserving_release(), &release);
 
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.writes.len(), 28);
+        assert_eq!(shared.writes.len(), 32);
         assert!(
             shared.writes[..8]
                 .iter()
-                .all(|write| write[4..=6] == [2, 56, 2]),
-            "the first protocol writes must be the redundant present-position reads"
+                .all(|write| write[4..=6] == [2, 56, 15]),
+            "the first protocol writes must be the redundant full-telemetry reads"
         );
         assert!(
             shared
@@ -5983,12 +6301,212 @@ mod tests {
         assert!(
             shared.writes[16..20]
                 .iter()
+                .all(|write| write[4..=6] == [2, 56, 15])
+        );
+        assert!(
+            shared.writes[20..24]
+                .iter()
                 .all(|write| write[5..=6] == [40, 1])
         );
         assert!(
-            shared.writes[20..28]
+            shared.writes[24..32]
                 .iter()
                 .all(|write| write[4..=6] == [2, 56, 15])
+        );
+    }
+
+    #[tokio::test]
+    async fn production_takeover_rejects_raw_telemetry_limits_before_any_motion_write() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        for (voltage_raw, temperature_raw, expected) in [
+            (
+                120,
+                56,
+                HeadTelemetrySafetyViolation::PreTorqueTemperatureAboveInclusiveMaximum {
+                    observed_raw: 56,
+                    maximum_raw_inclusive: 55,
+                },
+            ),
+            (
+                89,
+                30,
+                HeadTelemetrySafetyViolation::VoltageBelowInclusiveMinimum {
+                    observed_raw: 89,
+                    minimum_raw_inclusive: 90,
+                },
+            ),
+            (
+                136,
+                30,
+                HeadTelemetrySafetyViolation::VoltageAboveInclusiveMaximum {
+                    observed_raw: 136,
+                    maximum_raw_inclusive: 135,
+                },
+            ),
+        ] {
+            let mut reads = successful_reads();
+            reads[0] = ReadAction::Bytes(telemetry_response_with_voltage_temperature(
+                HeadJoint::Bow,
+                positions[0],
+                false,
+                0,
+                voltage_raw,
+                temperature_raw,
+            ));
+            let (handle, receipt, task, shared) =
+                spawn_tension_preserving_return_fake(reads, valid_return_config(positions, [1; 4]));
+            let error = receipt
+                .wait()
+                .await
+                .expect("startup channel")
+                .expect_err("unsafe raw telemetry must refuse takeover");
+            let HeadRuntimeError::PreTorqueTelemetrySafety {
+                joint: HeadJoint::Bow,
+                sample: VerificationSample::First,
+                source,
+                response,
+            } = &error
+            else {
+                panic!("unexpected startup error: {error:?}");
+            };
+            assert_eq!(*source, expected);
+            assert_eq!(response.value().voltage_raw(), voltage_raw);
+            assert_eq!(response.value().temperature_raw(), temperature_raw);
+
+            drop(handle);
+            let exit = task.join().await.expect("actor task");
+            assert_eq!(exit.termination(), &ActorTermination::StartupFault);
+            let shared = shared.lock().expect("fake state");
+            assert_eq!(shared.writes.len(), 1);
+            assert_eq!(&shared.writes[0][4..=6], &[2, 56, 15]);
+            assert!(
+                shared.writes.iter().all(|write| {
+                    write.get(5) != Some(&48)
+                        && write.get(5) != Some(&42)
+                        && write.get(5..=6) != Some(&[40, 1])
+                        && write.get(5..=6) != Some(&[40, 0])
+                }),
+                "a rejected tension-preserving observation must not alter torque or goals"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn production_takeover_requires_stationary_zero_status_full_telemetry() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+
+        let mut status_reads = successful_reads();
+        status_reads[0] = ReadAction::Bytes(telemetry_response_with_status(
+            HeadJoint::Bow,
+            positions[0],
+            false,
+            7,
+        ));
+        let (handle, receipt, task, shared) = spawn_tension_preserving_return_fake(
+            status_reads,
+            valid_return_config(positions, [1; 4]),
+        );
+        let error = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect_err("nonzero device status must refuse takeover");
+        assert!(matches!(
+            &error,
+            HeadRuntimeError::PreTorqueDeviceStatus {
+                joint: HeadJoint::Bow,
+                sample: VerificationSample::First,
+                position,
+                raw: 7,
+                response,
+            } if position.get() == positions[0]
+                && response.value().device_status_raw() == 7
+        ));
+        drop(handle);
+        assert_eq!(
+            task.join().await.expect("actor task").termination(),
+            &ActorTermination::StartupFault
+        );
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 1);
+
+        let mut moving_reads = successful_reads();
+        moving_reads[0] = ReadAction::Bytes(telemetry_response_with_moving(
+            HeadJoint::Bow,
+            positions[0],
+            true,
+        ));
+        let (handle, receipt, task, shared) = spawn_tension_preserving_return_fake(
+            moving_reads,
+            valid_return_config(positions, [1; 4]),
+        );
+        let error = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect_err("moving telemetry must refuse takeover");
+        assert!(matches!(
+            &error,
+            HeadRuntimeError::PreTorqueMoving {
+                joint: HeadJoint::Bow,
+                sample: VerificationSample::First,
+                position,
+                response,
+            } if position.get() == positions[0] && response.value().is_moving()
+        ));
+        drop(handle);
+        assert_eq!(
+            task.join().await.expect("actor task").termination(),
+            &ActorTermination::StartupFault
+        );
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn late_raw_telemetry_trip_prevents_every_torque_enable_write() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads[11] = ReadAction::Bytes(telemetry_response_with_voltage_temperature(
+            HeadJoint::Roll,
+            positions[3],
+            false,
+            0,
+            120,
+            56,
+        ));
+        let (handle, receipt, task, shared) =
+            spawn_tension_preserving_return_fake(reads, valid_return_config(positions, [1; 4]));
+        let error = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect_err("post-configuration raw telemetry trip must refuse enable");
+        assert!(matches!(
+            &error,
+            HeadRuntimeError::PreEnableTelemetrySafety {
+                joint: HeadJoint::Roll,
+                source:
+                    HeadTelemetrySafetyViolation::PreTorqueTemperatureAboveInclusiveMaximum {
+                        observed_raw: 56,
+                        maximum_raw_inclusive: 55,
+                    },
+                response,
+            } if response.value().temperature_raw() == 56
+                && response.value().position().get() == positions[3]
+        ));
+        drop(handle);
+        assert_eq!(
+            task.join().await.expect("actor task").termination(),
+            &ActorTermination::StartupFault
+        );
+
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.writes.len(), 20);
+        assert!(
+            shared
+                .writes
+                .iter()
+                .all(|write| write.get(5..=6) != Some(&[40, 1])),
+            "the complete fresh telemetry barrier precedes every enable write"
         );
     }
 
@@ -5996,7 +6514,7 @@ mod tests {
     async fn production_takeover_rejects_invalid_pose_evidence_before_motion_writes() {
         let positions = [2_127, 2_558, 2_925, 2_930];
         let mut invalid = successful_reads();
-        invalid[1] = ReadAction::Bytes(position_response(HeadJoint::Bow, 2_200));
+        invalid[1] = ReadAction::Bytes(telemetry_response(HeadJoint::Bow, 2_200));
         let (handle, receipt, task, shared) =
             spawn_tension_preserving_return_fake(invalid, valid_return_config(positions, [1; 4]));
         let error = receipt
@@ -6020,7 +6538,7 @@ mod tests {
         assert!(
             shared.writes[..2]
                 .iter()
-                .all(|write| write[4..=6] == [2, 56, 2])
+                .all(|write| write[4..=6] == [2, 56, 15])
         );
         assert!(
             shared.writes[..2]
@@ -6091,7 +6609,7 @@ mod tests {
             assert!(
                 shared.writes[..8]
                     .iter()
-                    .all(|write| write[4..=6] == [2, 56, 2]),
+                    .all(|write| write[4..=6] == [2, 56, 15]),
                 "boundary admission happens only after the complete redundant observation"
             );
             assert!(
@@ -6113,7 +6631,7 @@ mod tests {
         let mut reads = successful_reads();
         reads[1] = ReadAction::SetClockAndBytes {
             milliseconds: 100,
-            bytes: position_response(HeadJoint::Bow, positions[0]),
+            bytes: telemetry_response(HeadJoint::Bow, positions[0]),
         };
         let config = return_config_with_start_bounds_and_freshness(
             positions, positions, positions, [1; 4], 50,
@@ -6139,7 +6657,12 @@ mod tests {
 
         let shared = shared.lock().expect("fake state");
         assert_eq!(shared.writes.len(), 8);
-        assert!(shared.writes.iter().all(|write| write[4..=6] == [2, 56, 2]));
+        assert!(
+            shared
+                .writes
+                .iter()
+                .all(|write| write[4..=6] == [2, 56, 15])
+        );
         assert!(
             shared
                 .writes
@@ -6237,6 +6760,85 @@ mod tests {
                 .writes
                 .iter()
                 .all(|write| write.get(5..=6) != Some(&[40, 0]))
+        );
+    }
+
+    #[tokio::test]
+    async fn return_telemetry_safety_fault_retains_the_complete_response_set() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        for (joint, position) in HeadJoint::ALL.into_iter().zip(positions) {
+            let temperature_raw = if joint == HeadJoint::Bow { 65 } else { 30 };
+            reads.push(ReadAction::Bytes(
+                telemetry_response_with_voltage_temperature(
+                    joint,
+                    position,
+                    false,
+                    0,
+                    120,
+                    temperature_raw,
+                ),
+            ));
+        }
+        let (handle, receipt, task, shared) =
+            spawn_tension_preserving_return_fake(reads, valid_return_config(positions, [1; 4]));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified tension-preserving takeover");
+
+        let error = handle
+            .return_to_target()
+            .await
+            .expect("actor command receipt")
+            .expect_err("energized raw telemetry limit must reject the return set");
+        let HeadReturnError::TelemetrySetAdmission {
+            source,
+            responses,
+            waypoint_writes,
+        } = &error
+        else {
+            panic!("expected return telemetry admission evidence, got {error:#?}");
+        };
+        assert!(waypoint_writes.is_empty());
+        assert!(matches!(
+            source,
+            HeadMotionError::TelemetrySafety {
+                joint: HeadJoint::Bow,
+                source:
+                    HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
+                        observed_raw: 65,
+                        maximum_raw_exclusive: 65,
+                    },
+            }
+        ));
+        for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+            let response = &responses[index];
+            assert_eq!(response.value().id(), joint.servo_id());
+            assert_eq!(response.value().position().get(), positions[index]);
+            assert_eq!(response.value().voltage_raw(), 120);
+            assert_eq!(
+                response.value().temperature_raw(),
+                if joint == HeadJoint::Bow { 65 } else { 30 }
+            );
+            assert_eq!(response.request_write().attempts_used(), 1);
+            assert_eq!(response.discarded_noise_bytes(), 0);
+            assert!(response.request_write().completed_at() <= response.received_at());
+        }
+
+        drop(handle);
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.termination(), &ActorTermination::HeadReturnFault);
+        assert_eq!(exit.head_return(), Some(&Err(error)));
+        assert!(
+            shared
+                .lock()
+                .expect("fake state")
+                .writes
+                .iter()
+                .all(|write| write.get(5..=6) != Some(&[40, 0])),
+            "production cleanup must never drop neck tension"
         );
     }
 
@@ -6484,6 +7086,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_health_check_surfaces_raw_limit_fault_without_dropping_tension() {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads.push(ReadAction::Bytes(
+            telemetry_response_with_voltage_temperature(
+                HeadJoint::Bow,
+                positions[0],
+                false,
+                0,
+                120,
+                65,
+            ),
+        ));
+        reads.extend(health_reads(positions));
+        let (handle, receipt, task, shared) =
+            spawn_tension_preserving_return_fake(reads, valid_return_config(positions, [1; 4]));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified tension-preserving takeover");
+
+        let fault = handle
+            .check_health()
+            .await
+            .expect_err("energized raw telemetry limit must fail health admission");
+        let fault = health_observation_error(fault);
+        assert!(fault.accepted_prefix().iter().all(Option::is_none));
+        assert!(matches!(
+            fault.failure(),
+            HeadHealthFailure::TelemetrySafety {
+                joint: HeadJoint::Bow,
+                source:
+                    HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
+                        observed_raw: 65,
+                        maximum_raw_exclusive: 65,
+                    },
+                response,
+            } if response.value().temperature_raw() == 65
+                && response.value().voltage_raw() == 120
+        ));
+        let writes_after_fault = shared.lock().expect("fake state").writes.len();
+        let repeated = handle
+            .check_health()
+            .await
+            .expect_err("raw telemetry safety faults are absorbing for this owner");
+        assert!(matches!(
+            repeated,
+            HeadHealthRequestError::Check {
+                source: HeadHealthCheckError::TelemetrySafetyFaultLatched(source),
+            } if source.as_ref() == fault.as_ref()
+        ));
+        assert!(matches!(
+            handle
+                .return_to_target()
+                .await
+                .expect("latched actor returns a typed refusal"),
+            Err(HeadReturnError::TelemetrySafetyFaultLatched { source })
+                if source.as_ref() == fault.as_ref()
+        ));
+        assert_eq!(
+            shared.lock().expect("fake state").writes.len(),
+            writes_after_fault,
+            "latched monitoring and motion refusal must not touch the bus"
+        );
+
+        handle
+            .release_ownership_preserving_hold()
+            .await
+            .expect("hold-preserving ownership release");
+        assert_eq!(
+            task.join().await.expect("actor task").termination(),
+            &ActorTermination::RequestedHoldPreservingRelease
+        );
+        assert!(
+            shared
+                .lock()
+                .expect("fake state")
+                .writes
+                .iter()
+                .all(|write| write.get(5..=6) != Some(&[40, 0]))
+        );
+    }
+
+    #[tokio::test]
     async fn health_transport_failure_is_exact_and_the_actor_can_be_queried_again() {
         let positions = [2_127_u16, 2_558, 2_925, 2_930];
         let mut reads = successful_reads();
@@ -6584,7 +7271,7 @@ mod tests {
             .expect("queue health request");
         drop(cancelled_receiver);
         loop {
-            if shared.lock().expect("fake state").writes.len() >= 36 {
+            if shared.lock().expect("fake state").writes.len() >= 40 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -6596,9 +7283,9 @@ mod tests {
             .expect("actor remains usable after the query receiver disappears");
         {
             let shared = shared.lock().expect("fake state");
-            assert_eq!(shared.writes.len(), 40);
+            assert_eq!(shared.writes.len(), 44);
             assert!(
-                shared.writes[32..40]
+                shared.writes[36..44]
                     .iter()
                     .all(|write| write[4..=6] == [2, 56, 15]),
                 "health requests are read-only and receiver cancellation adds no disable write"
@@ -6633,7 +7320,7 @@ mod tests {
                 .all(|joint| joint.telemetry().device_status_raw() == 0
                     && !joint.telemetry().is_moving())
         );
-        assert_eq!(shared.lock().expect("fake state").writes.len(), 40);
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 44);
 
         handle.shutdown().await.expect("shutdown");
         task.join().await.expect("actor task");
@@ -6747,8 +7434,8 @@ mod tests {
         assert_eq!(exit.termination(), &ActorTermination::RequestedShutdown);
 
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.read_calls, 160);
-        assert_eq!(shared.writes.len(), 64);
+        assert_eq!(shared.read_calls, 176);
+        assert_eq!(shared.writes.len(), 68);
         assert_eq!(
             shared
                 .writes
@@ -6970,8 +7657,8 @@ mod tests {
         assert!(exit.torque_disable().all_writes_completed());
 
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.read_calls, 96);
-        assert_eq!(shared.writes.len(), 44);
+        assert_eq!(shared.read_calls, 112);
+        assert_eq!(shared.writes.len(), 48);
         assert_eq!(
             shared
                 .writes
@@ -7080,7 +7767,7 @@ mod tests {
         assert!(
             shared.writes[4..12]
                 .iter()
-                .all(|write| write[4..=6] == [2, 56, 2])
+                .all(|write| write[4..=6] == [2, 56, 15])
         );
         assert!(
             shared.writes[12..]
@@ -7117,7 +7804,7 @@ mod tests {
 
     #[tokio::test]
     async fn noise_budget_and_declared_frame_bound_fail_closed() {
-        let mut noisy = position_response(HeadJoint::Bow, 2_125);
+        let mut noisy = telemetry_response(HeadJoint::Bow, 2_125);
         noisy.splice(0..0, [0x01; 17]);
         let (error, _, _) =
             run_startup_fault(vec![ReadAction::Bytes(noisy)], valid_config(1)).await;
@@ -7150,7 +7837,7 @@ mod tests {
 
     #[tokio::test]
     async fn truncation_is_not_relabelled_as_a_protocol_error() {
-        let complete = position_response(HeadJoint::Bow, 2_125);
+        let complete = telemetry_response(HeadJoint::Bow, 2_125);
         let reads = vec![ReadAction::Bytes(complete[..4].to_vec()), ReadAction::Eof];
         let (error, exit, _) = run_startup_fault(reads, valid_config(1)).await;
         assert!(matches!(
@@ -7158,7 +7845,7 @@ mod tests {
             HeadRuntimeError::PositionObservation {
                 source: RequestError::ResponseFrame(FrameReadError::Truncated {
                     buffered_bytes: 4,
-                    expected_bytes: Some(8),
+                    expected_bytes: Some(21),
                 }),
                 ..
             }
@@ -7168,7 +7855,10 @@ mod tests {
 
     #[tokio::test]
     async fn response_id_length_checksum_and_status_are_propagated_exactly() {
-        let wrong_id = vec![ReadAction::Bytes(position_response(HeadJoint::Curl, 2_125))];
+        let wrong_id = vec![ReadAction::Bytes(telemetry_response(
+            HeadJoint::Curl,
+            2_125,
+        ))];
         let (error, _, _) = run_startup_fault(wrong_id, valid_config(1)).await;
         assert!(matches!(
             error,
@@ -7180,7 +7870,7 @@ mod tests {
             }
         ));
 
-        let mut corrupt = position_response(HeadJoint::Bow, 2_125);
+        let mut corrupt = telemetry_response(HeadJoint::Bow, 2_125);
         let last = corrupt.len() - 1;
         corrupt[last] ^= 1;
         let (error, _, _) =
@@ -7206,7 +7896,7 @@ mod tests {
             HeadRuntimeError::PositionObservation {
                 source: RequestError::Telemetry(TelemetryParseError::Response(
                     ResponseParseError::ParameterCountMismatch {
-                        expected: 2,
+                        expected: 15,
                         actual: 1,
                     }
                 )),
@@ -7214,7 +7904,7 @@ mod tests {
             }
         ));
 
-        let mut device_fault = position_response(HeadJoint::Bow, 2_125);
+        let mut device_fault = telemetry_response(HeadJoint::Bow, 2_125);
         device_fault[4] = 0x40;
         let last = device_fault.len() - 1;
         device_fault[last] = !device_fault[2..last]
@@ -7306,7 +7996,7 @@ mod tests {
     #[tokio::test]
     async fn post_write_position_mismatch_prevents_success() {
         let mut reads = successful_reads();
-        reads[8] = ReadAction::Bytes(telemetry_response(HeadJoint::Bow, 2_200));
+        reads[12] = ReadAction::Bytes(telemetry_response(HeadJoint::Bow, 2_200));
         let (error, exit, _) = run_startup_fault(reads, valid_config(1)).await;
         assert!(matches!(
             error,
@@ -7320,6 +8010,54 @@ mod tests {
             } if target.get() == 2_127 && actual.get() == 2_200
         ));
         assert!(exit.torque_disable().all_writes_completed());
+    }
+
+    #[tokio::test]
+    async fn energized_telemetry_limit_fault_retains_evidence_and_existing_tension() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads[12] = ReadAction::Bytes(telemetry_response_with_voltage_temperature(
+            HeadJoint::Bow,
+            positions[0],
+            false,
+            0,
+            120,
+            65,
+        ));
+        let (handle, receipt, task, shared) =
+            spawn_tension_preserving_return_fake(reads, valid_return_config(positions, [1; 4]));
+        let error = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect_err("energized raw limit must prevent a successful takeover");
+        assert!(matches!(
+            &error,
+            HeadRuntimeError::ReadbackTelemetrySafety {
+                joint: HeadJoint::Bow,
+                sample: VerificationSample::First,
+                source:
+                    HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
+                        observed_raw: 65,
+                        maximum_raw_exclusive: 65,
+                    },
+                response,
+            } if response.value().temperature_raw() == 65
+                && response.value().voltage_raw() == 120
+        ));
+
+        drop(handle);
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.termination(), &ActorTermination::StartupFault);
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.writes.len(), 25);
+        assert!(
+            shared
+                .writes
+                .iter()
+                .all(|write| write.get(5..=6) != Some(&[40, 0])),
+            "the tension-preserving owner must surface the fault without dropping the neck"
+        );
     }
 
     #[tokio::test]
@@ -7354,8 +8092,12 @@ mod tests {
 
     #[tokio::test]
     async fn arming_requires_remaining_freshness_for_every_bounded_write_attempt() {
-        let (error, exit, shared) =
-            run_startup_fault(successful_reads(), config_with_freshness(8, 44)).await;
+        let mut reads = successful_reads();
+        reads[11] = ReadAction::SetClockAndBytes {
+            milliseconds: 147,
+            bytes: telemetry_response(HeadJoint::Roll, 2_930),
+        };
+        let (error, exit, shared) = run_startup_fault(reads, config_with_freshness(8, 100)).await;
         assert!(matches!(
             error,
             HeadRuntimeError::ObservationArmingWriteBudgetInsufficient {
@@ -7368,9 +8110,9 @@ mod tests {
         ));
         assert_eq!(exit.termination(), &ActorTermination::StartupFault);
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.writes.len(), 24);
+        assert_eq!(shared.writes.len(), 28);
         assert!(
-            shared.writes[20..]
+            shared.writes[24..]
                 .iter()
                 .all(|write| write[5..=6] == [40, 0])
         );
@@ -7379,7 +8121,7 @@ mod tests {
     #[tokio::test]
     async fn moving_or_unstable_second_readback_never_claims_hold() {
         let mut moving = successful_reads();
-        moving[9] = ReadAction::Bytes(telemetry_response_with_moving(HeadJoint::Bow, 2_127, true));
+        moving[13] = ReadAction::Bytes(telemetry_response_with_moving(HeadJoint::Bow, 2_127, true));
         let (error, _, _) = run_startup_fault(moving, valid_config(1)).await;
         assert!(matches!(
             error,
@@ -7391,8 +8133,8 @@ mod tests {
         ));
 
         let mut unstable = successful_reads();
-        unstable[8] = ReadAction::Bytes(telemetry_response(HeadJoint::Bow, 2_107));
-        unstable[9] = ReadAction::Bytes(telemetry_response(HeadJoint::Bow, 2_147));
+        unstable[12] = ReadAction::Bytes(telemetry_response(HeadJoint::Bow, 2_107));
+        unstable[13] = ReadAction::Bytes(telemetry_response(HeadJoint::Bow, 2_147));
         let (error, _, _) = run_startup_fault(unstable, valid_config(1)).await;
         assert!(matches!(
             error,
@@ -7407,7 +8149,7 @@ mod tests {
     #[tokio::test]
     async fn nonzero_startup_readback_device_status_never_claims_hold() {
         let mut reads = successful_reads();
-        reads[8] = ReadAction::Bytes(telemetry_response_with_status(
+        reads[12] = ReadAction::Bytes(telemetry_response_with_status(
             HeadJoint::Bow,
             2_127,
             false,
@@ -7463,11 +8205,11 @@ mod tests {
             let mut state = shared.lock().expect("fake state");
             let error = io::Error::from(io::ErrorKind::BrokenPipe);
             state.write_failures.insert(
-                32,
+                36,
                 TransportFailure::from_io(TransportOperation::Write, &error, 0),
             );
             state.write_failures.insert(
-                33,
+                37,
                 TransportFailure::from_io(TransportOperation::Write, &error, 0),
             );
         }
@@ -7480,7 +8222,7 @@ mod tests {
         assert!(report.outcomes()[3].result().is_ok());
         let exit = task.join().await.expect("actor task");
         assert_eq!(exit.torque_disable().outcomes().len(), 4);
-        assert_eq!(shared.lock().expect("fake state").writes.len(), 36);
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 40);
     }
 
     #[tokio::test]

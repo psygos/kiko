@@ -31,14 +31,18 @@ pub use actor::{
 };
 pub use config::{
     ArmingFreshness, ConfigParseError, ConfiguredHeadPoseBound, ConfiguredHeadPoseBounds,
-    ConfiguredHeadPoseBoundsError, DeviceIdentity, DeviceIdentityKind, HEAD_RETURN_CONTROL_PERIOD,
-    HEAD_RETURN_MOTION_TIMEOUT, HEAD_RETURN_NO_PROGRESS_TIMEOUT, HEAD_RETURN_POSITION_STEP_TICKS,
+    ConfiguredHeadPoseBoundsError, DeviceIdentity, DeviceIdentityKind,
+    HEAD_PRE_ENABLE_TELEMETRY_MAXIMUM_AGE, HEAD_RETURN_CONTROL_PERIOD, HEAD_RETURN_MOTION_TIMEOUT,
+    HEAD_RETURN_NO_PROGRESS_TIMEOUT, HEAD_RETURN_POSITION_STEP_TICKS,
     HEAD_RETURN_TELEMETRY_SET_MAX_AGE, HeadPoseBoundsAdmissionError,
     HeadPoseWithinConfiguredBounds, HeadProbeConfig, HeadProbeConfigInput, HeadRuntimeConfig,
-    HeadRuntimeConfigInput, MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS, MAX_HEAD_RETURN_TRAVEL_TICKS,
-    ObservedHoldConfig, ObservedHoldConfigInput, ObservedHoldConfigParseError, OperationTimeout,
-    ReturnToTargetConfig, ReturnToTargetConfigInput, ReturnToTargetConfigParseError,
-    WriteAttemptLimit,
+    HeadRuntimeConfigInput, HeadTelemetrySafetyLimits, HeadTelemetrySafetyViolation,
+    KIKO_MAXIMUM_ENERGIZED_HEAD_TEMPERATURE_RAW_EXCLUSIVE, KIKO_MAXIMUM_HEAD_VOLTAGE_RAW_INCLUSIVE,
+    KIKO_MAXIMUM_PRE_TORQUE_HEAD_TEMPERATURE_RAW_INCLUSIVE,
+    KIKO_MINIMUM_HEAD_VOLTAGE_RAW_INCLUSIVE, MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS,
+    MAX_HEAD_RETURN_TRAVEL_TICKS, ObservedHoldConfig, ObservedHoldConfigInput,
+    ObservedHoldConfigParseError, OperationTimeout, ReturnToTargetConfig,
+    ReturnToTargetConfigInput, ReturnToTargetConfigParseError, WriteAttemptLimit,
 };
 pub use framing::{FrameReadError, MAX_RESPONSE_BYTES};
 pub use motion::HeadMotionError;

@@ -6,7 +6,10 @@ use kiko_head_protocol::{
     PositionTicks,
 };
 
-use crate::config::{HeadPoseBoundsAdmissionError, HeadReturnPlan};
+use crate::config::{
+    HeadPoseBoundsAdmissionError, HeadReturnPlan, HeadTelemetrySafetyLimits,
+    HeadTelemetrySafetyViolation,
+};
 use crate::transport::MonotonicTime;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +25,7 @@ impl FreshHeadTelemetrySet {
         received_at: [MonotonicTime; 4],
         admitted_at: MonotonicTime,
         maximum_age: Duration,
+        telemetry_safety_limits: HeadTelemetrySafetyLimits,
     ) -> Result<Self, HeadMotionError> {
         for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
             let sample = samples[index];
@@ -38,6 +42,9 @@ impl FreshHeadTelemetrySet {
                     raw: sample.device_status_raw(),
                 });
             }
+            telemetry_safety_limits
+                .admit_energized(sample.voltage_raw(), sample.temperature_raw())
+                .map_err(|source| HeadMotionError::TelemetrySafety { joint, source })?;
         }
 
         for index in 1..received_at.len() {
@@ -233,6 +240,10 @@ pub enum HeadMotionError {
         joint: HeadJoint,
         raw: u8,
     },
+    TelemetrySafety {
+        joint: HeadJoint,
+        source: HeadTelemetrySafetyViolation,
+    },
     OutsidePathCorridor {
         joint: HeadJoint,
         actual: PositionTicks,
@@ -273,6 +284,7 @@ impl std::error::Error for HeadMotionError {
         match self {
             Self::ReturnStartPose { source } => Some(source),
             Self::ReturnStartOutsideConfiguredBounds { source } => Some(source),
+            Self::TelemetrySafety { source, .. } => Some(source),
             Self::StartOutsideTravelLimit { .. }
             | Self::ReturnStartMoving { .. }
             | Self::ClockRegression { .. }
@@ -620,10 +632,22 @@ mod tests {
         moving: bool,
         device_status: [u8; 4],
     ) -> [FullTelemetry; 4] {
+        telemetry_with_raw_safety(positions, moving, device_status, [120; 4], [30; 4])
+    }
+
+    fn telemetry_with_raw_safety(
+        positions: [u16; 4],
+        moving: bool,
+        device_status: [u8; 4],
+        voltage_raw: [u8; 4],
+        temperature_raw: [u8; 4],
+    ) -> [FullTelemetry; 4] {
         std::array::from_fn(|index| {
             let joint = HeadJoint::ALL[index];
             let mut data = [0_u8; 15];
             data[..2].copy_from_slice(&positions[index].to_le_bytes());
+            data[6] = voltage_raw[index];
+            data[7] = temperature_raw[index];
             data[9] = device_status[index];
             data[10] = u8::from(moving);
             FullTelemetry::parse(&response(joint.servo_id().get(), &data), joint.servo_id())
@@ -665,6 +689,10 @@ mod tests {
         MonotonicTime::from_duration_since_origin(Duration::from_millis(milliseconds))
     }
 
+    fn telemetry_limits() -> HeadTelemetrySafetyLimits {
+        HeadTelemetrySafetyLimits::for_test(90, 135, 55, 65)
+    }
+
     fn set(at_ms: u64, positions: [u16; 4], moving: bool) -> FreshHeadTelemetrySet {
         let received_at = [at(at_ms), at(at_ms + 1), at(at_ms + 2), at(at_ms + 3)];
         FreshHeadTelemetrySet::try_new(
@@ -672,6 +700,7 @@ mod tests {
             received_at,
             at(at_ms + 3),
             Duration::from_millis(100),
+            telemetry_limits(),
         )
         .expect("fresh set")
     }
@@ -690,6 +719,7 @@ mod tests {
                 [at(0), at(1), at(2), at(3)],
                 at(3),
                 Duration::from_millis(100),
+                telemetry_limits(),
             ),
             Err(HeadMotionError::DeviceStatus {
                 joint: HeadJoint::Yaw,
@@ -702,6 +732,7 @@ mod tests {
                 [at(0), at(2), at(1), at(3)],
                 at(3),
                 Duration::from_millis(100),
+                telemetry_limits(),
             ),
             Err(HeadMotionError::TelemetryClockRegression { .. })
         ));
@@ -711,8 +742,31 @@ mod tests {
                 [at(0), at(1), at(2), at(101)],
                 at(101),
                 Duration::from_millis(100),
+                telemetry_limits(),
             ),
             Err(HeadMotionError::TelemetrySetSpanExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn fresh_set_rejects_energized_raw_telemetry_before_motion_planning() {
+        let positions = [2_512, 2_916, 2_903, 2_903];
+        assert!(matches!(
+            FreshHeadTelemetrySet::try_new(
+                telemetry_with_raw_safety(positions, false, [0; 4], [120; 4], [30, 65, 30, 30],),
+                [at(0), at(1), at(2), at(3)],
+                at(3),
+                Duration::from_millis(100),
+                telemetry_limits(),
+            ),
+            Err(HeadMotionError::TelemetrySafety {
+                joint: HeadJoint::Curl,
+                source:
+                    HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
+                        observed_raw: 65,
+                        maximum_raw_exclusive: 65,
+                    },
+            })
         ));
     }
 

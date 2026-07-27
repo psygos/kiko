@@ -6,9 +6,10 @@ reads the torque-switch register and qualified telemetry window for the four
 fixed servo IDs and reports exactly what it observed. The runtime implements
 two separately gated energising operations:
 
-- capture the physical pose twice, command that same observed pose with
+- capture full telemetry twice, admit identity, status, stopped state, raw
+  voltage/temperature, and physical pose, command that same observed pose with
   explicit nonzero speed and torque limits, enable torque, and read back all
-  four positions; and
+  four complete telemetry windows; and
 - from an admitted start window, execute one bounded waypoint return to one
   exact, reviewed raw-encoder target.
 
@@ -152,11 +153,31 @@ admits success only when every response has the expected identity, telemetry
 device status is zero, the moving flag reports stopped, and position remains
 inside the parsed readback tolerance around that active target. Speed, load,
 voltage, temperature, current, and unqualified registers remain raw; this
-crate assigns them no physical units or policy thresholds. Transport, framing,
-protocol, clock, status, moving, and position failures remain distinct typed
-outcomes with the accepted joint prefix. A failed or caller-cancelled health
-receipt does not itself change goals or torque and does not release the actor's
-exclusive bus ownership.
+crate assigns none of them physical units. It does apply one fixed,
+Kiko-specific conservative raw-register policy inherited from the deployed
+legacy controller: voltage must be in the inclusive range
+`90..=135`, pre-torque temperature must be at most `55`, and energized
+temperature must be strictly below `65`. These are raw protocol values, not
+claims of calibrated volts or degrees. Full telemetry is checked before any
+production torque/goal write, after enable, throughout bounded return motion,
+and on every health observation. Transport, framing, protocol, clock, status,
+raw-register safety, moving, and position failures remain distinct typed
+outcomes with retained response evidence where the safety decision is made. A
+failed or caller-cancelled health receipt does not itself change goals or
+torque and does not release the actor's exclusive bus ownership.
+
+An energized raw-register fault is therefore surfaced immediately to the
+supervisor and prevents further admitted head motion. A safety fault found by
+a periodic health check is latched: later health checks and return requests
+reuse that exact fault without bus traffic while the actor retains ownership
+until explicit release. A startup/readback or return-telemetry safety fault
+instead terminates that transaction and the production actor closes serial
+ownership without a torque-switch write. Neither path automatically disables
+torque because an unpowered Kiko neck can fall. The integrated supervisor must
+stop the mobile base, keep the head mechanically supported, and retain or
+deliberately hand off the exact head owner. This policy is a software
+admission boundary, not proof that the installed servos are thermally or
+electrically healthy.
 
 One actor admits at most one return attempt. A second request during motion is
 reported as `CommandAlreadyInProgress`; a request after the recorded attempt is
@@ -175,6 +196,11 @@ The runtime accepts only:
 - one through eight explicitly configured write attempts;
 - at most 1,024 prefix-noise bytes and protocol-qualified position tolerances;
 - a protocol-valid nonzero speed and four nonzero torque limits.
+
+The raw voltage and temperature limits are deliberately not weak
+configuration. They are one fixed typed Kiko policy; changing them requires a
+reviewed code change and boundary tests rather than an unchecked deployment
+override.
 
 Production opening claims OS-level exclusive ownership and applies 1,000,000
 baud, 8 data bits, no parity, 1 stop bit, and no flow control. Because opening a
@@ -212,16 +238,24 @@ Production performs no torque-switch read or write and makes no claim about
 the prior torque state. Its first protocol traffic is the observation below.
 The remaining startup transaction is shared and ordered:
 
-1. Read every joint twice and admit only same-ID positions within tolerance.
+1. Read every complete telemetry window twice and admit only exact identity,
+   status zero, stopped state, the fixed pre-torque raw-register envelope, and
+   same-joint positions within tolerance.
 2. Write all four nonzero torque limits before any goal write.
 3. Write each freshly observed position together with mandatory nonzero speed.
-4. Enable or refresh torque on all four joints.
-5. Before each enable write, require that the oldest admitted observation is
-   still inside the typed arming-freshness bound and that the remaining window
-   covers every configured bounded write attempt; otherwise fail.
+4. After those configuration writes, read every complete telemetry window
+   again and require exact identity, status zero, stopped state, the fixed
+   pre-torque raw-register envelope, and position agreement with the admitted
+   target. No torque-enable write can precede all four accepted responses.
+5. Enable or refresh torque on all four joints. Before each enable write,
+   require that the oldest post-configuration telemetry response remains
+   inside both the configured arming-freshness bound and the fixed 250 ms
+   safety-freshness ceiling, with enough time left for every configured
+   bounded write attempt; otherwise fail.
 6. Read exact full telemetry twice for each expected ID. Both samples must be
-   status zero and stopped, each must agree with its observed target, and the
-   pair must agree with each other inside the configured tick bound.
+   status zero, stopped, and inside the energized raw-register envelope; each
+   must agree with its observed target, and the pair must agree with each other
+   inside the configured tick bound.
 
 Every status response is delimited into a fixed 21-byte buffer. Prefix noise is
 bounded and counted. After `FF FF`, the frame is never silently skipped:
@@ -322,9 +356,10 @@ field retention, canonical identity order, status and moving precedence,
 target drift, transport and clock faults, repeated fresh reads, and a dropped
 request receiver without an implicit torque write.
 
-The current macOS host software-only run passed 49 runtime library tests and 8
-commissioning-binary tests. A prior aarch64 software-only Nano run, before the
-health seam existed, passed 17 protocol tests, 41 runtime library tests, and 8
+The current macOS host software-only run passed 18 protocol tests, 104 runtime
+library tests, and 9 commissioning-binary tests, plus strict all-target,
+all-feature Clippy. A prior aarch64 software-only Nano run, before the health
+seam existed, passed 17 protocol tests, 41 runtime library tests, and 8
 commissioning-binary tests. No later Nano result is inferred from the host run.
 
 Run the host checks with:

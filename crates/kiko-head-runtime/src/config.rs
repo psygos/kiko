@@ -22,7 +22,19 @@ pub const HEAD_RETURN_MOTION_TIMEOUT: Duration = Duration::from_secs(20);
 /// motion/recovery boundary. The serial requests themselves may have a longer
 /// diagnostic timeout, but such a delayed response cannot authorize motion.
 pub const HEAD_RETURN_TELEMETRY_SET_MAX_AGE: Duration = HEAD_RETURN_CONTROL_PERIOD;
+/// Maximum elapsed time from the oldest post-configuration telemetry refresh
+/// to a torque-enable write. This is a conservative software freshness
+/// boundary, not a servo thermal-response claim.
+pub const HEAD_PRE_ENABLE_TELEMETRY_MAXIMUM_AGE: Duration = Duration::from_millis(250);
 pub const MAX_HEAD_RETURN_TRAVEL_TICKS: u16 = 512;
+/// Conservative Kiko-specific raw register gates retained from the deployed
+/// legacy natural-head runtime. These values are register units, not
+/// calibrated volts or degrees, and are not independent hardware
+/// qualification.
+pub const KIKO_MINIMUM_HEAD_VOLTAGE_RAW_INCLUSIVE: u8 = 90;
+pub const KIKO_MAXIMUM_HEAD_VOLTAGE_RAW_INCLUSIVE: u8 = 135;
+pub const KIKO_MAXIMUM_PRE_TORQUE_HEAD_TEMPERATURE_RAW_INCLUSIVE: u8 = 55;
+pub const KIKO_MAXIMUM_ENERGIZED_HEAD_TEMPERATURE_RAW_EXCLUSIVE: u8 = 65;
 /// Maximum admitted width of one raw-encoder startup pose window.
 ///
 /// This is a structural anti-bypass bound, not a physical joint envelope. The
@@ -259,6 +271,203 @@ impl ArmingFreshness {
         self.0
     }
 }
+
+/// Parsed raw-register safety envelope for the complete natural-head lifecycle.
+///
+/// The STS protocol exposes voltage and temperature as one-byte registers.
+/// This type deliberately retains those raw units: accepting a register range
+/// does not claim calibrated volts or degrees. Inclusive/exclusive semantics
+/// are encoded in the field names and admission errors so callers cannot
+/// silently disagree at the boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HeadTelemetrySafetyLimits {
+    minimum_voltage_raw_inclusive: u8,
+    maximum_voltage_raw_inclusive: u8,
+    maximum_pre_torque_temperature_raw_inclusive: u8,
+    maximum_energized_temperature_raw_exclusive: u8,
+}
+
+impl HeadTelemetrySafetyLimits {
+    fn kiko_conservative() -> Self {
+        Self::parse(
+            KIKO_MINIMUM_HEAD_VOLTAGE_RAW_INCLUSIVE,
+            KIKO_MAXIMUM_HEAD_VOLTAGE_RAW_INCLUSIVE,
+            KIKO_MAXIMUM_PRE_TORQUE_HEAD_TEMPERATURE_RAW_INCLUSIVE,
+            KIKO_MAXIMUM_ENERGIZED_HEAD_TEMPERATURE_RAW_EXCLUSIVE,
+        )
+        .expect("fixed Kiko raw telemetry limits are internally ordered")
+    }
+
+    fn parse(
+        minimum_voltage_raw_inclusive: u8,
+        maximum_voltage_raw_inclusive: u8,
+        maximum_pre_torque_temperature_raw_inclusive: u8,
+        maximum_energized_temperature_raw_exclusive: u8,
+    ) -> Result<Self, HeadTelemetrySafetyLimitsParseError> {
+        if minimum_voltage_raw_inclusive > maximum_voltage_raw_inclusive {
+            return Err(HeadTelemetrySafetyLimitsParseError::VoltageBoundsReversed {
+                minimum_raw_inclusive: minimum_voltage_raw_inclusive,
+                maximum_raw_inclusive: maximum_voltage_raw_inclusive,
+            });
+        }
+        if maximum_energized_temperature_raw_exclusive == 0 {
+            return Err(HeadTelemetrySafetyLimitsParseError::EmptyEnergizedTemperatureDomain);
+        }
+        if maximum_pre_torque_temperature_raw_inclusive
+            >= maximum_energized_temperature_raw_exclusive
+        {
+            return Err(
+                HeadTelemetrySafetyLimitsParseError::TemperatureBoundsNotStrictlyOrdered {
+                    maximum_pre_torque_raw_inclusive: maximum_pre_torque_temperature_raw_inclusive,
+                    maximum_energized_raw_exclusive: maximum_energized_temperature_raw_exclusive,
+                },
+            );
+        }
+        Ok(Self {
+            minimum_voltage_raw_inclusive,
+            maximum_voltage_raw_inclusive,
+            maximum_pre_torque_temperature_raw_inclusive,
+            maximum_energized_temperature_raw_exclusive,
+        })
+    }
+
+    pub const fn minimum_voltage_raw_inclusive(self) -> u8 {
+        self.minimum_voltage_raw_inclusive
+    }
+
+    pub const fn maximum_voltage_raw_inclusive(self) -> u8 {
+        self.maximum_voltage_raw_inclusive
+    }
+
+    pub const fn maximum_pre_torque_temperature_raw_inclusive(self) -> u8 {
+        self.maximum_pre_torque_temperature_raw_inclusive
+    }
+
+    pub const fn maximum_energized_temperature_raw_exclusive(self) -> u8 {
+        self.maximum_energized_temperature_raw_exclusive
+    }
+
+    pub fn admit_pre_torque(
+        self,
+        voltage_raw: u8,
+        temperature_raw: u8,
+    ) -> Result<(), HeadTelemetrySafetyViolation> {
+        self.admit_voltage(voltage_raw)?;
+        if temperature_raw > self.maximum_pre_torque_temperature_raw_inclusive {
+            return Err(
+                HeadTelemetrySafetyViolation::PreTorqueTemperatureAboveInclusiveMaximum {
+                    observed_raw: temperature_raw,
+                    maximum_raw_inclusive: self.maximum_pre_torque_temperature_raw_inclusive,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub fn admit_energized(
+        self,
+        voltage_raw: u8,
+        temperature_raw: u8,
+    ) -> Result<(), HeadTelemetrySafetyViolation> {
+        self.admit_voltage(voltage_raw)?;
+        if temperature_raw >= self.maximum_energized_temperature_raw_exclusive {
+            return Err(
+                HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
+                    observed_raw: temperature_raw,
+                    maximum_raw_exclusive: self.maximum_energized_temperature_raw_exclusive,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn admit_voltage(self, observed_raw: u8) -> Result<(), HeadTelemetrySafetyViolation> {
+        if observed_raw < self.minimum_voltage_raw_inclusive {
+            return Err(HeadTelemetrySafetyViolation::VoltageBelowInclusiveMinimum {
+                observed_raw,
+                minimum_raw_inclusive: self.minimum_voltage_raw_inclusive,
+            });
+        }
+        if observed_raw > self.maximum_voltage_raw_inclusive {
+            return Err(HeadTelemetrySafetyViolation::VoltageAboveInclusiveMaximum {
+                observed_raw,
+                maximum_raw_inclusive: self.maximum_voltage_raw_inclusive,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        minimum_voltage_raw_inclusive: u8,
+        maximum_voltage_raw_inclusive: u8,
+        maximum_pre_torque_temperature_raw_inclusive: u8,
+        maximum_energized_temperature_raw_exclusive: u8,
+    ) -> Self {
+        Self::parse(
+            minimum_voltage_raw_inclusive,
+            maximum_voltage_raw_inclusive,
+            maximum_pre_torque_temperature_raw_inclusive,
+            maximum_energized_temperature_raw_exclusive,
+        )
+        .expect("test telemetry limits must be valid")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HeadTelemetrySafetyLimitsParseError {
+    VoltageBoundsReversed {
+        minimum_raw_inclusive: u8,
+        maximum_raw_inclusive: u8,
+    },
+    EmptyEnergizedTemperatureDomain,
+    TemperatureBoundsNotStrictlyOrdered {
+        maximum_pre_torque_raw_inclusive: u8,
+        maximum_energized_raw_exclusive: u8,
+    },
+}
+
+impl fmt::Display for HeadTelemetrySafetyLimitsParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid raw head-telemetry safety limits: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for HeadTelemetrySafetyLimitsParseError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HeadTelemetrySafetyViolation {
+    VoltageBelowInclusiveMinimum {
+        observed_raw: u8,
+        minimum_raw_inclusive: u8,
+    },
+    VoltageAboveInclusiveMaximum {
+        observed_raw: u8,
+        maximum_raw_inclusive: u8,
+    },
+    PreTorqueTemperatureAboveInclusiveMaximum {
+        observed_raw: u8,
+        maximum_raw_inclusive: u8,
+    },
+    EnergizedTemperatureAtOrAboveExclusiveMaximum {
+        observed_raw: u8,
+        maximum_raw_exclusive: u8,
+    },
+}
+
+impl fmt::Display for HeadTelemetrySafetyViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "raw head telemetry is outside the admitted safety envelope: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for HeadTelemetrySafetyViolation {}
 
 /// Exact caller-reviewed raw-encoder windows in bow/curl/yaw/roll order.
 ///
@@ -854,6 +1063,7 @@ pub struct HeadRuntimeConfig {
     readback_tolerance: PositionAgreementTicks,
     goal_speed: GoalSpeedTicksPerSecond,
     torque_limits: HeadTorqueLimits,
+    telemetry_safety_limits: HeadTelemetrySafetyLimits,
 }
 
 impl HeadRuntimeConfig {
@@ -897,6 +1107,14 @@ impl HeadRuntimeConfig {
                 maximum_write_budget,
             });
         }
+        if maximum_write_budget > HEAD_PRE_ENABLE_TELEMETRY_MAXIMUM_AGE {
+            return Err(
+                ConfigParseError::WriteBudgetExceedsPreEnableTelemetryFreshness {
+                    maximum_write_budget,
+                    maximum_pre_enable_telemetry_age: HEAD_PRE_ENABLE_TELEMETRY_MAXIMUM_AGE,
+                },
+            );
+        }
         let redundant_read_tolerance = PositionAgreementTicks::try_new(
             input.redundant_read_tolerance_ticks,
         )
@@ -918,6 +1136,7 @@ impl HeadRuntimeConfig {
             parse_torque_limit(HeadJoint::Yaw, yaw)?,
             parse_torque_limit(HeadJoint::Roll, roll)?,
         );
+        let telemetry_safety_limits = HeadTelemetrySafetyLimits::kiko_conservative();
 
         Ok(Self {
             device,
@@ -930,6 +1149,7 @@ impl HeadRuntimeConfig {
             readback_tolerance,
             goal_speed,
             torque_limits,
+            telemetry_safety_limits,
         })
     }
 
@@ -953,6 +1173,12 @@ impl HeadRuntimeConfig {
         self.arming_freshness
     }
 
+    pub fn pre_enable_telemetry_maximum_age(&self) -> Duration {
+        self.arming_freshness
+            .get()
+            .min(HEAD_PRE_ENABLE_TELEMETRY_MAXIMUM_AGE)
+    }
+
     pub const fn noise_budget_bytes(&self) -> u16 {
         self.noise_budget_bytes
     }
@@ -971,6 +1197,10 @@ impl HeadRuntimeConfig {
 
     pub const fn torque_limits(&self) -> HeadTorqueLimits {
         self.torque_limits
+    }
+
+    pub const fn telemetry_safety_limits(&self) -> HeadTelemetrySafetyLimits {
+        self.telemetry_safety_limits
     }
 }
 
@@ -1041,6 +1271,10 @@ pub enum ConfigParseError {
         arming_freshness: Duration,
         maximum_write_budget: Duration,
     },
+    WriteBudgetExceedsPreEnableTelemetryFreshness {
+        maximum_write_budget: Duration,
+        maximum_pre_enable_telemetry_age: Duration,
+    },
     NoiseBudgetOutOfRange {
         value: u16,
         maximum: u16,
@@ -1084,6 +1318,7 @@ impl std::error::Error for ConfigParseError {
             | Self::WriteAttemptsOutOfRange { .. }
             | Self::ArmingFreshnessOutOfRange { .. }
             | Self::ArmingFreshnessShorterThanWriteBudget { .. }
+            | Self::WriteBudgetExceedsPreEnableTelemetryFreshness { .. }
             | Self::NoiseBudgetOutOfRange { .. } => None,
         }
     }
@@ -1176,6 +1411,93 @@ mod tests {
         assert_eq!(probe.response_timeout(), runtime.response_timeout());
         assert_eq!(probe.request_timeout(), runtime.write_timeout());
         assert_eq!(probe.noise_budget_bytes(), runtime.noise_budget_bytes());
+    }
+
+    #[test]
+    fn fixed_raw_telemetry_envelope_has_exact_boundary_semantics() {
+        let runtime = HeadRuntimeConfig::parse(valid_input()).expect("valid runtime");
+        let limits = runtime.telemetry_safety_limits();
+
+        assert_eq!(
+            limits.minimum_voltage_raw_inclusive(),
+            KIKO_MINIMUM_HEAD_VOLTAGE_RAW_INCLUSIVE
+        );
+        assert_eq!(
+            limits.maximum_voltage_raw_inclusive(),
+            KIKO_MAXIMUM_HEAD_VOLTAGE_RAW_INCLUSIVE
+        );
+        assert_eq!(
+            limits.maximum_pre_torque_temperature_raw_inclusive(),
+            KIKO_MAXIMUM_PRE_TORQUE_HEAD_TEMPERATURE_RAW_INCLUSIVE
+        );
+        assert_eq!(
+            limits.maximum_energized_temperature_raw_exclusive(),
+            KIKO_MAXIMUM_ENERGIZED_HEAD_TEMPERATURE_RAW_EXCLUSIVE
+        );
+
+        assert!(limits.admit_pre_torque(90, 55).is_ok());
+        assert!(limits.admit_pre_torque(135, 55).is_ok());
+        assert!(matches!(
+            limits.admit_pre_torque(89, 30),
+            Err(HeadTelemetrySafetyViolation::VoltageBelowInclusiveMinimum {
+                observed_raw: 89,
+                minimum_raw_inclusive: 90,
+            })
+        ));
+        assert!(matches!(
+            limits.admit_pre_torque(136, 30),
+            Err(HeadTelemetrySafetyViolation::VoltageAboveInclusiveMaximum {
+                observed_raw: 136,
+                maximum_raw_inclusive: 135,
+            })
+        ));
+        assert!(matches!(
+            limits.admit_pre_torque(120, 56),
+            Err(
+                HeadTelemetrySafetyViolation::PreTorqueTemperatureAboveInclusiveMaximum {
+                    observed_raw: 56,
+                    maximum_raw_inclusive: 55,
+                }
+            )
+        ));
+
+        assert!(limits.admit_energized(90, 64).is_ok());
+        assert!(limits.admit_energized(135, 64).is_ok());
+        assert!(matches!(
+            limits.admit_energized(120, 65),
+            Err(
+                HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
+                    observed_raw: 65,
+                    maximum_raw_exclusive: 65,
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn raw_telemetry_envelope_rejects_empty_or_crossed_domains() {
+        assert!(matches!(
+            HeadTelemetrySafetyLimits::parse(136, 135, 55, 65),
+            Err(HeadTelemetrySafetyLimitsParseError::VoltageBoundsReversed {
+                minimum_raw_inclusive: 136,
+                maximum_raw_inclusive: 135,
+            })
+        ));
+        assert!(matches!(
+            HeadTelemetrySafetyLimits::parse(90, 135, 0, 0),
+            Err(HeadTelemetrySafetyLimitsParseError::EmptyEnergizedTemperatureDomain)
+        ));
+        for (pre_torque, energized) in [(65, 65), (66, 65)] {
+            assert!(matches!(
+                HeadTelemetrySafetyLimits::parse(90, 135, pre_torque, energized),
+                Err(
+                    HeadTelemetrySafetyLimitsParseError::TemperatureBoundsNotStrictlyOrdered {
+                        maximum_pre_torque_raw_inclusive,
+                        maximum_energized_raw_exclusive: 65,
+                    }
+                ) if maximum_pre_torque_raw_inclusive == pre_torque
+            ));
+        }
     }
 
     #[test]
@@ -1410,6 +1732,40 @@ mod tests {
                 joint: HeadJoint::Yaw,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn pre_enable_telemetry_freshness_bounds_the_complete_retry_budget() {
+        let mut exact = valid_input();
+        exact.write_timeout_ms = 125;
+        exact.write_attempts = 2;
+        exact.arming_freshness_ms = 5_000;
+        let runtime =
+            HeadRuntimeConfig::parse(exact).expect("250 ms retry budget is exactly admitted");
+        assert_eq!(
+            runtime.write_timeout().get() * u32::from(runtime.write_attempts().get()),
+            HEAD_PRE_ENABLE_TELEMETRY_MAXIMUM_AGE
+        );
+        assert_eq!(
+            runtime.pre_enable_telemetry_maximum_age(),
+            HEAD_PRE_ENABLE_TELEMETRY_MAXIMUM_AGE
+        );
+
+        let mut above = valid_input();
+        above.write_timeout_ms = 126;
+        above.write_attempts = 2;
+        above.arming_freshness_ms = 5_000;
+        assert!(matches!(
+            HeadRuntimeConfig::parse(above),
+            Err(
+                ConfigParseError::WriteBudgetExceedsPreEnableTelemetryFreshness {
+                    maximum_write_budget,
+                    maximum_pre_enable_telemetry_age,
+                }
+            ) if maximum_write_budget == Duration::from_millis(252)
+                && maximum_pre_enable_telemetry_age
+                    == HEAD_PRE_ENABLE_TELEMETRY_MAXIMUM_AGE
         ));
     }
 
