@@ -141,6 +141,70 @@ endpoint owner. Its ownership still conflicts with starting the single
 canonical owner, irrespective of its provenance. No process or respawn entry
 was changed during this snapshot.
 
+## Current Kiko-owner and head-fault snapshot
+
+At `2026-07-28T02:43+05:30`, a later read-only Nano inspection reconfirmed:
+
+- boot ID `305f4c72-249f-4225-b34e-3decc740764f`;
+- the clean Nano checkout at `af4a24a`;
+- `/home/makerspace/kiko-follow/engine-guardian.sh` as automatic
+  reacquisition authority, repeatedly launching a short-lived
+  `kiko_face_follow.py` child that opens OAK/head/eye;
+- both the reboot crontab entry and the minute-level guardian restoration
+  entry;
+- no active canonical Kiko service;
+- STM32, head, and eye at the retained persistent serial-by-id identities; and
+- the OAK USB device below sysfs node `1-2.3` at `480M`, with sysfs product
+  `2485` and sysfs serial `03e72485`, while the separate `10000M` root/hub had
+  no OAK child.
+
+The separately retained DepthAI/deployment identity is MXID
+`19443010F1B43A2E00`. This snapshot did not obtain that MXID from sysfs and
+does not equate it with the distinct USB serial string.
+
+This is a Kiko-owned legacy runtime. Fable is not running it and is not a
+current owner, dependency, service, or subsystem. The process name and
+provenance do not relax the single-owner rule: the canonical Kiko runtime
+cannot overlap this Kiko guardian on the OAK, head, or eye endpoints.
+
+The guardian log then showed a repeated unhealthy restart sequence. Exact
+reported raw faults included:
+
+```text
+bow overtemp 150
+yaw overtemp 68
+curl too hot pre-engage: 56
+```
+
+The guardian continued respawning the child at approximately eight-second
+intervals through the observed `02:45:02..03:02:18` window. A fresh
+`03:02:23` tail showed repeated `curl too hot pre-engage: 57` failures after
+admitting Bow at raw temperature `54..55` and raw voltage `119..120`. Each
+restart first reported `camera_ready usb=HIGH`, so the current evidence says
+the camera opens successfully under this legacy Kiko runtime; it does not
+support a bad-camera or bad-cable diagnosis. `HIGH` is consistent with the
+observed USB2 link and still fails the canonical SuperSpeed gate. No inference
+is made about calibrated degrees, electrical health, the physical cause, or
+whether each reading came from a stable servo response. These are raw
+legacy-runtime reports and a reason to keep Gate A closed.
+
+The inspected files had SHA-256 identities
+`1255a9563b1e03ef917b74f220698a1ee80804c3c474f30f1d0e3f3d703b4336`
+(`engine-guardian.sh`) and
+`ef0c9fb48743bd51ec8af317084273682553ac6b30bed384c74731a0eb3daf4e`
+(`kiko_face_follow.py`). The legacy source admits pre-engage raw temperature
+only when `<=55`, admits raw voltage in inclusive `90..=135`, and rejects
+energized raw temperature at or above the effective `65` override in
+`config.json`. Those deployed values justify a conservative canonical
+software admission policy; they do not independently qualify the servo
+register scaling, safe operating envelope, thermal response, or fault action.
+
+No process was stopped, signalled, paused, reconfigured, or replaced. No
+camera or serial endpoint was opened. The head must remain mechanically
+supported, and final handoff requires an explicit, separately authorized
+retirement of the exact Kiko guardian plus both respawn authorities followed
+by a fresh conflict-free owner audit.
+
 ## V4 software-leaf inventory
 
 At `2026-07-28T01:56:58+05:30`, a second read-only inspection resolved the
