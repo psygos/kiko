@@ -17325,7 +17325,7 @@ mod tests {
     fn dataset_device_label_retains_runtime_identity_and_build_provenance() {
         let provenance = OakRuntimeProvenance {
             connected_mxid: "mxid-123".to_owned(),
-            usb_requested_maximum: oak_sys::UsbTransportSpeed::Super,
+            usb_requested_maximum: oak_sys::UsbTransportSpeed::SuperPlus,
             usb_required_minimum: oak_sys::UsbTransportSpeed::Super,
             usb_observed: oak_sys::UsbTransportSpeed::Super,
             depthai_sdk_version: "3.6.1".to_owned(),
@@ -17335,7 +17335,7 @@ mod tests {
         };
         assert_eq!(
             provenance.dataset_device_label(),
-            "OAK-D mxid=mxid-123 usb_requested_maximum=SUPER usb_required_minimum=SUPER usb_observed=SUPER depthai_sdk=3.6.1 depthai_commit=commit-abc embedded_device=device-1 embedded_bootloader=bootloader-1 timestamp=device_exposure_midpoint"
+            "OAK-D mxid=mxid-123 usb_requested_maximum=SUPER_PLUS usb_required_minimum=SUPER usb_observed=SUPER depthai_sdk=3.6.1 depthai_commit=commit-abc embedded_device=device-1 embedded_bootloader=bootloader-1 timestamp=device_exposure_midpoint"
         );
     }
 

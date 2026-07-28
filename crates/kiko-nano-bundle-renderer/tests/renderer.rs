@@ -1566,6 +1566,8 @@ fn production_derives_navigation_digest_and_loopback_port() {
     assert_eq!(limits.minimum_free_bytes_after_write(), 1_073_741_824);
     assert_eq!(limits.terminal_reserve_bytes(), 268_435_456);
     let launch: Value = serde_json::from_slice(&launch_bytes).expect("production launch JSON");
+    assert_eq!(launch["oak"]["maximum_usb_speed"], "SUPER_PLUS");
+    assert_eq!(launch["oak"]["minimum_usb_speed"], "SUPER");
     assert_eq!(
         launch["calibration_artifact"]["asset"]["sha256_hex"],
         sha256_hex(
@@ -2372,7 +2374,7 @@ fn qualification_v4_template_renders_exact_policy_and_leaves_only_evidence_bound
         launch["oak"],
         json!({
             "selector_source": "exact_inventory_oak_mxid",
-            "maximum_usb_speed": "SUPER",
+            "maximum_usb_speed": "SUPER_PLUS",
             "minimum_usb_speed": "SUPER",
             "rgb": {"width_px": 640, "height_px": 400, "fps": 15},
             "rectified_stereo": {

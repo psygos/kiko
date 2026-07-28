@@ -1151,7 +1151,7 @@ mod tests {
             },
             "oak": {
                 "selector_source": "exact_inventory_oak_mxid",
-                "maximum_usb_speed": "SUPER",
+                "maximum_usb_speed": "SUPER_PLUS",
                 "minimum_usb_speed": "SUPER",
                 "rgb": {"width_px": 640, "height_px": 480, "fps": 30},
                 "rectified_stereo": {

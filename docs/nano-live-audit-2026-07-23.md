@@ -86,9 +86,13 @@ The OAK was the only Movidius device and remained on Bus 001 under the
 The preserved Fable owner explicitly opens the exact device with
 `dai.UsbSpeed.HIGH`, so its current 480 Mbit/s enumeration is requested
 behavior and cannot diagnose the port, cable, or device's SuperSpeed ability.
-The canonical owner instead requests `SUPER` and requires an exact same-owner
-`SUPER` readback. That future readback—not this Fable topology—is the
-production admission evidence.
+The canonical owner now requests `SUPER_PLUS` and requires a same-owner
+readback of at least `SUPER`. Newly rendered bundles therefore prefer the
+fastest DepthAI USB-3 mode while failing closed below USB 3. A retained older
+bundle that explicitly caps its maximum at `SUPER` remains a truthful 5
+Gbit/s input rather than being silently reinterpreted. The canonical
+same-owner readback—not this legacy topology—is the production admission
+evidence.
 
 ## STM32 state
 

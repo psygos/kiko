@@ -20,7 +20,7 @@ use kiko_device_inventory::{
 };
 use oak_sys::{
     DepthAlignment, DepthConfig, DeviceConfig, DeviceConfigError, ImuConfig, MonoConfig,
-    QueueConfig, RgbConfig, UsbTransportPolicy,
+    QueueConfig, RgbConfig, UsbTransportPolicy, UsbTransportSpeed,
 };
 use serde::Deserialize;
 
@@ -388,6 +388,7 @@ impl NanoOakImageStream {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NanoOakStreamGraph {
     selector_source: NanoOakSelectorSource,
+    usb_transport: UsbTransportPolicy,
     rgb: NanoOakImageStream,
     rectified_stereo: NanoOakImageStream,
     depth: NanoOakImageStream,
@@ -398,6 +399,10 @@ pub struct NanoOakStreamGraph {
 impl NanoOakStreamGraph {
     pub const fn selector_source(&self) -> NanoOakSelectorSource {
         self.selector_source
+    }
+
+    pub const fn usb_transport(&self) -> UsbTransportPolicy {
+        self.usb_transport
     }
 
     pub const fn rgb(&self) -> NanoOakImageStream {
@@ -426,7 +431,7 @@ impl NanoOakStreamGraph {
     /// exact connected MXID.
     pub fn device_config(&self) -> DeviceConfig {
         DeviceConfig {
-            usb_transport: UsbTransportPolicy::super_speed_required(),
+            usb_transport: self.usb_transport,
             rgb: Some(RgbConfig {
                 width: self.rgb.width_px(),
                 height: self.rgb.height_px(),
@@ -1573,7 +1578,18 @@ pub(crate) fn parse_oak(
     if dto.selector_source != "exact_inventory_oak_mxid" {
         return Err(NanoAgentLaunchParseError::UnsupportedOakSelectorSource);
     }
-    if dto.maximum_usb_speed != "SUPER" || dto.minimum_usb_speed != "SUPER" {
+    let maximum_usb_speed = UsbTransportSpeed::parse(&dto.maximum_usb_speed)
+        .map_err(|_| NanoAgentLaunchParseError::ProductionOakUsbPolicyRequired)?;
+    let minimum_usb_speed = UsbTransportSpeed::parse(&dto.minimum_usb_speed)
+        .map_err(|_| NanoAgentLaunchParseError::ProductionOakUsbPolicyRequired)?;
+    let usb_transport = UsbTransportPolicy::try_new(maximum_usb_speed, minimum_usb_speed)
+        .map_err(|_| NanoAgentLaunchParseError::ProductionOakUsbPolicyRequired)?;
+    if minimum_usb_speed != UsbTransportSpeed::Super
+        || !matches!(
+            maximum_usb_speed,
+            UsbTransportSpeed::Super | UsbTransportSpeed::SuperPlus
+        )
+    {
         return Err(NanoAgentLaunchParseError::ProductionOakUsbPolicyRequired);
     }
     if !dto.rectified_stereo.rectified {
@@ -1607,6 +1623,7 @@ pub(crate) fn parse_oak(
 
     let graph = NanoOakStreamGraph {
         selector_source: NanoOakSelectorSource::ExactInventoryOakMxid,
+        usb_transport,
         rgb,
         rectified_stereo,
         depth,
@@ -2217,7 +2234,7 @@ mod tests {
             },
             "oak": {
                 "selector_source": "exact_inventory_oak_mxid",
-                "maximum_usb_speed": "SUPER",
+                "maximum_usb_speed": "SUPER_PLUS",
                 "minimum_usb_speed": "SUPER",
                 "rgb": {"width_px": 640, "height_px": 480, "fps": 30},
                 "rectified_stereo": {
@@ -2549,10 +2566,33 @@ mod tests {
 
     #[test]
     fn production_oak_graph_cannot_drop_required_contracts() {
+        let preferred = parse(&valid_value()).expect("preferred USB 3 graph parses");
+        assert_eq!(
+            preferred.oak().usb_transport(),
+            UsbTransportPolicy::super_speed_required()
+        );
+
+        let mut capped_usb3 = valid_value();
+        capped_usb3["oak"]["maximum_usb_speed"] = json!("SUPER");
+        let capped_usb3 = parse(&capped_usb3).expect("published capped USB 3 graph remains valid");
+        assert_eq!(
+            capped_usb3.oak().usb_transport(),
+            UsbTransportPolicy::try_new(UsbTransportSpeed::Super, UsbTransportSpeed::Super)
+                .expect("ordered capped USB 3 policy")
+        );
+
         let mut usb2 = valid_value();
         usb2["oak"]["minimum_usb_speed"] = json!("HIGH");
         assert!(matches!(
             parse(&usb2),
+            Err(NanoAgentLaunchParseError::ProductionOakUsbPolicyRequired)
+        ));
+
+        let mut forced_usb2 = valid_value();
+        forced_usb2["oak"]["maximum_usb_speed"] = json!("HIGH");
+        forced_usb2["oak"]["minimum_usb_speed"] = json!("HIGH");
+        assert!(matches!(
+            parse(&forced_usb2),
             Err(NanoAgentLaunchParseError::ProductionOakUsbPolicyRequired)
         ));
 

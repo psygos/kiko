@@ -41,7 +41,7 @@
   },
   "oak": {
     "selector_source": "exact_inventory_oak_mxid",
-    "maximum_usb_speed": "SUPER",
+    "maximum_usb_speed": "SUPER_PLUS",
     "minimum_usb_speed": "SUPER",
     "rgb": {
       "width_px": ${OAK_RGB_WIDTH_PX},

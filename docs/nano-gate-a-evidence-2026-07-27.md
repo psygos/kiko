@@ -4,6 +4,40 @@ This file records current, bounded evidence for the wheel-attachment gate. It
 does not declare Gate A passed and does not authorize wheel attachment,
 powered motion, deployment, or production use.
 
+## OAK-D S2 10 Gbit/s transport diagnosis
+
+At approximately `2026-07-28T16:19+05:30`, the current legacy Kiko child had
+exited naturally after its existing pre-engage raw head-temperature gate. Its
+source was inspected and found to open the exact OAK MXID with
+`dai.UsbSpeed.HIGH`; that argument deliberately caps DepthAI at USB 2. The
+observed 480 Mbit/s legacy link was therefore requested behavior, not evidence
+that the Orin Nano port, installed cable, or OAK-D S2 lacked USB 3.
+
+The exact guardian PID `1068` was temporarily paused while no child existed.
+No serial endpoint, head, eye, STM32, or motor was opened or commanded. A
+camera-only probe then opened MXID `19443010F1B43A2E00` with
+`dai.UsbSpeed.SUPER_PLUS`. DepthAI read back `SUPER_PLUS`; while that same
+owner retained the open device, the kernel placed the OAK below Bus 02's
+four-port USB-3 hub and reported `10000M`:
+
+```text
+requested=SUPER_PLUS observed=SUPER_PLUS
+Bus 02 ... 4-Port USB 3.0 Hub, 10000M
+    Port 3 ... Vendor Specific Class, usbfs, 10000M
+```
+
+The probe closed normally with status zero and the exact guardian was resumed.
+An earlier probe attempted without exclusive ownership failed after the
+legacy process raced it; that failure is retained as ownership-conflict
+evidence and is not counted as a transport result.
+
+This establishes that the current host/port/cable/OAK path can negotiate the
+10 Gbit/s DepthAI mode. It does not measure sustained throughput, frame loss,
+latency, thermal behavior, or full-graph stability. The canonical policy now
+requests `SUPER_PLUS`, requires at least `SUPER`, retains the exact negotiated
+readback, and keeps an older explicit `SUPER/SUPER` launch truthful as a
+capped 5 Gbit/s input.
+
 ## Current 9f1061d native qualification build
 
 The clean Nano checkout at `/home/makerspace/kiko` was fast-forwarded to the

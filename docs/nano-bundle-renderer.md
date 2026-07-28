@@ -38,7 +38,15 @@ incorrectly selected the system ABI name `libusb-1.0.so.0` for the pinned
 DepthAI libusb role, so it is retired rather than silently reinterpreted.
 V3 did not bind face cascades or a head-gaze policy. Qualification
 render-input V4 emits `nano-wheels-off-qualification-launch-v4.json`.
-Production render-input V1 and launch V3 are unchanged.
+Production render-input schema V1 and launch schema V3 retain their published
+versions and document shapes.
+
+Current rendered launches request DepthAI `SUPER_PLUS` and require at least
+`SUPER`. The exact maximum and minimum are parsed into the runtime transport
+policy and the already-open device's negotiated speed is read back before
+admission. A previously retained launch with `SUPER` as both maximum and
+minimum remains an explicit capped USB-3 input; rendering new bundles does not
+rewrite old evidence.
 
 Prepare the JSON input from one retained discovery record and reviewed source
 files. The strict parser:
