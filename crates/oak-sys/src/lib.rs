@@ -491,7 +491,7 @@ pub struct UsbTransportSpeedParseError;
 ///
 /// Construction makes `minimum <= maximum` unrepresentable. A HIGH/HIGH
 /// policy is available for deliberately bandwidth-limited diagnostics; camera
-/// production constructors request SUPER_PLUS while requiring at least SUPER.
+/// production constructors request and require SUPER.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsbTransportPolicy {
     maximum: UsbTransportSpeed,
@@ -509,11 +509,10 @@ impl UsbTransportPolicy {
         Ok(Self { maximum, minimum })
     }
 
-    /// Production camera policy: request the fastest DepthAI USB 3 transport
-    /// while requiring at least USB 3 SuperSpeed.
+    /// Production camera policy: request and require USB 3 SuperSpeed.
     pub const fn super_speed_required() -> Self {
         Self {
-            maximum: UsbTransportSpeed::SuperPlus,
+            maximum: UsbTransportSpeed::Super,
             minimum: UsbTransportSpeed::Super,
         }
     }
@@ -3115,38 +3114,34 @@ mod tests {
 
     #[test]
     fn usb_transport_admission_rejects_unknown_and_below_minimum_readbacks() {
-        let policy = UsbTransportPolicy::super_speed_required();
+        let production = UsbTransportPolicy::super_speed_required();
 
         assert_eq!(
-            admit_usb_transport(policy, ffi::UsbSpeed::Unknown),
+            admit_usb_transport(production, ffi::UsbSpeed::Unknown),
             Err(UsbTransportAdmissionError::UnknownReadback)
         );
         assert_eq!(
-            admit_usb_transport(policy, ffi::UsbSpeed::Unrecognized),
+            admit_usb_transport(production, ffi::UsbSpeed::Unrecognized),
             Err(UsbTransportAdmissionError::UnrecognizedReadback)
         );
         assert_eq!(
-            admit_usb_transport(policy, ffi::UsbSpeed::High),
+            admit_usb_transport(production, ffi::UsbSpeed::High),
             Err(UsbTransportAdmissionError::BelowMinimum {
                 observed: UsbTransportSpeed::High,
                 required_minimum: UsbTransportSpeed::Super,
-                requested_maximum: UsbTransportSpeed::SuperPlus,
+                requested_maximum: UsbTransportSpeed::Super,
             })
         );
-
-        let capped =
-            UsbTransportPolicy::try_new(UsbTransportSpeed::Super, UsbTransportSpeed::Super)
-                .expect("ordered capped SuperSpeed policy");
         assert_eq!(
-            admit_usb_transport(capped, ffi::UsbSpeed::SuperPlus),
+            admit_usb_transport(production, ffi::UsbSpeed::SuperPlus),
             Err(UsbTransportAdmissionError::AboveMaximum {
                 observed: UsbTransportSpeed::SuperPlus,
                 requested_maximum: UsbTransportSpeed::Super,
             })
         );
 
-        let evidence = admit_usb_transport(policy, ffi::UsbSpeed::Super)
-            .expect("minimum transport speed is admissible");
+        let evidence =
+            admit_usb_transport(production, ffi::UsbSpeed::Super).expect("production USB 3 speed");
         assert_eq!(
             (
                 evidence.requested_maximum(),
@@ -3154,13 +3149,16 @@ mod tests {
                 evidence.observed(),
             ),
             (
-                UsbTransportSpeed::SuperPlus,
+                UsbTransportSpeed::Super,
                 UsbTransportSpeed::Super,
                 UsbTransportSpeed::Super,
             )
         );
-        let evidence = admit_usb_transport(policy, ffi::UsbSpeed::SuperPlus)
-            .expect("preferred transport speed is admissible");
+        let super_plus_diagnostic =
+            UsbTransportPolicy::try_new(UsbTransportSpeed::SuperPlus, UsbTransportSpeed::Super)
+                .expect("ordered explicit 10 Gbit/s diagnostic policy");
+        let evidence = admit_usb_transport(super_plus_diagnostic, ffi::UsbSpeed::SuperPlus)
+            .expect("explicit diagnostic transport speed is admissible");
         assert_eq!(
             (
                 evidence.requested_maximum(),
@@ -3179,8 +3177,8 @@ mod tests {
     fn production_camera_constructors_require_super_speed() {
         assert_eq!(
             UsbTransportPolicy::super_speed_required(),
-            UsbTransportPolicy::try_new(UsbTransportSpeed::SuperPlus, UsbTransportSpeed::Super,)
-                .expect("preferred production USB 3 policy")
+            UsbTransportPolicy::try_new(UsbTransportSpeed::Super, UsbTransportSpeed::Super)
+                .expect("production USB 3 policy")
         );
         assert_eq!(
             DeviceConfig::all_streams().usb_transport,

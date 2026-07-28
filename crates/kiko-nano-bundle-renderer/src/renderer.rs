@@ -1201,7 +1201,7 @@ fn render_launch(
         },
         "oak": {
             "selector_source": "exact_inventory_oak_mxid",
-            "maximum_usb_speed": "SUPER_PLUS",
+            "maximum_usb_speed": "SUPER",
             "minimum_usb_speed": "SUPER",
             "rgb": {
                 "width_px": runtime.oak.rgb_width_px,

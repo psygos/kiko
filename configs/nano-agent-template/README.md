@@ -110,12 +110,14 @@ inventory, OAK identity and SuperSpeed readback, model loading, controller
 session/receipts, accessory health, calibration, plant evidence, and physical
 stop behavior.
 
-The current renderer writes `maximum_usb_speed=SUPER_PLUS` and
-`minimum_usb_speed=SUPER`. This requests the fastest DepthAI USB-3 mode while
-requiring at least a USB-3 link. Runtime retains the exact requested maximum,
-required minimum, and observed readback. Older retained launch documents that
-explicitly cap both values at `SUPER` remain parseable as capped 5 Gbit/s
-inputs; they are not silently promoted.
+The current renderer writes `maximum_usb_speed=SUPER` and
+`minimum_usb_speed=SUPER`. This requests and requires 5 Gbit/s USB 3; runtime
+retains the exact requested maximum, required minimum, and observed readback.
+The canonical `640x400@15` RGB/stereo/depth and `200 Hz` IMU graph completed
+two retained full-stream Nano qualifications at that transport, while
+explicit `SUPER_PLUS/SUPER` startup was not reliable. Retained launch
+documents with that exact policy remain parseable and retain their request;
+fresh rendering does not silently select or relabel it.
 
 Do not expand these templates with shell substitution. Feed exact discovery
 and reviewed source paths to `kiko-nano-bundle-renderer`; it emits the agent

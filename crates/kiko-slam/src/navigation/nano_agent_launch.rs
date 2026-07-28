@@ -2234,7 +2234,7 @@ mod tests {
             },
             "oak": {
                 "selector_source": "exact_inventory_oak_mxid",
-                "maximum_usb_speed": "SUPER_PLUS",
+                "maximum_usb_speed": "SUPER",
                 "minimum_usb_speed": "SUPER",
                 "rgb": {"width_px": 640, "height_px": 480, "fps": 30},
                 "rectified_stereo": {
@@ -2566,19 +2566,20 @@ mod tests {
 
     #[test]
     fn production_oak_graph_cannot_drop_required_contracts() {
-        let preferred = parse(&valid_value()).expect("preferred USB 3 graph parses");
+        let production = parse(&valid_value()).expect("production USB 3 graph parses");
         assert_eq!(
-            preferred.oak().usb_transport(),
+            production.oak().usb_transport(),
             UsbTransportPolicy::super_speed_required()
         );
 
-        let mut capped_usb3 = valid_value();
-        capped_usb3["oak"]["maximum_usb_speed"] = json!("SUPER");
-        let capped_usb3 = parse(&capped_usb3).expect("published capped USB 3 graph remains valid");
+        let mut explicit_super_plus = valid_value();
+        explicit_super_plus["oak"]["maximum_usb_speed"] = json!("SUPER_PLUS");
+        let explicit_super_plus =
+            parse(&explicit_super_plus).expect("retained explicit 10 Gbit/s input remains valid");
         assert_eq!(
-            capped_usb3.oak().usb_transport(),
-            UsbTransportPolicy::try_new(UsbTransportSpeed::Super, UsbTransportSpeed::Super)
-                .expect("ordered capped USB 3 policy")
+            explicit_super_plus.oak().usb_transport(),
+            UsbTransportPolicy::try_new(UsbTransportSpeed::SuperPlus, UsbTransportSpeed::Super)
+                .expect("ordered explicit 10 Gbit/s policy")
         );
 
         let mut usb2 = valid_value();

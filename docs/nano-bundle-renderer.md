@@ -41,12 +41,13 @@ render-input V4 emits `nano-wheels-off-qualification-launch-v4.json`.
 Production render-input schema V1 and launch schema V3 retain their published
 versions and document shapes.
 
-Current rendered launches request DepthAI `SUPER_PLUS` and require at least
-`SUPER`. The exact maximum and minimum are parsed into the runtime transport
-policy and the already-open device's negotiated speed is read back before
-admission. A previously retained launch with `SUPER` as both maximum and
-minimum remains an explicit capped USB-3 input; rendering new bundles does not
-rewrite old evidence.
+Current rendered launches request and require DepthAI `SUPER`, the qualified
+5 Gbit/s USB-3 transport. The exact maximum and minimum are parsed into the
+runtime transport policy and the already-open device's negotiated speed is
+read back before admission. Retained `SUPER_PLUS/SUPER` launch documents
+remain parseable and retain their exact request; fresh rendering neither
+selects nor relabels them. The camera qualifier provides the explicit new
+diagnostic path.
 
 Prepare the JSON input from one retained discovery record and reviewed source
 files. The strict parser:

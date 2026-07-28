@@ -1799,7 +1799,8 @@ mod tests {
             ),
             (
                 QualificationUsbMaximum::SuperPlus,
-                UsbTransportPolicy::super_speed_required(),
+                UsbTransportPolicy::try_new(UsbTransportSpeed::SuperPlus, UsbTransportSpeed::Super)
+                    .expect("ordered explicit 10 Gbit/s diagnostic policy"),
             ),
         ] {
             let config = canonical_config(maximum);

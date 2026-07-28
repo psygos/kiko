@@ -33,10 +33,67 @@ evidence and is not counted as a transport result.
 
 This establishes that the current host/port/cable/OAK path can negotiate the
 10 Gbit/s DepthAI mode. It does not measure sustained throughput, frame loss,
-latency, thermal behavior, or full-graph stability. The canonical policy now
-requests `SUPER_PLUS`, requires at least `SUPER`, retains the exact negotiated
-readback, and keeps an older explicit `SUPER/SUPER` launch truthful as a
-capped 5 Gbit/s input.
+latency, thermal behavior, or full-graph stability. The `SUPER_PLUS/SUPER`
+policy selected immediately after this probe is superseded by the full-graph
+evidence below; the retained probe remains negotiation evidence only.
+
+## OAK full-graph USB-3 qualification and production cap
+
+Camera-only qualification used exact MXID `19443010F1B43A2E00` with RGB,
+rectified left, rectified right, and depth at `640x400@15`, IMU at `200 Hz`,
+and nonblocking queues of four. The legacy guardian was paused only after its
+only live child was an idle `sleep`; a trap restored it after every attempt.
+No serial endpoint, head, eye, STM32, or motor was opened or commanded.
+
+The first quiet-window full-graph `SUPER_PLUS` connection reached a 10 Gbit/s
+same-owner readback and delivered two exact RGB frames plus 12 IMU samples. It
+then exposed a host-contract defect: DepthAI StereoDepth documents rectified
+mono as `RAW8`, while Kiko required `GRAY8`. Commit `cf0659e` fixed the bridge
+to require `RAW8` only for rectified mono and retain `GRAY8` for direct-camera
+mono. The retained pre-fix evidence is
+`/home/makerspace/kiko-native-evidence/692508f-oak-20260728T213822+0530`.
+
+After that fix, one standalone attempt and three bounded retry-window
+attempts, all from `cf0659e`, failed with an explicit `SUPER_PLUS/SUPER`
+policy during startup with DepthAI's
+`Device already closed or disconnected: Input/output error`. None of the
+three controlled retry-window attempts observed the OAK device at `10000M`.
+This proves repeated startup failure in the tested DepthAI 3.4 state; it does
+not identify USB transport, device firmware, power, or another cause.
+
+The retained failed-start evidence directories are:
+
+- `/home/makerspace/kiko-native-evidence/cf0659e-oak-20260728T214543+0530`;
+- `/home/makerspace/kiko-native-evidence/cf0659e-oak-a1-20260728T214924+0530`;
+- `/home/makerspace/kiko-native-evidence/cf0659e-oak-a2-20260728T214942+0530`;
+- `/home/makerspace/kiko-native-evidence/cf0659e-oak-a3-20260728T215001+0530`.
+
+The subsequently built `94d4f15` binary then ran the unchanged graph twice
+with an explicit `SUPER/SUPER` policy. Both runs connected on their first
+controlled attempt, read back `SUPER`, and observed the owned OAK at kernel
+`5000M` in 11 samples.
+
+| evidence directory | elapsed (s) | each image stream | native sequences | IMU delivered / required | measured IMU delivery |
+|---|---:|---:|---|---:|---:|
+| `94d4f15-oak-SUPER-a1-20260728T215339+0530` | 10.007847785 | 150 / 150 | 0–149; 0 gaps, duplicates, regressions | 1959 / 1602 | 195.746382 Hz |
+| `94d4f15-oak-SUPER-a1-20260728T215459+0530` | 10.000549404 | 150 / 150 | 0–149; 0 gaps, duplicates, regressions | 1967 / 1601 | 196.689194 Hz |
+
+The table basenames resolve below
+`/home/makerspace/kiko-native-evidence/`; both directories retain the complete
+report, raw stdout, stderr, USB topology timeline, source commit, executable
+hash, promotion decision, and evidence manifest.
+
+Each run delivered exactly 115,200,000 RGB bytes, 38,400,000 bytes from each
+rectified mono stream, and 76,800,000 depth bytes. The combined measured host
+payload was therefore about 26.86 and 26.88 MB/s respectively. These are
+host-delivery measurements for this graph, not USB line-capacity, latency, or
+thermal claims.
+
+Freshly rendered production now requests and requires `SUPER`: explicit 5
+Gbit/s USB 3, with no USB2 or automatic `SUPER_PLUS` fallback. Retained
+`SUPER_PLUS/SUPER` launch documents remain parseable and retain that exact
+request; fresh rendering neither selects nor relabels them. The camera
+qualifier is the explicit path for new `SUPER_PLUS` diagnosis.
 
 ## Current 9f1061d native qualification build
 

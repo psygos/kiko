@@ -40,8 +40,8 @@ asking deployment-time string replacement to make software-policy decisions:
 
 - RGB and rectified stereo/depth are `640x400@15`, IMU is `200 Hz`, and each
   nonblocking OAK queue has capacity 4;
-- the OAK requests DepthAI `SUPER_PLUS` while requiring at least `SUPER`, so
-  a fresh same-owner readback below USB 3 fails admission;
+- the OAK requests and requires DepthAI `SUPER`, so a fresh same-owner
+  readback must be the qualified 5 Gbit/s USB-3 transport;
 - global occupancy is a 20 m square at 5 cm resolution with 160,000 cells,
   4,096 retained keyframes, and a snapshot every 20 keyframes;
 - SuperPoint and LightGlue use the reviewed CPU boundary, downscale 2, and at
