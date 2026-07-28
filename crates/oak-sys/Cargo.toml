@@ -21,3 +21,7 @@ cxx-build = "1.0"
 name = "rerun_view"
 path = "src/bin/rerun_view.rs"
 required-features = ["rerun-view"]
+
+[[bin]]
+name = "oak_stream_qualify"
+path = "src/bin/oak_stream_qualify.rs"
