@@ -13,11 +13,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 
 use crate::config::{
-    ConfiguredHeadPoseBounds, HeadPoseBoundsAdmissionError, HeadPoseWithinConfiguredBounds,
-    HeadReturnPlan, HeadRuntimeConfig, HeadTelemetrySafetyViolation, OperationTimeout,
-    ReturnToTargetConfig,
+    ConfigParseError, ConfiguredHeadPoseBounds, HeadPoseBoundsAdmissionError,
+    HeadPoseWithinConfiguredBounds, HeadReturnPlan, HeadRuntimeConfig,
+    HeadTelemetrySafetyViolation, OperationTimeout, ReturnToTargetConfig,
 };
 use crate::framing::{FrameReadError, read_response_frame};
+use crate::gaze_control::{
+    HeadGazeCommitReceipt, HeadGazeControlConfig, HeadGazeController, HeadGazeControllerInitError,
+    HeadGazeExternalFault, HeadGazePreparedStepError, HeadGazeProposal, HeadGazeProposalAdmission,
+    HeadGazeProposalAdmissionError, HeadGazeTickError,
+};
 use crate::motion::{
     FreshHeadTelemetrySet, HeadMotionError, HeadReturnAction, HeadReturnController,
     admit_stopped_return_start,
@@ -48,6 +53,107 @@ pub struct PhysicalHeadMotionConsent(());
 impl PhysicalHeadMotionConsent {
     pub const fn explicitly_granted() -> Self {
         Self(())
+    }
+}
+
+/// Exclusive authority to service one physical head-gaze transaction while
+/// base motion is inhibited.
+///
+/// This type deliberately has no public constructor. A one-time "base is
+/// stopped" receipt is not sufficient: the eventual motion-owner integration
+/// must issue an owned lease which prevents nonzero base command admission
+/// until the complete head goal-write/readback transaction has returned and
+/// this value has been dropped. Until that shared lease exists, proposal
+/// admission is usable but physical gaze servicing is unavailable.
+#[derive(Debug)]
+pub struct HeadGazeBaseZeroExclusiveLease {
+    _private: (),
+}
+
+/// Actor-local physical gaze configuration.
+///
+/// Construction binds the pure controller's natural pose to the exact
+/// reviewed return target. The complete four-joint goal write/readback budget
+/// must fit within one controller period, preventing a configured transaction
+/// timeout from making the following planner tick late by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadGazeActuationConfig {
+    controller: HeadGazeControlConfig,
+    goal_register_transaction_timeout: OperationTimeout,
+}
+
+impl HeadGazeActuationConfig {
+    pub fn try_new(
+        controller: HeadGazeControlConfig,
+        reviewed_return_target: ExactHeadTargetPose,
+        goal_register_transaction_timeout_ms: u64,
+    ) -> Result<Self, HeadGazeActuationConfigError> {
+        if controller.natural_pose() != reviewed_return_target {
+            return Err(
+                HeadGazeActuationConfigError::NaturalPoseDoesNotMatchReviewedReturn {
+                    controller: controller.natural_pose(),
+                    reviewed_return: reviewed_return_target,
+                },
+            );
+        }
+        let goal_register_transaction_timeout = OperationTimeout::parse(
+            "head_gaze_goal_register_transaction_timeout_ms",
+            goal_register_transaction_timeout_ms,
+        )
+        .map_err(HeadGazeActuationConfigError::TransactionTimeout)?;
+        let control_period = controller.timing().control_period().get();
+        if goal_register_transaction_timeout.get() > control_period {
+            return Err(
+                HeadGazeActuationConfigError::TransactionTimeoutExceedsControlPeriod {
+                    transaction_timeout: goal_register_transaction_timeout.get(),
+                    control_period,
+                },
+            );
+        }
+        Ok(Self {
+            controller,
+            goal_register_transaction_timeout,
+        })
+    }
+
+    pub const fn controller(self) -> HeadGazeControlConfig {
+        self.controller
+    }
+
+    pub const fn goal_register_transaction_timeout(self) -> OperationTimeout {
+        self.goal_register_transaction_timeout
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadGazeActuationConfigError {
+    NaturalPoseDoesNotMatchReviewedReturn {
+        controller: ExactHeadTargetPose,
+        reviewed_return: ExactHeadTargetPose,
+    },
+    TransactionTimeout(ConfigParseError),
+    TransactionTimeoutExceedsControlPeriod {
+        transaction_timeout: Duration,
+        control_period: Duration,
+    },
+}
+
+impl fmt::Display for HeadGazeActuationConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid physical head-gaze actuation configuration: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for HeadGazeActuationConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TransactionTimeout(source) => Some(source),
+            Self::NaturalPoseDoesNotMatchReviewedReturn { .. }
+            | Self::TransactionTimeoutExceedsControlPeriod { .. } => None,
+        }
     }
 }
 
@@ -700,6 +806,10 @@ impl HeadHealthJointEvidence {
 pub enum HeadHoldTarget {
     StartupObserved(HeadPose),
     ReviewedReturn(ExactHeadTargetPose),
+    /// Latest actor-local gaze target whose goal registers were verified.
+    ///
+    /// This does not claim the mechanism has reached the target.
+    ReviewedGaze(ExactHeadTargetPose),
     RecoverableReturnCommand([PositionTicks; 4]),
 }
 
@@ -707,7 +817,7 @@ impl HeadHoldTarget {
     pub const fn position(self, joint: HeadJoint) -> PositionTicks {
         match self {
             Self::StartupObserved(pose) => pose.position(joint),
-            Self::ReviewedReturn(target) => target.position(joint),
+            Self::ReviewedReturn(target) | Self::ReviewedGaze(target) => target.position(joint),
             Self::RecoverableReturnCommand(positions) => positions[joint as usize],
         }
     }
@@ -715,7 +825,7 @@ impl HeadHoldTarget {
     pub const fn positions(self) -> [PositionTicks; 4] {
         match self {
             Self::StartupObserved(pose) => pose.positions(),
-            Self::ReviewedReturn(target) => target.positions(),
+            Self::ReviewedReturn(target) | Self::ReviewedGaze(target) => target.positions(),
             Self::RecoverableReturnCommand(positions) => positions,
         }
     }
@@ -1564,12 +1674,121 @@ impl TensionPreservingHeadActorExit {
     }
 }
 
+/// Physical disposition of one successfully committed gaze planner step.
+///
+/// A retained target performs no serial traffic because this exclusive actor
+/// already has exact evidence for that unchanged goal. A changed target is
+/// committed only after all four goal writes and all four exact register
+/// readbacks complete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadGazeHardwareApplication {
+    RetainedPreviouslyVerifiedTarget { target: ExactHeadTargetPose },
+    GoalRegistersVerified(Box<VerifiedHeadGoalRegisterEvidence>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedHeadGazeControlStep {
+    controller: HeadGazeCommitReceipt,
+    hardware: HeadGazeHardwareApplication,
+}
+
+impl VerifiedHeadGazeControlStep {
+    pub const fn controller(&self) -> HeadGazeCommitReceipt {
+        self.controller
+    }
+
+    pub const fn hardware(&self) -> &HeadGazeHardwareApplication {
+        &self.hardware
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadGazeProposalCommandError {
+    CommandBeforeReviewedReturn,
+    CommandAlreadyInProgress,
+    NotConfigured,
+    ControllerInitialization(HeadGazeControllerInitError),
+    Admission(HeadGazeProposalAdmissionError),
+}
+
+impl fmt::Display for HeadGazeProposalCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "head-gaze proposal command failed: {self:?}")
+    }
+}
+
+impl std::error::Error for HeadGazeProposalCommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ControllerInitialization(source) => Some(source),
+            Self::Admission(source) => Some(source),
+            Self::CommandBeforeReviewedReturn
+            | Self::CommandAlreadyInProgress
+            | Self::NotConfigured => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadGazeServiceOutcome {
+    BeforeScheduledTick {
+        scheduled_for: MonotonicTime,
+        observed_at: MonotonicTime,
+    },
+    Applied(Box<VerifiedHeadGazeControlStep>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadGazeServiceError {
+    CommandBeforeReviewedReturn,
+    CommandAlreadyInProgress,
+    NotConfigured,
+    ControllerInitialization(HeadGazeControllerInitError),
+    Controller(HeadGazeTickError),
+    GoalRegisters {
+        source: Box<HeadGoalRegisterError>,
+        abort: Result<(), HeadGazePreparedStepError>,
+    },
+    CommitAfterVerifiedApplication {
+        source: HeadGazePreparedStepError,
+        target: ExactHeadTargetPose,
+    },
+}
+
+impl fmt::Display for HeadGazeServiceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "head-gaze service failed: {self:?}")
+    }
+}
+
+impl std::error::Error for HeadGazeServiceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ControllerInitialization(source) => Some(source),
+            Self::Controller(source) => Some(source),
+            Self::GoalRegisters { source, .. } => Some(source.as_ref()),
+            Self::CommitAfterVerifiedApplication { source, .. } => Some(source),
+            Self::CommandBeforeReviewedReturn
+            | Self::CommandAlreadyInProgress
+            | Self::NotConfigured => None,
+        }
+    }
+}
+
 enum HeadCommand {
     CheckHealth {
         response: oneshot::Sender<Result<VerifiedHeadHealthEvidence, HeadHealthCheckError>>,
     },
     ReturnToTarget {
         response: oneshot::Sender<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
+    },
+    AdmitGazeProposal {
+        proposal: HeadGazeProposal,
+        response: oneshot::Sender<Result<HeadGazeProposalAdmission, HeadGazeProposalCommandError>>,
+    },
+    ServiceGaze {
+        _base_zero_lease: HeadGazeBaseZeroExclusiveLease,
+        response: oneshot::Sender<Result<HeadGazeServiceOutcome, HeadGazeServiceError>>,
     },
     Shutdown {
         response: oneshot::Sender<TorqueDisableReport>,
@@ -1678,6 +1897,88 @@ impl TensionPreservingHeadReturnActorHandle {
         let (response, result) = oneshot::channel();
         self.commands
             .send(HeadCommand::ReturnToTarget { response })
+            .await
+            .map_err(|_| HeadCommandError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| HeadCommandError::ActorStoppedBeforeReporting)
+    }
+
+    pub async fn check_health(&self) -> Result<VerifiedHeadHealthEvidence, HeadHealthRequestError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::CheckHealth { response })
+            .await
+            .map_err(|_| HeadHealthRequestError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| HeadHealthRequestError::ActorStoppedBeforeReporting)?
+            .map_err(|source| HeadHealthRequestError::Check { source })
+    }
+
+    pub async fn release_ownership_preserving_hold(
+        self,
+    ) -> Result<HoldPreservingOwnershipReleaseEvidence, ShutdownError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::ReleaseOwnershipPreservingHold { response })
+            .await
+            .map_err(|_| ShutdownError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| ShutdownError::ActorStoppedBeforeReporting)
+    }
+}
+
+/// Production-only single-owner endpoint for reviewed return plus actor-local
+/// face-gaze control.
+///
+/// Proposal time and controller time share the injected actor clock. Proposal
+/// admission is pure. Physical servicing additionally requires the opaque
+/// base-zero exclusive lease, for which no public issuer exists yet.
+pub struct TensionPreservingHeadGazeActorHandle {
+    commands: mpsc::Sender<HeadCommand>,
+}
+
+impl TensionPreservingHeadGazeActorHandle {
+    pub async fn return_to_target(
+        &self,
+    ) -> Result<Result<VerifiedHeadReturnEvidence, HeadReturnError>, HeadCommandError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::ReturnToTarget { response })
+            .await
+            .map_err(|_| HeadCommandError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| HeadCommandError::ActorStoppedBeforeReporting)
+    }
+
+    pub async fn admit_gaze_proposal(
+        &self,
+        proposal: HeadGazeProposal,
+    ) -> Result<Result<HeadGazeProposalAdmission, HeadGazeProposalCommandError>, HeadCommandError>
+    {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::AdmitGazeProposal { proposal, response })
+            .await
+            .map_err(|_| HeadCommandError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| HeadCommandError::ActorStoppedBeforeReporting)
+    }
+
+    pub async fn service_gaze(
+        &self,
+        base_zero_lease: HeadGazeBaseZeroExclusiveLease,
+    ) -> Result<Result<HeadGazeServiceOutcome, HeadGazeServiceError>, HeadCommandError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::ServiceGaze {
+                _base_zero_lease: base_zero_lease,
+                response,
+            })
             .await
             .map_err(|_| HeadCommandError::ActorAlreadyStopped)?;
         result
@@ -1854,7 +2155,7 @@ pub fn spawn_head_actor<T, C>(
     clock: C,
     config: HeadRuntimeConfig,
     configured_pose_bounds: ConfiguredHeadPoseBounds,
-    consent: PhysicalTorqueEnableConsent,
+    _consent: PhysicalTorqueEnableConsent,
 ) -> Result<(HeadActorHandle, StartupReceipt, HeadActorTask), HeadActorSpawnError>
 where
     T: AsyncByteTransport,
@@ -1868,7 +2169,7 @@ where
         clock,
         config,
         configured_pose_bounds,
-        consent,
+        None,
         None,
     );
     Ok((HeadActorHandle { commands }, startup, task))
@@ -1879,7 +2180,7 @@ pub fn spawn_head_return_actor<T, C>(
     transport: T,
     clock: C,
     config: ReturnToTargetConfig,
-    torque_consent: PhysicalTorqueEnableConsent,
+    _torque_consent: PhysicalTorqueEnableConsent,
     _motion_consent: PhysicalHeadMotionConsent,
 ) -> Result<(HeadReturnActorHandle, StartupReceipt, HeadActorTask), HeadActorSpawnError>
 where
@@ -1895,8 +2196,8 @@ where
         clock,
         runtime_config,
         start_bounds,
-        torque_consent,
         Some(plan),
+        None,
     );
     Ok((HeadReturnActorHandle { commands }, startup, task))
 }
@@ -1911,7 +2212,7 @@ pub fn spawn_tension_preserving_head_return_actor<T, C>(
     transport: T,
     clock: C,
     config: ReturnToTargetConfig,
-    torque_consent: PhysicalTorqueEnableConsent,
+    _torque_consent: PhysicalTorqueEnableConsent,
     _motion_consent: PhysicalHeadMotionConsent,
     _takeover_consent: ProductionTensionPreservingTakeoverConsent,
 ) -> Result<
@@ -1935,11 +2236,54 @@ where
         clock,
         runtime_config,
         start_bounds,
-        torque_consent,
         Some(plan),
+        None,
     );
     Ok((
         TensionPreservingHeadReturnActorHandle { commands },
+        startup,
+        task,
+    ))
+}
+
+/// Spawn the testable tension-preserving owner with actor-local gaze control.
+///
+/// The injected clock is the only time origin used for proposal admission,
+/// controller service, register-transaction evidence, and health evidence.
+pub fn spawn_tension_preserving_head_gaze_actor<T, C>(
+    transport: T,
+    clock: C,
+    config: ReturnToTargetConfig,
+    gaze_config: HeadGazeActuationConfig,
+    _torque_consent: PhysicalTorqueEnableConsent,
+    _motion_consent: PhysicalHeadMotionConsent,
+    _takeover_consent: ProductionTensionPreservingTakeoverConsent,
+) -> Result<
+    (
+        TensionPreservingHeadGazeActorHandle,
+        StartupReceipt,
+        TensionPreservingHeadActorTask,
+    ),
+    HeadActorSpawnError,
+>
+where
+    T: AsyncByteTransport,
+    C: MonotonicClock,
+{
+    let runtime =
+        Handle::try_current().map_err(|source| HeadActorSpawnError::NoTokioRuntime { source })?;
+    let (runtime_config, start_bounds, plan) = config.into_actor_parts();
+    let (commands, startup, task) = spawn_tension_preserving_head_actor_on(
+        &runtime,
+        transport,
+        clock,
+        runtime_config,
+        start_bounds,
+        Some(plan),
+        Some(gaze_config),
+    );
+    Ok((
+        TensionPreservingHeadGazeActorHandle { commands },
         startup,
         task,
     ))
@@ -1951,8 +2295,8 @@ fn spawn_head_actor_on<T, C>(
     clock: C,
     config: HeadRuntimeConfig,
     configured_pose_bounds: ConfiguredHeadPoseBounds,
-    _consent: PhysicalTorqueEnableConsent,
     return_plan: Option<HeadReturnPlan>,
+    gaze_config: Option<HeadGazeActuationConfig>,
 ) -> (mpsc::Sender<HeadCommand>, StartupReceipt, HeadActorTask)
 where
     T: AsyncByteTransport,
@@ -1967,6 +2311,7 @@ where
         configured_pose_bounds,
         startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
         return_plan,
+        gaze_config,
     };
     let task = runtime.spawn(async move {
         actor
@@ -1989,8 +2334,8 @@ fn spawn_tension_preserving_head_actor_on<T, C>(
     clock: C,
     config: HeadRuntimeConfig,
     configured_pose_bounds: ConfiguredHeadPoseBounds,
-    _consent: PhysicalTorqueEnableConsent,
     return_plan: Option<HeadReturnPlan>,
+    gaze_config: Option<HeadGazeActuationConfig>,
 ) -> (
     mpsc::Sender<HeadCommand>,
     StartupReceipt,
@@ -2009,6 +2354,7 @@ where
         configured_pose_bounds,
         startup_torque_policy: StartupTorquePolicy::TensionPreservingTakeover,
         return_plan,
+        gaze_config,
     };
     let task = runtime.spawn(async move {
         actor
@@ -2031,7 +2377,7 @@ where
 pub fn start_serial_head_actor(
     config: HeadRuntimeConfig,
     configured_pose_bounds: ConfiguredHeadPoseBounds,
-    consent: PhysicalTorqueEnableConsent,
+    _consent: PhysicalTorqueEnableConsent,
 ) -> Result<
     (
         SerialConfigurationEvidence,
@@ -2053,7 +2399,7 @@ pub fn start_serial_head_actor(
         TokioClock::new(),
         config,
         configured_pose_bounds,
-        consent,
+        None,
         None,
     );
     Ok((
@@ -2068,7 +2414,7 @@ pub fn start_serial_head_actor(
 /// transaction. No target/limits can be supplied later through the command API.
 pub fn start_serial_head_return_actor(
     config: ReturnToTargetConfig,
-    torque_consent: PhysicalTorqueEnableConsent,
+    _torque_consent: PhysicalTorqueEnableConsent,
     _motion_consent: PhysicalHeadMotionConsent,
 ) -> Result<
     (
@@ -2091,8 +2437,8 @@ pub fn start_serial_head_return_actor(
         TokioClock::new(),
         runtime_config,
         start_bounds,
-        torque_consent,
         Some(plan),
+        None,
     );
     Ok((
         serial_evidence,
@@ -2110,7 +2456,7 @@ pub fn start_serial_head_return_actor(
 /// torque-switch state.
 pub fn start_serial_tension_preserving_head_return_actor(
     config: ReturnToTargetConfig,
-    torque_consent: PhysicalTorqueEnableConsent,
+    _torque_consent: PhysicalTorqueEnableConsent,
     _motion_consent: PhysicalHeadMotionConsent,
     _takeover_consent: ProductionTensionPreservingTakeoverConsent,
 ) -> Result<
@@ -2134,12 +2480,59 @@ pub fn start_serial_tension_preserving_head_return_actor(
         TokioClock::new(),
         runtime_config,
         start_bounds,
-        torque_consent,
         Some(plan),
+        None,
     );
     Ok((
         serial_evidence,
         TensionPreservingHeadReturnActorHandle { commands },
+        startup,
+        task,
+    ))
+}
+
+/// Open one production serial owner with reviewed natural return and
+/// actor-local physical gaze control.
+///
+/// Unlike the compatibility constructor, the clock is injected so the caller
+/// can share one exact monotonic epoch with camera ingress and face tracking.
+pub fn start_serial_tension_preserving_head_gaze_actor<C>(
+    config: ReturnToTargetConfig,
+    gaze_config: HeadGazeActuationConfig,
+    clock: C,
+    _torque_consent: PhysicalTorqueEnableConsent,
+    _motion_consent: PhysicalHeadMotionConsent,
+    _takeover_consent: ProductionTensionPreservingTakeoverConsent,
+) -> Result<
+    (
+        SerialConfigurationEvidence,
+        TensionPreservingHeadGazeActorHandle,
+        StartupReceipt,
+        TensionPreservingHeadActorTask,
+    ),
+    HeadActorStartError,
+>
+where
+    C: MonotonicClock,
+{
+    let runtime =
+        Handle::try_current().map_err(|source| HeadActorStartError::NoTokioRuntime { source })?;
+    let (runtime_config, start_bounds, plan) = config.into_actor_parts();
+    let transport = SerialTransport::open(runtime_config.device())
+        .map_err(|source| HeadActorStartError::Serial { source })?;
+    let serial_evidence = transport.evidence().clone();
+    let (commands, startup, task) = spawn_tension_preserving_head_actor_on(
+        &runtime,
+        transport,
+        clock,
+        runtime_config,
+        start_bounds,
+        Some(plan),
+        Some(gaze_config),
+    );
+    Ok((
+        serial_evidence,
+        TensionPreservingHeadGazeActorHandle { commands },
         startup,
         task,
     ))
@@ -2158,6 +2551,7 @@ struct HeadActor<T, C> {
     configured_pose_bounds: ConfiguredHeadPoseBounds,
     startup_torque_policy: StartupTorquePolicy,
     return_plan: Option<HeadReturnPlan>,
+    gaze_config: Option<HeadGazeActuationConfig>,
 }
 
 struct ControlState {
@@ -2452,6 +2846,20 @@ where
                                 .is_ok();
                             ActorTermination::StartupFault
                         }
+                        Ok(HeadCommand::AdmitGazeProposal { response, .. }) => {
+                            let _requester_present = response
+                                .send(Err(
+                                    HeadGazeProposalCommandError::CommandBeforeReviewedReturn,
+                                ))
+                                .is_ok();
+                            ActorTermination::StartupFault
+                        }
+                        Ok(HeadCommand::ServiceGaze { response, .. }) => {
+                            let _requester_present = response
+                                .send(Err(HeadGazeServiceError::CommandBeforeReviewedReturn))
+                                .is_ok();
+                            ActorTermination::StartupFault
+                        }
                         Err(
                             mpsc::error::TryRecvError::Empty
                             | mpsc::error::TryRecvError::Disconnected,
@@ -2516,6 +2924,8 @@ where
     ) -> ActorTermination {
         let mut hold_target = HeadHoldTarget::StartupObserved(start_pose);
         let mut telemetry_safety_fault: Option<Box<HeadHealthObservationError>> = None;
+        let mut gaze_controller: Option<Result<HeadGazeController, HeadGazeControllerInitError>> =
+            None;
         loop {
             match commands.recv().await {
                 Some(HeadCommand::Shutdown { response }) => {
@@ -2590,6 +3000,13 @@ where
                         Err(_) => hold_target,
                     };
                     let _requester_present = response.send(result.clone()).is_ok();
+                    if let (Some(gaze_config), Ok(evidence)) = (self.gaze_config, &result) {
+                        gaze_controller = Some(HeadGazeController::try_new(
+                            gaze_config.controller(),
+                            evidence.target(),
+                            self.clock.now(),
+                        ));
+                    }
                     *head_return = Some(result.clone());
                     if result.is_err() && !owner_retained_after_fault {
                         return control
@@ -2598,7 +3015,122 @@ where
                             .unwrap_or(ActorTermination::HeadReturnFault);
                     }
                 }
+                Some(HeadCommand::AdmitGazeProposal { proposal, response }) => {
+                    let result = if self.gaze_config.is_none() {
+                        Err(HeadGazeProposalCommandError::NotConfigured)
+                    } else {
+                        match gaze_controller.as_mut() {
+                            Some(Ok(controller)) => controller
+                                .admit_proposal(proposal, self.clock.now())
+                                .map_err(HeadGazeProposalCommandError::Admission),
+                            Some(Err(source)) => Err(
+                                HeadGazeProposalCommandError::ControllerInitialization(*source),
+                            ),
+                            None => Err(HeadGazeProposalCommandError::CommandBeforeReviewedReturn),
+                        }
+                    };
+                    let _requester_present = response.send(result).is_ok();
+                }
+                Some(HeadCommand::ServiceGaze {
+                    _base_zero_lease,
+                    response,
+                }) => {
+                    let result = if self.gaze_config.is_none() {
+                        Err(HeadGazeServiceError::NotConfigured)
+                    } else {
+                        match gaze_controller.as_mut() {
+                            Some(Ok(controller)) => {
+                                self.execute_gaze_control_step(controller, commands, control)
+                                    .await
+                            }
+                            Some(Err(source)) => {
+                                Err(HeadGazeServiceError::ControllerInitialization(*source))
+                            }
+                            None => Err(HeadGazeServiceError::CommandBeforeReviewedReturn),
+                        }
+                    };
+                    if let Ok(HeadGazeServiceOutcome::Applied(evidence)) = &result {
+                        hold_target =
+                            HeadHoldTarget::ReviewedGaze(evidence.controller().committed_target());
+                    }
+                    let _requester_present = response.send(result).is_ok();
+                    if let Some(termination) = control.termination.clone() {
+                        return termination;
+                    }
+                }
                 None => return ActorTermination::HandleDropped,
+            }
+        }
+    }
+
+    async fn execute_gaze_control_step(
+        &mut self,
+        controller: &mut HeadGazeController,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<HeadGazeServiceOutcome, HeadGazeServiceError> {
+        let now = self.clock.now();
+        let prepared = match controller.prepare_tick(now) {
+            Ok(prepared) => prepared,
+            Err(HeadGazeTickError::BeforeScheduledTick {
+                scheduled_for,
+                observed_at,
+            }) => {
+                return Ok(HeadGazeServiceOutcome::BeforeScheduledTick {
+                    scheduled_for,
+                    observed_at,
+                });
+            }
+            Err(source) => return Err(HeadGazeServiceError::Controller(source)),
+        };
+        let target = prepared.planned_target();
+        let hardware = if target == controller.committed_target() {
+            HeadGazeHardwareApplication::RetainedPreviouslyVerifiedTarget { target }
+        } else {
+            let gaze_config = self
+                .gaze_config
+                .expect("gaze service is called only for a configured actor");
+            match self
+                .write_goals_with_register_readback(
+                    target,
+                    self.config.goal_speed(),
+                    gaze_config.goal_register_transaction_timeout(),
+                    commands,
+                    control,
+                )
+                .await
+            {
+                Ok(evidence) => {
+                    HeadGazeHardwareApplication::GoalRegistersVerified(Box::new(evidence))
+                }
+                Err(source) => {
+                    let abort = controller.abort_prepared_with_fault(
+                        prepared,
+                        HeadGazeExternalFault::ActuatorApplicationUncertain,
+                    );
+                    if abort.is_err() {
+                        controller.latch_external_fault(
+                            HeadGazeExternalFault::ActuatorApplicationUncertain,
+                        );
+                    }
+                    return Err(HeadGazeServiceError::GoalRegisters {
+                        source: Box::new(source),
+                        abort,
+                    });
+                }
+            }
+        };
+        match controller.commit_prepared(prepared) {
+            Ok(controller) => Ok(HeadGazeServiceOutcome::Applied(Box::new(
+                VerifiedHeadGazeControlStep {
+                    controller,
+                    hardware,
+                },
+            ))),
+            Err(source) => {
+                controller
+                    .latch_external_fault(HeadGazeExternalFault::ActuatorApplicationUncertain);
+                Err(HeadGazeServiceError::CommitAfterVerifiedApplication { source, target })
             }
         }
     }
@@ -3304,6 +3836,18 @@ where
                     .is_ok();
                 Ok(())
             }
+            Ok(HeadCommand::AdmitGazeProposal { response, .. }) => {
+                let _requester_present = response
+                    .send(Err(HeadGazeProposalCommandError::CommandAlreadyInProgress))
+                    .is_ok();
+                Ok(())
+            }
+            Ok(HeadCommand::ServiceGaze { response, .. }) => {
+                let _requester_present = response
+                    .send(Err(HeadGazeServiceError::CommandAlreadyInProgress))
+                    .is_ok();
+                Ok(())
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 control.termination = Some(ActorTermination::HandleDropped);
                 Err(HeadReturnError::Cancelled {
@@ -3502,6 +4046,18 @@ where
             Ok(HeadCommand::ReturnToTarget { response }) => {
                 let _requester_present = response
                     .send(Err(HeadReturnError::CommandAlreadyInProgress))
+                    .is_ok();
+                Ok(())
+            }
+            Ok(HeadCommand::AdmitGazeProposal { response, .. }) => {
+                let _requester_present = response
+                    .send(Err(HeadGazeProposalCommandError::CommandAlreadyInProgress))
+                    .is_ok();
+                Ok(())
+            }
+            Ok(HeadCommand::ServiceGaze { response, .. }) => {
+                let _requester_present = response
+                    .send(Err(HeadGazeServiceError::CommandAlreadyInProgress))
                     .is_ok();
                 Ok(())
             }
@@ -4177,6 +4733,16 @@ where
                         .send(Err(HeadReturnError::CommandAlreadyInProgress))
                         .is_ok();
                 }
+                Ok(HeadCommand::AdmitGazeProposal { response, .. }) => {
+                    let _requester_present = response
+                        .send(Err(HeadGazeProposalCommandError::CommandAlreadyInProgress))
+                        .is_ok();
+                }
+                Ok(HeadCommand::ServiceGaze { response, .. }) => {
+                    let _requester_present = response
+                        .send(Err(HeadGazeServiceError::CommandAlreadyInProgress))
+                        .is_ok();
+                }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     control.termination = Some(ActorTermination::HandleDropped);
                     return Err(CancellationCause::HandleDropped);
@@ -4635,6 +5201,20 @@ where
                     .is_ok();
                 Ok(())
             }
+            Ok(HeadCommand::AdmitGazeProposal { response, .. }) => {
+                let _requester_present = response
+                    .send(Err(
+                        HeadGazeProposalCommandError::CommandBeforeReviewedReturn,
+                    ))
+                    .is_ok();
+                Ok(())
+            }
+            Ok(HeadCommand::ServiceGaze { response, .. }) => {
+                let _requester_present = response
+                    .send(Err(HeadGazeServiceError::CommandBeforeReviewedReturn))
+                    .is_ok();
+                Ok(())
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 control.termination = Some(ActorTermination::HandleDropped);
                 Err(HeadRuntimeError::Cancelled {
@@ -4737,11 +5317,17 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use kiko_head_protocol::{ResponseParseError, ServoId, TelemetryParseError};
+    use kiko_head_protocol::{PositionStepLimit, ResponseParseError, ServoId, TelemetryParseError};
 
     use super::*;
     use crate::config::{
         HeadProbeConfig, HeadProbeConfigInput, HeadRuntimeConfigInput, ReturnToTargetConfigInput,
+    };
+    use crate::gaze_control::{
+        HeadAcquisitionProposalCount, HeadControlPeriod, HeadDeadbandTicks, HeadGazeErrorBand,
+        HeadGazeProposalId, HeadGazeTiming, HeadJointMotionLimits, HeadMotionLimits,
+        HeadProposalTtl, HeadResumeThresholdTicks, HeadTickLateness,
+        ServoAccelerationLimitTicksPerControlTickSquared, ServoVelocityLimitTicksPerControlTick,
     };
     use crate::transport::{TransportFailureKind, TransportOperation};
 
@@ -5225,6 +5811,7 @@ mod tests {
                 configured_pose_bounds: valid_pose_bounds(),
                 startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
                 return_plan: None,
+                gaze_config: None,
             },
             shared,
         )
@@ -5235,6 +5822,45 @@ mod tests {
             .expect("exact test target")
     }
 
+    fn gaze_control_config(natural: ExactHeadTargetPose) -> HeadGazeControlConfig {
+        fn limit(natural: PositionTicks) -> HeadJointMotionLimits {
+            HeadJointMotionLimits::try_new(
+                PositionTicks::try_new(natural.get() - 100).expect("test minimum"),
+                PositionTicks::try_new(natural.get() + 100).expect("test maximum"),
+                ServoVelocityLimitTicksPerControlTick::try_new(4).expect("velocity"),
+                ServoAccelerationLimitTicksPerControlTickSquared::try_new(1).expect("acceleration"),
+                PositionStepLimit::try_new(4).expect("step"),
+            )
+            .expect("test joint limits")
+        }
+        HeadGazeControlConfig::try_new(
+            HeadGazeTiming::new(
+                HeadControlPeriod::try_new(Duration::from_millis(200)).expect("period"),
+                HeadTickLateness::new(Duration::from_millis(20)),
+                HeadProposalTtl::try_new(Duration::from_millis(300)).expect("TTL"),
+                HeadAcquisitionProposalCount::try_new(1).expect("acquisition"),
+            ),
+            natural,
+            HeadMotionLimits::new(
+                limit(natural.position(HeadJoint::Bow)),
+                limit(natural.position(HeadJoint::Curl)),
+                limit(natural.position(HeadJoint::Yaw)),
+                limit(natural.position(HeadJoint::Roll)),
+            ),
+            HeadGazeErrorBand::try_new(
+                HeadDeadbandTicks::try_new(1).expect("deadband"),
+                HeadResumeThresholdTicks::try_new(3).expect("resume"),
+            )
+            .expect("hysteresis"),
+        )
+        .expect("test gaze controller")
+    }
+
+    fn gaze_actuation_config(natural: ExactHeadTargetPose) -> HeadGazeActuationConfig {
+        HeadGazeActuationConfig::try_new(gaze_control_config(natural), natural, 100)
+            .expect("test gaze actuation")
+    }
+
     fn health_observation_error(error: HeadHealthRequestError) -> Box<HeadHealthObservationError> {
         match error {
             HeadHealthRequestError::Check {
@@ -5242,6 +5868,139 @@ mod tests {
             } => observation,
             other => panic!("expected health observation error, got {other:#?}"),
         }
+    }
+
+    #[test]
+    fn gaze_actuation_config_cross_binds_natural_target_and_tick_budget() {
+        let natural = goal_register_target();
+        let config = gaze_control_config(natural);
+        assert_eq!(
+            HeadGazeActuationConfig::try_new(config, natural, 100)
+                .expect("matching reviewed target")
+                .goal_register_transaction_timeout()
+                .get(),
+            Duration::from_millis(100)
+        );
+
+        let other = ExactHeadTargetPose::try_from_ticks([2_128, 2_558, 2_925, 2_930])
+            .expect("other target");
+        assert!(matches!(
+            HeadGazeActuationConfig::try_new(config, other, 100),
+            Err(HeadGazeActuationConfigError::NaturalPoseDoesNotMatchReviewedReturn {
+                controller,
+                reviewed_return,
+            }) if controller == natural && reviewed_return == other
+        ));
+        assert!(matches!(
+            HeadGazeActuationConfig::try_new(config, natural, 201),
+            Err(HeadGazeActuationConfigError::TransactionTimeoutExceedsControlPeriod {
+                transaction_timeout,
+                control_period,
+            }) if transaction_timeout == Duration::from_millis(201)
+                && control_period == Duration::from_millis(200)
+        ));
+    }
+
+    #[tokio::test]
+    async fn gaze_step_commits_only_after_all_goal_registers_match() {
+        let natural = goal_register_target();
+        let expected = ExactHeadTargetPose::try_from_ticks([2_127, 2_558, 2_926, 2_930])
+            .expect("first acceleration-bounded yaw step");
+        let reads = HeadJoint::ALL
+            .into_iter()
+            .map(|joint| {
+                ReadAction::Bytes(goal_position_response(
+                    joint,
+                    expected.position(joint).get(),
+                ))
+            })
+            .collect();
+        let (mut actor, shared) = goal_register_actor(reads);
+        actor.gaze_config = Some(gaze_actuation_config(natural));
+        let mut controller =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .expect("controller");
+        controller
+            .admit_proposal(
+                HeadGazeProposal::new(
+                    HeadGazeProposalId::try_new(1).expect("proposal id"),
+                    MonotonicTime::ZERO,
+                    ExactHeadTargetPose::try_from_ticks([2_127, 2_558, 2_935, 2_930])
+                        .expect("face target"),
+                ),
+                MonotonicTime::ZERO,
+            )
+            .expect("fresh proposal");
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let outcome = actor
+            .execute_gaze_control_step(&mut controller, &mut receiver, &mut control)
+            .await
+            .expect("verified gaze step");
+        drop(commands);
+
+        let HeadGazeServiceOutcome::Applied(evidence) = outcome else {
+            panic!("expected applied gaze step");
+        };
+        assert_eq!(evidence.controller().committed_target(), expected);
+        let HeadGazeHardwareApplication::GoalRegistersVerified(registers) = evidence.hardware()
+        else {
+            panic!("changed target requires register evidence");
+        };
+        assert_eq!(registers.target(), expected);
+        assert_eq!(controller.committed_target(), expected);
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn partial_gaze_write_aborts_candidate_and_latches_controller_fault() {
+        let natural = goal_register_target();
+        let (mut actor, shared) = goal_register_actor(Vec::new());
+        actor.gaze_config = Some(gaze_actuation_config(natural));
+        shared
+            .lock()
+            .expect("fake state")
+            .write_failures
+            .insert(1, TransportFailure::timed_out(TransportOperation::Write, 3));
+        let mut controller =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .expect("controller");
+        controller
+            .admit_proposal(
+                HeadGazeProposal::new(
+                    HeadGazeProposalId::try_new(1).expect("proposal id"),
+                    MonotonicTime::ZERO,
+                    ExactHeadTargetPose::try_from_ticks([2_127, 2_558, 2_935, 2_930])
+                        .expect("face target"),
+                ),
+                MonotonicTime::ZERO,
+            )
+            .expect("fresh proposal");
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .execute_gaze_control_step(&mut controller, &mut receiver, &mut control)
+            .await
+            .expect_err("partial write is terminal for this controller instance");
+        drop(commands);
+
+        assert!(matches!(
+            error,
+            HeadGazeServiceError::GoalRegisters {
+                source,
+                abort: Ok(()),
+            } if source.completed_writes()[0].is_some()
+                && source.completed_writes()[1..].iter().all(Option::is_none)
+        ));
+        assert_eq!(controller.committed_target(), natural);
+        assert!(matches!(
+            controller.fault(),
+            Some(crate::gaze_control::HeadGazeFaultReason::External(
+                HeadGazeExternalFault::ActuatorApplicationUncertain
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -7477,6 +8236,7 @@ mod tests {
             configured_pose_bounds: valid_pose_bounds(),
             startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: Some(plan()),
+            gaze_config: None,
         };
         let (commands, mut receiver) = mpsc::channel(1);
         let mut control = ControlState::new();
@@ -7522,6 +8282,7 @@ mod tests {
             configured_pose_bounds: valid_pose_bounds(),
             startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: Some(plan()),
+            gaze_config: None,
         };
         let (commands, mut receiver) = mpsc::channel(1);
         let mut control = ControlState::new();
@@ -7572,6 +8333,7 @@ mod tests {
             configured_pose_bounds: valid_pose_bounds(),
             startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: None,
+            gaze_config: None,
         };
         let positions =
             kiko_head_protocol::ExactHeadTargetPose::try_from_ticks([2_127, 2_558, 2_925, 2_930])

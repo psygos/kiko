@@ -12,7 +12,7 @@ const POSE_ROTATION_VALIDATION_TOLERANCE: f64 = 1e-6;
 ///
 /// Camera coordinates follow the image convention used throughout Kiko: `+x`
 /// points right, `+y` points down, and `+z` points forward.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PinholeIntrinsics {
     fx: f32,
     fy: f32,
@@ -20,7 +20,7 @@ pub struct PinholeIntrinsics {
     cy: f32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IntrinsicsError {
     NonFinite { fx: f32, fy: f32, cx: f32, cy: f32 },
     NonPositiveFocal { fx: f32, fy: f32 },

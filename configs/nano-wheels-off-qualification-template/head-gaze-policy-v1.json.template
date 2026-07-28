@@ -26,10 +26,10 @@
       }
     },
     "natural_encoder_position_ticks": {
-      "bow_ticks": 2155,
-      "curl_ticks": 2545,
-      "yaw_ticks": 2943,
-      "roll_ticks": 2876
+      "bow_ticks": 2174,
+      "curl_ticks": 2570,
+      "yaw_ticks": 1637,
+      "roll_ticks": 3047
     },
     "hard_encoder_envelopes_ticks": {
       "bow": {

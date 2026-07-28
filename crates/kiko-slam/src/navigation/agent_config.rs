@@ -116,19 +116,26 @@ pub const MIN_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS: u64 = 5;
 /// Loosest admitted operator-console deadman scheduler period.
 pub const MAX_NANO_OPERATOR_CONSOLE_DEADMAN_TICK_MS: u64 = 100;
 
-/// The only target qualified by the recorded prior Kiko return-to-natural run.
+/// The operator-confirmed neutral target selected by the superseding
+/// 2026-07-29 head-policy evidence.
 ///
 /// Values are raw bow/curl/yaw/roll encoder ticks. This is not a geometric
-/// servo calibration and changing it requires new reviewed physical evidence.
-pub const KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS: [u16; 4] = [2_155, 2_545, 2_943, 2_876];
+/// servo calibration or a completed Kiko return-motion qualification.
+pub const KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS: [u16; 4] = [2_174, 2_570, 1_637, 3_047];
 
-/// Exact per-joint union of the evidenced prior return-start envelope and the
-/// reviewed natural target minus its 20-tick readback tolerance.
-pub const KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS: [u16; 4] = [2_135, 2_525, 2_842, 2_856];
+/// Lower bound of the exact per-joint union of the operator-confirmed target
+/// and five-sample canonical stopped pose, each expanded by 20 ticks.
+pub const KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS: [u16; 4] = [2_133, 2_550, 1_617, 3_023];
 
-/// Exact per-joint union of the evidenced prior return-start envelope and the
-/// reviewed natural target plus its 20-tick readback tolerance.
-pub const KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS: [u16; 4] = [2_227, 2_592, 2_963, 2_922];
+/// Upper bound of the exact per-joint union of the operator-confirmed target
+/// and five-sample canonical stopped pose, each expanded by 20 ticks.
+pub const KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS: [u16; 4] = [2_194, 2_660, 1_852, 3_067];
+
+/// Exact software travel caps for the superseding natural-return policy.
+///
+/// These cover the start-window-to-target maxima `[41, 90, 215, 24]` ticks
+/// without claiming mechanical travel limits or a completed motion test.
+pub const KIKO_REVIEWED_NATURAL_HEAD_MAXIMUM_TRAVEL_TICKS: [u16; 4] = [48, 96, 224, 32];
 
 /// The only torque envelope qualified by the recorded prior Kiko natural return.
 ///
@@ -1328,6 +1335,10 @@ pub enum NanoAgentPolicyConfigParseError {
         required_minimum_ticks: [u16; 4],
         required_maximum_ticks: [u16; 4],
     },
+    ReviewedNaturalHeadMaximumTravelMismatch {
+        configured_ticks: [u16; 4],
+        required_ticks: [u16; 4],
+    },
     ReviewedNaturalHeadTorqueMismatch {
         configured_permille: [u16; 4],
         required_permille: [u16; 4],
@@ -1472,6 +1483,7 @@ impl std::error::Error for NanoAgentPolicyConfigParseError {
             | Self::ReviewedNaturalHeadTargetMismatch { .. }
             | Self::ReviewedNaturalHoldEnvelopeOutsideStartupWindow { .. }
             | Self::ReviewedNaturalHeadStartBoundsMismatch { .. }
+            | Self::ReviewedNaturalHeadMaximumTravelMismatch { .. }
             | Self::ReviewedNaturalHeadTorqueMismatch { .. }
             | Self::DuplicateAccessorySerialPath
             | Self::RgbExpressionRequiresEye
@@ -1894,6 +1906,14 @@ fn parse_head(
                         configured_maximum_ticks: maximum_start_ticks,
                         required_minimum_ticks: KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS,
                         required_maximum_ticks: KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS,
+                    },
+                );
+            }
+            if maximum_travel_ticks != KIKO_REVIEWED_NATURAL_HEAD_MAXIMUM_TRAVEL_TICKS {
+                return Err(
+                    NanoAgentPolicyConfigParseError::ReviewedNaturalHeadMaximumTravelMismatch {
+                        configured_ticks: maximum_travel_ticks,
+                        required_ticks: KIKO_REVIEWED_NATURAL_HEAD_MAXIMUM_TRAVEL_TICKS,
                     },
                 );
             }
@@ -2707,10 +2727,10 @@ mod tests {
                 "direction_regression_tolerance_ticks": 20,
                 "goal_speed_ticks_per_second": 50,
                 "torque_limit_permille": [600, 400, 400, 400],
-                "minimum_start_ticks": [2135, 2525, 2842, 2856],
-                "maximum_start_ticks": [2227, 2592, 2963, 2922],
-                "reviewed_natural_target_ticks": [2155, 2545, 2943, 2876],
-                "maximum_travel_ticks": [80, 64, 128, 64],
+                "minimum_start_ticks": [2133, 2550, 1617, 3023],
+                "maximum_start_ticks": [2194, 2660, 1852, 3067],
+                "reviewed_natural_target_ticks": [2174, 2570, 1637, 3047],
+                "maximum_travel_ticks": [48, 96, 224, 32],
                 "physical_torque_consent": "enable_for_reviewed_natural_return_and_hold",
                 "physical_motion_consent": "return_to_reviewed_natural_target"
             },
@@ -3336,14 +3356,14 @@ mod tests {
                 .start_bounds()
                 .minimum(HeadJoint::Bow)
                 .get(),
-            2_135
+            2_133
         );
         assert_eq!(
             head.return_config()
                 .start_bounds()
                 .maximum(HeadJoint::Roll)
                 .get(),
-            2_922
+            3_067
         );
         let configured_minimums =
             HeadJoint::ALL.map(|joint| head.return_config().start_bounds().minimum(joint).get());
@@ -3364,7 +3384,7 @@ mod tests {
             assert!(configured_minimums[index] <= target.saturating_sub(20));
             assert!(configured_maximums[index] >= target.saturating_add(20));
         }
-        for (index, observed) in [2_154, 2_544, 2_946, 2_873].into_iter().enumerate() {
+        for (index, observed) in [2_153, 2_640, 1_832, 3_043].into_iter().enumerate() {
             assert!(configured_minimums[index] <= observed);
             assert!(configured_maximums[index] >= observed);
         }
@@ -3387,8 +3407,8 @@ mod tests {
         ));
 
         let mut descending = valid_value();
-        descending["head"]["minimum_start_ticks"] = json!([2228, 2560, 2842, 2890]);
-        descending["head"]["maximum_start_ticks"] = json!([2227, 2592, 2874, 2922]);
+        descending["head"]["minimum_start_ticks"] = json!([2195, 2550, 1617, 3023]);
+        descending["head"]["maximum_start_ticks"] = json!([2194, 2660, 1852, 3067]);
         assert!(matches!(
             parse(&descending),
             Err(NanoAgentPolicyConfigParseError::HeadReturn(
@@ -3402,39 +3422,39 @@ mod tests {
         ));
 
         let mut travel_too_short = valid_value();
-        travel_too_short["head"]["maximum_travel_ticks"] = json!([71, 64, 128, 64]);
+        travel_too_short["head"]["maximum_travel_ticks"] = json!([40, 96, 224, 32]);
         assert!(matches!(
             parse(&travel_too_short),
             Err(NanoAgentPolicyConfigParseError::HeadReturn(
                 ReturnToTargetConfigParseError::TravelAboveMaximum {
                     joint: HeadJoint::Bow,
-                    required_ticks: 72,
-                    maximum_ticks: 71,
+                    required_ticks: 41,
+                    maximum_ticks: 40,
                 }
             ))
         ));
 
         let mut excludes_reviewed_hold = valid_value();
-        excludes_reviewed_hold["head"]["minimum_start_ticks"] = json!([2136, 2525, 2842, 2856]);
+        excludes_reviewed_hold["head"]["minimum_start_ticks"] = json!([2155, 2550, 1617, 3023]);
         assert!(matches!(
             parse(&excludes_reviewed_hold),
             Err(
                 NanoAgentPolicyConfigParseError::ReviewedNaturalHoldEnvelopeOutsideStartupWindow {
                     joint: HeadJoint::Bow,
-                    configured_minimum_ticks: 2_136,
-                    required_minimum_ticks: 2_135,
+                    configured_minimum_ticks: 2_155,
+                    required_minimum_ticks: 2_154,
                     ..
                 }
             )
         ));
 
         let mut silently_widened = valid_value();
-        silently_widened["head"]["minimum_start_ticks"] = json!([2134, 2525, 2842, 2856]);
+        silently_widened["head"]["minimum_start_ticks"] = json!([2132, 2550, 1617, 3023]);
         assert!(matches!(
             parse(&silently_widened),
             Err(
                 NanoAgentPolicyConfigParseError::ReviewedNaturalHeadStartBoundsMismatch {
-                    configured_minimum_ticks: [2_134, 2_525, 2_842, 2_856],
+                    configured_minimum_ticks: [2_132, 2_550, 1_617, 3_023],
                     required_minimum_ticks: KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS,
                     required_maximum_ticks: KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS,
                     ..
@@ -3446,13 +3466,25 @@ mod tests {
     #[test]
     fn natural_return_is_bound_to_reviewed_target_torque_and_fixed_motion_policy() {
         let mut wrong_target = valid_value();
-        wrong_target["head"]["reviewed_natural_target_ticks"] = json!([2_156, 2_545, 2_943, 2_876]);
+        wrong_target["head"]["reviewed_natural_target_ticks"] = json!([2_175, 2_570, 1_637, 3_047]);
         assert!(matches!(
             parse(&wrong_target),
             Err(
                 NanoAgentPolicyConfigParseError::ReviewedNaturalHeadTargetMismatch {
-                    configured_ticks: [2_156, 2_545, 2_943, 2_876],
+                    configured_ticks: [2_175, 2_570, 1_637, 3_047],
                     required_ticks: KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS,
+                }
+            )
+        ));
+
+        let mut wrong_travel = valid_value();
+        wrong_travel["head"]["maximum_travel_ticks"] = json!([49, 96, 224, 32]);
+        assert!(matches!(
+            parse(&wrong_travel),
+            Err(
+                NanoAgentPolicyConfigParseError::ReviewedNaturalHeadMaximumTravelMismatch {
+                    configured_ticks: [49, 96, 224, 32],
+                    required_ticks: KIKO_REVIEWED_NATURAL_HEAD_MAXIMUM_TRAVEL_TICKS,
                 }
             )
         ));

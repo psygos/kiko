@@ -747,15 +747,15 @@ mod tests {
 
     #[test]
     fn exact_target_parses_canonical_ticks_once() {
-        let target = ExactHeadTargetPose::try_from_ticks([2_155, 2_545, 2_943, 2_876])
+        let target = ExactHeadTargetPose::try_from_ticks([2_174, 2_570, 1_637, 3_047])
             .expect("reviewed target");
         assert_eq!(
             target.positions().map(PositionTicks::get),
-            [2_155, 2_545, 2_943, 2_876]
+            [2_174, 2_570, 1_637, 3_047]
         );
 
         assert!(matches!(
-            ExactHeadTargetPose::try_from_ticks([2_155, 4_096, 2_943, 2_876]),
+            ExactHeadTargetPose::try_from_ticks([2_174, 4_096, 1_637, 3_047]),
             Err(ExactHeadTargetPoseError::Position {
                 joint: HeadJoint::Curl,
                 value: 4_096,

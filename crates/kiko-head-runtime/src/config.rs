@@ -148,7 +148,7 @@ impl DeviceIdentity {
 pub struct OperationTimeout(Duration);
 
 impl OperationTimeout {
-    fn parse(field: &'static str, milliseconds: u64) -> Result<Self, ConfigParseError> {
+    pub(crate) fn parse(field: &'static str, milliseconds: u64) -> Result<Self, ConfigParseError> {
         if !(1..=MAX_OPERATION_TIMEOUT_MS).contains(&milliseconds) {
             return Err(ConfigParseError::OperationTimeoutOutOfRange {
                 field,
@@ -1380,10 +1380,10 @@ mod tests {
             direction_regression_tolerance_ticks: 20,
             goal_speed_ticks_per_second: 50,
             torque_limit_permille: [600, 400, 400, 400],
-            minimum_start_ticks: [2_496, 2_900, 2_887, 2_887],
-            maximum_start_ticks: [2_518, 2_932, 2_919, 2_919],
-            target_ticks: [2_155, 2_545, 2_943, 2_876],
-            maximum_travel_ticks: [400, 400, 64, 64],
+            minimum_start_ticks: [2_133, 2_550, 1_617, 3_023],
+            maximum_start_ticks: [2_194, 2_660, 1_852, 3_067],
+            target_ticks: [2_174, 2_570, 1_637, 3_047],
+            maximum_travel_ticks: [48, 96, 224, 32],
         }
     }
 
@@ -1509,7 +1509,7 @@ mod tests {
         assert_eq!(config.runtime().device(), probe.device());
         assert_eq!(
             config.plan().target().positions().map(PositionTicks::get),
-            [2_155, 2_545, 2_943, 2_876]
+            [2_174, 2_570, 1_637, 3_047]
         );
         assert_eq!(config.plan().position_step_ticks(), 50);
         assert_eq!(config.plan().control_period(), Duration::from_millis(100));
@@ -1551,13 +1551,13 @@ mod tests {
         ));
 
         let mut input = valid_return_input();
-        input.maximum_travel_ticks[1] = 300;
+        input.maximum_travel_ticks[1] = 89;
         assert!(matches!(
             ReturnToTargetConfig::parse(&probe, input),
             Err(ReturnToTargetConfigParseError::TravelAboveMaximum {
                 joint: HeadJoint::Curl,
-                required_ticks: 387,
-                maximum_ticks: 300,
+                required_ticks: 90,
+                maximum_ticks: 89,
             })
         ));
 
@@ -1587,8 +1587,8 @@ mod tests {
 
         let mut input = valid_return_input();
         input.maximum_travel_ticks[3] = 10;
-        input.minimum_start_ticks[3] = 2_876;
-        input.maximum_start_ticks[3] = 2_876;
+        input.minimum_start_ticks[3] = 3_047;
+        input.maximum_start_ticks[3] = 3_047;
         assert!(matches!(
             ReturnToTargetConfig::parse(&probe, input),
             Err(ReturnToTargetConfigParseError::ToleranceAboveTravel {

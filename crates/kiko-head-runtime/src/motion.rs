@@ -677,7 +677,7 @@ mod tests {
     fn plan(target: [u16; 4]) -> HeadReturnPlan {
         HeadReturnPlan::for_test(
             ExactHeadTargetPose::try_from_ticks(target).expect("target"),
-            [400, 400, 64, 64],
+            [48, 96, 224, 32],
             ticks(20),
             ticks(20),
             ticks(20),
@@ -772,8 +772,8 @@ mod tests {
 
     #[test]
     fn waypoints_are_fifty_ticks_from_fresh_telemetry_and_never_cross_target() {
-        let start = [2_512, 2_916, 2_903, 2_903];
-        let target = [2_155, 2_545, 2_943, 2_876];
+        let start = [2_153, 2_640, 1_832, 3_043];
+        let target = [2_174, 2_570, 1_637, 3_047];
         let mut controller = controller(start, target);
         let HeadReturnAction::WriteWaypoints(next) = controller
             .advance(at(3), set(0, start, false))
@@ -781,9 +781,9 @@ mod tests {
         else {
             panic!("expected waypoint action");
         };
-        assert_eq!(next.map(PositionTicks::get), [2_462, 2_866, 2_943, 2_876]);
+        assert_eq!(next.map(PositionTicks::get), [2_174, 2_590, 1_782, 3_047]);
 
-        let near = [2_160, 2_550, 2_940, 2_880];
+        let near = [2_170, 2_575, 1_640, 3_043];
         assert!(matches!(
             controller.advance(at(103), set(100, near, true)),
             Ok(HeadReturnAction::WriteWaypoints(next))
@@ -793,8 +793,8 @@ mod tests {
 
     #[test]
     fn exact_target_write_and_two_stopped_samples_are_required_for_completion() {
-        let target = [2_155, 2_545, 2_943, 2_876];
-        let mut controller = controller([2_160, 2_550, 2_940, 2_880], target);
+        let target = [2_174, 2_570, 1_637, 3_047];
+        let mut controller = controller([2_170, 2_575, 1_640, 3_043], target);
         assert!(matches!(
             controller.advance(at(3), set(0, target, false)),
             Ok(HeadReturnAction::WriteWaypoints(positions)) if positions.map(PositionTicks::get) == target
@@ -812,11 +812,11 @@ mod tests {
 
     #[test]
     fn complete_geometry_is_admitted_before_a_recovery_pose_exists() {
-        let start = [2_512, 2_916, 2_903, 2_903];
-        let target = [2_155, 2_545, 2_943, 2_876];
+        let start = [2_153, 2_640, 1_832, 3_043];
+        let target = [2_174, 2_570, 1_637, 3_047];
         let mut active_controller = controller(start, target);
         let fault = active_controller
-            .advance(at(3), set(0, [2_490, 2_960, 2_943, 2_876], false))
+            .advance(at(3), set(0, [2_153, 2_685, 1_832, 3_043], false))
             .expect_err("curl is outside the complete path corridor");
         assert!(matches!(
             fault.source(),
@@ -840,17 +840,17 @@ mod tests {
 
     #[test]
     fn runtime_start_admission_defends_against_a_cross_paired_plan() {
-        let target = [2_155, 2_545, 2_943, 2_876];
+        let target = [2_174, 2_570, 1_637, 3_047];
         let result = HeadReturnController::try_new(
             HeadReturnPlan::for_test(
                 ExactHeadTargetPose::try_from_ticks(target).expect("target"),
-                [100, 400, 64, 64],
+                [20, 96, 224, 32],
                 ticks(20),
                 ticks(20),
                 ticks(20),
                 ticks(10),
             ),
-            observed_pose([2_512, 2_916, 2_903, 2_903]),
+            observed_pose([2_153, 2_640, 1_832, 3_043]),
             at(0),
             at(0),
         );
@@ -858,8 +858,8 @@ mod tests {
             result,
             Err(HeadMotionError::StartOutsideTravelLimit {
                 joint: HeadJoint::Bow,
-                travel_ticks: 357,
-                maximum_ticks: 100,
+                travel_ticks: 21,
+                maximum_ticks: 20,
                 ..
             })
         ));

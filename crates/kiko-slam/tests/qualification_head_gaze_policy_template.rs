@@ -63,14 +63,14 @@ fn render_parser_fixture() -> String {
             "${HEAD_GAZE_UNVALIDATED_PROPOSAL_EVIDENCE_CONTENT_SHA256}",
             "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff",
         ),
-        ("${HEAD_GAZE_UNVALIDATED_BOW_MINIMUM_TICKS}", "1955"),
-        ("${HEAD_GAZE_UNVALIDATED_BOW_MAXIMUM_TICKS}", "2355"),
-        ("${HEAD_GAZE_UNVALIDATED_CURL_MINIMUM_TICKS}", "2345"),
-        ("${HEAD_GAZE_UNVALIDATED_CURL_MAXIMUM_TICKS}", "2745"),
-        ("${HEAD_GAZE_UNVALIDATED_YAW_MINIMUM_TICKS}", "2743"),
-        ("${HEAD_GAZE_UNVALIDATED_YAW_MAXIMUM_TICKS}", "3143"),
-        ("${HEAD_GAZE_UNVALIDATED_ROLL_MINIMUM_TICKS}", "2776"),
-        ("${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_TICKS}", "2976"),
+        ("${HEAD_GAZE_UNVALIDATED_BOW_MINIMUM_TICKS}", "1974"),
+        ("${HEAD_GAZE_UNVALIDATED_BOW_MAXIMUM_TICKS}", "2374"),
+        ("${HEAD_GAZE_UNVALIDATED_CURL_MINIMUM_TICKS}", "2370"),
+        ("${HEAD_GAZE_UNVALIDATED_CURL_MAXIMUM_TICKS}", "2770"),
+        ("${HEAD_GAZE_UNVALIDATED_YAW_MINIMUM_TICKS}", "1437"),
+        ("${HEAD_GAZE_UNVALIDATED_YAW_MAXIMUM_TICKS}", "1837"),
+        ("${HEAD_GAZE_UNVALIDATED_ROLL_MINIMUM_TICKS}", "2847"),
+        ("${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_TICKS}", "3247"),
         (
             "${HEAD_GAZE_UNVALIDATED_PITCH_DOWN_BOW_TICKS_PER_RADIAN}",
             "-300.0",
@@ -201,7 +201,7 @@ fn rendered_contract_is_typed_proposal_only_with_exact_known_geometry() {
             .natural_declaration()
             .positions()
             .map(|position| position.get()),
-        [2155, 2545, 2943, 2876]
+        [2174, 2570, 1637, 3047]
     );
 
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]

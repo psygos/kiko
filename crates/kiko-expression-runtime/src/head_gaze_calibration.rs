@@ -914,27 +914,27 @@ mod tests {
                 neutral_head_from_camera_quaternion_xyzw: [0.0, 0.0, 0.0, 1.0],
             },
             natural: NamedNaturalHeadTicksInput {
-                bow_ticks: 2_155,
-                curl_ticks: 2_545,
-                yaw_ticks: 2_943,
-                roll_ticks: 2_876,
+                bow_ticks: 2_174,
+                curl_ticks: 2_570,
+                yaw_ticks: 1_637,
+                roll_ticks: 3_047,
             },
             hard_envelopes: NamedHeadTickEnvelopesInput {
                 bow: HeadTickEnvelopeInput {
-                    minimum_ticks: 2_110,
-                    maximum_ticks: 2_200,
+                    minimum_ticks: 2_129,
+                    maximum_ticks: 2_219,
                 },
                 curl: HeadTickEnvelopeInput {
-                    minimum_ticks: 2_455,
-                    maximum_ticks: 2_635,
+                    minimum_ticks: 2_480,
+                    maximum_ticks: 2_660,
                 },
                 yaw: HeadTickEnvelopeInput {
-                    minimum_ticks: 2_683,
-                    maximum_ticks: 3_203,
+                    minimum_ticks: 1_377,
+                    maximum_ticks: 1_897,
                 },
                 roll: HeadTickEnvelopeInput {
-                    minimum_ticks: 2_876,
-                    maximum_ticks: 2_876,
+                    minimum_ticks: 3_047,
+                    maximum_ticks: 3_047,
                 },
             },
             tick_offsets_per_radian: HeadGazeTickOffsetsPerRadianInput {
@@ -1098,9 +1098,9 @@ mod tests {
         let calibration = HeadGazeMappingDeclaration::parse(input).unwrap();
 
         let proposal = calibration.proposal_for_gaze(gaze(0.25, 0.25)).unwrap();
-        assert_eq!(proposal.position(HeadJoint::Bow).get(), 2_155);
-        assert_eq!(proposal.position(HeadJoint::Curl).get(), 2_546);
-        assert_eq!(proposal.position(HeadJoint::Yaw).get(), 2_944);
+        assert_eq!(proposal.position(HeadJoint::Bow).get(), 2_174);
+        assert_eq!(proposal.position(HeadJoint::Curl).get(), 2_571);
+        assert_eq!(proposal.position(HeadJoint::Yaw).get(), 1_638);
     }
 
     #[test]
@@ -1120,17 +1120,17 @@ mod tests {
                 }
                 assert_eq!(
                     proposal.position(HeadJoint::Bow).get(),
-                    expected_tick(2_155, -100.0, pitch)
+                    expected_tick(2_174, -100.0, pitch)
                 );
                 assert_eq!(
                     proposal.position(HeadJoint::Curl).get(),
-                    expected_tick(2_545, 200.0, pitch)
+                    expected_tick(2_570, 200.0, pitch)
                 );
                 assert_eq!(
                     proposal.position(HeadJoint::Yaw).get(),
-                    expected_tick(2_943, 300.0, yaw)
+                    expected_tick(1_637, 300.0, yaw)
                 );
-                assert_eq!(proposal.position(HeadJoint::Roll).get(), 2_876);
+                assert_eq!(proposal.position(HeadJoint::Roll).get(), 3_047);
             }
         }
     }
@@ -1171,7 +1171,7 @@ mod tests {
         ));
 
         let mut input = valid_input();
-        input.hard_envelopes.curl.minimum_ticks = 2_545;
+        input.hard_envelopes.curl.minimum_ticks = 2_570;
         assert!(matches!(
             HeadGazeMappingDeclaration::parse(input),
             Err(

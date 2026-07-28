@@ -1065,16 +1065,16 @@ mod tests {
                     }
                 },
                 "natural_encoder_position_ticks": {
-                    "bow_ticks": 2155,
-                    "curl_ticks": 2545,
-                    "yaw_ticks": 2943,
-                    "roll_ticks": 2876
+                    "bow_ticks": 2174,
+                    "curl_ticks": 2570,
+                    "yaw_ticks": 1637,
+                    "roll_ticks": 3047
                 },
                 "hard_encoder_envelopes_ticks": {
-                    "bow": {"minimum_ticks": 1955, "maximum_ticks": 2355},
-                    "curl": {"minimum_ticks": 2345, "maximum_ticks": 2745},
-                    "yaw": {"minimum_ticks": 2743, "maximum_ticks": 3143},
-                    "roll": {"minimum_ticks": 2776, "maximum_ticks": 2976}
+                    "bow": {"minimum_ticks": 1974, "maximum_ticks": 2374},
+                    "curl": {"minimum_ticks": 2370, "maximum_ticks": 2770},
+                    "yaw": {"minimum_ticks": 1437, "maximum_ticks": 1837},
+                    "roll": {"minimum_ticks": 2847, "maximum_ticks": 3247}
                 },
                 "encoder_tick_offsets_per_radian": {
                     "pitch_down_rad": {
@@ -1155,8 +1155,8 @@ mod tests {
             REQUIRED_HEAD_GAZE_ACQUISITION_PROPOSALS
         );
         let yaw = policy.controller().motion_limits().joint(HeadJoint::Yaw);
-        assert_eq!(yaw.minimum().get(), 2743);
-        assert_eq!(yaw.maximum().get(), 3143);
+        assert_eq!(yaw.minimum().get(), 1437);
+        assert_eq!(yaw.maximum().get(), 1837);
         assert_eq!(yaw.maximum_velocity().get(), 8);
         assert_eq!(yaw.maximum_acceleration().get(), 2);
         assert_eq!(yaw.maximum_position_step().get(), 8);

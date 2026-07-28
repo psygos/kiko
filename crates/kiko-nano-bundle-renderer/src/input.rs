@@ -22,9 +22,10 @@ pub const CANDIDATE_CAPABILITIES_BITS: u32 = 575;
 const MAX_TEXT_BYTES: usize = 256;
 const MAX_ABSOLUTE_PATH_BYTES: usize = 4_096;
 const MAX_RELATIVE_PATH_BYTES: usize = 1_024;
-const REVIEWED_NATURAL_HEAD_TARGET_TICKS: [u16; 4] = [2_155, 2_545, 2_943, 2_876];
-const REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS: [u16; 4] = [2_135, 2_525, 2_842, 2_856];
-const REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS: [u16; 4] = [2_227, 2_592, 2_963, 2_922];
+const REVIEWED_NATURAL_HEAD_TARGET_TICKS: [u16; 4] = [2_174, 2_570, 1_637, 3_047];
+const REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS: [u16; 4] = [2_133, 2_550, 1_617, 3_023];
+const REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS: [u16; 4] = [2_194, 2_660, 1_852, 3_067];
+const REVIEWED_NATURAL_HEAD_MAXIMUM_TRAVEL_TICKS: [u16; 4] = [48, 96, 224, 32];
 const REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE: [u16; 4] = [600, 400, 400, 400];
 const RENDERED_EYE_RESPONSE_TIMEOUT_MS: u64 = 20;
 const RENDERED_EYE_WRITE_TIMEOUT_MS: u64 = 5;
@@ -1188,6 +1189,7 @@ impl HeadPolicy {
         if dto.reviewed_natural_target_ticks != REVIEWED_NATURAL_HEAD_TARGET_TICKS
             || dto.minimum_start_ticks != REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS
             || dto.maximum_start_ticks != REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS
+            || dto.maximum_travel_ticks != REVIEWED_NATURAL_HEAD_MAXIMUM_TRAVEL_TICKS
             || dto.torque_limit_permille != REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE
         {
             return Err(InputError::UnreviewedNaturalHeadPolicy);
@@ -2178,7 +2180,7 @@ impl fmt::Display for InputError {
             ),
             Self::UnreviewedNaturalHeadPolicy => write!(
                 formatter,
-                "head policy does not exactly match Kiko's physically reviewed natural target, startup bounds, and torque envelope"
+                "head policy does not exactly match Kiko's operator-confirmed natural target and reviewed startup, travel, and torque policy"
             ),
             Self::InvalidRgbExpressionPolicy => write!(
                 formatter,
