@@ -10,8 +10,8 @@
 use oak_sys::{
     CloseError, ConnectedDeviceIdentityError, DepthAlignment, DepthConfig, DepthError, Device,
     DeviceConfig, DeviceFrameSequence, ImageError, ImageFrame, ImuConfig, ImuError, MonoConfig,
-    QueueConfig, RgbConfig, UsbTransportAdmissionEvidence, UsbTransportEvidenceError,
-    UsbTransportPolicy,
+    QueueConfig, RgbConfig, StreamId, UsbTransportEvidenceError, UsbTransportPolicy,
+    UsbTransportSpeed,
 };
 use std::ffi::OsString;
 use std::fmt;
@@ -24,7 +24,16 @@ const RGB_WIDTH: u32 = 640;
 const RGB_HEIGHT: u32 = 400;
 const IMAGE_RATE_HZ: u32 = 15;
 const IMU_RATE_HZ: u32 = 200;
+/// Qualification admits at least 4/5 of the requested 200 Hz IMU rate.
+const MINIMUM_IMU_RATE_NUMERATOR: u32 = 4;
+const MINIMUM_IMU_RATE_DENOMINATOR: u32 = 5;
 const QUEUE_SIZE: u32 = 4;
+const RGB_STRIDE_BYTES: u32 = RGB_WIDTH * 3;
+const MONO_STRIDE_BYTES: u32 = RGB_WIDTH;
+const DEPTH_STRIDE_BYTES: u32 = RGB_WIDTH * 2;
+const RGB_PAYLOAD_BYTES: u64 = 640 * 400 * 3;
+const MONO_PAYLOAD_BYTES: u64 = 640 * 400;
+const DEPTH_PAYLOAD_BYTES: u64 = 640 * 400 * 2;
 const MAXIMUM_FRAMES_PER_STREAM: u32 = IMAGE_RATE_HZ * 60 * 60;
 const MAXIMUM_DURATION_SECONDS: u64 = 60 * 60;
 const IDLE_POLL_SLEEP: Duration = Duration::from_millis(1);
@@ -250,10 +259,13 @@ fn qualify(
     let attempt = capture(device, arguments);
     let report = QualificationReport {
         connected_mxid,
-        usb_transport,
+        requested_maximum_usb_speed: usb_transport.requested_maximum(),
+        required_minimum_usb_speed: usb_transport.required_minimum(),
+        observed_usb_speed: usb_transport.observed(),
         frames_per_image_stream: arguments.frames_per_image_stream,
         maximum_duration_seconds: arguments.maximum_duration_seconds,
         elapsed: attempt.elapsed,
+        required_minimum_imu_samples: attempt.required_minimum_imu_samples,
         stats: attempt.stats,
     };
     if let Some(source) = attempt.failure {
@@ -270,8 +282,15 @@ fn qualify(
                 mono_left: report.stats.mono_left.delivered,
                 mono_right: report.stats.mono_right.delivered,
                 depth: report.stats.depth.delivered,
-                imu: report.stats.imu_samples,
+                imu_delivered: report.stats.imu_samples,
+                imu_required: report.required_minimum_imu_samples,
             },
+            report,
+        ));
+    }
+    if let Some(evidence) = report.stats.sequence_anomalies() {
+        return Err(OperationFailure::with_report(
+            OperationError::NativeSequenceAnomalies { evidence },
             report,
         ));
     }
@@ -282,6 +301,7 @@ fn qualify(
 struct CaptureAttempt {
     stats: CaptureStats,
     elapsed: Duration,
+    required_minimum_imu_samples: u64,
     failure: Option<CaptureError>,
 }
 
@@ -291,61 +311,57 @@ fn capture(device: &mut Device, arguments: &Arguments) -> CaptureAttempt {
     let target = u64::from(arguments.frames_per_image_stream);
 
     loop {
-        if stats.image_targets_reached(target) && stats.imu_samples > 0 {
+        let elapsed = started.elapsed();
+        let required_minimum_imu_samples = minimum_imu_samples_for_elapsed(elapsed);
+        if stats.image_targets_reached(target) && stats.imu_samples >= required_minimum_imu_samples
+        {
             return CaptureAttempt {
                 stats,
-                elapsed: started.elapsed(),
+                elapsed,
+                required_minimum_imu_samples,
                 failure: None,
             };
         }
-        let elapsed = started.elapsed();
         if elapsed >= arguments.maximum_duration {
             return CaptureAttempt {
                 stats,
                 elapsed,
+                required_minimum_imu_samples,
                 failure: None,
             };
         }
 
         let mut delivered_anything = false;
-        if stats.rgb.delivered < target {
-            match poll_image(device.rgb(0), &mut stats.rgb) {
-                Ok(delivered) => delivered_anything |= delivered,
-                Err(source) => {
-                    return failed_attempt(stats, started.elapsed(), CaptureError::Rgb(source));
-                }
+        match poll_image(device.rgb(0), ImageContract::rgb(), &mut stats.rgb) {
+            Ok(delivered) => delivered_anything |= delivered,
+            Err(source) => {
+                return failed_attempt(stats, started.elapsed(), CaptureError::Rgb(source));
             }
         }
-        if stats.mono_left.delivered < target {
-            match poll_image(device.mono_left(0), &mut stats.mono_left) {
-                Ok(delivered) => delivered_anything |= delivered,
-                Err(source) => {
-                    return failed_attempt(
-                        stats,
-                        started.elapsed(),
-                        CaptureError::MonoLeft(source),
-                    );
-                }
+        match poll_image(
+            device.mono_left(0),
+            ImageContract::mono_left(),
+            &mut stats.mono_left,
+        ) {
+            Ok(delivered) => delivered_anything |= delivered,
+            Err(source) => {
+                return failed_attempt(stats, started.elapsed(), CaptureError::MonoLeft(source));
             }
         }
-        if stats.mono_right.delivered < target {
-            match poll_image(device.mono_right(0), &mut stats.mono_right) {
-                Ok(delivered) => delivered_anything |= delivered,
-                Err(source) => {
-                    return failed_attempt(
-                        stats,
-                        started.elapsed(),
-                        CaptureError::MonoRight(source),
-                    );
-                }
+        match poll_image(
+            device.mono_right(0),
+            ImageContract::mono_right(),
+            &mut stats.mono_right,
+        ) {
+            Ok(delivered) => delivered_anything |= delivered,
+            Err(source) => {
+                return failed_attempt(stats, started.elapsed(), CaptureError::MonoRight(source));
             }
         }
-        if stats.depth.delivered < target {
-            match poll_depth(device.depth(0), &mut stats.depth) {
-                Ok(delivered) => delivered_anything |= delivered,
-                Err(source) => {
-                    return failed_attempt(stats, started.elapsed(), CaptureError::Depth(source));
-                }
+        match poll_depth(device.depth(0), &mut stats.depth) {
+            Ok(delivered) => delivered_anything |= delivered,
+            Err(source) => {
+                return failed_attempt(stats, started.elapsed(), CaptureError::Depth(source));
             }
         }
         match device.imu() {
@@ -398,24 +414,110 @@ fn failed_attempt(stats: CaptureStats, elapsed: Duration, failure: CaptureError)
     CaptureAttempt {
         stats,
         elapsed,
+        required_minimum_imu_samples: minimum_imu_samples_for_elapsed(elapsed),
         failure: Some(failure),
+    }
+}
+
+fn minimum_imu_samples_for_elapsed(elapsed: Duration) -> u64 {
+    let scaled =
+        elapsed.as_nanos() * u128::from(IMU_RATE_HZ) * u128::from(MINIMUM_IMU_RATE_NUMERATOR);
+    let divisor = 1_000_000_000_u128 * u128::from(MINIMUM_IMU_RATE_DENOMINATOR);
+    let required = scaled.div_ceil(divisor);
+    u64::try_from(required)
+        .expect("parsed one-hour qualification duration keeps the IMU requirement in u64")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ImageContract {
+    name: &'static str,
+    stream: StreamId,
+    width: u32,
+    height: u32,
+    stride_bytes: u32,
+    payload_bytes: u64,
+}
+
+impl ImageContract {
+    const fn rgb() -> Self {
+        Self {
+            name: "RGB",
+            stream: StreamId::Rgb,
+            width: RGB_WIDTH,
+            height: RGB_HEIGHT,
+            stride_bytes: RGB_STRIDE_BYTES,
+            payload_bytes: RGB_PAYLOAD_BYTES,
+        }
+    }
+
+    const fn mono_left() -> Self {
+        Self {
+            name: "rectified-left mono",
+            stream: StreamId::MonoLeft,
+            width: RGB_WIDTH,
+            height: RGB_HEIGHT,
+            stride_bytes: MONO_STRIDE_BYTES,
+            payload_bytes: MONO_PAYLOAD_BYTES,
+        }
+    }
+
+    const fn mono_right() -> Self {
+        Self {
+            name: "rectified-right mono",
+            stream: StreamId::MonoRight,
+            width: RGB_WIDTH,
+            height: RGB_HEIGHT,
+            stride_bytes: MONO_STRIDE_BYTES,
+            payload_bytes: MONO_PAYLOAD_BYTES,
+        }
+    }
+
+    fn validate(self, frame: &ImageFrame, payload_bytes: u64) -> Result<(), ImageContractError> {
+        if frame.stream != self.stream {
+            return Err(ImageContractError::UnexpectedStream {
+                name: self.name,
+                expected: self.stream,
+                actual: frame.stream,
+            });
+        }
+        if (frame.width, frame.height, frame.stride_bytes, payload_bytes)
+            != (
+                self.width,
+                self.height,
+                self.stride_bytes,
+                self.payload_bytes,
+            )
+        {
+            return Err(ImageContractError::LayoutMismatch {
+                name: self.name,
+                expected_width: self.width,
+                expected_height: self.height,
+                expected_stride_bytes: self.stride_bytes,
+                expected_payload_bytes: self.payload_bytes,
+                actual_width: frame.width,
+                actual_height: frame.height,
+                actual_stride_bytes: frame.stride_bytes,
+                actual_payload_bytes: payload_bytes,
+            });
+        }
+        Ok(())
     }
 }
 
 fn poll_image(
     result: Result<ImageFrame, ImageError>,
+    contract: ImageContract,
     stats: &mut ImageStreamStats,
 ) -> Result<bool, CaptureImageError> {
     match result {
         Ok(frame) => {
-            stats.record(
-                frame.device_capture_sequence,
-                u64::try_from(frame.pixels().len()).map_err(|_| {
-                    AccountingError::CounterOverflow {
-                        counter: "image.payload_bytes",
-                    }
-                })?,
-            )?;
+            let payload_bytes = u64::try_from(frame.pixels().len()).map_err(|_| {
+                AccountingError::CounterOverflow {
+                    counter: "image.payload_bytes",
+                }
+            })?;
+            contract.validate(&frame, payload_bytes)?;
+            stats.record(frame.device_capture_sequence, payload_bytes)?;
             Ok(true)
         }
         Err(ImageError::QueueEmpty) => {
@@ -442,6 +544,7 @@ fn poll_depth(
                 .ok_or(AccountingError::CounterOverflow {
                     counter: "depth.payload_bytes",
                 })?;
+            validate_depth_contract(&frame, payload_bytes)?;
             stats.record(frame.device_capture_sequence, payload_bytes)?;
             Ok(true)
         }
@@ -455,6 +558,41 @@ fn poll_depth(
         }
         Err(source) => Err(CaptureDepthError::Acquisition(source)),
     }
+}
+
+fn validate_depth_contract(
+    frame: &oak_sys::DepthFrame,
+    payload_bytes: u64,
+) -> Result<(), DepthContractError> {
+    let observed_packed_stride_bytes = frame.width.checked_mul(2);
+    let observed_alignment = frame.connected_alignment();
+    if (
+        frame.width,
+        frame.height,
+        observed_packed_stride_bytes,
+        payload_bytes,
+        observed_alignment,
+    ) != (
+        RGB_WIDTH,
+        RGB_HEIGHT,
+        Some(DEPTH_STRIDE_BYTES),
+        DEPTH_PAYLOAD_BYTES,
+        Some(DepthAlignment::RectifiedLeft),
+    ) {
+        return Err(DepthContractError::LayoutOrAlignmentMismatch {
+            expected_width: RGB_WIDTH,
+            expected_height: RGB_HEIGHT,
+            expected_packed_stride_bytes: DEPTH_STRIDE_BYTES,
+            expected_payload_bytes: DEPTH_PAYLOAD_BYTES,
+            expected_alignment: DepthAlignment::RectifiedLeft,
+            actual_width: frame.width,
+            actual_height: frame.height,
+            actual_packed_stride_bytes: observed_packed_stride_bytes,
+            actual_payload_bytes: payload_bytes,
+            actual_alignment: observed_alignment,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -477,6 +615,16 @@ impl CaptureStats {
         ]
         .into_iter()
         .all(|delivered| delivered >= target)
+    }
+
+    fn sequence_anomalies(self) -> Option<SequenceAnomalyEvidence> {
+        let evidence = SequenceAnomalyEvidence {
+            rgb: self.rgb.sequence,
+            mono_left: self.mono_left.sequence,
+            mono_right: self.mono_right.sequence,
+            depth: self.depth.sequence,
+        };
+        evidence.has_any().then_some(evidence)
     }
 }
 
@@ -578,15 +726,61 @@ impl SequenceAccounting {
         *self = updated;
         Ok(())
     }
+
+    const fn has_anomaly(self) -> bool {
+        self.gaps != 0 || self.duplicates != 0 || self.regressions != 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SequenceAnomalyEvidence {
+    rgb: SequenceAccounting,
+    mono_left: SequenceAccounting,
+    mono_right: SequenceAccounting,
+    depth: SequenceAccounting,
+}
+
+impl SequenceAnomalyEvidence {
+    const fn has_any(self) -> bool {
+        self.rgb.has_anomaly()
+            || self.mono_left.has_anomaly()
+            || self.mono_right.has_anomaly()
+            || self.depth.has_anomaly()
+    }
+}
+
+impl fmt::Display for SequenceAnomalyEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let write_stream = |formatter: &mut fmt::Formatter<'_>,
+                            name: &str,
+                            sequence: SequenceAccounting|
+         -> fmt::Result {
+            write!(
+                formatter,
+                "{name}=gaps:{}/duplicates:{}/regressions:{}",
+                sequence.gaps, sequence.duplicates, sequence.regressions
+            )
+        };
+        write_stream(formatter, "rgb", self.rgb)?;
+        formatter.write_str(", ")?;
+        write_stream(formatter, "mono_left", self.mono_left)?;
+        formatter.write_str(", ")?;
+        write_stream(formatter, "mono_right", self.mono_right)?;
+        formatter.write_str(", ")?;
+        write_stream(formatter, "depth", self.depth)
+    }
 }
 
 #[derive(Debug)]
 struct QualificationReport {
     connected_mxid: String,
-    usb_transport: UsbTransportAdmissionEvidence,
+    requested_maximum_usb_speed: UsbTransportSpeed,
+    required_minimum_usb_speed: UsbTransportSpeed,
+    observed_usb_speed: UsbTransportSpeed,
     frames_per_image_stream: u32,
     maximum_duration_seconds: u64,
     elapsed: Duration,
+    required_minimum_imu_samples: u64,
     stats: CaptureStats,
 }
 
@@ -594,7 +788,7 @@ impl QualificationReport {
     fn targets_reached(&self) -> bool {
         self.stats
             .image_targets_reached(u64::from(self.frames_per_image_stream))
-            && self.stats.imu_samples > 0
+            && self.stats.imu_samples >= self.required_minimum_imu_samples
     }
 
     fn json<'a>(&'a self, status: &'a str) -> QualificationJson<'a> {
@@ -626,19 +820,9 @@ impl fmt::Display for QualificationJson<'_> {
              \"elapsed_seconds\":{elapsed_seconds:.9},\"image_streams\":{{",
             JsonString(self.status),
             JsonString(&report.connected_mxid),
-            JsonString(
-                report
-                    .usb_transport
-                    .requested_maximum()
-                    .as_depthai_name()
-            ),
-            JsonString(
-                report
-                    .usb_transport
-                    .required_minimum()
-                    .as_depthai_name()
-            ),
-            JsonString(report.usb_transport.observed().as_depthai_name()),
+            JsonString(report.requested_maximum_usb_speed.as_depthai_name()),
+            JsonString(report.required_minimum_usb_speed.as_depthai_name()),
+            JsonString(report.observed_usb_speed.as_depthai_name()),
             report.frames_per_image_stream,
             report.maximum_duration_seconds,
         )?;
@@ -662,12 +846,17 @@ impl fmt::Display for QualificationJson<'_> {
         let imu_rate = rate(report.stats.imu_samples, elapsed_seconds);
         write!(
             formatter,
-            "}},\"imu\":{{\"delivered_samples\":{},\"empty_polls\":{},\
+            "}},\"imu\":{{\"requested_rate_hz\":{IMU_RATE_HZ},\
+             \"minimum_delivery_rate_fraction\":{{\"numerator\":{MINIMUM_IMU_RATE_NUMERATOR},\"denominator\":{MINIMUM_IMU_RATE_DENOMINATOR}}},\
+             \"required_minimum_samples_for_elapsed\":{},\
+             \"delivered_samples\":{},\"empty_polls\":{},\
              \"measured_host_delivery_samples_per_second\":{imu_rate:.6}}},\
              \"interpretation\":{{\
-             \"native_sequence_gaps\":\"missing host deliveries; no USB-cause attribution\",\
+             \"native_sequence_anomalies\":\"gaps prove missing deliveries and duplicates/regressions prove invalid adjacent native capture ordering; none attributes cause to USB\",\
              \"measured_rates\":\"host delivery only; not USB link capacity or sustained line-rate utilisation\"}}}}",
-            report.stats.imu_samples, report.stats.imu_empty_polls,
+            report.required_minimum_imu_samples,
+            report.stats.imu_samples,
+            report.stats.imu_empty_polls,
         )
     }
 }
@@ -744,10 +933,55 @@ impl fmt::Display for JsonString<'_> {
     }
 }
 
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageContractError {
+    #[error("{name} returned stream {actual:?}, expected {expected:?}")]
+    UnexpectedStream {
+        name: &'static str,
+        expected: StreamId,
+        actual: StreamId,
+    },
+    #[error(
+        "{name} delivered layout {actual_width}x{actual_height}, stride={actual_stride_bytes} bytes, payload={actual_payload_bytes} bytes; expected {expected_width}x{expected_height}, stride={expected_stride_bytes} bytes, payload={expected_payload_bytes} bytes"
+    )]
+    LayoutMismatch {
+        name: &'static str,
+        expected_width: u32,
+        expected_height: u32,
+        expected_stride_bytes: u32,
+        expected_payload_bytes: u64,
+        actual_width: u32,
+        actual_height: u32,
+        actual_stride_bytes: u32,
+        actual_payload_bytes: u64,
+    },
+}
+
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+enum DepthContractError {
+    #[error(
+        "depth delivered layout {actual_width}x{actual_height}, packed_stride={actual_packed_stride_bytes:?} bytes, payload={actual_payload_bytes} bytes, alignment={actual_alignment:?}; expected {expected_width}x{expected_height}, packed_stride={expected_packed_stride_bytes} bytes, payload={expected_payload_bytes} bytes, alignment={expected_alignment:?}"
+    )]
+    LayoutOrAlignmentMismatch {
+        expected_width: u32,
+        expected_height: u32,
+        expected_packed_stride_bytes: u32,
+        expected_payload_bytes: u64,
+        expected_alignment: DepthAlignment,
+        actual_width: u32,
+        actual_height: u32,
+        actual_packed_stride_bytes: Option<u32>,
+        actual_payload_bytes: u64,
+        actual_alignment: Option<DepthAlignment>,
+    },
+}
+
 #[derive(Error, Debug)]
 enum CaptureImageError {
     #[error("{0}")]
     Acquisition(#[source] ImageError),
+    #[error("{0}")]
+    Contract(#[from] ImageContractError),
     #[error("{0}")]
     Accounting(#[from] AccountingError),
 }
@@ -756,6 +990,8 @@ enum CaptureImageError {
 enum CaptureDepthError {
     #[error("{0}")]
     Acquisition(#[source] DepthError),
+    #[error("{0}")]
+    Contract(#[from] DepthContractError),
     #[error("{0}")]
     Accounting(#[from] AccountingError),
 }
@@ -791,7 +1027,7 @@ enum OperationError {
     #[error("{0}")]
     Capture(#[source] CaptureError),
     #[error(
-        "duration limit reached before all targets: target={target}, rgb={rgb}, mono_left={mono_left}, mono_right={mono_right}, depth={depth}, imu_samples={imu}"
+        "duration limit reached before all targets: image target={target}, rgb={rgb}, mono_left={mono_left}, mono_right={mono_right}, depth={depth}, IMU delivered={imu_delivered}, IMU required={imu_required}"
     )]
     DurationLimit {
         target: u32,
@@ -799,8 +1035,13 @@ enum OperationError {
         mono_left: u64,
         mono_right: u64,
         depth: u64,
-        imu: u64,
+        imu_delivered: u64,
+        imu_required: u64,
     },
+    #[error(
+        "native image sequence anomalies observed; successful qualification requires zero: {evidence}"
+    )]
+    NativeSequenceAnomalies { evidence: SequenceAnomalyEvidence },
 }
 
 impl OperationError {
@@ -808,6 +1049,7 @@ impl OperationError {
         match self {
             Self::DurationLimit { .. } => "duration_limit",
             Self::Capture(_) => "capture_error",
+            Self::NativeSequenceAnomalies { .. } => "native_sequence_anomaly",
             Self::Identity(_) | Self::UsbTransport(_) => "evidence_error",
         }
     }
@@ -817,21 +1059,21 @@ impl OperationError {
 #[error("{source}")]
 struct OperationFailure {
     #[source]
-    source: OperationError,
+    source: Box<OperationError>,
     report: Option<Box<QualificationReport>>,
 }
 
 impl OperationFailure {
     fn without_report(source: OperationError) -> Self {
         Self {
-            source,
+            source: Box::new(source),
             report: None,
         }
     }
 
     fn with_report(source: OperationError, report: QualificationReport) -> Self {
         Self {
-            source,
+            source: Box::new(source),
             report: Some(Box::new(report)),
         }
     }
@@ -881,6 +1123,7 @@ impl ProgramError {
             Self::OperationAndClose { operation, .. } => match operation.source.status() {
                 "duration_limit" => "duration_limit_and_close_error",
                 "capture_error" => "capture_and_close_error",
+                "native_sequence_anomaly" => "native_sequence_anomaly_and_close_error",
                 _ => "evidence_and_close_error",
             },
         }
@@ -890,9 +1133,55 @@ impl ProgramError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn parse(values: &[&str]) -> Result<Command, ArgumentError> {
         Command::parse(values.iter().map(OsString::from))
+    }
+
+    fn image_stats(
+        delivered: u64,
+        payload_bytes_per_frame: u64,
+        first_sequence: u64,
+    ) -> ImageStreamStats {
+        ImageStreamStats {
+            delivered,
+            payload_bytes: delivered * payload_bytes_per_frame,
+            queue_empty_polls: 3,
+            timeout_polls: 0,
+            sequence: if delivered == 0 {
+                SequenceAccounting::default()
+            } else {
+                SequenceAccounting {
+                    first: Some(first_sequence),
+                    previous: Some(first_sequence + delivered - 1),
+                    gaps: 0,
+                    duplicates: 0,
+                    regressions: 0,
+                }
+            },
+        }
+    }
+
+    fn complete_report(mxid: &str) -> QualificationReport {
+        QualificationReport {
+            connected_mxid: mxid.to_owned(),
+            requested_maximum_usb_speed: UsbTransportSpeed::SuperPlus,
+            required_minimum_usb_speed: UsbTransportSpeed::Super,
+            observed_usb_speed: UsbTransportSpeed::SuperPlus,
+            frames_per_image_stream: 2,
+            maximum_duration_seconds: 10,
+            elapsed: Duration::from_secs(2),
+            required_minimum_imu_samples: 320,
+            stats: CaptureStats {
+                rgb: image_stats(2, RGB_PAYLOAD_BYTES, 10),
+                mono_left: image_stats(2, MONO_PAYLOAD_BYTES, 20),
+                mono_right: image_stats(2, MONO_PAYLOAD_BYTES, 30),
+                depth: image_stats(2, DEPTH_PAYLOAD_BYTES, 40),
+                imu_samples: 400,
+                imu_empty_polls: 4,
+            },
+        }
     }
 
     #[test]
@@ -959,6 +1248,83 @@ mod tests {
                 regressions: 1,
             }
         );
+    }
+
+    #[test]
+    fn minimum_imu_delivery_is_exactly_four_fifths_of_elapsed_200_hz() {
+        assert_eq!(minimum_imu_samples_for_elapsed(Duration::ZERO), 0);
+        assert_eq!(minimum_imu_samples_for_elapsed(Duration::from_nanos(1)), 1);
+        assert_eq!(minimum_imu_samples_for_elapsed(Duration::from_secs(1)), 160);
+        assert_eq!(
+            minimum_imu_samples_for_elapsed(Duration::from_millis(1_500)),
+            240
+        );
+    }
+
+    #[test]
+    fn complete_json_round_trips_and_escapes_exact_mxid() {
+        let mxid = "mxid\"with\\escapes\nand\u{1}control";
+        let report = complete_report(mxid);
+        assert!(report.targets_reached());
+        assert!(report.stats.sequence_anomalies().is_none());
+
+        let rendered = report.json("complete").to_string();
+        let parsed: Value = serde_json::from_str(&rendered).expect("complete report is valid JSON");
+        assert_eq!(parsed["status"], "complete");
+        assert_eq!(parsed["connected_mxid"], mxid);
+        assert_eq!(parsed["usb_transport"]["requested_maximum"], "SUPER_PLUS");
+        assert_eq!(parsed["usb_transport"]["required_minimum"], "SUPER");
+        assert_eq!(parsed["usb_transport"]["observed"], "SUPER_PLUS");
+        assert_eq!(
+            parsed["imu"]["minimum_delivery_rate_fraction"]["numerator"],
+            4
+        );
+        assert_eq!(
+            parsed["imu"]["minimum_delivery_rate_fraction"]["denominator"],
+            5
+        );
+        assert_eq!(parsed["imu"]["required_minimum_samples_for_elapsed"], 320);
+        assert_eq!(parsed["imu"]["delivered_samples"], 400);
+        assert_eq!(
+            parsed["image_streams"]["rgb"]["delivered_payload_bytes"],
+            2 * RGB_PAYLOAD_BYTES
+        );
+    }
+
+    #[test]
+    fn partial_json_round_trips_with_required_and_delivered_counts() {
+        let mut report = complete_report("partial-mxid");
+        report.elapsed = Duration::from_secs(1);
+        report.required_minimum_imu_samples = 160;
+        report.stats.imu_samples = 100;
+        report.stats.depth = ImageStreamStats::default();
+        assert!(!report.targets_reached());
+
+        let rendered = report.json("duration_limit").to_string();
+        let parsed: Value = serde_json::from_str(&rendered).expect("partial report is valid JSON");
+        assert_eq!(parsed["status"], "duration_limit");
+        assert_eq!(parsed["imu"]["required_minimum_samples_for_elapsed"], 160);
+        assert_eq!(parsed["imu"]["delivered_samples"], 100);
+        assert_eq!(
+            parsed["image_streams"]["depth"]["native_sequence"]["first"],
+            Value::Null
+        );
+        assert_eq!(
+            parsed["image_streams"]["depth"]["native_sequence"]["last"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn any_native_sequence_anomaly_is_disqualifying_evidence() {
+        let mut stats = complete_report("mxid").stats;
+        assert!(stats.sequence_anomalies().is_none());
+        stats.mono_right.sequence.gaps = 1;
+        let evidence = stats
+            .sequence_anomalies()
+            .expect("one observed gap is disqualifying");
+        assert!(evidence.has_any());
+        assert_eq!(evidence.mono_right.gaps, 1);
     }
 
     #[test]

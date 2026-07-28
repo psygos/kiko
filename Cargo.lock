@@ -2794,6 +2794,7 @@ dependencies = [
  "cxx",
  "cxx-build",
  "rerun",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

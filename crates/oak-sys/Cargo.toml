@@ -17,6 +17,9 @@ thiserror = "1.0"
 [build-dependencies]
 cxx-build = "1.0"
 
+[dev-dependencies]
+serde_json = "1.0"
+
 [[bin]]
 name = "rerun_view"
 path = "src/bin/rerun_view.rs"
