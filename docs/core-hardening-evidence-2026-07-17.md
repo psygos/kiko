@@ -62,7 +62,7 @@ At the recorded revision, `configs/navigation-shadow-v1.example.json` was valid 
 through the public `ShadowNavigationConfigV1::parse_json` boundary with an explicit 640x400 runtime
 depth-camera model. The parser accepted the 4,695-byte fixture at implementation commit `3968993`;
 those exact bytes have SHA-256
-`2c08ea565ca59935669e088d35c7c826ec74395329e2f603812a80c1e9bd98b0`.
+`2c08eaf5262ac02f881580a05a650d882b3328851231113ff432b15d24ed6c07`.
 V1 evolved after that recorded test. Its final 4,735-byte form is retained at
 `crates/kiko-slam/testdata/legacy-navigation-shadow-v1.example.json` with SHA-256
 `9cb77b15ae38acd6b21c56f65687f6c5683415348de4851a299b8637522c370f`.
