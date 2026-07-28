@@ -2,7 +2,7 @@
 //! graph.
 //!
 //! Usage:
-//! `oak_stream_qualify EXACT_MXID FRAMES_PER_IMAGE_STREAM MAX_DURATION_SECONDS`
+//! `oak_stream_qualify EXACT_MXID MAXIMUM_USB_SPEED FRAMES_PER_IMAGE_STREAM MAX_DURATION_SECONDS`
 //!
 //! Successful stdout is one JSON document. Native sequence gaps describe
 //! missing host deliveries only; they do not attribute loss to USB.
@@ -93,7 +93,7 @@ impl Command {
                 usage: usage(&program),
             });
         }
-        if values.len() != 3 {
+        if values.len() != 4 {
             return Err(ArgumentError::WrongArity {
                 usage: usage(&program),
                 actual: values.len(),
@@ -104,15 +104,17 @@ impl Command {
         if mxid.is_empty() {
             return Err(ArgumentError::EmptyMxid);
         }
+        let maximum_usb_speed = QualificationUsbMaximum::parse(&values[1])?;
         let frames_per_image_stream = parse_bounded_u32(
-            &values[1],
+            &values[2],
             "FRAMES_PER_IMAGE_STREAM",
             MAXIMUM_FRAMES_PER_STREAM,
         )?;
         let maximum_duration_seconds =
-            parse_bounded_u64(&values[2], "MAX_DURATION_SECONDS", MAXIMUM_DURATION_SECONDS)?;
+            parse_bounded_u64(&values[3], "MAX_DURATION_SECONDS", MAXIMUM_DURATION_SECONDS)?;
         Ok(Self::Run(Arguments {
             mxid,
+            maximum_usb_speed,
             frames_per_image_stream,
             maximum_duration: Duration::from_secs(maximum_duration_seconds),
             maximum_duration_seconds,
@@ -122,7 +124,8 @@ impl Command {
 
 fn usage(program: &str) -> String {
     format!(
-        "usage: {program} EXACT_MXID FRAMES_PER_IMAGE_STREAM MAX_DURATION_SECONDS\n\
+        "usage: {program} EXACT_MXID MAXIMUM_USB_SPEED FRAMES_PER_IMAGE_STREAM MAX_DURATION_SECONDS\n\
+         MAXIMUM_USB_SPEED: SUPER or SUPER_PLUS\n\
          FRAMES_PER_IMAGE_STREAM: 1..={MAXIMUM_FRAMES_PER_STREAM}\n\
          MAX_DURATION_SECONDS: 1..={MAXIMUM_DURATION_SECONDS}"
     )
@@ -173,9 +176,37 @@ fn parse_bounded_u64(value: &str, field: &'static str, maximum: u64) -> Result<u
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Arguments {
     mxid: String,
+    maximum_usb_speed: QualificationUsbMaximum,
     frames_per_image_stream: u32,
     maximum_duration: Duration,
     maximum_duration_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QualificationUsbMaximum {
+    Super,
+    SuperPlus,
+}
+
+impl QualificationUsbMaximum {
+    fn parse(value: &str) -> Result<Self, ArgumentError> {
+        match value {
+            "SUPER" => Ok(Self::Super),
+            "SUPER_PLUS" => Ok(Self::SuperPlus),
+            _ => Err(ArgumentError::UnsupportedMaximumUsbSpeed {
+                value: value.to_owned(),
+            }),
+        }
+    }
+
+    fn policy(self) -> UsbTransportPolicy {
+        let maximum = match self {
+            Self::Super => UsbTransportSpeed::Super,
+            Self::SuperPlus => UsbTransportSpeed::SuperPlus,
+        };
+        UsbTransportPolicy::try_new(maximum, UsbTransportSpeed::Super)
+            .expect("qualification USB maximum always admits the fixed SUPER minimum")
+    }
 }
 
 #[derive(Error, Debug)]
@@ -186,6 +217,8 @@ enum ArgumentError {
     WrongArity { usage: String, actual: usize },
     #[error("EXACT_MXID must be nonempty")]
     EmptyMxid,
+    #[error("MAXIMUM_USB_SPEED must be exactly SUPER or SUPER_PLUS, got '{value}'")]
+    UnsupportedMaximumUsbSpeed { value: String },
     #[error("{field} must be an unsigned decimal integer, got '{value}': {source}")]
     InvalidInteger {
         field: &'static str,
@@ -201,9 +234,9 @@ enum ArgumentError {
     },
 }
 
-fn canonical_config() -> DeviceConfig {
+fn canonical_config(maximum_usb_speed: QualificationUsbMaximum) -> DeviceConfig {
     DeviceConfig {
-        usb_transport: UsbTransportPolicy::super_speed_required(),
+        usb_transport: maximum_usb_speed.policy(),
         rgb: Some(RgbConfig {
             width: RGB_WIDTH,
             height: RGB_HEIGHT,
@@ -232,8 +265,11 @@ fn canonical_config() -> DeviceConfig {
 }
 
 fn execute(arguments: Arguments) -> Result<QualificationReport, ProgramError> {
-    let mut device =
-        Device::connect(&arguments.mxid, canonical_config()).map_err(ProgramError::Connect)?;
+    let mut device = Device::connect(
+        &arguments.mxid,
+        canonical_config(arguments.maximum_usb_speed),
+    )
+    .map_err(ProgramError::Connect)?;
     let operation = qualify(&mut device, &arguments);
     let close = device.close();
 
@@ -1580,45 +1616,61 @@ mod tests {
 
     #[test]
     fn arguments_parse_once_into_bounded_domain_values() {
-        let command =
-            parse(&["qualify", "19443010F1B43A2E00", "150", "30"]).expect("valid command");
+        let command = parse(&["qualify", "19443010F1B43A2E00", "SUPER_PLUS", "150", "30"])
+            .expect("valid command");
         assert_eq!(
             command,
             Command::Run(Arguments {
                 mxid: "19443010F1B43A2E00".to_owned(),
+                maximum_usb_speed: QualificationUsbMaximum::SuperPlus,
                 frames_per_image_stream: 150,
                 maximum_duration: Duration::from_secs(30),
                 maximum_duration_seconds: 30,
             })
         );
         assert!(matches!(
-            parse(&["qualify", "", "1", "1"]),
+            parse(&["qualify", "", "SUPER", "1", "1"]),
             Err(ArgumentError::EmptyMxid)
         ));
         assert!(matches!(
-            parse(&["qualify", "mxid", "0", "1"]),
+            parse(&["qualify", "mxid", "SUPER", "0", "1"]),
             Err(ArgumentError::OutsideBounds {
                 field: "FRAMES_PER_IMAGE_STREAM",
                 ..
             })
         ));
         assert!(matches!(
-            parse(&["qualify", "mxid", "1", "3601"]),
+            parse(&["qualify", "mxid", "SUPER", "1", "3601"]),
             Err(ArgumentError::OutsideBounds {
                 field: "MAX_DURATION_SECONDS",
                 ..
             })
         ));
         assert!(matches!(
-            parse(&["qualify", "mxid", "one", "1"]),
+            parse(&["qualify", "mxid", "SUPER", "one", "1"]),
             Err(ArgumentError::InvalidInteger {
                 field: "FRAMES_PER_IMAGE_STREAM",
                 ..
             })
         ));
         assert!(matches!(
-            parse(&["qualify", "mxid", "1"]),
-            Err(ArgumentError::WrongArity { actual: 2, .. })
+            parse(&["qualify", "mxid", "SUPER", "1"]),
+            Err(ArgumentError::WrongArity { actual: 3, .. })
+        ));
+        for unsupported in ["HIGH", "super", "SUPER_PLUS "] {
+            assert!(matches!(
+                parse(&["qualify", "mxid", unsupported, "1", "1"]),
+                Err(ArgumentError::UnsupportedMaximumUsbSpeed { .. })
+            ));
+        }
+        let capped = parse(&["qualify", "mxid", "SUPER", "1", "1"])
+            .expect("explicit USB 3 5 Gbit/s maximum parses");
+        assert!(matches!(
+            capped,
+            Command::Run(Arguments {
+                maximum_usb_speed: QualificationUsbMaximum::Super,
+                ..
+            })
         ));
         assert!(matches!(
             parse(&["qualify", "--help"]),
@@ -1739,25 +1791,34 @@ mod tests {
 
     #[test]
     fn canonical_graph_is_fixed_and_nonblocking() {
-        let config = canonical_config();
-        assert_eq!(
-            config.usb_transport,
-            UsbTransportPolicy::super_speed_required()
-        );
-        let rgb = config.rgb.expect("RGB enabled");
-        assert_eq!((rgb.width, rgb.height, rgb.fps), (640, 400, 15));
-        let mono = config.mono.expect("mono enabled");
-        assert_eq!(
-            (mono.width, mono.height, mono.fps, mono.rectified),
-            (640, 400, 15, true)
-        );
-        let depth = config.depth.expect("depth enabled");
-        assert_eq!(
-            (depth.width, depth.height, depth.fps, depth.alignment),
-            (640, 400, 15, DepthAlignment::RectifiedLeft)
-        );
-        assert_eq!(config.imu.expect("IMU enabled").rate_hz, 200);
-        assert_eq!((config.queue.size, config.queue.blocking), (4, false));
-        config.validate().expect("canonical graph is valid");
+        for (maximum, expected_policy) in [
+            (
+                QualificationUsbMaximum::Super,
+                UsbTransportPolicy::try_new(UsbTransportSpeed::Super, UsbTransportSpeed::Super)
+                    .expect("ordered capped USB 3 policy"),
+            ),
+            (
+                QualificationUsbMaximum::SuperPlus,
+                UsbTransportPolicy::super_speed_required(),
+            ),
+        ] {
+            let config = canonical_config(maximum);
+            assert_eq!(config.usb_transport, expected_policy);
+            let rgb = config.rgb.expect("RGB enabled");
+            assert_eq!((rgb.width, rgb.height, rgb.fps), (640, 400, 15));
+            let mono = config.mono.expect("mono enabled");
+            assert_eq!(
+                (mono.width, mono.height, mono.fps, mono.rectified),
+                (640, 400, 15, true)
+            );
+            let depth = config.depth.expect("depth enabled");
+            assert_eq!(
+                (depth.width, depth.height, depth.fps, depth.alignment),
+                (640, 400, 15, DepthAlignment::RectifiedLeft)
+            );
+            assert_eq!(config.imu.expect("IMU enabled").rate_hz, 200);
+            assert_eq!((config.queue.size, config.queue.blocking), (4, false));
+            config.validate().expect("canonical graph is valid");
+        }
     }
 }
