@@ -26,8 +26,9 @@ use super::{
     WheelsOffQualificationCompletionError, WheelsOffQualificationConsoleHandle,
     WheelsOffQualificationDisconnectError, WheelsOffQualificationEventId,
     WheelsOffQualificationFrontendState, WheelsOffQualificationIngressEvent,
-    WheelsOffQualificationIngressReceiver, WheelsOffQualificationReceiveError,
-    WheelsOffQualificationSnapshot, WheelsOffQualificationTerminalCompletion,
+    WheelsOffQualificationIngressReceiver, WheelsOffQualificationMotionAuthorityEnableError,
+    WheelsOffQualificationReceiveError, WheelsOffQualificationSnapshot,
+    WheelsOffQualificationTerminalCompletion,
 };
 use crate::HostMonotonicTimestamp;
 
@@ -44,6 +45,12 @@ pub enum WheelsOffQualificationRuntimeState {
     Running,
     Faulted,
     Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelsOffQualificationMotionAuthorityState {
+    PendingAttestation,
+    Enabled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,7 +199,6 @@ pub enum WheelsOffQualificationRuntimeStartError {
         controller: std::time::Duration,
     },
     RuntimeServiceInterval(CandidateRuntimeServiceIntervalError),
-    Attestation(CandidatePwmAdmissionError),
 }
 
 impl fmt::Display for WheelsOffQualificationRuntimeStartError {
@@ -207,15 +213,45 @@ impl fmt::Display for WheelsOffQualificationRuntimeStartError {
 impl std::error::Error for WheelsOffQualificationRuntimeStartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Attestation(source) => Some(source),
             Self::RuntimeServiceInterval(source) => Some(source),
             _ => None,
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelsOffQualificationMotionAuthorityEnableFailure {
+    RuntimeNotRunning(WheelsOffQualificationRuntimeState),
+    AlreadyEnabled,
+    ControllerNotExactlyStopped(WheelsOffQualificationControllerState),
+    Attestation(CandidatePwmAdmissionError),
+    Console(WheelsOffQualificationMotionAuthorityEnableError),
+}
+
+impl fmt::Display for WheelsOffQualificationMotionAuthorityEnableFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "wheels-off qualification motion authority enablement rejected: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for WheelsOffQualificationMotionAuthorityEnableFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Attestation(source) => Some(source),
+            Self::Console(source) => Some(source),
+            Self::RuntimeNotRunning(_)
+            | Self::AlreadyEnabled
+            | Self::ControllerNotExactlyStopped(_) => None,
+        }
+    }
+}
+
 pub enum WheelsOffQualificationRuntimeFailure {
     RuntimeNotRunning(WheelsOffQualificationRuntimeState),
+    MotionAuthorityPending,
     ReceiverDisconnected,
     CandidateRequest(DomainError),
     CandidateAdmission(CandidatePwmAdmissionError),
@@ -242,6 +278,9 @@ impl fmt::Display for WheelsOffQualificationRuntimeFailure {
         match self {
             Self::RuntimeNotRunning(state) => {
                 write!(formatter, "runtime is not running ({state:?})")
+            }
+            Self::MotionAuthorityPending => {
+                formatter.write_str("nonzero motion authority is pending attended attestation")
             }
             Self::ReceiverDisconnected => formatter.write_str("console receiver disconnected"),
             Self::CandidateRequest(source) => write!(formatter, "invalid candidate PWM: {source}"),
@@ -339,6 +378,30 @@ enum CandidateControllerOwner {
     Transitioning,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelsOffQualificationMotionAuthority {
+    PendingAttestation,
+    Enabled(OperatorClaimedWheelsOffAttestation),
+}
+
+impl WheelsOffQualificationMotionAuthority {
+    const fn state(self) -> WheelsOffQualificationMotionAuthorityState {
+        match self {
+            Self::PendingAttestation => {
+                WheelsOffQualificationMotionAuthorityState::PendingAttestation
+            }
+            Self::Enabled(_) => WheelsOffQualificationMotionAuthorityState::Enabled,
+        }
+    }
+
+    const fn attestation(self) -> Option<OperatorClaimedWheelsOffAttestation> {
+        match self {
+            Self::PendingAttestation => None,
+            Self::Enabled(attestation) => Some(attestation),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RetainedTarget {
     event_id: WheelsOffQualificationEventId,
@@ -352,7 +415,7 @@ pub struct WheelsOffQualificationRuntime {
     stopped_applied: Option<AppliedCommandReceipt>,
     last_stop: Option<DisarmReceipt>,
     limits: WheelsOffCandidateLimits,
-    attestation: OperatorClaimedWheelsOffAttestation,
+    motion_authority: WheelsOffQualificationMotionAuthority,
     console: WheelsOffQualificationConsoleHandle,
     receiver: WheelsOffQualificationIngressReceiver,
     target: Option<RetainedTarget>,
@@ -362,14 +425,13 @@ pub struct WheelsOffQualificationRuntime {
 
 impl WheelsOffQualificationRuntime {
     #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
+    pub fn try_new_pending(
         stopped: StoppedWheelsOffCandidateController,
         initial_applied: AppliedCommandReceipt,
         initial_stop: DisarmReceipt,
         limits: WheelsOffCandidateLimits,
         admitted_runtime_service_interval: WheelsOffCandidateRuntimeServiceInterval,
         actual_runtime_service_interval: std::time::Duration,
-        attestation: OperatorClaimedWheelsOffAttestation,
         console: WheelsOffQualificationConsoleHandle,
         receiver: WheelsOffQualificationIngressReceiver,
     ) -> Result<Self, WheelsOffQualificationRuntimeStartError> {
@@ -388,9 +450,6 @@ impl WheelsOffQualificationRuntime {
         if session.boot_id() != initial_stop.observed_boot_id() {
             return Err(WheelsOffQualificationRuntimeStartError::InitialReceiptBootMismatch);
         }
-        stopped
-            .require_fresh_attestation(&attestation, Instant::now())
-            .map_err(WheelsOffQualificationRuntimeStartError::Attestation)?;
         let console_snapshot = console.snapshot();
         admit_console_before_runtime(&console_snapshot)?;
         let profile = console_snapshot.control_profile;
@@ -433,7 +492,7 @@ impl WheelsOffQualificationRuntime {
             stopped_applied: Some(initial_applied),
             last_stop: Some(initial_stop),
             limits,
-            attestation,
+            motion_authority: WheelsOffQualificationMotionAuthority::PendingAttestation,
             console,
             receiver,
             target: None,
@@ -448,6 +507,50 @@ impl WheelsOffQualificationRuntime {
 
     pub const fn state(&self) -> WheelsOffQualificationRuntimeState {
         self.state
+    }
+
+    pub const fn motion_authority_state(&self) -> WheelsOffQualificationMotionAuthorityState {
+        self.motion_authority.state()
+    }
+
+    pub fn enable_motion_authority(
+        &mut self,
+        attestation: OperatorClaimedWheelsOffAttestation,
+    ) -> Result<(), WheelsOffQualificationMotionAuthorityEnableFailure> {
+        if self.state != WheelsOffQualificationRuntimeState::Running {
+            return Err(
+                WheelsOffQualificationMotionAuthorityEnableFailure::RuntimeNotRunning(self.state),
+            );
+        }
+        if self.motion_authority != WheelsOffQualificationMotionAuthority::PendingAttestation {
+            return Err(WheelsOffQualificationMotionAuthorityEnableFailure::AlreadyEnabled);
+        }
+        let CandidateControllerOwner::Stopped(stopped) = &self.controller else {
+            return Err(
+                WheelsOffQualificationMotionAuthorityEnableFailure::ControllerNotExactlyStopped(
+                    self.controller_state(),
+                ),
+            );
+        };
+        stopped
+            .require_fresh_attestation(&attestation, Instant::now())
+            .map_err(WheelsOffQualificationMotionAuthorityEnableFailure::Attestation)?;
+        // The runtime owner is single-threaded, while HTTP submission can
+        // concurrently lock the console. Install the runtime-side authority
+        // first while the console is still closed, then publish the console
+        // generation. A concurrent request therefore sees either the old
+        // closed generation or a console generation whose sole consumer
+        // already carries this attestation. No candidate event is consumed
+        // until a later owner tick. Roll back if the console refuses the
+        // transition so the two authorities cannot remain split.
+        self.motion_authority = WheelsOffQualificationMotionAuthority::Enabled(attestation);
+        if let Err(source) = self.console.enable_motion_authority() {
+            self.motion_authority = WheelsOffQualificationMotionAuthority::PendingAttestation;
+            return Err(WheelsOffQualificationMotionAuthorityEnableFailure::Console(
+                source,
+            ));
+        }
+        Ok(())
     }
 
     pub fn controller_state(&self) -> WheelsOffQualificationControllerState {
@@ -636,8 +739,13 @@ impl WheelsOffQualificationRuntime {
         requested: CandidatePwmRequest,
         now: Instant,
     ) -> Result<WheelsOffQualificationRuntimeTick, WheelsOffQualificationRuntimeError> {
+        let Some(attestation) = self.motion_authority.attestation() else {
+            return Err(
+                self.fail_closed(WheelsOffQualificationRuntimeFailure::MotionAuthorityPending)
+            );
+        };
         if let CandidateControllerOwner::Stopped(stopped) = &self.controller
-            && let Err(source) = stopped.require_fresh_attestation(&self.attestation, now)
+            && let Err(source) = stopped.require_fresh_attestation(&attestation, now)
         {
             return Err(self.fail_closed(
                 WheelsOffQualificationRuntimeFailure::CandidateAdmission(source),
@@ -687,7 +795,7 @@ impl WheelsOffQualificationRuntime {
         }
         let admitted = match &self.controller {
             CandidateControllerOwner::Active(session) => session
-                .admit_target(requested, Some(&self.attestation))
+                .admit_target(requested, Some(&attestation))
                 .map_err(|source| {
                     self.fail_closed(WheelsOffQualificationRuntimeFailure::CandidateAdmission(
                         source,
@@ -1061,6 +1169,32 @@ mod tests {
         assert!(!refresh_due(now, Some(deadline)));
         assert!(refresh_due(deadline, Some(deadline)));
         assert!(refresh_due(now, None));
+    }
+
+    #[test]
+    fn pending_motion_authority_carries_no_attestation() {
+        let pending = WheelsOffQualificationMotionAuthority::PendingAttestation;
+        assert_eq!(
+            pending.state(),
+            WheelsOffQualificationMotionAuthorityState::PendingAttestation
+        );
+        assert!(pending.attestation().is_none());
+
+        let attestation = OperatorClaimedWheelsOffAttestation::try_new(
+            true,
+            true,
+            true,
+            true,
+            true,
+            Instant::now(),
+        )
+        .expect("explicit test attestation");
+        let enabled = WheelsOffQualificationMotionAuthority::Enabled(attestation);
+        assert_eq!(
+            enabled.state(),
+            WheelsOffQualificationMotionAuthorityState::Enabled
+        );
+        assert_eq!(enabled.attestation(), Some(attestation));
     }
 
     #[test]

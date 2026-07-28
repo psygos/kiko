@@ -463,12 +463,12 @@ impl NanoOakStreamGraph {
 /// Global occupancy resource policy selected by the launch document.
 ///
 /// This deliberately does not duplicate projection or obstacle semantics. The
-/// exact parsed [`crate::navigation::ShadowNavigationConfigV1`] owns
-/// `world_to_occupancy` (including the declared level
-/// optical-world/camera-height transform), the runtime depth
-/// camera/intrinsics, height and depth ranges, and sampling block. The fixed
-/// integer evidence model remains executable code. This launch component owns
-/// only global extent, retained-evidence capacity, and publication cadence.
+/// exact parsed [`crate::navigation::ShadowNavigationConfigV2`] owns
+/// the explicit, reviewed world-to-floor-occupancy transform, the runtime
+/// depth camera/intrinsics, height and depth ranges, and sampling block. The
+/// fixed integer evidence model remains executable code. This launch
+/// component owns only global extent, retained-evidence capacity, and
+/// publication cadence.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NanoLaunchOccupancy {
     host_policy: LiveOccupancyHostPolicy,
@@ -2207,7 +2207,7 @@ mod tests {
             "schema_version": 2,
             "agent_policy_asset": asset("config/agent-policy-v3.json", 65_536, 1),
             "navigation_shadow_config_asset": asset(
-                "config/navigation-shadow-v1.json",
+                "config/navigation-shadow-v2.json",
                 262_144,
                 2
             ),

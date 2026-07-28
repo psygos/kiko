@@ -1,6 +1,6 @@
 //! Strict JSON configuration boundary for live, transport-free navigation.
 //!
-//! JSON is admitted through [`ShadowNavigationConfigV1::parse_json`] only. The
+//! JSON is admitted through [`ShadowNavigationConfigV2::parse_json`] only. The
 //! input is size bounded, every object rejects unknown fields, and every field
 //! is required. Weak scalar values are then consumed exactly once by the
 //! existing domain constructors. In particular, the runtime depth camera is a
@@ -17,11 +17,13 @@
 //! extending stale control. These are host shadow-mode admission invariants;
 //! they do not verify plant-identification evidence or authorize actuation.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::dense::occupancy::{
     DepthCameraModel, DepthRangeError, DepthRangeMeters, HeightRangeError, HeightRangeMeters,
@@ -33,7 +35,10 @@ use super::global_planner::{GlobalPlanError, GlobalPlannerConfig, UnknownSpacePo
 use super::ingress::{
     MAX_NAVIGATION_INGRESS_RECORDS, NavigationIngressCapacity, NavigationIngressCapacityError,
 };
-use super::local_costmap::{LocalCostmapConfig, LocalCostmapConfigError, TrackingCameraToBase};
+use super::local_costmap::{
+    BaseZRangeError, BaseZRangeMeters, LocalCostmapConfig, LocalCostmapConfigError,
+    TrackingCameraToBase,
+};
 use super::mpc::{
     FitResidualsV1Dto, MpcConfigParseError, MpcConfigV1, MpcConfigV1Dto, MpcCreateError, MpcSolver,
     PlantEvidenceV1Dto, PlantModelParseError, PlantModelV1, PlantModelV1Dto,
@@ -51,10 +56,13 @@ use super::shadow_command::{
 };
 
 /// The only supported top-level live shadow-navigation configuration format.
-pub const SHADOW_NAVIGATION_CONFIG_V1: u32 = 1;
+///
+/// V2 replaces V1's ambiguous obstacle-height pair with distinct
+/// floor-relative global-occupancy and axle-relative local-costmap bounds.
+pub const SHADOW_NAVIGATION_CONFIG_V2: u32 = 2;
 
 /// Hard bound applied before JSON parsing or allocation from input-controlled
-/// string lengths. The V1 fixture is under 5 KiB; this leaves ample room for
+/// string lengths. The V2 fixture is under 5 KiB; this leaves ample room for
 /// bounded provenance identifiers without accepting arbitrarily large files.
 pub const MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES: usize = 256 * 1024;
 
@@ -82,9 +90,10 @@ impl ControlPeriodNs {
 /// Fully parsed runtime configuration. Invalid weak states cannot be
 /// represented, and the retained MPC solver proves plant/controller
 /// compatibility without repeating that validation in the live adapter.
-pub struct ShadowNavigationConfigV1 {
+pub struct ShadowNavigationConfigV2 {
     tracking_camera_to_base: TrackingCameraToBase,
     world_to_occupancy: WorldToOccupancy,
+    global_occupancy_height_range: HeightRangeMeters,
     odometry: PlanarOdometryConfig,
     local_costmap: LocalCostmapConfig,
     global_planner: GlobalPlannerConfig,
@@ -96,8 +105,8 @@ pub struct ShadowNavigationConfigV1 {
     ingress_capacity: NavigationIngressCapacity,
 }
 
-impl ShadowNavigationConfigV1 {
-    pub const FORMAT_VERSION: u32 = SHADOW_NAVIGATION_CONFIG_V1;
+impl ShadowNavigationConfigV2 {
+    pub const FORMAT_VERSION: u32 = SHADOW_NAVIGATION_CONFIG_V2;
     pub const MAX_JSON_BYTES: usize = MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES;
     pub const MAX_INGRESS_RECORDS: usize = MAX_NAVIGATION_INGRESS_RECORDS;
 
@@ -139,14 +148,46 @@ impl ShadowNavigationConfigV1 {
                 maximum_bytes: MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
             });
         }
-        let dto: ShadowNavigationConfigV1Dto =
+        let discriminator: ShadowNavigationSchemaDiscriminator =
             serde_json::from_slice(json).map_err(ShadowNavigationConfigParseError::Json)?;
-        if dto.schema_version != SHADOW_NAVIGATION_CONFIG_V1 {
+        if discriminator.schema_version != SHADOW_NAVIGATION_CONFIG_V2 {
             return Err(ShadowNavigationConfigParseError::UnsupportedSchemaVersion {
-                actual: dto.schema_version,
-                supported: SHADOW_NAVIGATION_CONFIG_V1,
+                actual: discriminator.schema_version,
+                supported: SHADOW_NAVIGATION_CONFIG_V2,
             });
         }
+        let dto: ShadowNavigationConfigWireDto =
+            serde_json::from_slice(json).map_err(ShadowNavigationConfigParseError::Json)?;
+        debug_assert_eq!(dto.schema_version, discriminator.schema_version);
+        let global_occupancy =
+            dto.global_occupancy
+                .ok_or(ShadowNavigationConfigParseError::MissingV2Field {
+                    field: "global_occupancy",
+                })?;
+        for (field, present) in [
+            (
+                "local_costmap.obstacle_height_minimum_m",
+                dto.local_costmap.obstacle_height_minimum_m.is_some(),
+            ),
+            (
+                "local_costmap.obstacle_height_maximum_m",
+                dto.local_costmap.obstacle_height_maximum_m.is_some(),
+            ),
+        ] {
+            if present {
+                return Err(ShadowNavigationConfigParseError::LegacyV1FieldInV2 { field });
+            }
+        }
+        let obstacle_base_z_minimum_m = dto.local_costmap.obstacle_base_z_minimum_m.ok_or(
+            ShadowNavigationConfigParseError::MissingV2Field {
+                field: "local_costmap.obstacle_base_z_minimum_m",
+            },
+        )?;
+        let obstacle_base_z_maximum_m = dto.local_costmap.obstacle_base_z_maximum_m.ok_or(
+            ShadowNavigationConfigParseError::MissingV2Field {
+                field: "local_costmap.obstacle_base_z_maximum_m",
+            },
+        )?;
 
         let tracking_camera_to_base = TrackingCameraToBase::new(
             Pose::try_from_rt(
@@ -204,11 +245,14 @@ impl ShadowNavigationConfigV1 {
             dto.local_costmap.maximum_cells,
         )
         .map_err(ShadowNavigationConfigParseError::LocalCostmapGeometry)?;
-        let obstacle_height_range = HeightRangeMeters::try_new(
-            dto.local_costmap.obstacle_height_minimum_m,
-            dto.local_costmap.obstacle_height_maximum_m,
+        let global_occupancy_height_range = HeightRangeMeters::try_new(
+            global_occupancy.obstacle_floor_height_minimum_m,
+            global_occupancy.obstacle_floor_height_maximum_m,
         )
-        .map_err(ShadowNavigationConfigParseError::ObstacleHeightRange)?;
+        .map_err(ShadowNavigationConfigParseError::GlobalOccupancyHeightRange)?;
+        let obstacle_base_z_range =
+            BaseZRangeMeters::try_new(obstacle_base_z_minimum_m, obstacle_base_z_maximum_m)
+                .map_err(ShadowNavigationConfigParseError::LocalCostmapBaseZRange)?;
         let depth_range = DepthRangeMeters::try_new(
             dto.local_costmap.depth_minimum_m,
             dto.local_costmap.depth_maximum_m,
@@ -219,7 +263,7 @@ impl ShadowNavigationConfigV1 {
             geometry,
             runtime_depth_camera,
             tracking_camera_to_base,
-            obstacle_height_range,
+            obstacle_base_z_range,
             depth_range,
             dto.local_costmap.sampling_block_pixels,
             dto.local_costmap.footprint_radius_m,
@@ -342,6 +386,7 @@ impl ShadowNavigationConfigV1 {
         Ok(Self {
             tracking_camera_to_base,
             world_to_occupancy,
+            global_occupancy_height_range,
             odometry,
             local_costmap,
             global_planner,
@@ -364,6 +409,10 @@ impl ShadowNavigationConfigV1 {
 
     pub fn world_to_occupancy(&self) -> WorldToOccupancy {
         self.world_to_occupancy
+    }
+
+    pub fn global_occupancy_height_range(&self) -> HeightRangeMeters {
+        self.global_occupancy_height_range
     }
 
     pub fn local_costmap(&self) -> &LocalCostmapConfig {
@@ -398,10 +447,11 @@ impl ShadowNavigationConfigV1 {
         self.ingress_capacity
     }
 
-    pub fn into_runtime_parts(self) -> ShadowNavigationRuntimePartsV1 {
-        ShadowNavigationRuntimePartsV1 {
+    pub fn into_runtime_parts(self) -> ShadowNavigationRuntimePartsV2 {
+        ShadowNavigationRuntimePartsV2 {
             tracking_camera_to_base: self.tracking_camera_to_base,
             world_to_occupancy: self.world_to_occupancy,
+            global_occupancy_height_range: self.global_occupancy_height_range,
             odometry: self.odometry,
             local_costmap: self.local_costmap,
             global_planner: self.global_planner,
@@ -416,9 +466,10 @@ impl ShadowNavigationConfigV1 {
 }
 
 /// Owned parts consumed by the pure coordinator and safety supervisor.
-pub struct ShadowNavigationRuntimePartsV1 {
+pub struct ShadowNavigationRuntimePartsV2 {
     pub tracking_camera_to_base: TrackingCameraToBase,
     pub world_to_occupancy: WorldToOccupancy,
+    pub global_occupancy_height_range: HeightRangeMeters,
     pub odometry: PlanarOdometryConfig,
     pub local_costmap: LocalCostmapConfig,
     pub global_planner: GlobalPlannerConfig,
@@ -450,11 +501,18 @@ pub enum ShadowNavigationConfigParseError {
         actual: u32,
         supported: u32,
     },
+    MissingV2Field {
+        field: &'static str,
+    },
+    LegacyV1FieldInV2 {
+        field: &'static str,
+    },
     TrackingCameraToBase(PoseError),
     WorldToOccupancy(WorldToOccupancyError),
     Odometry(PlanarOdometryConfigError),
     LocalCostmapGeometry(OccupancyGridGeometryError),
-    ObstacleHeightRange(HeightRangeError),
+    GlobalOccupancyHeightRange(HeightRangeError),
+    LocalCostmapBaseZRange(BaseZRangeError),
     DepthRange(DepthRangeError),
     LocalCostmap(LocalCostmapConfigError),
     GlobalPlanner(GlobalPlanError),
@@ -512,6 +570,13 @@ impl fmt::Display for ShadowNavigationConfigParseError {
                 formatter,
                 "unsupported shadow navigation schema version {actual}; supported version is {supported}"
             ),
+            Self::MissingV2Field { field } => {
+                write!(formatter, "shadow navigation V2 requires field `{field}`")
+            }
+            Self::LegacyV1FieldInV2 { field } => write!(
+                formatter,
+                "shadow navigation V2 rejects legacy V1 field `{field}`"
+            ),
             Self::TrackingCameraToBase(source) => {
                 write!(formatter, "invalid tracking-camera-to-base pose: {source}")
             }
@@ -522,7 +587,8 @@ impl fmt::Display for ShadowNavigationConfigParseError {
             Self::LocalCostmapGeometry(source) => {
                 write!(formatter, "invalid local-costmap geometry: {source}")
             }
-            Self::ObstacleHeightRange(source) => write!(formatter, "{source}"),
+            Self::GlobalOccupancyHeightRange(source) => write!(formatter, "{source}"),
+            Self::LocalCostmapBaseZRange(source) => write!(formatter, "{source}"),
             Self::DepthRange(source) => write!(formatter, "{source}"),
             Self::LocalCostmap(source) => write!(formatter, "{source}"),
             Self::GlobalPlanner(source) => write!(formatter, "{source}"),
@@ -596,7 +662,8 @@ impl std::error::Error for ShadowNavigationConfigParseError {
             Self::WorldToOccupancy(source) => Some(source),
             Self::Odometry(source) => Some(source),
             Self::LocalCostmapGeometry(source) => Some(source),
-            Self::ObstacleHeightRange(source) => Some(source),
+            Self::GlobalOccupancyHeightRange(source) => Some(source),
+            Self::LocalCostmapBaseZRange(source) => Some(source),
             Self::DepthRange(source) => Some(source),
             Self::LocalCostmap(source) => Some(source),
             Self::GlobalPlanner(source) => Some(source),
@@ -609,6 +676,8 @@ impl std::error::Error for ShadowNavigationConfigParseError {
             Self::MpcSolver(source) => Some(source),
             Self::InputTooLarge { .. }
             | Self::UnsupportedSchemaVersion { .. }
+            | Self::MissingV2Field { .. }
+            | Self::LegacyV1FieldInV2 { .. }
             | Self::PlantArtifactModelMismatch
             | Self::ZeroControlPeriod
             | Self::MpcStepPeriodNotIntegralNanoseconds { .. }
@@ -651,13 +720,157 @@ struct OdometryFreshness {
     maximum_history_bracket_gap_ns: u64,
 }
 
+/// Parse only the bounded schema discriminator before selecting a versioned
+/// DTO, while still rejecting ambiguous duplicate-key JSON at every depth.
+///
+/// The input-size check precedes this parser. `serde_json::from_slice` also
+/// requires the complete document and rejects trailing data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShadowNavigationSchemaDiscriminator {
+    schema_version: u32,
+}
+
+impl<'de> Deserialize<'de> for ShadowNavigationSchemaDiscriminator {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ShadowNavigationSchemaDiscriminatorVisitor)
+    }
+}
+
+struct ShadowNavigationSchemaDiscriminatorVisitor;
+
+impl<'de> Visitor<'de> for ShadowNavigationSchemaDiscriminatorVisitor {
+    type Value = ShadowNavigationSchemaDiscriminator;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object with one unsigned integer `schema_version`")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut fields = BTreeSet::new();
+        let mut schema_version = None;
+        while let Some(field) = map.next_key::<String>()? {
+            if !fields.insert(field.clone()) {
+                return Err(de::Error::custom(format_args!(
+                    "duplicate JSON object key `{field}`"
+                )));
+            }
+            if field == "schema_version" {
+                schema_version = Some(map.next_value::<u32>()?);
+            } else {
+                map.next_value::<DuplicateRejectingIgnoredJsonValue>()?;
+            }
+        }
+        let schema_version =
+            schema_version.ok_or_else(|| de::Error::missing_field("schema_version"))?;
+        Ok(ShadowNavigationSchemaDiscriminator { schema_version })
+    }
+}
+
+/// A zero-storage JSON value used only by schema dispatch. It consumes the
+/// complete value recursively so duplicate object keys cannot be hidden in a
+/// document that will be rejected as an unsupported version.
+struct DuplicateRejectingIgnoredJsonValue;
+
+impl<'de> Deserialize<'de> for DuplicateRejectingIgnoredJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateRejectingIgnoredJsonValueVisitor)
+    }
+}
+
+struct DuplicateRejectingIgnoredJsonValueVisitor;
+
+impl<'de> Visitor<'de> for DuplicateRejectingIgnoredJsonValueVisitor {
+    type Value = DuplicateRejectingIgnoredJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an unambiguous JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingIgnoredJsonValue)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingIgnoredJsonValue)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingIgnoredJsonValue)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingIgnoredJsonValue)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingIgnoredJsonValue)
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingIgnoredJsonValue)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingIgnoredJsonValue)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingIgnoredJsonValue)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Deserialize::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence
+            .next_element::<DuplicateRejectingIgnoredJsonValue>()?
+            .is_some()
+        {}
+        Ok(DuplicateRejectingIgnoredJsonValue)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut fields = BTreeSet::new();
+        while let Some(field) = map.next_key::<String>()? {
+            if !fields.insert(field.clone()) {
+                return Err(de::Error::custom(format_args!(
+                    "duplicate JSON object key `{field}`"
+                )));
+            }
+            map.next_value::<DuplicateRejectingIgnoredJsonValue>()?;
+        }
+        Ok(DuplicateRejectingIgnoredJsonValue)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ShadowNavigationConfigV1Dto {
+struct ShadowNavigationConfigWireDto {
     schema_version: u32,
     coordinate_frames: CoordinateFramesV1Dto,
     odometry: OdometryV1Dto,
-    local_costmap: LocalCostmapV1Dto,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    global_occupancy: Option<GlobalOccupancyV2Dto>,
+    local_costmap: LocalCostmapWireDto,
     global_planner: GlobalPlannerV1Dto,
     plant_model: PlantModelJsonV1Dto,
     mpc: MpcJsonV1Dto,
@@ -665,6 +878,13 @@ struct ShadowNavigationConfigV1Dto {
     control_loop: ControlLoopV1Dto,
     shadow_command: ShadowCommandJsonV1Dto,
     ingress_journal: IngressJournalV1Dto,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalOccupancyV2Dto {
+    obstacle_floor_height_minimum_m: f64,
+    obstacle_floor_height_maximum_m: f64,
 }
 
 #[derive(Deserialize)]
@@ -758,20 +978,34 @@ impl SensorAccuracyV1Dto {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LocalCostmapV1Dto {
+struct LocalCostmapWireDto {
     resolution_m: f64,
     lower_bound_m: [f64; 2],
     width_cells: u32,
     height_cells: u32,
     maximum_cells: usize,
-    obstacle_height_minimum_m: f64,
-    obstacle_height_maximum_m: f64,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    obstacle_base_z_minimum_m: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    obstacle_base_z_maximum_m: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    obstacle_height_minimum_m: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    obstacle_height_maximum_m: Option<f64>,
     depth_minimum_m: f64,
     depth_maximum_m: f64,
     sampling_block_pixels: u32,
     footprint_radius_m: f64,
     clearance_m: f64,
     maximum_observation_age_ns: u64,
+}
+
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -1071,7 +1305,7 @@ mod tests {
 
     fn fixture() -> Value {
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "coordinate_frames": {
                 "tracking_camera_to_base": {
                     "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -1108,14 +1342,18 @@ mod tests {
                 "gyro_history_capacity": 128,
                 "pose_history_capacity": 128
             },
+            "global_occupancy": {
+                "obstacle_floor_height_minimum_m": 0.05,
+                "obstacle_floor_height_maximum_m": 1.6
+            },
             "local_costmap": {
                 "resolution_m": 0.1,
                 "lower_bound_m": [-2.0, -2.0],
                 "width_cells": 40,
                 "height_cells": 40,
                 "maximum_cells": 1600,
-                "obstacle_height_minimum_m": -0.1,
-                "obstacle_height_maximum_m": 1.5,
+                "obstacle_base_z_minimum_m": -0.2,
+                "obstacle_base_z_maximum_m": 1.35,
                 "depth_minimum_m": 0.2,
                 "depth_maximum_m": 5.0,
                 "sampling_block_pixels": 1,
@@ -1210,8 +1448,8 @@ mod tests {
         })
     }
 
-    fn parse(value: &Value) -> Result<ShadowNavigationConfigV1, ShadowNavigationConfigParseError> {
-        ShadowNavigationConfigV1::parse_json(
+    fn parse(value: &Value) -> Result<ShadowNavigationConfigV2, ShadowNavigationConfigParseError> {
+        ShadowNavigationConfigV2::parse_json(
             &serde_json::to_vec(value).expect("serialize fixture"),
             camera(),
         )
@@ -1240,6 +1478,23 @@ mod tests {
             parsed.tracking_camera_to_base().pose().rotation(),
             parsed.local_costmap().tracking_to_base().pose().rotation()
         );
+        assert_eq!(
+            parsed.global_occupancy_height_range(),
+            HeightRangeMeters::try_new(0.05, 1.6).expect("global floor-height range")
+        );
+        assert_eq!(
+            parsed.local_costmap().obstacle_base_z_range(),
+            BaseZRangeMeters::try_new(-0.2, 1.35).expect("local base-z range")
+        );
+    }
+
+    #[test]
+    fn runtime_parts_preserve_global_floor_height_range() {
+        let expected = HeightRangeMeters::try_new(0.05, 1.6).expect("global floor-height range");
+        let parts = parse(&fixture())
+            .expect("parse fixture")
+            .into_runtime_parts();
+        assert_eq!(parts.global_occupancy_height_range, expected);
     }
 
     #[test]
@@ -1249,7 +1504,7 @@ mod tests {
         let plant_bytes =
             serde_json::to_vec(&value["plant_model"]).expect("plant artifact fixture");
         let plant = PlantModelV1::parse_json(&plant_bytes).expect("canonical plant artifact");
-        let parsed = ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+        let parsed = ShadowNavigationConfigV2::parse_json_bound_to_plant_artifact(
             &navigation_bytes,
             camera(),
             plant,
@@ -1264,7 +1519,7 @@ mod tests {
         )
         .expect("individually valid different model");
         assert!(matches!(
-            ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+            ShadowNavigationConfigV2::parse_json_bound_to_plant_artifact(
                 &navigation_bytes,
                 camera(),
                 different,
@@ -1277,7 +1532,7 @@ mod tests {
     fn preserves_runtime_camera_without_json_extrinsic_inference() {
         let expected = camera();
         let bytes = serde_json::to_vec(&fixture()).expect("serialize fixture");
-        let parsed = ShadowNavigationConfigV1::parse_json(&bytes, expected).expect("parse");
+        let parsed = ShadowNavigationConfigV2::parse_json(&bytes, expected).expect("parse");
         let actual = parsed.local_costmap().camera();
         assert_eq!(actual.dimensions(), expected.dimensions());
         assert_eq!(actual.intrinsics().fx(), expected.intrinsics().fx());
@@ -1315,6 +1570,88 @@ mod tests {
     }
 
     #[test]
+    fn v2_requires_distinct_floor_and_base_height_ranges() {
+        let parsed = parse(&fixture()).expect("V2 fixture");
+        assert_ne!(
+            parsed.global_occupancy_height_range().minimum_m(),
+            parsed.local_costmap().obstacle_base_z_range().minimum_m()
+        );
+
+        let mut missing_global = fixture();
+        missing_global
+            .as_object_mut()
+            .expect("object")
+            .remove("global_occupancy");
+        assert!(matches!(
+            parse(&missing_global),
+            Err(ShadowNavigationConfigParseError::MissingV2Field {
+                field: "global_occupancy"
+            })
+        ));
+
+        let mut legacy_local = fixture();
+        let local = legacy_local["local_costmap"]
+            .as_object_mut()
+            .expect("local costmap object");
+        local.remove("obstacle_base_z_minimum_m");
+        local.remove("obstacle_base_z_maximum_m");
+        local.insert("obstacle_height_minimum_m".to_owned(), json!(-0.1));
+        local.insert("obstacle_height_maximum_m".to_owned(), json!(1.5));
+        assert!(matches!(
+            parse(&legacy_local),
+            Err(ShadowNavigationConfigParseError::LegacyV1FieldInV2 {
+                field: "local_costmap.obstacle_height_minimum_m"
+            })
+        ));
+    }
+
+    #[test]
+    fn exact_retired_v1_document_reports_unsupported_schema_before_v2_shape_errors() {
+        let legacy = include_bytes!("../../testdata/legacy-navigation-shadow-v1.example.json");
+        assert!(matches!(
+            ShadowNavigationConfigV2::parse_json(legacy, camera()),
+            Err(ShadowNavigationConfigParseError::UnsupportedSchemaVersion {
+                actual: 1,
+                supported: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn future_schema_dispatch_precedes_shape_but_not_json_ambiguity() {
+        let incompatible_future = br#"{
+            "schema_version": 3,
+            "future_only": {"replacement_shape": true}
+        }"#;
+        assert!(matches!(
+            ShadowNavigationConfigV2::parse_json(incompatible_future, camera()),
+            Err(ShadowNavigationConfigParseError::UnsupportedSchemaVersion {
+                actual: 3,
+                supported: 2
+            })
+        ));
+
+        let duplicate_nested_key =
+            br#"{"schema_version":3,"future_only":{"ambiguous":1,"ambiguous":2}}"#;
+        assert!(matches!(
+            ShadowNavigationConfigV2::parse_json(duplicate_nested_key, camera()),
+            Err(ShadowNavigationConfigParseError::Json(_))
+        ));
+
+        let duplicate_discriminator = br#"{"schema_version":3,"schema_version":2}"#;
+        assert!(matches!(
+            ShadowNavigationConfigV2::parse_json(duplicate_discriminator, camera()),
+            Err(ShadowNavigationConfigParseError::Json(_))
+        ));
+
+        let trailing = br#"{"schema_version":3} true"#;
+        assert!(matches!(
+            ShadowNavigationConfigV2::parse_json(trailing, camera()),
+            Err(ShadowNavigationConfigParseError::Json(_))
+        ));
+    }
+
+    #[test]
     fn rejects_ambiguous_unit_spelling_instead_of_defaulting() {
         let mut value = fixture();
         let loop_object = value["control_loop"].as_object_mut().expect("object");
@@ -1329,12 +1666,12 @@ mod tests {
     #[test]
     fn rejects_bad_top_version_and_unknown_enums() {
         let mut version = fixture();
-        version["schema_version"] = json!(2);
+        version["schema_version"] = json!(1);
         assert!(matches!(
             parse(&version),
             Err(ShadowNavigationConfigParseError::UnsupportedSchemaVersion {
-                actual: 2,
-                supported: 1
+                actual: 1,
+                supported: 2
             })
         ));
 
@@ -1410,7 +1747,7 @@ mod tests {
         let encoded = serde_json::to_string(&fixture()).expect("serialize fixture");
         let overflow = encoded.replacen("\"step_period_s\":0.1", "\"step_period_s\":1e400", 1);
         assert!(matches!(
-            ShadowNavigationConfigV1::parse_json(overflow.as_bytes(), camera()),
+            ShadowNavigationConfigV2::parse_json(overflow.as_bytes(), camera()),
             Err(ShadowNavigationConfigParseError::Json(_))
         ));
 
@@ -1543,8 +1880,8 @@ mod tests {
 
     #[test]
     fn checked_in_shadow_example_stays_strict_and_synthetic() {
-        let bytes = include_bytes!("../../../../configs/navigation-shadow-v1.example.json");
-        let parsed = ShadowNavigationConfigV1::parse_json(bytes, camera())
+        let bytes = include_bytes!("../../../../configs/navigation-shadow-v2.example.json");
+        let parsed = ShadowNavigationConfigV2::parse_json(bytes, camera())
             .expect("checked-in shadow configuration must satisfy the public parser");
 
         assert_eq!(
@@ -1574,7 +1911,7 @@ mod tests {
     #[test]
     fn qualification_shadow_plant_binds_domain_identically_to_non_deployable_example() {
         let navigation_bytes =
-            include_bytes!("../../../../configs/navigation-shadow-v1.example.json");
+            include_bytes!("../../../../configs/navigation-shadow-v2.example.json");
         let plant_bytes = include_bytes!(
             "../../../../configs/nano-wheels-off-qualification-template/qualification-shadow-only-synthetic-unvalidated-plant-v2.json"
         );
@@ -1600,7 +1937,7 @@ mod tests {
             }
         }
 
-        let parsed = ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+        let parsed = ShadowNavigationConfigV2::parse_json_bound_to_plant_artifact(
             navigation_bytes,
             camera(),
             plant,
@@ -1647,7 +1984,7 @@ mod tests {
     fn rejects_input_before_json_parsing_when_size_bound_is_exceeded() {
         let oversized = vec![b' '; MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES + 1];
         assert!(matches!(
-            ShadowNavigationConfigV1::parse_json(&oversized, camera()),
+            ShadowNavigationConfigV2::parse_json(&oversized, camera()),
             Err(ShadowNavigationConfigParseError::InputTooLarge {
                 actual_bytes,
                 maximum_bytes: MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES
@@ -1668,7 +2005,7 @@ mod tests {
 
         let mut too_large = fixture();
         too_large["ingress_journal"]["maximum_ingress_records"] =
-            json!(ShadowNavigationConfigV1::MAX_INGRESS_RECORDS + 1);
+            json!(ShadowNavigationConfigV2::MAX_INGRESS_RECORDS + 1);
         assert!(matches!(
             parse(&too_large),
             Err(ShadowNavigationConfigParseError::IngressCapacity(

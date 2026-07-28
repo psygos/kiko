@@ -58,11 +58,18 @@ cargo test --locked -p kiko-slam --lib navigation::local_costmap::tests
 15 passed; 0 failed
 ```
 
-`configs/navigation-shadow-v1.example.json` is valid JSON and was passed through the public
-`ShadowNavigationConfigV1::parse_json` boundary with an explicit 640x400 runtime depth-camera
-model. The parser accepted all 4,695 bytes. Its calibration IDs and plant evidence identify it as
-a synthetic, non-actuating, non-physically-validated schema example; its values are not Kiko plant
-identification or sensor calibration.
+At the recorded revision, `configs/navigation-shadow-v1.example.json` was valid JSON and was passed
+through the public `ShadowNavigationConfigV1::parse_json` boundary with an explicit 640x400 runtime
+depth-camera model. The parser accepted the 4,695-byte fixture at implementation commit `3968993`;
+those exact bytes have SHA-256
+`2c08ea565ca59935669e088d35c7c826ec74395329e2f603812a80c1e9bd98b0`.
+V1 evolved after that recorded test. Its final 4,735-byte form is retained at
+`crates/kiko-slam/testdata/legacy-navigation-shadow-v1.example.json` with SHA-256
+`9cb77b15ae38acd6b21c56f65687f6c5683415348de4851a299b8637522c370f`.
+Navigation V2 subsequently retired that configuration path. Both V1 fixtures
+identify themselves as synthetic, non-actuating, non-physically-validated
+schema examples; their values are not Kiko plant identification or sensor
+calibration.
 
 Rerun remains output-only. The live adapter submits best-effort entries on explicit capture and
 navigation timelines for the CLI goal, poses/transforms, map and local grid, path, predicted

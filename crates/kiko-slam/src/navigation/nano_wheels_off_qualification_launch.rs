@@ -1231,7 +1231,7 @@ mod tests {
                 asset("bin/kiko-nano-wheels-off-qualification"),
             "native_runtime_manifest_asset": asset("native-runtime-v1.json"),
             "agent_policy_asset": asset("agent-policy-v3.json"),
-            "navigation_shadow_config_asset": asset("navigation-shadow-v1.json"),
+            "navigation_shadow_config_asset": asset("navigation-shadow-v2.json"),
             "candidate_inventory_manifest_asset": asset("device-inventory-candidate-v2.json"),
             "candidate_controller_policy_asset": asset("candidate-controller-policy-v1.json"),
             "controller_server": {

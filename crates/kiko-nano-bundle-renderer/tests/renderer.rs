@@ -293,7 +293,7 @@ fn add_face_assets(root: &Path, input: &mut Value) {
 fn navigation_for_plant(plant: &Value) -> Value {
     let mut navigation: Value = serde_json::from_slice(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../configs/navigation-shadow-v1.example.json"
+        "/../../configs/navigation-shadow-v2.example.json"
     )))
     .expect("checked-in navigation example is JSON");
     navigation["coordinate_frames"]["tracking_camera_to_base"] = json!({
@@ -635,10 +635,10 @@ fn source_fixture() -> (TempDir, Value) {
             "direction_regression_tolerance_ticks": 20,
             "goal_speed_ticks_per_second": 50,
             "torque_limit_permille": [600, 400, 400, 400],
-            "minimum_start_ticks": [2135, 2525, 2842, 2856],
-            "maximum_start_ticks": [2227, 2592, 2963, 2922],
-            "reviewed_natural_target_ticks": [2155, 2545, 2943, 2876],
-            "maximum_travel_ticks": [80, 64, 128, 64]
+            "minimum_start_ticks": [2133, 2550, 1617, 3023],
+            "maximum_start_ticks": [2194, 2660, 1852, 3067],
+            "reviewed_natural_target_ticks": [2174, 2570, 1637, 3047],
+            "maximum_travel_ticks": [48, 96, 224, 32]
         },
         "rgb_expression_policy": {
             "sampling_columns": 16,
@@ -1521,7 +1521,7 @@ fn production_derives_navigation_digest_and_loopback_port() {
         plan.files.last().unwrap().relative_path,
         "nano-agent-launch-v3.json"
     );
-    let navigation = fs::read(destination.join("navigation-shadow-v1.json")).unwrap();
+    let navigation = fs::read(destination.join("navigation-shadow-v2.json")).unwrap();
     let actuation: Value = serde_json::from_slice(
         &fs::read(destination.join("navigation-actuation-v2.json")).unwrap(),
     )
@@ -2055,16 +2055,23 @@ fn renderer_requires_and_checks_navigation_dataset_storage_limits() {
 fn renderer_rejects_policy_values_the_agent_would_reject() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
-    input["head_policy"]["reviewed_natural_target_ticks"][0] = json!(2156);
+    input["head_policy"]["reviewed_natural_target_ticks"][0] = json!(2175);
     let input_path = write_input(&root, &input);
     let error = render_bundle(&input_path, RenderMode::DryRun).expect_err("unreviewed head target");
     assert!(
         error
             .to_string()
-            .contains("physically reviewed natural target")
+            .contains("operator-confirmed natural target")
     );
 
-    input["head_policy"]["reviewed_natural_target_ticks"][0] = json!(2155);
+    input["head_policy"]["reviewed_natural_target_ticks"][0] = json!(2174);
+    input["head_policy"]["maximum_travel_ticks"][0] = json!(49);
+    let input_path = write_input(&root, &input);
+    let error = render_bundle(&input_path, RenderMode::DryRun)
+        .expect_err("widened head travel must not be admitted");
+    assert!(error.to_string().contains("reviewed startup, travel"));
+
+    input["head_policy"]["maximum_travel_ticks"][0] = json!(48);
     input["rgb_expression_policy"]["sampling_columns"] = json!(65);
     input["rgb_expression_policy"]["sampling_rows"] = json!(65);
     let input_path = write_input(&root, &input);
@@ -2257,7 +2264,7 @@ fn qualification_v4_template_renders_exact_policy_and_leaves_only_evidence_bound
     );
     assert_eq!(
         shape["head_policy"]["reviewed_natural_target_ticks"],
-        json!([2155, 2545, 2943, 2876])
+        json!([2174, 2570, 1637, 3047])
     );
     assert_eq!(
         shape["rgb_expression_policy"]["head_origin_in_camera_m"],
@@ -2326,10 +2333,10 @@ fn qualification_v4_template_renders_exact_policy_and_leaves_only_evidence_bound
             "direction_regression_tolerance_ticks": 20,
             "goal_speed_ticks_per_second": 50,
             "torque_limit_permille": [600, 400, 400, 400],
-            "minimum_start_ticks": [2135, 2525, 2842, 2856],
-            "maximum_start_ticks": [2227, 2592, 2963, 2922],
-            "reviewed_natural_target_ticks": [2155, 2545, 2943, 2876],
-            "maximum_travel_ticks": [80, 64, 128, 64],
+            "minimum_start_ticks": [2133, 2550, 1617, 3023],
+            "maximum_start_ticks": [2194, 2660, 1852, 3067],
+            "reviewed_natural_target_ticks": [2174, 2570, 1637, 3047],
+            "maximum_travel_ticks": [48, 96, 224, 32],
             "physical_torque_consent": "enable_for_reviewed_natural_return_and_hold",
             "physical_motion_consent": "return_to_reviewed_natural_target"
         })

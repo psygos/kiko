@@ -1,14 +1,46 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "coordinate_frames": {
-    "tracking_camera_to_base": "${CALIBRATION_PREPARER_REPLACES_TRACKING_CAMERA_TO_BASE}",
+    "tracking_camera_to_base": {
+      "rotation": [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0]
+      ],
+      "translation_m": [0.0, 0.0, 0.0]
+    },
     "world_to_occupancy": {
-      "rotation": ${NAV_SHADOW_UNVALIDATED_WORLD_TO_OCCUPANCY_ROTATION_F64_MATRIX},
-      "translation_m": ${NAV_SHADOW_UNVALIDATED_WORLD_TO_OCCUPANCY_TRANSLATION_M_F64_ARRAY}
+      "rotation": [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0]
+      ],
+      "translation_m": [0.0, 0.0, 0.0]
     }
   },
   "odometry": {
-    "raw_imu_calibration": "${CALIBRATION_PREPARER_REPLACES_RAW_IMU_CALIBRATION}",
+    "raw_imu_calibration": {
+      "format_version": 1,
+      "source_id": "synthetic-host-shadow-example-not-calibrated",
+      "content_id": "synthetic-host-shadow-example-v1",
+      "gyro_affine": [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0]
+      ],
+      "gyro_bias_native_rad_per_sec": [0.0, 0.0, 0.0],
+      "accel_affine": [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0]
+      ],
+      "accel_bias_native_m_per_sec2": [0.0, 0.0, 0.0],
+      "native_imu_to_base_rotation": [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0]
+      ]
+    },
     "maximum_visual_interval_ns": 250000000,
     "maximum_visual_linear_speed_m_per_sec": 0.5,
     "maximum_visual_yaw_rate_rad_per_sec": 2.0,
@@ -24,18 +56,22 @@
     "gyro_history_capacity": 512,
     "pose_history_capacity": 128
   },
+  "global_occupancy": {
+    "obstacle_floor_height_minimum_m": 0.05,
+    "obstacle_floor_height_maximum_m": 1.5
+  },
   "local_costmap": {
     "resolution_m": 0.05,
     "lower_bound_m": [-3.0, -3.0],
     "width_cells": 120,
     "height_cells": 120,
     "maximum_cells": 14400,
-    "obstacle_height_minimum_m": ${NAV_SHADOW_UNVALIDATED_OBSTACLE_HEIGHT_MINIMUM_M},
-    "obstacle_height_maximum_m": ${NAV_SHADOW_UNVALIDATED_OBSTACLE_HEIGHT_MAXIMUM_M},
+    "obstacle_base_z_minimum_m": -0.25,
+    "obstacle_base_z_maximum_m": 1.2,
     "depth_minimum_m": 0.3,
     "depth_maximum_m": 5.0,
     "sampling_block_pixels": 1,
-    "footprint_radius_m": ${NAV_SHADOW_UNVALIDATED_FOOTPRINT_RADIUS_M},
+    "footprint_radius_m": 0.2,
     "clearance_m": 0.1,
     "maximum_observation_age_ns": 100000000
   },

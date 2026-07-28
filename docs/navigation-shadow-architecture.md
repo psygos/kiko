@@ -67,6 +67,9 @@ alignment or authorize actuation.
   frame. Host dequeue time uses a separate monotonic process clock with no wall-clock meaning.
 - Depth is metric and tied to its exact optical projection contract. The live navigation branch is
   capacity one/drop-oldest so it exposes the newest complete observation without delaying SLAM.
+- Navigation V2 carries two distinct obstacle slabs. Global occupancy uses height above the
+  occupancy floor; the local costmap uses `z` in the axle-midpoint base frame. Separate parsed
+  domain types prevent either range from being supplied to the other mapper.
 - Command-line goals, environment values, manifests, calibration files, and plant models are
   parsed once. Nonfinite values, ambiguous units, unsupported versions, stale identities, and
   incompatible frames are typed failures. Live navigation requires `--navigation-config`,
@@ -103,7 +106,7 @@ differential-drive plant parameters must come from a versioned identified model 
 dataset provenance, fit residuals, and a declared validity envelope. Shadow mode may exercise
 controller mathematics with a synthetic fixture model, but that does not establish physical
 accuracy and cannot unlock actuation. The checked-in
-`configs/navigation-shadow-v1.example.json` is deliberately marked synthetic, non-actuating, and
+`configs/navigation-shadow-v2.example.json` is deliberately marked synthetic, non-actuating, and
 not physically validated; its values are a schema example, not robot calibration.
 
 Each optimization has a host-monotonic deadline and a typed safe fallback. A late or infeasible

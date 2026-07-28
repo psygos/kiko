@@ -1,0 +1,130 @@
+{
+  "schema_version": 2,
+  "coordinate_frames": {
+    "tracking_camera_to_base": "${CALIBRATION_PREPARER_REPLACES_TRACKING_CAMERA_TO_BASE}",
+    "world_to_occupancy": {
+      "rotation": ${NAV_SHADOW_UNVALIDATED_WORLD_TO_OCCUPANCY_ROTATION_F64_MATRIX},
+      "translation_m": ${NAV_SHADOW_UNVALIDATED_WORLD_TO_OCCUPANCY_TRANSLATION_M_F64_ARRAY}
+    }
+  },
+  "odometry": {
+    "raw_imu_calibration": "${CALIBRATION_PREPARER_REPLACES_RAW_IMU_CALIBRATION}",
+    "maximum_visual_interval_ns": 250000000,
+    "maximum_visual_linear_speed_m_per_sec": 0.5,
+    "maximum_visual_yaw_rate_rad_per_sec": 2.0,
+    "maximum_calibrated_yaw_rate_rad_per_sec": 2.0,
+    "minimum_gyro_accuracy": "low",
+    "maximum_vertical_increment_m": 0.1,
+    "maximum_relative_roll_pitch_increment_rad": 0.2,
+    "maximum_absolute_map_roll_pitch_rad": 0.2,
+    "maximum_imu_gap_ns": 50000000,
+    "maximum_prediction_age_ns": 100000000,
+    "maximum_host_observation_age_ns": 100000000,
+    "maximum_history_bracket_gap_ns": 50000000,
+    "gyro_history_capacity": 512,
+    "pose_history_capacity": 128
+  },
+  "global_occupancy": {
+    "obstacle_floor_height_minimum_m": ${NAV_SHADOW_UNVALIDATED_OBSTACLE_FLOOR_HEIGHT_MINIMUM_M},
+    "obstacle_floor_height_maximum_m": ${NAV_SHADOW_UNVALIDATED_OBSTACLE_FLOOR_HEIGHT_MAXIMUM_M}
+  },
+  "local_costmap": {
+    "resolution_m": 0.05,
+    "lower_bound_m": [-3.0, -3.0],
+    "width_cells": 120,
+    "height_cells": 120,
+    "maximum_cells": 14400,
+    "obstacle_base_z_minimum_m": ${NAV_SHADOW_UNVALIDATED_OBSTACLE_BASE_Z_MINIMUM_M},
+    "obstacle_base_z_maximum_m": ${NAV_SHADOW_UNVALIDATED_OBSTACLE_BASE_Z_MAXIMUM_M},
+    "depth_minimum_m": 0.3,
+    "depth_maximum_m": 5.0,
+    "sampling_block_pixels": 1,
+    "footprint_radius_m": ${NAV_SHADOW_UNVALIDATED_FOOTPRINT_RADIUS_M},
+    "clearance_m": 0.1,
+    "maximum_observation_age_ns": 100000000
+  },
+  "global_planner": {
+    "unknown_space_policy": "blocked"
+  },
+  "plant_model": {
+    "schema_version": 1,
+    "model_id": "qualification-shadow-only-synthetic-unvalidated-v2",
+    "model_version": 2,
+    "sample_period_s": 0.05,
+    "wheelbase_m": 0.4,
+    "left": {
+      "velocity_gain_mps_per_pwm_percent": 0.01,
+      "time_constant_s": 0.5
+    },
+    "right": {
+      "velocity_gain_mps_per_pwm_percent": 0.01,
+      "time_constant_s": 0.6
+    },
+    "validity": {
+      "left_pwm_min_percent": -30,
+      "left_pwm_max_percent": 30,
+      "right_pwm_min_percent": -30,
+      "right_pwm_max_percent": 30,
+      "left_velocity_min_mps": -0.3,
+      "left_velocity_max_mps": 0.3,
+      "right_velocity_min_mps": -0.3,
+      "right_velocity_max_mps": 0.3,
+      "maximum_absolute_yaw_rate_rad_per_sec": 2.0,
+      "maximum_absolute_lateral_velocity_m_per_sec": 0.1
+    },
+    "evidence": {
+      "kind": "synthetic_fixture",
+      "fixture_id": "qualification-shadow-only-synthetic-unvalidated-fixture-v2",
+      "generator_id": "synthetic-unvalidated-hand-authored-qualification-shadow-v2"
+    }
+  },
+  "mpc": {
+    "schema_version": 1,
+    "horizon_steps": 10,
+    "step_period_s": 0.05,
+    "integration_substeps": 4,
+    "optimization_iterations": 2,
+    "candidates_per_wheel": 3,
+    "maximum_rollout_evaluations": 181,
+    "initial_search_radius_percent": 5,
+    "search_radius_decay_numerator": 1,
+    "search_radius_decay_denominator": 2,
+    "left_pwm_min_percent": -30,
+    "left_pwm_max_percent": 30,
+    "right_pwm_min_percent": -30,
+    "right_pwm_max_percent": 30,
+    "left_maximum_slew_percent_per_step": 5,
+    "right_maximum_slew_percent_per_step": 5,
+    "maximum_integration_tube_radius_m": 0.05,
+    "position_cost_per_m2": 100.0,
+    "heading_cost_per_rad2": 10.0,
+    "forward_velocity_cost_s2_per_m2": 100.0,
+    "yaw_rate_cost_s2_per_rad2": 4.0,
+    "pwm_cost_per_percent2": 0.001,
+    "slew_cost_per_percent2": 0.004,
+    "terminal_state_cost_multiplier": 4.0
+  },
+  "path_reference": {
+    "schema_version": 1,
+    "maximum_path_points": 2048,
+    "minimum_segment_length_m": 0.01,
+    "maximum_path_length_m": 100.0,
+    "maximum_projection_distance_m": 1.0,
+    "target_forward_speed_m_per_sec": 0.1,
+    "goal_stop_distance_m": 0.2,
+    "maximum_absolute_yaw_rate_rad_per_sec": 1.0,
+    "nearest_segment_tie_policy": 1
+  },
+  "control_loop": {
+    "control_period_ns": 50000000,
+    "solver_budget_ns": 25000000
+  },
+  "shadow_command": {
+    "lease_ms": 100,
+    "retained_records": 2048,
+    "initial_sequence": 0
+  },
+  "ingress_journal": {
+    "maximum_ingress_records": 100000
+  }
+}

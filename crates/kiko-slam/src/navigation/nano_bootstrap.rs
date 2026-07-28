@@ -79,7 +79,7 @@ use super::{
     NavigationActuationConfigV1, NavigationClockEpoch, PendingLiveMpcControlDriver,
     PreparedNanoProductionRuntime, ProductionNavigationControllerBindingError,
     ProductionNavigationControllerBindingV1, ProductionNavigationControllerContractV1,
-    ShadowNavigationConfigParseError, ShadowNavigationConfigV1, load_nano_agent_launch_v3,
+    ShadowNavigationConfigParseError, ShadowNavigationConfigV2, load_nano_agent_launch_v3,
 };
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
@@ -812,7 +812,7 @@ pub struct NanoBootstrapStereoEvidence {
 /// Parsed, mutually bound live configuration. No environment fallback was
 /// consulted while constructing this value.
 pub struct ParsedNanoLiveConfiguration {
-    pub navigation: ShadowNavigationConfigV1,
+    pub navigation: ShadowNavigationConfigV2,
     pub occupancy_host_policy: LiveOccupancyHostPolicy,
 }
 
@@ -1370,7 +1370,7 @@ pub async fn bootstrap_nano_production(
 struct ConnectedOakPreparation {
     depthai_build_metadata: DepthAiBuildMetadata,
     stereo: NanoBootstrapStereoEvidence,
-    navigation: ShadowNavigationConfigV1,
+    navigation: ShadowNavigationConfigV2,
     occupancy_host_policy: LiveOccupancyHostPolicy,
     actuation: NavigationActuationConfigV1,
 }
@@ -1422,7 +1422,7 @@ fn prepare_connected_oak(
     calibration
         .require_observed_stereo(&stereo.calibration)
         .map_err(NanoBootstrapPrimaryError::CalibrationBinding)?;
-    let navigation = ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+    let navigation = ShadowNavigationConfigV2::parse_json_bound_to_plant_artifact(
         navigation_bytes,
         stereo.runtime_depth_camera,
         plant_artifact_model,

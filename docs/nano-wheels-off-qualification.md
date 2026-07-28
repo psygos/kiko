@@ -99,7 +99,10 @@ input V1 and launch V3 are unchanged.
 Gate A omits `assets.head_gaze_policy_source_path`. Consequently its bundle
 contains no head-gaze policy file or hash, bootstrap returns no policy, and no
 gaze adapter is claimed. This does not disable the separately reviewed natural
-head hold.
+head hold. The current return-and-hold target, startup envelope, exact software
+travel caps, retained torque limits, and remaining physical claim boundary are
+recorded in `docs/nano-head-neutral-policy-2026-07-29.md`; older return evidence
+must not be substituted for that superseding policy.
 
 For later proposal-only qualification work, start from
 `configs/nano-wheels-off-qualification-template/head-gaze-policy-v1.json.template`.
@@ -141,7 +144,7 @@ staging root. The canonical installed layout is:
 ├── controller-server-candidate-v2.json
 ├── device-inventory-candidate-v2.json
 ├── nano-wheels-off-qualification-launch-v4.json
-├── navigation-shadow-v1.json
+├── navigation-shadow-v2.json
 ├── native-runtime-v1.json
 ├── artifacts/
 │   ├── calibration/<exact calibration asset>
@@ -339,13 +342,26 @@ a hermetic transitive OS-library closure. Retain exact
 `DT_NEEDED`/loader-graph evidence from the final ELF as a separate target-side
 `readelf` release gate.
 
-After the fallible setup completes, the process binds the loopback console
-with its manual-motion boundary still disabled and reports
-`motion-attestation-pending`. While the terminal waits, read the newly created
+After the fallible setup completes, the process creates the exactly stopped
+runtime owner and binds the loopback console with its manual-motion boundary
+still disabled. OAK capture, online SLAM, occupancy, Rerun, accessories,
+console telemetry, MPC shadow decisions, and the exact applied-zero/disarm
+STM32 evidence can run while nonzero authority is structurally locked and
+motor output power remains physically disconnected. This does not relabel the
+motion-capable candidate firmware as motor-inert. The transition worker remains
+absent until one stopped control tick has fresh admitted visual, depth, and IMU
+observations; a current ready head/eye/RGB-expression health observation; one
+admitted occupancy revision published to the console; successful coordinator
+`motion_start_readiness_at` evidence; and acceptance of that tick's navigation
+diagnostic by the bounded visualization queue. Queue acceptance does not claim
+that Rerun has consumed, displayed, or persisted the message.
+
+While the console reports `motion-attestation-pending`, read the newly created
 capability in a separate authenticated Nano shell, open the console through
-the already-established tunnel, and confirm that requests other than the
-one-way software safety stop are rejected. The process then requires one fresh
-fresh challenged through-setup reply:
+the already-established tunnel, and confirm that every motion-capable request
+is rejected. The reduction-only ordinary `stop` and one-way software safety
+stop remain available. The worker discards pending TTY input before generating
+each fresh challenge. It first requires this through-setup reply:
 
 ```text
 MOTOR POWER REMAINED PHYSICALLY DISCONNECTED THROUGH SETUP <32-lowercase-hex-challenge>
@@ -360,21 +376,44 @@ requires:
 MOTOR POWER RECONNECTED WHEELS OFF HEAD SUPPORTED POWER CUT READY <32-lowercase-hex-challenge>
 ```
 
-Only after that reply does the process create the stopped runtime owner and
-atomically enable the console's manual-motion boundary. A pre-attestation
-software safety stop prevents enablement. The attestation may authorize
+Only after that reply does the existing stopped runtime recheck all integrated
+readiness evidence, the process-running authority, and the console safety
+boundary at the enable linearization. Readiness loss during the operator delay
+closes the one-shot gate and requires a process restart. A software safety
+stop, frontend loss, runtime receiver loss, process shutdown, controller-owner
+exit, or propagated accessory failure cancels and joins the TTY worker without
+enabling motion. Cancellation is rechecked after terminal input is discarded,
+after the fresh challenge is generated, immediately before prompt output, and
+while input is polled. Under a concurrent stop, the hard guarantee is that
+no authority is enabled when the stop wins the console/process linearization;
+the documentation does not claim that racing prompt bytes can never already
+have reached the terminal. If enablement linearizes first, no queued command
+can be consumed until a later owner tick whose process-running check passes,
+and a subsequently linearized software safety stop preempts candidate motion.
+The attestation may authorize
 nonzero candidate requests for at most 30 seconds from its monotonic creation;
-console and dataset startup no longer consume that window. It is not a
+read-only startup and mapping do not consume that window. It is not a
 30-second continuous-motion request. A safely stopped mapping session may
 continue after expiry, but a new nonzero request—or a retained nonzero target
 crossing the deadline—fails closed. Restart and repeat the attended preflight
 for a new motion window.
 
-Treat the pending prompt as a short, continuously attended startup check, not
-an indefinite pause. Sensor/navigation processing is not claimed to advance
-while that worker is waiting for the terminal reply. If console inspection is
-delayed or the frontend exits, do not attest into an aged startup: stop and
-restart the qualification.
+Treat the pending prompt as a short, continuously attended transition check,
+not an unattended pause. Sensor/navigation processing continues while motion
+authority remains unrepresentable. If console inspection is delayed or the
+frontend exits, do not attest into an aged startup: stop and restart the
+qualification.
+
+Sessions opened while motion attestation is pending are stamped with that
+pending authority generation. They remain authenticated for the one-way
+software safety stop and the reduction-only ordinary `stop`; neither can create
+or retain nonzero authority. Every motion-capable intent remains
+generation-bound, so no prebuilt motion request or idempotency key can cross
+enablement. Browser and agent clients must open a fresh session after
+enablement. The browser keeps the old stop-capable session until its
+replacement exists, atomically switches to the replacement, and only then
+retires the old session. It clears every held key/pointer state before that
+handshake, so motion requires a later physical release and new input edge.
 
 ## Use the unified human/agent console
 

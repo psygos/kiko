@@ -3503,7 +3503,7 @@ mod tests {
         ManualDriveConfigV1, ManualDriveConfigV1Dto, NavigationClockEpoch,
         NavigationIngressCapacity, NavigationIngressLog, NavigationRecordingId,
         PathReferenceBuilderV1, PendingVisualAttemptIngress, PlanarOdometry,
-        ShadowNavigationConfigV1, ShadowSafetySupervisor, VisualAttemptOutcome,
+        ShadowNavigationConfigV2, ShadowSafetySupervisor, VisualAttemptOutcome,
         agent_control_runtime_queue,
     };
     use crate::{
@@ -3964,8 +3964,8 @@ mod tests {
             dimensions,
             DepthToTrackingCamera::new(Pose::identity()),
         );
-        let parsed = ShadowNavigationConfigV1::parse_json(
-            include_bytes!("../../../../configs/navigation-shadow-v1.example.json"),
+        let parsed = ShadowNavigationConfigV2::parse_json(
+            include_bytes!("../../../../configs/navigation-shadow-v2.example.json"),
             camera,
         )
         .expect("example navigation policy");

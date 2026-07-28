@@ -8,6 +8,8 @@
   const driveSafety = model.driveSafety;
   if (!driveSafety) throw new Error("operator-console drive safety model is unavailable");
   const API_REQUEST_TIMEOUT_MILLISECONDS = 750;
+  const SOFTWARE_SAFETY_STOP_MAX_ATTEMPTS = 4;
+  const SOFTWARE_SAFETY_STOP_RETRY_DELAY_MILLISECONDS = 75;
   const PRODUCTION_CONTROL_PROFILE_KIND = "production_body_frame_si";
   const QUALIFICATION_CONTROL_PROFILE_KIND =
     "wheels_off_raw_timer_pwm_qualification";
@@ -30,6 +32,7 @@
     capability: null,
     sessionId: null,
     sessionCapability: null,
+    sessionMotionAuthorityCurrent: false,
     sequence: 0n,
     idempotency: 0n,
     held: new Set(),
@@ -134,12 +137,29 @@
     );
   }
 
-  function sessionHeaders(headers = {}) {
+  function currentSessionCredentials() {
+    if (!state.sessionId || !state.sessionCapability) return null;
+    return Object.freeze({
+      sessionId: state.sessionId,
+      sessionCapability: state.sessionCapability,
+    });
+  }
+
+  function sameSession(left, right) {
+    return left != null
+      && right != null
+      && left.sessionId === right.sessionId
+      && left.sessionCapability === right.sessionCapability;
+  }
+
+  function sessionHeaders(headers = {}, credentials = currentSessionCredentials()) {
     const output = new Headers(headers);
-    if (state.sessionCapability) {
-      output.set("X-Kiko-Session-Capability", state.sessionCapability);
+    if (credentials?.sessionCapability) {
+      output.set("X-Kiko-Session-Capability", credentials.sessionCapability);
     }
-    if (state.sessionId) output.set("X-Kiko-Session-Id", state.sessionId);
+    if (credentials?.sessionId) {
+      output.set("X-Kiko-Session-Id", credentials.sessionId);
+    }
     return output;
   }
 
@@ -147,9 +167,10 @@
     if (!state.capability) throw new Error("console is locked");
     const {
       timeoutMilliseconds = API_REQUEST_TIMEOUT_MILLISECONDS,
+      sessionCredentials = currentSessionCredentials(),
       ...fetchOptions
     } = options;
-    const headers = sessionHeaders(fetchOptions.headers);
+    const headers = sessionHeaders(fetchOptions.headers, sessionCredentials);
     headers.set("X-Kiko-Console-Capability", state.capability);
     if (fetchOptions.body) headers.set("Content-Type", "application/json");
     const abort = new AbortController();
@@ -214,9 +235,10 @@
     return consumeResponse(response, () => response.arrayBuffer());
   }
 
-  async function openSession() {
+  async function requestSession() {
     const response = await api("/api/v1/sessions", {
       method: "POST",
+      sessionCredentials: null,
       body: JSON.stringify({ schema_version: 1, source: "operator" }),
     });
     const body = await responseJson(response);
@@ -226,10 +248,40 @@
       || !/^[0-9a-f]{64}$/.test(body.session_capability)) {
       throw new Error("invalid typed session response");
     }
-    state.sessionId = body.session_id;
-    state.sessionCapability = body.session_capability;
+    return Object.freeze({
+      sessionId: body.session_id,
+      sessionCapability: body.session_capability,
+    });
+  }
+
+  function installSession(credentials) {
+    state.sessionId = credentials.sessionId;
+    state.sessionCapability = credentials.sessionCapability;
+    // Qualification authority is intentionally not exposed by the v1 HTTP
+    // session schema. A session is marked current only by the guarded
+    // post-ready replacement below.
+    state.sessionMotionAuthorityCurrent = false;
     state.sequence = 0n;
     state.idempotency = 0n;
+  }
+
+  async function openSession() {
+    installSession(await requestSession());
+  }
+
+  async function closeSession(credentials) {
+    const response = await api("/api/v1/sessions/close", {
+      method: "POST",
+      sessionCredentials: credentials,
+      body: JSON.stringify({
+        schema_version: 1,
+        session_id: credentials.sessionId,
+      }),
+    });
+    const body = await responseJson(response);
+    if (body.closed !== true) {
+      throw new Error("qualification session close was not acknowledged");
+    }
   }
 
   function qualificationProfile() {
@@ -599,6 +651,78 @@
     updateControlAvailability();
   }
 
+  function softwareSafetyStopWasAlreadyLatched(error) {
+    return error instanceof ApiError
+      && error.status === 423
+      && error.code === "software_safety_stop_latched";
+  }
+
+  function softwareSafetyStopErrorIsRetryable(error) {
+    if (!(error instanceof ApiError)) return true;
+    return error.status === 401
+      || error.status === 408
+      || error.status === 429
+      || error.status >= 500;
+  }
+
+  async function submitSoftwareSafetyStopUntilResolved() {
+    let lastError = new Error("software safety stop was not attempted");
+    for (let attempt = 1; attempt <= SOFTWARE_SAFETY_STOP_MAX_ATTEMPTS; attempt += 1) {
+      if (!currentSessionCredentials()) {
+        try {
+          installSession(await requestSession());
+        } catch (error) {
+          lastError = error;
+          const decision = model.softwareSafetyStopRetryDecision({
+            attempt,
+            maximumAttempts: SOFTWARE_SAFETY_STOP_MAX_ATTEMPTS,
+            confirmed: false,
+            retryable: softwareSafetyStopErrorIsRetryable(error),
+            consoleUnlocked: state.capability != null,
+          });
+          if (decision === "unavailable") break;
+          await delay(SOFTWARE_SAFETY_STOP_RETRY_DELAY_MILLISECONDS);
+          continue;
+        }
+      }
+
+      const attemptedSession = currentSessionCredentials();
+      try {
+        await submit({ kind: "software_safety_stop" });
+        return "accepted";
+      } catch (error) {
+        lastError = error;
+        const confirmed = softwareSafetyStopWasAlreadyLatched(error);
+        const decision = model.softwareSafetyStopRetryDecision({
+          attempt,
+          maximumAttempts: SOFTWARE_SAFETY_STOP_MAX_ATTEMPTS,
+          confirmed,
+          retryable: softwareSafetyStopErrorIsRetryable(error),
+          consoleUnlocked: state.capability != null,
+        });
+        if (decision === "confirmed") return "already_latched";
+        if (decision === "unavailable") break;
+
+        // A concurrent session retirement can reject the old credentials.
+        // Replace them only if another path has not already installed a new
+        // active session, then retry the one-way latch.
+        if (error instanceof ApiError
+          && error.status === 401
+          && sameSession(currentSessionCredentials(), attemptedSession)) {
+          try {
+            installSession(await requestSession());
+          } catch (replacementError) {
+            lastError = replacementError;
+          }
+        }
+        await delay(SOFTWARE_SAFETY_STOP_RETRY_DELAY_MILLISECONDS);
+      }
+    }
+    throw new Error(
+      `software safety-stop server latch remains unconfirmed after ${SOFTWARE_SAFETY_STOP_MAX_ATTEMPTS} bounded attempts: ${errorDetail(lastError)}`,
+    );
+  }
+
   function renderSafetyState(snapshot = state.snapshot) {
     const signal = snapshot?.software_safety_signal_state;
     if (state.serverSafetyLatched || snapshot?.software_safety_stop_latched === true) {
@@ -627,23 +751,17 @@
     applyLocalSafetyInhibit();
     renderSafetyState();
     try {
-      await submit({ kind: "software_safety_stop" });
+      const outcome = await submitSoftwareSafetyStopUntilResolved();
       state.serverSafetyLatched = true;
       state.manualBegun = false;
-      renderSafetyState();
-    } catch (error) {
-      if (error instanceof ApiError
-        && error.status === 423
-        && error.code === "software_safety_stop_latched") {
-        state.serverSafetyLatched = true;
-        state.manualBegun = false;
+      if (outcome === "already_latched") {
         state.lastResponseId = null;
         $("request-state").textContent =
           "software safety stop already latched outside this session · no session-scoped receipt";
-        renderSafetyState();
         toast("Software safety stop was already latched outside this session.");
-        return;
       }
+      renderSafetyState();
+    } catch (error) {
       // Delivery may have failed before the server latch was reached. Preserve
       // the one-way local inhibit, but still attempt the ordinary manual
       // release path; if the latch did arrive, the server will reject it.
@@ -793,7 +911,46 @@
 
   function qualificationMotionReady() {
     if (!qualificationProfile()) return true;
-    return state.snapshot?.qualification_motion_gate?.ready === true;
+    return state.snapshot?.qualification_motion_gate?.ready === true
+      && state.sessionMotionAuthorityCurrent;
+  }
+
+  async function refreshQualificationMotionSession(snapshot) {
+    const qualification = qualificationProfile() != null;
+    const motionReady = snapshot.qualification_motion_gate?.ready === true;
+    if (qualification && !motionReady) {
+      state.sessionMotionAuthorityCurrent = false;
+    }
+    const decision = model.qualificationMotionSessionDecision(
+      qualification,
+      motionReady,
+      state.sessionMotionAuthorityCurrent,
+    );
+    if (!decision.freshSessionRequired) return;
+
+    // A session opened while attestation was pending is intentionally unable
+    // to cross the server's authority generation. Clear every held input
+    // before the fresh post-enable handshake so a still-held key/pointer
+    // cannot become motion without a later physical release/new edge.
+    if (decision.clearHeldInputBeforeHandshake) clearDriveUi();
+    state.manualBegun = false;
+    const previous = currentSessionCredentials();
+    if (!previous) {
+      throw new Error("qualification session disappeared before motion refresh");
+    }
+    // Keep the pending-generation session usable for ordinary Stop and the
+    // one-way software safety stop until its replacement is established.
+    const replacement = await requestSession();
+    const swap = model.qualificationMotionSessionSwap(previous, replacement);
+    installSession(swap.activeSession);
+    // The snapshot already established that the one-way server authority
+    // generation exists. This session was opened after that observation, so
+    // it is the only browser session this page may use for motion.
+    state.sessionMotionAuthorityCurrent = true;
+    // The active credentials are switched without an await. A concurrent
+    // safety-stop handler therefore uses either the retained old session or
+    // the installed replacement, never an unauthenticated gap.
+    await closeSession(swap.retiringSession);
   }
 
   function updateControlAvailability() {
@@ -1310,6 +1467,7 @@
     const response = await api("/api/v1/snapshot");
     const snapshot = model.parseConsoleSnapshot(await responseJson(response));
     applyControlProfile(snapshot);
+    await refreshQualificationMotionSession(snapshot);
     const serverSafetyLatched = snapshot.software_safety_stop_latched === true;
     if (serverSafetyLatched) {
       state.serverSafetyLatched = true;
@@ -1379,6 +1537,7 @@
       state.capability = null;
       state.sessionId = null;
       state.sessionCapability = null;
+      state.sessionMotionAuthorityCurrent = false;
       applyDriveSafetyEvent({ kind: "locked" });
       setConnectionView("locked", error.message);
       toast(error.message, true);

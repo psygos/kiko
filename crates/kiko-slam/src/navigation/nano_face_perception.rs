@@ -14,6 +14,7 @@
 
 use core::fmt;
 
+use kiko_expression_core::MonotonicTimestamp;
 #[cfg(any(feature = "nano-agent", test))]
 use kiko_expression_core::{ImageLayout, RgbObservation};
 use kiko_expression_runtime::{
@@ -117,12 +118,21 @@ impl OakFaceFrameProvenance {
 pub struct NanoFacePerceptionOutput {
     batch: FaceDetectionBatch,
     tracking: FaceTrackingUpdate,
+    tracked_at: MonotonicTimestamp,
 }
 
 impl NanoFacePerceptionOutput {
     #[cfg(any(feature = "nano-agent", test))]
-    const fn from_parts(batch: FaceDetectionBatch, tracking: FaceTrackingUpdate) -> Self {
-        Self { batch, tracking }
+    const fn from_parts(
+        batch: FaceDetectionBatch,
+        tracking: FaceTrackingUpdate,
+        tracked_at: MonotonicTimestamp,
+    ) -> Self {
+        Self {
+            batch,
+            tracking,
+            tracked_at,
+        }
     }
 
     pub const fn batch(self) -> FaceDetectionBatch {
@@ -131,6 +141,16 @@ impl NanoFacePerceptionOutput {
 
     pub const fn tracking(self) -> FaceTrackingUpdate {
         self.tracking
+    }
+
+    /// Exact process-local monotonic sample used to admit this tracking
+    /// update.
+    ///
+    /// This shares the observation freshness epoch and is sampled immediately
+    /// after detector conversion. Proposal-only head-gaze diagnostics reuse
+    /// this value rather than sampling a different clock after another queue.
+    pub const fn tracked_at(self) -> MonotonicTimestamp {
+        self.tracked_at
     }
 }
 
@@ -291,7 +311,7 @@ impl FacePerceptionCore {
             .tracker
             .update(&batch, now)
             .map_err(NanoFacePerceptionError::Tracking)?;
-        Ok(NanoFacePerceptionOutput::from_parts(batch, tracking))
+        Ok(NanoFacePerceptionOutput::from_parts(batch, tracking, now))
     }
 
     #[cfg(test)]
@@ -890,6 +910,7 @@ mod tests {
             FaceTargetState::Acquiring(_)
         ));
         assert_eq!(first.tracking().admission(), FaceResultAdmission::ColdStart);
+        assert_eq!(first.tracked_at(), at(110));
 
         clock.set(210);
         let second = core
@@ -900,6 +921,7 @@ mod tests {
                 &clock,
             )
             .unwrap();
+        assert_eq!(second.tracked_at(), at(210));
         assert_eq!(
             second.batch().detector_result_sequence(),
             DetectorResultSequence::new(2)

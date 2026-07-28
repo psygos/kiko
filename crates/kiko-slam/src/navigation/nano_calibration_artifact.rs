@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use super::{
     NavigationActuationConfigV1, RawImuCalibration, RawImuCalibrationDto, RawImuCalibrationError,
-    ShadowNavigationConfigV1, TrackingCameraToBase,
+    ShadowNavigationConfigV2, TrackingCameraToBase,
 };
 use crate::dataset::Calibration;
 use crate::{
@@ -234,7 +234,7 @@ impl NanoCalibrationArtifactV1 {
 
     pub fn require_navigation(
         &self,
-        navigation: &ShadowNavigationConfigV1,
+        navigation: &ShadowNavigationConfigV2,
     ) -> Result<(), NanoCalibrationBindingError> {
         self.require_navigation_parts(
             navigation.odometry().raw_imu_calibration(),

@@ -79,6 +79,12 @@ use super::nano_face_perception::{
     NanoFacePerception, NanoFacePerceptionError, NanoFacePerceptionLoadError,
     NanoFacePerceptionOutput, OakFaceFrameProvenance,
 };
+#[cfg(feature = "nano-agent")]
+use super::{
+    HeadGazeFaceProposalAdapter, HeadGazeFaceProposalAdapterError, HeadGazeFaceProposalError,
+    HeadGazeFaceProposalOutcome, HeadGazePolicyLifecycleClaim, HeadGazePolicyV1,
+    RgbFacePinholeProjection,
+};
 use super::{
     ManifestBoundNanoAgentPolicyConfigV3, NanoRgbExpressionConfig, RgbExpressionBridge,
     RgbExpressionBridgeError,
@@ -86,7 +92,7 @@ use super::{
 #[cfg(feature = "nano-agent")]
 use crate::{
     ChannelCapacity, ChannelStats, ChannelStatsHandle, DropPolicy, DropReceiver, DropSender,
-    SendOutcome, bounded_channel,
+    IntrinsicsError, PinholeIntrinsics, SendOutcome, bounded_channel,
 };
 
 /// A health cadence long enough to avoid a zero-duration busy loop and short
@@ -345,6 +351,8 @@ pub struct NanoAccessoryWorkerConfig {
     rgb_expression: NanoRgbExpressionConfig,
     stream_epoch: StreamEpochId,
     health_period: NanoAccessoryHealthPeriod,
+    #[cfg(feature = "nano-agent")]
+    head_gaze_diagnostics: Option<HeadGazeFaceProposalAdapter>,
 }
 
 impl NanoAccessoryWorkerConfig {
@@ -383,7 +391,61 @@ impl NanoAccessoryWorkerConfig {
             rgb_expression,
             stream_epoch,
             health_period,
+            #[cfg(feature = "nano-agent")]
+            head_gaze_diagnostics: None,
         })
+    }
+
+    /// Attach a parsed proposal-only policy to the non-actuating face
+    /// diagnostic lane.
+    ///
+    /// This does not configure the head actor for gaze, issue a base-zero
+    /// lease, or expose a serial head command. A physical-review lifecycle is
+    /// rejected here because this lane has no retained physical-review
+    /// evidence to cross-bind.
+    #[cfg(feature = "nano-agent")]
+    pub fn with_proposal_only_head_gaze_diagnostics(
+        mut self,
+        policy: HeadGazePolicyV1,
+    ) -> Result<Self, NanoHeadGazeDiagnosticConfigError> {
+        if !matches!(
+            policy.lifecycle(),
+            HeadGazePolicyLifecycleClaim::ProposalOnly(_)
+        ) {
+            return Err(NanoHeadGazeDiagnosticConfigError::NotProposalOnly);
+        }
+        self.head_gaze_diagnostics = Some(
+            HeadGazeFaceProposalAdapter::try_new(policy)
+                .map_err(NanoHeadGazeDiagnosticConfigError::Adapter)?,
+        );
+        Ok(self)
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NanoHeadGazeDiagnosticConfigError {
+    NotProposalOnly,
+    Adapter(HeadGazeFaceProposalAdapterError),
+}
+
+#[cfg(feature = "nano-agent")]
+impl fmt::Display for NanoHeadGazeDiagnosticConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "head-gaze proposal diagnostics are not configured: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl std::error::Error for NanoHeadGazeDiagnosticConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Adapter(source) => Some(source),
+            Self::NotProposalOnly => None,
+        }
     }
 }
 
@@ -972,29 +1034,134 @@ struct NanoFaceTrackedRgbFrame {
     output: NanoFacePerceptionOutput,
 }
 
+/// Exact same-frame RGB projection metadata used by one diagnostic proposal.
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NanoHeadGazeRgbProjectionEvidence {
+    fx_px: f32,
+    fy_px: f32,
+    cx_px: f32,
+    cy_px: f32,
+    width_px: u32,
+    height_px: u32,
+}
+
+#[cfg(feature = "nano-agent")]
+impl NanoHeadGazeRgbProjectionEvidence {
+    fn from_frame(frame: &ImageFrame) -> Self {
+        let intrinsics = frame.intrinsics();
+        Self {
+            fx_px: intrinsics.fx(),
+            fy_px: intrinsics.fy(),
+            cx_px: intrinsics.cx(),
+            cy_px: intrinsics.cy(),
+            width_px: intrinsics.width(),
+            height_px: intrinsics.height(),
+        }
+    }
+
+    pub const fn coefficients_px(self) -> [f32; 4] {
+        [self.fx_px, self.fy_px, self.cx_px, self.cy_px]
+    }
+
+    pub const fn dimensions_px(self) -> [u32; 2] {
+        [self.width_px, self.height_px]
+    }
+}
+
+/// Per-frame proposal failure. Every value remains diagnostic-only.
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NanoHeadGazeDiagnosticError {
+    ProjectionGridMismatch {
+        frame_width_px: u32,
+        frame_height_px: u32,
+        intrinsic_width_px: u32,
+        intrinsic_height_px: u32,
+    },
+    Intrinsics(IntrinsicsError),
+    Proposal(HeadGazeFaceProposalError),
+}
+
+/// Truthful disposition of the physical head-gaze path.
+///
+/// The only current value is intentionally negative. No code in this worker
+/// can construct the actor's opaque base-zero lease, so a proposal can never
+/// become a serial transaction here.
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NanoHeadGazeActuationAvailability {
+    UnavailableWithoutBaseZeroExclusiveLease,
+}
+
+/// One same-frame head-gaze diagnostic.
+///
+/// `ProposalOnly` records the exact face-tracker clock sample and RGB
+/// intrinsics used by the typed adapter. It is historical observability, not a
+/// live command or evidence that the target remained fresh after publication.
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NanoHeadGazeDiagnostic {
+    DisabledNoPolicy {
+        actuation: NanoHeadGazeActuationAvailability,
+    },
+    ProposalOnly {
+        evaluated_at: MonotonicTimestamp,
+        projection: NanoHeadGazeRgbProjectionEvidence,
+        outcome: Result<HeadGazeFaceProposalOutcome, NanoHeadGazeDiagnosticError>,
+        actuation: NanoHeadGazeActuationAvailability,
+    },
+}
+
+#[cfg(feature = "nano-agent")]
+impl NanoHeadGazeDiagnostic {
+    pub const fn actuation(self) -> NanoHeadGazeActuationAvailability {
+        match self {
+            Self::DisabledNoPolicy { actuation } | Self::ProposalOnly { actuation, .. } => {
+                actuation
+            }
+        }
+    }
+
+    pub const fn outcome(
+        self,
+    ) -> Option<Result<HeadGazeFaceProposalOutcome, NanoHeadGazeDiagnosticError>> {
+        match self {
+            Self::DisabledNoPolicy { .. } => None,
+            Self::ProposalOnly { outcome, .. } => Some(outcome),
+        }
+    }
+}
+
 /// Copy-only face metadata derived from the exact authoritative RGB frame.
 ///
 /// This contains no pixels and grants no actuation authority. A diagnostic
 /// consumer must join it to an RGB visualization only through the exact OAK
 /// provenance key; a merely "latest" image may describe another capture.
 #[cfg(feature = "nano-agent")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NanoFaceDiagnosticFrame {
     provenance: OakFaceFrameProvenance,
     output: NanoFacePerceptionOutput,
     accessory_observed_at: MonotonicTimestamp,
     accessory_source_deadline: Deadline,
+    head_gaze: NanoHeadGazeDiagnostic,
 }
 
 #[cfg(feature = "nano-agent")]
 impl NanoFaceDiagnosticFrame {
-    fn from_parsed(frame: &ParsedIngressRgbFrame, output: NanoFacePerceptionOutput) -> Self {
+    fn from_parsed(
+        frame: &ParsedIngressRgbFrame,
+        output: NanoFacePerceptionOutput,
+        head_gaze: NanoHeadGazeDiagnostic,
+    ) -> Self {
         let freshness = frame.observation().freshness();
         Self {
             provenance: OakFaceFrameProvenance::from_frame(frame.frame()),
             output,
             accessory_observed_at: freshness.observed_at(),
             accessory_source_deadline: freshness.valid_until_exclusive(),
+            head_gaze,
         }
     }
 
@@ -1018,6 +1185,11 @@ impl NanoFaceDiagnosticFrame {
     pub const fn accessory_source_deadline(self) -> Deadline {
         self.accessory_source_deadline
     }
+
+    /// Proposal-only head-gaze result for this exact frame.
+    pub const fn head_gaze(self) -> NanoHeadGazeDiagnostic {
+        self.head_gaze
+    }
 }
 
 #[cfg(feature = "nano-agent")]
@@ -1038,6 +1210,10 @@ impl NanoFaceDiagnosticStatsHandle {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NanoFacePerceptionStageStats {
     pub results_produced: u64,
+    pub head_gaze_disabled_no_policy: u64,
+    pub head_gaze_proposed: u64,
+    pub head_gaze_withheld: u64,
+    pub head_gaze_rejected: u64,
     pub handoff_enqueued: u64,
     pub handoff_replaced_older: u64,
     pub handoff_terminal_pending: u64,
@@ -1067,6 +1243,10 @@ impl NanoFacePerceptionStageStatsHandle {
 #[derive(Debug)]
 struct NanoFacePerceptionStageCounters {
     results_produced: AtomicU64,
+    head_gaze_disabled_no_policy: AtomicU64,
+    head_gaze_proposed: AtomicU64,
+    head_gaze_withheld: AtomicU64,
+    head_gaze_rejected: AtomicU64,
     handoff_enqueued: AtomicU64,
     handoff_replaced_older: AtomicU64,
     handoff_terminal_pending: AtomicU64,
@@ -1080,6 +1260,10 @@ impl NanoFacePerceptionStageCounters {
     fn new() -> Self {
         Self {
             results_produced: AtomicU64::new(0),
+            head_gaze_disabled_no_policy: AtomicU64::new(0),
+            head_gaze_proposed: AtomicU64::new(0),
+            head_gaze_withheld: AtomicU64::new(0),
+            head_gaze_rejected: AtomicU64::new(0),
             handoff_enqueued: AtomicU64::new(0),
             handoff_replaced_older: AtomicU64::new(0),
             handoff_terminal_pending: AtomicU64::new(0),
@@ -1091,6 +1275,24 @@ impl NanoFacePerceptionStageCounters {
 
     fn record_result(&self) {
         saturating_increment(&self.results_produced);
+    }
+
+    fn record_head_gaze(&self, diagnostic: NanoHeadGazeDiagnostic) {
+        let counter = match diagnostic {
+            NanoHeadGazeDiagnostic::DisabledNoPolicy { .. } => &self.head_gaze_disabled_no_policy,
+            NanoHeadGazeDiagnostic::ProposalOnly {
+                outcome: Ok(HeadGazeFaceProposalOutcome::Proposed(_)),
+                ..
+            } => &self.head_gaze_proposed,
+            NanoHeadGazeDiagnostic::ProposalOnly {
+                outcome: Ok(HeadGazeFaceProposalOutcome::Withheld(_)),
+                ..
+            } => &self.head_gaze_withheld,
+            NanoHeadGazeDiagnostic::ProposalOnly {
+                outcome: Err(_), ..
+            } => &self.head_gaze_rejected,
+        };
+        saturating_increment(counter);
     }
 
     fn record_handoff(&self, outcome: NanoAccessoryFrameSubmitOutcome) {
@@ -1112,6 +1314,10 @@ impl NanoFacePerceptionStageCounters {
     fn snapshot(&self) -> NanoFacePerceptionStageStats {
         NanoFacePerceptionStageStats {
             results_produced: self.results_produced.load(Ordering::Relaxed),
+            head_gaze_disabled_no_policy: self.head_gaze_disabled_no_policy.load(Ordering::Relaxed),
+            head_gaze_proposed: self.head_gaze_proposed.load(Ordering::Relaxed),
+            head_gaze_withheld: self.head_gaze_withheld.load(Ordering::Relaxed),
+            head_gaze_rejected: self.head_gaze_rejected.load(Ordering::Relaxed),
             handoff_enqueued: self.handoff_enqueued.load(Ordering::Relaxed),
             handoff_replaced_older: self.handoff_replaced_older.load(Ordering::Relaxed),
             handoff_terminal_pending: self.handoff_terminal_pending.load(Ordering::Relaxed),
@@ -2363,7 +2569,7 @@ impl NanoAccessoryWorker {
     /// timeout/detachment evidence; a native call is never claimed cancelled.
     #[cfg(feature = "nano-agent")]
     pub(super) fn start_with_face_perception(
-        config: NanoAccessoryWorkerConfig,
+        mut config: NanoAccessoryWorkerConfig,
         assets: NanoFacePerceptionAssets,
     ) -> Result<Self, NanoAccessoryWorkerStartError> {
         let detector_config = canonical_nano_face_detector_config()
@@ -2393,6 +2599,7 @@ impl NanoAccessoryWorker {
         let face_clock = expression_clock.clone();
         let stream_epoch = config.stream_epoch;
         let freshness = config.rgb_expression.frame_freshness();
+        let head_gaze_diagnostics = config.head_gaze_diagnostics.take();
         let face_thread = thread::Builder::new()
             .name("kiko-nano-face-perception".into())
             .spawn(move || {
@@ -2409,6 +2616,7 @@ impl NanoAccessoryWorker {
                     face_thread_diagnostics_active,
                     face_thread_stage_counters,
                     face_startup_tx,
+                    head_gaze_diagnostics,
                 )
             })
             .map_err(NanoAccessoryWorkerStartError::FacePerceptionThreadSpawn)?;
@@ -2780,6 +2988,67 @@ fn join_face_perception_thread_bounded(
     )
 }
 
+#[cfg(feature = "nano-agent")]
+fn evaluate_head_gaze_diagnostic(
+    adapter: Option<&HeadGazeFaceProposalAdapter>,
+    frame: &ParsedIngressRgbFrame,
+    output: NanoFacePerceptionOutput,
+) -> NanoHeadGazeDiagnostic {
+    let actuation = NanoHeadGazeActuationAvailability::UnavailableWithoutBaseZeroExclusiveLease;
+    let Some(adapter) = adapter else {
+        return NanoHeadGazeDiagnostic::DisabledNoPolicy { actuation };
+    };
+
+    let observation = frame.observation();
+    let layout = observation.layout();
+    let oak_intrinsics = frame.frame().intrinsics();
+    let projection_evidence = NanoHeadGazeRgbProjectionEvidence::from_frame(frame.frame());
+    let evaluated_at = output.tracked_at();
+    if oak_intrinsics.width() != layout.width_px() || oak_intrinsics.height() != layout.height_px()
+    {
+        return NanoHeadGazeDiagnostic::ProposalOnly {
+            evaluated_at,
+            projection: projection_evidence,
+            outcome: Err(NanoHeadGazeDiagnosticError::ProjectionGridMismatch {
+                frame_width_px: layout.width_px(),
+                frame_height_px: layout.height_px(),
+                intrinsic_width_px: oak_intrinsics.width(),
+                intrinsic_height_px: oak_intrinsics.height(),
+            }),
+            actuation,
+        };
+    }
+    let intrinsics = match PinholeIntrinsics::try_new(
+        oak_intrinsics.fx(),
+        oak_intrinsics.fy(),
+        oak_intrinsics.cx(),
+        oak_intrinsics.cy(),
+    ) {
+        Ok(intrinsics) => intrinsics,
+        Err(source) => {
+            return NanoHeadGazeDiagnostic::ProposalOnly {
+                evaluated_at,
+                projection: projection_evidence,
+                outcome: Err(NanoHeadGazeDiagnosticError::Intrinsics(source)),
+                actuation,
+            };
+        }
+    };
+    let outcome = adapter
+        .evaluate(
+            output.tracking(),
+            evaluated_at,
+            RgbFacePinholeProjection::new(intrinsics, layout),
+        )
+        .map_err(NanoHeadGazeDiagnosticError::Proposal);
+    NanoHeadGazeDiagnostic::ProposalOnly {
+        evaluated_at,
+        projection: projection_evidence,
+        outcome,
+        actuation,
+    }
+}
+
 /// Last-resort ownership closure around the entire face OS-thread body.
 ///
 /// The inner `catch_unwind` translates detector/body panics into a typed
@@ -2853,6 +3122,7 @@ fn run_face_perception_thread_catching_panics(
     diagnostics_active: Arc<AtomicBool>,
     stage_counters: Arc<NanoFacePerceptionStageCounters>,
     startup_tx: std::sync::mpsc::SyncSender<FacePerceptionStartupSignal>,
+    head_gaze_diagnostics: Option<HeadGazeFaceProposalAdapter>,
 ) -> NanoFacePerceptionThreadExit {
     let lifecycle_guard =
         NanoFacePerceptionThreadLifecycleGuard::new(Arc::clone(&input), Arc::clone(&output));
@@ -2873,6 +3143,7 @@ fn run_face_perception_thread_catching_panics(
             diagnostics_active,
             stage_counters,
             startup_tx,
+            head_gaze_diagnostics,
         )
     }))
     .unwrap_or_else(|_| {
@@ -2903,6 +3174,7 @@ fn run_face_perception_thread(
     diagnostics_active: Arc<AtomicBool>,
     stage_counters: Arc<NanoFacePerceptionStageCounters>,
     startup_tx: std::sync::mpsc::SyncSender<FacePerceptionStartupSignal>,
+    head_gaze_diagnostics: Option<HeadGazeFaceProposalAdapter>,
 ) -> NanoFacePerceptionThreadExit {
     let mut diagnostic_tx = Some(diagnostic_tx);
     let asset_evidence = assets.evidence();
@@ -2983,7 +3255,14 @@ fn run_face_perception_thread(
             }
         };
         stage_counters.record_result();
-        let diagnostic = NanoFaceDiagnosticFrame::from_parsed(&parsed, perception_output);
+        let head_gaze = evaluate_head_gaze_diagnostic(
+            head_gaze_diagnostics.as_ref(),
+            &parsed,
+            perception_output,
+        );
+        stage_counters.record_head_gaze(head_gaze);
+        let diagnostic =
+            NanoFaceDiagnosticFrame::from_parsed(&parsed, perception_output, head_gaze);
         let outcome = output.submit_unmetered(Ok(NanoFaceTrackedRgbFrame {
             frame: parsed,
             output: perception_output,
@@ -3939,6 +4218,59 @@ mod tests {
             config.maximum_retained_detections(),
             u32::try_from(MAX_FACE_DETECTIONS).unwrap()
         );
+    }
+
+    #[cfg(feature = "nano-agent")]
+    #[test]
+    fn concurrent_head_gaze_diagnostic_health_accounting_is_exact_and_disjoint() {
+        const UPDATES_PER_CLASS: u64 = 1_000;
+        let counters = Arc::new(NanoFacePerceptionStageCounters::new());
+        let actuation = NanoHeadGazeActuationAvailability::UnavailableWithoutBaseZeroExclusiveLease;
+        let projection = NanoHeadGazeRgbProjectionEvidence {
+            fx_px: 398.0,
+            fy_px: 399.0,
+            cx_px: 319.5,
+            cy_px: 199.5,
+            width_px: 640,
+            height_px: 400,
+        };
+        let disabled = NanoHeadGazeDiagnostic::DisabledNoPolicy { actuation };
+        let withheld = NanoHeadGazeDiagnostic::ProposalOnly {
+            evaluated_at: MonotonicTimestamp::from_nanos_since_epoch(10),
+            projection,
+            outcome: Ok(HeadGazeFaceProposalOutcome::Withheld(
+                crate::navigation::HeadGazeFaceProposalWithheld::NoTarget,
+            )),
+            actuation,
+        };
+        let rejected = NanoHeadGazeDiagnostic::ProposalOnly {
+            evaluated_at: MonotonicTimestamp::from_nanos_since_epoch(11),
+            projection,
+            outcome: Err(NanoHeadGazeDiagnosticError::ProjectionGridMismatch {
+                frame_width_px: 640,
+                frame_height_px: 400,
+                intrinsic_width_px: 320,
+                intrinsic_height_px: 200,
+            }),
+            actuation,
+        };
+
+        thread::scope(|scope| {
+            for diagnostic in [disabled, withheld, rejected] {
+                let counters = Arc::clone(&counters);
+                scope.spawn(move || {
+                    for _ in 0..UPDATES_PER_CLASS {
+                        counters.record_head_gaze(diagnostic);
+                    }
+                });
+            }
+        });
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.head_gaze_disabled_no_policy, UPDATES_PER_CLASS);
+        assert_eq!(snapshot.head_gaze_withheld, UPDATES_PER_CLASS);
+        assert_eq!(snapshot.head_gaze_rejected, UPDATES_PER_CLASS);
+        assert_eq!(snapshot.head_gaze_proposed, 0);
     }
 
     #[cfg(feature = "nano-agent")]

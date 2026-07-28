@@ -592,7 +592,7 @@ macro_rules! metric_range {
 metric_range!(
     HeightRangeMeters,
     HeightRangeError,
-    "occupancy height range",
+    "floor-relative occupancy height range",
     false
 );
 metric_range!(

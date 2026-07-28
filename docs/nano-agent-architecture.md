@@ -270,19 +270,27 @@ behavior, voltage/temperature
 limits, process-kill behavior, and safe natural-pose approach have been
 qualified on this assembly.
 
-The production start window is the exact per-joint union of the evidenced
-return-start envelope and the reviewed natural target plus/minus its 20-tick
-readback tolerance:
-`[2135..2227,2525..2592,2842..2963,2856..2922]`. Policy parsing rejects a
-window which excludes any part of the reviewed hold envelope or widens beyond
-the evidenced union. The production head handle has no torque-disable
-operation. A terminal health/accessory fault stops the base/eye path but keeps
-the head owner and hold alive. A startup fault closes ownership without
-altering or claiming the prior servo state. Return faults, handle loss, and
-ordinary process or systemd shutdown preserve the last admitted goal while
-eventually releasing serial ownership without a torque-switch write. That is
-not torque readback: power loss, servo protection, or another bus owner can
-still release the neck. Intentional torque release remains a separately
+The superseding production target is the operator-confirmed bow/curl/yaw/roll
+pose `[2174,2570,1637,3047]`. Its start window is the exact per-joint union of
+that target plus/minus 20 ticks and the five-sample canonical stopped pose
+`[2153,2640,1832,3043]` plus/minus 20 ticks:
+`[2133..2194,2550..2660,1617..1852,3023..3067]`. Policy parsing rejects a
+window which excludes any part of the target tolerance or widens beyond that
+union. It also requires the exact software travel caps `[48,96,224,32]`,
+which cover the respective worst admitted start-to-target distances
+`[41,90,215,24]`. Neither the admission window nor those caps claim a
+mechanical envelope or a completed Kiko motion qualification; the bounded
+evidence and claim limits are recorded in
+`docs/nano-head-neutral-policy-2026-07-29.md`.
+
+The production head handle has no torque-disable operation. A terminal
+health/accessory fault stops the base/eye path but keeps the head owner and
+hold alive. A startup fault closes ownership without altering or claiming the
+prior servo state. Return faults, handle loss, and ordinary process or systemd
+shutdown preserve the last admitted goal while eventually releasing serial
+ownership without a torque-switch write. That is not torque readback: power
+loss, servo protection, or another bus owner can still release the neck.
+Intentional torque release remains a separately
 supported commissioning action.
 
 ## Rerun and control adapters

@@ -349,6 +349,70 @@ assert.equal(model.connectionView("stale").telemetryPrefix, "stale");
 assert.match(model.connectionView("disconnected").overlay, /MAP FROZEN/);
 
 {
+  assert.deepEqual(
+    model.qualificationMotionSessionDecision(true, true, false),
+    {
+      freshSessionRequired: true,
+      clearHeldInputBeforeHandshake: true,
+    },
+    "the pending-generation session must be replaced only after held input is cleared",
+  );
+  for (const inputs of [
+    [true, false, false],
+    [true, true, true],
+    [false, true, false],
+  ]) {
+    assert.equal(
+      model.qualificationMotionSessionDecision(...inputs).freshSessionRequired,
+      false,
+    );
+  }
+}
+
+{
+  const previous = {
+    sessionId: "7",
+    sessionCapability: "11".repeat(32),
+  };
+  const replacement = {
+    sessionId: "8",
+    sessionCapability: "22".repeat(32),
+  };
+  const swap = model.qualificationMotionSessionSwap(previous, replacement);
+  assert.deepEqual(swap.activeSession, replacement);
+  assert.deepEqual(swap.retiringSession, previous);
+  assert.notEqual(swap.activeSession, replacement);
+  assert.notEqual(swap.retiringSession, previous);
+  assert(Object.isFrozen(swap));
+  assert(Object.isFrozen(swap.activeSession));
+  assert(Object.isFrozen(swap.retiringSession));
+  assert.throws(
+    () => model.qualificationMotionSessionSwap(previous, previous),
+    /replacement session must be fresh/,
+  );
+}
+
+{
+  const decision = (overrides) => model.softwareSafetyStopRetryDecision({
+    attempt: 1,
+    maximumAttempts: 4,
+    confirmed: false,
+    retryable: true,
+    consoleUnlocked: true,
+    ...overrides,
+  });
+  assert.equal(decision({ confirmed: true }), "confirmed");
+  assert.equal(decision({}), "retry");
+  assert.equal(decision({ attempt: 4 }), "unavailable");
+  assert.equal(decision({ retryable: false }), "unavailable");
+  assert.equal(decision({ consoleUnlocked: false }), "unavailable");
+  assert.throws(
+    () => decision({ attempt: 0 }),
+    /retry attempt is invalid/,
+  );
+}
+
+{
   // Wire row zero is minimum map Y. The model deliberately does not invert Y;
   // inversion is only a canvas presentation concern.
   const cells = new Uint8Array([1, 2, 0, 1]);

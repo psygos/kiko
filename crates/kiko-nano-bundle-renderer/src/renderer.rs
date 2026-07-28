@@ -582,7 +582,7 @@ fn render_non_launch_files(
     ));
     staged.push(StagedFile::retained(
         "navigation_shadow",
-        "navigation-shadow-v1.json",
+        "navigation-shadow-v2.json",
         loaded.navigation_shadow,
     ));
     staged.push(StagedFile::retained(
@@ -927,7 +927,7 @@ fn render_navigation_actuation(
     staged: &[StagedFile],
     production: &ProductionControllerProfile,
 ) -> Result<StagedFile, RenderError> {
-    let navigation = find_staged(staged, "navigation-shadow-v1.json")?;
+    let navigation = find_staged(staged, "navigation-shadow-v2.json")?;
     let plant = find_staged(
         staged,
         input.assets.plant.destination_relative_path.as_str(),
@@ -1144,7 +1144,7 @@ fn render_launch(
     production: Option<&ProductionControllerProfile>,
 ) -> Result<StagedFile, RenderError> {
     let agent_policy = find_staged(staged, "agent-policy-v3.json")?;
-    let navigation = find_staged(staged, "navigation-shadow-v1.json")?;
+    let navigation = find_staged(staged, "navigation-shadow-v2.json")?;
     let calibration = find_staged(
         staged,
         input.assets.calibration.destination_relative_path.as_str(),
@@ -1386,7 +1386,7 @@ fn render_evidence_manifest(
         SourceEvidence::from_staged_source(
             "navigation_shadow",
             input.assets.navigation_shadow_source_path.as_path(),
-            "navigation-shadow-v1.json",
+            "navigation-shadow-v2.json",
             staged,
         )?,
         SourceEvidence::from_staged_source(
@@ -1616,7 +1616,7 @@ fn validate_rendered_tree(
         staged,
         input.assets.plant.destination_relative_path.as_str(),
     )?;
-    let navigation = find_staged(staged, "navigation-shadow-v1.json")?;
+    let navigation = find_staged(staged, "navigation-shadow-v2.json")?;
     match input.bundle {
         BundleSelection::WheelsOffQualification { .. } => {
             let controller = find_staged(staged, "controller-server-candidate-v2.json")?;

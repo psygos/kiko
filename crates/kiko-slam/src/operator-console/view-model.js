@@ -910,6 +910,79 @@
       : `request timed out after ${timeoutMilliseconds} ms while reading response`;
   }
 
+  function qualificationMotionSessionDecision(
+    qualification,
+    motionReady,
+    sessionMotionAuthorityCurrent,
+  ) {
+    for (const [field, value] of [
+      ["qualification", qualification],
+      ["motionReady", motionReady],
+      ["sessionMotionAuthorityCurrent", sessionMotionAuthorityCurrent],
+    ]) {
+      if (typeof value !== "boolean") {
+        throw new Error(`qualification motion session ${field} must be boolean`);
+      }
+    }
+    const freshSessionRequired =
+      qualification && motionReady && !sessionMotionAuthorityCurrent;
+    return Object.freeze({
+      freshSessionRequired,
+      clearHeldInputBeforeHandshake: freshSessionRequired,
+    });
+  }
+
+  function parsedConsoleSession(value, label) {
+    if (value == null || typeof value !== "object" || Array.isArray(value)
+      || typeof value.sessionId !== "string"
+      || !DECIMAL_ID.test(value.sessionId)
+      || typeof value.sessionCapability !== "string"
+      || !/^[0-9a-f]{64}$/.test(value.sessionCapability)) {
+      throw new Error(`${label} console session is invalid`);
+    }
+    return Object.freeze({
+      sessionId: value.sessionId,
+      sessionCapability: value.sessionCapability,
+    });
+  }
+
+  function qualificationMotionSessionSwap(previous, replacement) {
+    const retiringSession = parsedConsoleSession(previous, "previous");
+    const activeSession = parsedConsoleSession(replacement, "replacement");
+    if (retiringSession.sessionId === activeSession.sessionId) {
+      throw new Error("qualification replacement session must be fresh");
+    }
+    return Object.freeze({ activeSession, retiringSession });
+  }
+
+  function softwareSafetyStopRetryDecision({
+    attempt,
+    maximumAttempts,
+    confirmed,
+    retryable,
+    consoleUnlocked,
+  }) {
+    if (!Number.isInteger(attempt) || attempt < 1
+      || !Number.isInteger(maximumAttempts) || maximumAttempts < 1
+      || attempt > maximumAttempts) {
+      throw new Error("software safety-stop retry attempt is invalid");
+    }
+    for (const [field, value] of [
+      ["confirmed", confirmed],
+      ["retryable", retryable],
+      ["consoleUnlocked", consoleUnlocked],
+    ]) {
+      if (typeof value !== "boolean") {
+        throw new Error(`software safety-stop ${field} must be boolean`);
+      }
+    }
+    if (confirmed) return "confirmed";
+    if (!consoleUnlocked || !retryable || attempt === maximumAttempts) {
+      return "unavailable";
+    }
+    return "retry";
+  }
+
   function frozenTerminalStopState(nextStep, completed) {
     const state = Object.freeze({ nextStep, completed });
     TERMINAL_STOP_STATES.add(state);
@@ -960,6 +1033,9 @@
     faultView,
     physicalStopView,
     qualificationMotionView,
+    qualificationMotionSessionDecision,
+    qualificationMotionSessionSwap,
+    softwareSafetyStopRetryDecision,
     cellAt,
     driveSafety,
   });

@@ -2241,10 +2241,21 @@ mod tests {
         assert!(APP_JS.contains("LOCAL BROWSER CONTROLS INHIBITED. Server latch is unconfirmed"));
         assert!(APP_JS.contains("snapshot?.software_safety_signal_state"));
         assert!(APP_JS.contains("runtime_drained_awaiting_completion:"));
-        assert!(safety_handler.contains("await submit({ kind: \"software_safety_stop\" });"));
+        assert!(safety_handler.contains("await submitSoftwareSafetyStopUntilResolved();"));
+        let retry_start = APP_JS
+            .find("async function submitSoftwareSafetyStopUntilResolved()")
+            .expect("bounded software safety-stop retry helper");
+        let retry_end = APP_JS[retry_start..]
+            .find("\n  function renderSafetyState(")
+            .map(|offset| retry_start + offset)
+            .expect("software safety-stop retry helper boundary");
+        let retry = &APP_JS[retry_start..retry_end];
+        assert!(retry.contains("await submit({ kind: \"software_safety_stop\" });"));
+        assert!(retry.contains("SOFTWARE_SAFETY_STOP_MAX_ATTEMPTS"));
+        assert!(retry.contains("softwareSafetyStopRetryDecision"));
         assert!(APP_JS.contains("class ApiError extends Error"));
-        assert!(safety_handler.contains("error.status === 423"));
-        assert!(safety_handler.contains("error.code === \"software_safety_stop_latched\""));
+        assert!(APP_JS.contains("error.status === 423"));
+        assert!(APP_JS.contains("error.code === \"software_safety_stop_latched\""));
         assert!(safety_handler.contains("state.lastResponseId = null;"));
         assert!(safety_handler.contains("already latched outside this session"));
         assert!(safety_handler.contains("no session-scoped receipt"));

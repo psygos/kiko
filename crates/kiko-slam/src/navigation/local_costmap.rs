@@ -22,9 +22,7 @@
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use crate::dense::occupancy::{
-    DepthCameraModel, DepthRangeMeters, HeightRangeMeters, OccupancyGridGeometry,
-};
+use crate::dense::occupancy::{DepthCameraModel, DepthRangeMeters, OccupancyGridGeometry};
 use crate::{
     DepthImage, DepthObservation, DeviceSessionId, DeviceTimestamp, FrameDimensions, FrameId,
     HostMonotonicTimestamp, Pose,
@@ -60,13 +58,83 @@ impl TrackingCameraToBase {
     }
 }
 
+/// Closed obstacle-height slab in the robot base frame, in metres.
+///
+/// The base origin is the drive-wheel axle midpoint and `+z` points up. This
+/// type is intentionally distinct from the floor-relative occupancy height
+/// range: passing one frame's scalar bounds to the other mapper is a type
+/// error.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BaseZRangeMeters {
+    minimum_m: f64,
+    maximum_m: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BaseZRangeError {
+    NonFinite { minimum_m: f64, maximum_m: f64 },
+    InvalidOrder { minimum_m: f64, maximum_m: f64 },
+}
+
+impl std::fmt::Display for BaseZRangeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite {
+                minimum_m,
+                maximum_m,
+            } => write!(
+                formatter,
+                "base-frame obstacle z bounds must be finite metres, got [{minimum_m}, {maximum_m}]"
+            ),
+            Self::InvalidOrder {
+                minimum_m,
+                maximum_m,
+            } => write!(
+                formatter,
+                "base-frame obstacle z range requires minimum < maximum, got [{minimum_m}, {maximum_m}]"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BaseZRangeError {}
+
+impl BaseZRangeMeters {
+    pub fn try_new(minimum_m: f64, maximum_m: f64) -> Result<Self, BaseZRangeError> {
+        if !minimum_m.is_finite() || !maximum_m.is_finite() {
+            return Err(BaseZRangeError::NonFinite {
+                minimum_m,
+                maximum_m,
+            });
+        }
+        if minimum_m >= maximum_m {
+            return Err(BaseZRangeError::InvalidOrder {
+                minimum_m,
+                maximum_m,
+            });
+        }
+        Ok(Self {
+            minimum_m,
+            maximum_m,
+        })
+    }
+
+    pub fn minimum_m(self) -> f64 {
+        self.minimum_m
+    }
+
+    pub fn maximum_m(self) -> f64 {
+        self.maximum_m
+    }
+}
+
 /// Configuration parsed into bounded, finite domain values.
 #[derive(Clone, Debug)]
 pub struct LocalCostmapConfig {
     geometry: OccupancyGridGeometry,
     camera: DepthCameraModel,
     tracking_to_base: TrackingCameraToBase,
-    obstacle_height_range: HeightRangeMeters,
+    obstacle_base_z_range: BaseZRangeMeters,
     depth_range: DepthRangeMeters,
     sampling_block: NonZeroU32,
     footprint_radius_m: f64,
@@ -159,7 +227,7 @@ impl LocalCostmapConfig {
         geometry: OccupancyGridGeometry,
         camera: DepthCameraModel,
         tracking_to_base: TrackingCameraToBase,
-        obstacle_height_range: HeightRangeMeters,
+        obstacle_base_z_range: BaseZRangeMeters,
         depth_range: DepthRangeMeters,
         sampling_block: u32,
         footprint_radius_m: f64,
@@ -215,7 +283,7 @@ impl LocalCostmapConfig {
             geometry,
             camera,
             tracking_to_base,
-            obstacle_height_range,
+            obstacle_base_z_range,
             depth_range,
             sampling_block,
             footprint_radius_m,
@@ -237,8 +305,8 @@ impl LocalCostmapConfig {
         self.tracking_to_base
     }
 
-    pub fn obstacle_height_range(&self) -> HeightRangeMeters {
-        self.obstacle_height_range
+    pub fn obstacle_base_z_range(&self) -> BaseZRangeMeters {
+        self.obstacle_base_z_range
     }
 
     pub fn depth_range(&self) -> DepthRangeMeters {
@@ -1126,8 +1194,8 @@ impl LocalCostmap {
                 let endpoint = self.depth_to_base.transform_point(optical);
                 validate_projected_point(endpoint)?;
                 self.mark_free_ray(origin, endpoint)?;
-                if endpoint[2] >= self.config.obstacle_height_range.minimum_m()
-                    && endpoint[2] <= self.config.obstacle_height_range.maximum_m()
+                if endpoint[2] >= self.config.obstacle_base_z_range.minimum_m()
+                    && endpoint[2] <= self.config.obstacle_base_z_range.maximum_m()
                     && let Some(index) =
                         self.config.geometry.point_index([endpoint[0], endpoint[1]])
                 {
@@ -1157,7 +1225,7 @@ impl LocalCostmap {
     ) -> Result<(), LocalCostmapError> {
         let Some(clipped) = clip_segment_to_obstacle_slab(
             self.config.geometry,
-            self.config.obstacle_height_range,
+            self.config.obstacle_base_z_range,
             origin,
             endpoint,
         )?
@@ -1360,7 +1428,7 @@ struct ClippedPlanarSegment {
 
 fn clip_segment_to_obstacle_slab(
     geometry: OccupancyGridGeometry,
-    height_range: HeightRangeMeters,
+    height_range: BaseZRangeMeters,
     origin: [f64; 3],
     endpoint: [f64; 3],
 ) -> Result<Option<ClippedPlanarSegment>, LocalCostmapError> {
@@ -1540,7 +1608,7 @@ mod tests {
             geometry,
             camera,
             optical_to_base(0.5),
-            HeightRangeMeters::try_new(0.1, 1.5).expect("height range"),
+            BaseZRangeMeters::try_new(0.1, 1.5).expect("base z range"),
             DepthRangeMeters::try_new(0.1, 8.0).expect("depth range"),
             sampling_block,
             footprint_radius_m,
@@ -1658,6 +1726,26 @@ mod tests {
     }
 
     #[test]
+    fn base_z_range_rejects_nonfinite_and_unordered_bounds() {
+        assert!(matches!(
+            BaseZRangeMeters::try_new(f64::NAN, 1.0),
+            Err(BaseZRangeError::NonFinite { .. })
+        ));
+        assert!(matches!(
+            BaseZRangeMeters::try_new(1.0, f64::INFINITY),
+            Err(BaseZRangeError::NonFinite { .. })
+        ));
+        assert!(matches!(
+            BaseZRangeMeters::try_new(1.0, 1.0),
+            Err(BaseZRangeError::InvalidOrder { .. })
+        ));
+        assert!(matches!(
+            BaseZRangeMeters::try_new(2.0, 1.0),
+            Err(BaseZRangeError::InvalidOrder { .. })
+        ));
+    }
+
+    #[test]
     fn config_rejects_invalid_si_values_and_unusable_bounds() {
         let valid = config_with(1, 1, 1, 0.1, 0.0, 1);
         for radius in [0.0, -1.0, f64::NAN, f64::INFINITY] {
@@ -1666,7 +1754,7 @@ mod tests {
                     valid.geometry,
                     valid.camera,
                     valid.tracking_to_base,
-                    valid.obstacle_height_range,
+                    valid.obstacle_base_z_range,
                     valid.depth_range,
                     1,
                     radius,
@@ -1682,7 +1770,7 @@ mod tests {
                     valid.geometry,
                     valid.camera,
                     valid.tracking_to_base,
-                    valid.obstacle_height_range,
+                    valid.obstacle_base_z_range,
                     valid.depth_range,
                     1,
                     0.1,
@@ -1697,7 +1785,7 @@ mod tests {
                 valid.geometry,
                 valid.camera,
                 valid.tracking_to_base,
-                valid.obstacle_height_range,
+                valid.obstacle_base_z_range,
                 valid.depth_range,
                 0,
                 0.1,
@@ -1711,7 +1799,7 @@ mod tests {
                 valid.geometry,
                 valid.camera,
                 valid.tracking_to_base,
-                valid.obstacle_height_range,
+                valid.obstacle_base_z_range,
                 valid.depth_range,
                 2,
                 0.1,
@@ -1725,7 +1813,7 @@ mod tests {
                 valid.geometry,
                 valid.camera,
                 valid.tracking_to_base,
-                valid.obstacle_height_range,
+                valid.obstacle_base_z_range,
                 valid.depth_range,
                 1,
                 0.1,
@@ -1739,7 +1827,7 @@ mod tests {
                 valid.geometry,
                 valid.camera,
                 valid.tracking_to_base,
-                valid.obstacle_height_range,
+                valid.obstacle_base_z_range,
                 valid.depth_range,
                 1,
                 0.1,
@@ -1756,7 +1844,7 @@ mod tests {
                 too_narrow,
                 valid.camera,
                 valid.tracking_to_base,
-                valid.obstacle_height_range,
+                valid.obstacle_base_z_range,
                 valid.depth_range,
                 1,
                 0.2,
@@ -1810,6 +1898,32 @@ mod tests {
             view.cell_at_local(point(2.0, -0.5)),
             LocalCostmapQuery::InBounds(LocalCostmapCell::Occupied),
             "positive tracking x must become negative base y after composition"
+        );
+    }
+
+    #[test]
+    fn closed_base_z_slab_includes_transformed_minimum_and_excludes_below_minimum() {
+        fn obstacle_endpoints_at_camera_height(camera_height_m: f32) -> usize {
+            let mut config = config_with(1, 1, 1, 0.1, 0.0, 100);
+            config.tracking_to_base = optical_to_base(camera_height_m);
+            config.obstacle_base_z_range =
+                BaseZRangeMeters::try_new(0.5, 1.0).expect("closed base-z slab");
+            let mut map = LocalCostmap::try_new(config, session(1)).expect("costmap");
+            let image = depth(1, 10, 1, 1, vec![2.0]);
+            match map.update(observation(&image, 20)).expect("update") {
+                LocalCostmapUpdateOutcome::Accepted {
+                    obstacle_endpoints, ..
+                } => obstacle_endpoints,
+                LocalCostmapUpdateOutcome::IgnoredDuplicate { .. } => {
+                    panic!("first observation cannot be a duplicate")
+                }
+            }
+        }
+
+        assert_eq!(obstacle_endpoints_at_camera_height(0.5), 1);
+        assert_eq!(
+            obstacle_endpoints_at_camera_height(f32::from_bits(0.5_f32.to_bits() - 1)),
+            0
         );
     }
 
@@ -2020,7 +2134,7 @@ mod tests {
     #[test]
     fn slab_clipping_rejects_nonfinite_intermediate_arithmetic() {
         let geometry = config_with(1, 1, 1, 0.1, 0.0, 100).geometry;
-        let height = HeightRangeMeters::try_new(0.1, 1.5).expect("height range");
+        let height = BaseZRangeMeters::try_new(0.1, 1.5).expect("base z range");
         assert!(matches!(
             clip_segment_to_obstacle_slab(
                 geometry,

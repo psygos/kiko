@@ -283,10 +283,11 @@ pub use live_mpc_control::{
     PendingLiveMpcAdmissionError, PendingLiveMpcAdmissionStop, PendingLiveMpcControlDriver,
 };
 pub use local_costmap::{
-    DepthFrameKey, LocalCostmap, LocalCostmapCell, LocalCostmapClockRegression, LocalCostmapConfig,
-    LocalCostmapConfigError, LocalCostmapCoordinateError, LocalCostmapError, LocalCostmapFreshness,
-    LocalCostmapProvenance, LocalCostmapQuery, LocalCostmapUpdateOutcome, LocalCostmapView,
-    LocalDepthObservation, LocalDepthObservationError, TrackingCameraToBase,
+    BaseZRangeError, BaseZRangeMeters, DepthFrameKey, LocalCostmap, LocalCostmapCell,
+    LocalCostmapClockRegression, LocalCostmapConfig, LocalCostmapConfigError,
+    LocalCostmapCoordinateError, LocalCostmapError, LocalCostmapFreshness, LocalCostmapProvenance,
+    LocalCostmapQuery, LocalCostmapUpdateOutcome, LocalCostmapView, LocalDepthObservation,
+    LocalDepthObservationError, TrackingCameraToBase,
 };
 pub use manual_drive::{
     BODY_VELOCITY_TARGET_V1, BodyVelocityTargetV1, FiniteManualVelocityParseError,
@@ -324,6 +325,8 @@ pub use nano_accessory_worker::{
     NanoFacePerceptionRuntimeError, NanoFacePerceptionShutdownClass,
     NanoFacePerceptionShutdownEvidence, NanoFacePerceptionStageStats,
     NanoFacePerceptionStageStatsHandle, NanoFacePerceptionThreadExit,
+    NanoHeadGazeActuationAvailability, NanoHeadGazeDiagnostic, NanoHeadGazeDiagnosticConfigError,
+    NanoHeadGazeDiagnosticError, NanoHeadGazeRgbProjectionEvidence,
 };
 #[cfg(all(
     feature = "agent-runtime",
@@ -433,8 +436,8 @@ pub use shadow_command::{
 };
 pub use shadow_config::{
     ControlPeriodNs, FreshnessParameter, MAX_COMMAND_LEASE_CONTROL_PERIODS,
-    MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES, SHADOW_NAVIGATION_CONFIG_V1,
-    ShadowNavigationConfigParseError, ShadowNavigationConfigV1, ShadowNavigationRuntimePartsV1,
+    MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES, SHADOW_NAVIGATION_CONFIG_V2,
+    ShadowNavigationConfigParseError, ShadowNavigationConfigV2, ShadowNavigationRuntimePartsV2,
 };
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 pub use wheels_off_candidate_actuation::{

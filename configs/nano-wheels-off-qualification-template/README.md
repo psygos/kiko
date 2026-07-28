@@ -49,8 +49,12 @@ asking deployment-time string replacement to make software-policy decisions:
 - Rerun is decimated by 2 with a 128 MiB memory bound and 2 s flush timeout;
 - map/dataset storage has explicit 64 MiB, 4 GiB, file-count, ingress-count,
   free-space, and terminal-reserve bounds; and
-- the previously reviewed natural-head and RGB-expression values are copied
-  exactly, including the operator-declared head origin
+- the superseding natural-head policy is copied exactly: operator-confirmed
+  target `[2174,2570,1637,3047]`, start bounds
+  `[2133,2550,1617,3023]..[2194,2660,1852,3067]`, software travel caps
+  `[48,96,224,32]`, and retained torque limits `[600,400,400,400]`, all in
+  bow/curl/yaw/roll order; and
+- the RGB-expression values retain the operator-declared head origin
   `[0.0,-0.25,-0.20] m` and parallel neutral axes.
 
 These are admission choices for an attended, wheels-off qualification. They
@@ -74,7 +78,7 @@ fixes only these currently declared facts:
 - a two-dimensional face ray uses an assumed `1.5 m` camera-forward focus
   plane, not observed range;
 - the natural encoder declaration is bow/curl/yaw/roll
-  `[2155, 2545, 2943, 2876]`; and
+  `[2174, 2570, 1637, 3047]`; and
 - the lifecycle is `proposal_only`.
 
 The assembly identifier, retained proposal-evidence identifier and digest,
@@ -101,7 +105,7 @@ head-gaze activation is not part of the wheels-off attachment gate.
 checked-in, qualification-shadow-only synthetic fixture. Its numeric values
 are test inputs, not measurements, physical identification, performance
 evidence, or permission to actuate. The explicitly non-calibrated
-`../navigation-shadow-v1.example.json` duplicates the same plant declaration
+`../navigation-shadow-v2.example.json` duplicates the same plant declaration
 and is parser-tested against this artifact. It is only an example: its
 identity camera/base transform and synthetic IMU calibration are not suitable
 for a rendered qualification bundle.
@@ -116,7 +120,7 @@ The fixture is never wired into production. The qualification renderer does
 not discover it by ambient path: deployment supplies one explicit source, and
 the renderer binds that source to the exact V2 artifact ID, destination,
 semantic identity, and checked-in SHA-256 before staging it. The recommended
-`navigation-shadow-preparation-v1.json.template` embeds the same synthetic
+`navigation-shadow-preparation-v2.json.template` embeds the same synthetic
 plant domain so Gate A does not circularly claim wheel-on physical
 identification before wheel attachment. A qualification render must still
 supply a reviewed navigation document whose camera/base transform and IMU
@@ -124,6 +128,15 @@ calibration bind to the canonical physical calibration artifact. Bootstrap
 requires the embedded and separate plant domains to be exactly equal.
 Production admission rejects this synthetic evidence as physical plant
 identification.
+
+Navigation V2 also requires two independently named obstacle slabs. The
+global slab is floor-relative occupancy height. The local slab is `z` in the
+base frame whose origin is the drive-wheel axle midpoint. They are not copied
+or inferred from one another. Both ranges are closed: endpoints exactly on a
+bound are included. A qualification input must therefore place each minimum
+above the highest plausible floor return in that frame, including measured
+depth/extrinsic uncertainty and floor unevenness, instead of using nominal
+floor height itself as the minimum.
 
 ## Fixed candidate contract
 

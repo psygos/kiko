@@ -442,6 +442,13 @@ valid JSON mutation under the same label is rejected. A fresh rendered bundle
 must use the V2 plant and new derived hashes; no prior V1 bundle or digest is
 reinterpreted.
 
+Post-record migration note (2026-07-29): navigation schema V2 supersedes the
+single ambiguous obstacle-height pair described above. The current preparation
+template has nine unresolved values in total: the same two calibration
+replacement markers plus seven physically reviewed leaves, including separate
+floor-relative global bounds and axle-relative local base-`z` bounds. This note
+does not retroactively change the retained 2026-07-27 evidence.
+
 ## Prior 9da248a native qualification build (superseded)
 
 The clean Nano checkout at `/home/makerspace/kiko` was fast-forwarded to exact

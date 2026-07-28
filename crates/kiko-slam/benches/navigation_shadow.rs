@@ -30,11 +30,11 @@ use kiko_slam::navigation::mpc::{
     PlantValidityEnvelopeV1Dto, WheelPlantV1Dto,
 };
 use kiko_slam::navigation::{
-    FORWARD_MOST_NEAREST_SEGMENT_V1, GlobalPath, GlobalPlanner, GlobalPlannerConfig, LocalCostmap,
-    LocalCostmapConfig, LocalCostmapFreshness, MapPoint, MapToOdom, OdomSegmentId,
-    PATH_REFERENCE_CONFIG_V1, PathReferenceBuilderV1, PathReferenceConfigV1,
-    PathReferenceConfigV1Dto, PlanStart, PointGoal, SafetyDecisionOutcome, SafetyReadyTick,
-    SafetyStopCause, SafetyTickInput, ShadowCommandConfig, ShadowCommandConfigDto,
+    BaseZRangeMeters, FORWARD_MOST_NEAREST_SEGMENT_V1, GlobalPath, GlobalPlanner,
+    GlobalPlannerConfig, LocalCostmap, LocalCostmapConfig, LocalCostmapFreshness, MapPoint,
+    MapToOdom, OdomSegmentId, PATH_REFERENCE_CONFIG_V1, PathReferenceBuilderV1,
+    PathReferenceConfigV1, PathReferenceConfigV1Dto, PlanStart, PointGoal, SafetyDecisionOutcome,
+    SafetyReadyTick, SafetyStopCause, SafetyTickInput, ShadowCommandConfig, ShadowCommandConfigDto,
     ShadowCommandDisposition, ShadowSafetySupervisor, SolverBudgetNs, TrackingCameraToBase,
     UnknownSpacePolicy,
 };
@@ -258,7 +258,7 @@ fn build_fixtures() -> Fixtures {
             .expect("synthetic local geometry"),
         camera(),
         optical_to_base(),
-        HeightRangeMeters::try_new(0.05, 1.8).expect("synthetic local height range"),
+        BaseZRangeMeters::try_new(0.05, 1.8).expect("synthetic local base-z range"),
         DepthRangeMeters::try_new(0.1, 8.0).expect("synthetic local depth range"),
         1,
         0.18,

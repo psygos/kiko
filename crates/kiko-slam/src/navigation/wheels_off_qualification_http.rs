@@ -2390,6 +2390,107 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn pending_http_session_can_submit_reduction_only_stop_across_enablement() {
+        let (context, mut receiver) = test_context_with_motion_authority(false);
+        let (pending_id, pending_capability) =
+            open_session(Arc::clone(&context), ConsoleSourceKind::Operator).await;
+        context.console.enable_motion_authority().unwrap();
+
+        let stop = handle_qualification_request_inner(
+            authenticated_intent_request(
+                &pending_id,
+                &pending_capability,
+                1,
+                "{\"kind\":\"stop\"}",
+            ),
+            Arc::clone(&context),
+        )
+        .await;
+        assert_eq!(stop.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(super::super::WheelsOffQualificationIngressEvent::TerminalStop(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_http_session_cannot_replay_motion_after_enablement() {
+        let (context, mut receiver) = test_context_with_motion_authority(false);
+        let (pending_id, pending_capability) =
+            open_session(Arc::clone(&context), ConsoleSourceKind::Operator).await;
+        context.console.enable_motion_authority().unwrap();
+
+        let replay = handle_qualification_request_inner(
+            authenticated_intent_request(
+                &pending_id,
+                &pending_capability,
+                1,
+                "{\"kind\":\"begin_manual\"}",
+            ),
+            Arc::clone(&context),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::LOCKED);
+        assert_eq!(
+            receiver.try_recv(),
+            Err(super::super::WheelsOffQualificationReceiveError::Empty)
+        );
+
+        let (fresh_id, fresh_capability) =
+            open_session(Arc::clone(&context), ConsoleSourceKind::Operator).await;
+        let fresh = handle_qualification_request_inner(
+            authenticated_intent_request(
+                &fresh_id,
+                &fresh_capability,
+                1,
+                "{\"kind\":\"begin_manual\"}",
+            ),
+            context,
+        )
+        .await;
+        assert_eq!(fresh.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_pending_request_body_cannot_cross_concurrent_enablement() {
+        let (context, mut receiver) = test_context_with_motion_authority(false);
+        let (session_id, session_capability) =
+            open_session(Arc::clone(&context), ConsoleSourceKind::Operator).await;
+        let (mut body_tx, body) = Body::channel();
+        let mut request = api_request(
+            Method::POST,
+            super::super::WHEELS_OFF_QUALIFICATION_INTENT_ENDPOINT,
+            body,
+        );
+        request
+            .headers_mut()
+            .insert("x-kiko-session-id", session_id.parse().unwrap());
+        request.headers_mut().insert(
+            "x-kiko-session-capability",
+            session_capability.parse().unwrap(),
+        );
+        let request_context = Arc::clone(&context);
+        let pending = tokio::spawn(async move {
+            handle_qualification_request_inner(request, request_context).await
+        });
+        tokio::task::yield_now().await;
+        context.console.enable_motion_authority().unwrap();
+        body_tx
+            .send_data(Bytes::from(format!(
+                "{{\"schema_version\":1,\"control_profile\":\"wheels_off_raw_timer_pwm_qualification\",\"session_id\":\"{session_id}\",\"source_sequence\":\"1\",\"idempotency_key\":\"1\",\"intent\":{{\"kind\":\"begin_manual\"}}}}"
+            )))
+            .await
+            .unwrap();
+        drop(body_tx);
+
+        assert_eq!(pending.await.unwrap().status(), StatusCode::LOCKED);
+        assert_eq!(
+            receiver.try_recv(),
+            Err(super::super::WheelsOffQualificationReceiveError::Empty)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn adversarial_headers_content_types_and_bodies_are_rejected() {
         let (context, _receiver) = test_context();
 

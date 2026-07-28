@@ -30,7 +30,7 @@ use crate::navigation::{
 use crate::navigation::{
     ControlPeriodNs, GlobalPlannerConfig, LocalCostmap, LocalCostmapError, NavigationGoalArg,
     NavigationIngressCapacity, PathReferenceBuilderV1, PlanarOdometry, SafetySupervisorCreateError,
-    ShadowNavigationConfigParseError, ShadowNavigationConfigV1, ShadowSafetySupervisor,
+    ShadowNavigationConfigParseError, ShadowNavigationConfigV2, ShadowSafetySupervisor,
     SolverBudgetNs,
 };
 
@@ -132,7 +132,7 @@ impl LiveNavigationRequest {
         let navigation_config_bytes = read_live_config_bounded(
             &config_path,
             "navigation",
-            ShadowNavigationConfigV1::MAX_JSON_BYTES,
+            ShadowNavigationConfigV2::MAX_JSON_BYTES,
         )?;
         let actuation_config_bytes = match &actuation {
             LiveActuationRequest::ShadowOnly => None,
@@ -809,7 +809,7 @@ pub fn prepare_live_navigation_runtime(
         .expect("loaded enabled navigation always owns its bounded policy bytes");
     let occupancy_host_policy = occupancy_host_policy
         .expect("loaded enabled navigation always owns parsed occupancy host policy");
-    let parsed = ShadowNavigationConfigV1::parse_json(&bytes, runtime_depth_camera)?;
+    let parsed = ShadowNavigationConfigV2::parse_json(&bytes, runtime_depth_camera)?;
     #[cfg(feature = "actuation")]
     let actuation = match actuation {
         LiveActuationRequest::ShadowOnly => None,
@@ -850,7 +850,7 @@ pub fn prepare_live_navigation_runtime(
 /// returned runtime is shadow-only internally; the sole production motion
 /// owner receives its already-admitted driver through a separate type.
 pub fn prepare_live_navigation_runtime_from_parsed(
-    parsed: ShadowNavigationConfigV1,
+    parsed: ShadowNavigationConfigV2,
     goal: Option<NavigationGoalArg>,
     dataset_path: PathBuf,
     occupancy_host_policy: LiveOccupancyHostPolicy,
@@ -868,7 +868,7 @@ pub fn prepare_live_navigation_runtime_from_parsed(
 }
 
 fn assemble_live_navigation_runtime(
-    parsed: ShadowNavigationConfigV1,
+    parsed: ShadowNavigationConfigV2,
     goal: Option<NavigationGoalArg>,
     dataset_path: PathBuf,
     occupancy_host_policy: LiveOccupancyHostPolicy,
@@ -909,18 +909,17 @@ fn assemble_live_navigation_runtime(
 /// policy. Coordinate frame, camera, height/depth eligibility, and sampling
 /// come only from the strict navigation document.
 fn build_navigation_occupancy_runtime_config(
-    navigation: &ShadowNavigationConfigV1,
+    navigation: &ShadowNavigationConfigV2,
     host_policy: LiveOccupancyHostPolicy,
 ) -> Result<OccupancyRuntimeConfig, LiveNavigationPreparationError> {
-    let local = navigation.local_costmap();
     let world_to_occupancy = navigation.world_to_occupancy();
     let mapper = OccupancyConfig::try_new(
         host_policy.geometry,
         world_to_occupancy,
-        local.camera(),
-        local.obstacle_height_range(),
-        local.depth_range(),
-        local.sampling_block(),
+        navigation.local_costmap().camera(),
+        navigation.global_occupancy_height_range(),
+        navigation.local_costmap().depth_range(),
+        navigation.local_costmap().sampling_block(),
         host_policy.evidence,
         host_policy.maximum_keyframes.get(),
     )?;
@@ -949,9 +948,13 @@ mod tests {
         LiveActuationRequest, LiveNavigationBoundaryError, LiveNavigationConfigReadError,
         LiveNavigationLoadError, LiveNavigationPrerequisiteError, LiveNavigationPrerequisites,
         LiveNavigationRequest, LiveOccupancyHostPolicy, LiveOccupancyHostPolicyError,
+        build_navigation_occupancy_runtime_config,
     };
     #[cfg(unix)]
     use super::{LiveDatasetStorageAdmissionError, require_dataset_ingress_capacity};
+    use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
+    use crate::navigation::ShadowNavigationConfigV2;
+    use crate::{FrameDimensions, PinholeIntrinsics};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1055,6 +1058,45 @@ mod tests {
         assert_eq!((geometry.width(), geometry.height()), (400, 300));
         assert_eq!(policy.maximum_keyframes().get(), 300);
         assert_eq!(policy.snapshot_cadence().get(), 5);
+    }
+
+    #[test]
+    fn global_mapper_uses_floor_height_not_local_base_z() {
+        let camera = DepthCameraModel::new(
+            PinholeIntrinsics::try_new(411.0, 412.0, 319.5, 199.5).expect("synthetic intrinsics"),
+            FrameDimensions::try_new(640, 400).expect("synthetic dimensions"),
+            DepthToTrackingCamera::identity(),
+        );
+        let navigation = ShadowNavigationConfigV2::parse_json(
+            include_bytes!("../../../configs/navigation-shadow-v2.example.json"),
+            camera,
+        )
+        .expect("checked-in V2 navigation");
+        let policy = LiveOccupancyHostPolicy::try_new(0.05, -10.0, -5.0, 400, 300, 120_000, 300, 5)
+            .expect("bounded host policy");
+        let global = build_navigation_occupancy_runtime_config(&navigation, policy)
+            .expect("global occupancy config");
+
+        assert_eq!(
+            (
+                global.mapper().height_range().minimum_m(),
+                global.mapper().height_range().maximum_m(),
+            ),
+            (0.05, 1.5)
+        );
+        assert_eq!(
+            (
+                navigation
+                    .local_costmap()
+                    .obstacle_base_z_range()
+                    .minimum_m(),
+                navigation
+                    .local_costmap()
+                    .obstacle_base_z_range()
+                    .maximum_m(),
+            ),
+            (-0.25, 1.2)
+        );
     }
 
     #[test]
@@ -1202,7 +1244,7 @@ mod tests {
 
     #[test]
     fn load_reads_only_one_byte_beyond_the_navigation_bound() {
-        let maximum = crate::navigation::ShadowNavigationConfigV1::MAX_JSON_BYTES;
+        let maximum = crate::navigation::ShadowNavigationConfigV2::MAX_JSON_BYTES;
         let config = TemporaryConfig::new(&vec![b' '; maximum + 17]);
         let request = LiveNavigationRequest::parse(
             Some(config.path()),

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 const NAVIGATION_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../configs/nano-wheels-off-qualification-template/navigation-shadow-preparation-v1.json.template"
+    "/../../configs/nano-wheels-off-qualification-template/navigation-shadow-preparation-v2.json.template"
 ));
 const SHADOW_PLANT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -75,10 +75,18 @@ fn materialize_test_only_navigation() -> String {
             "[0.0, 0.0, 0.0]",
         ),
         (
-            "${NAV_SHADOW_UNVALIDATED_OBSTACLE_HEIGHT_MINIMUM_M}",
-            "-0.5",
+            "${NAV_SHADOW_UNVALIDATED_OBSTACLE_FLOOR_HEIGHT_MINIMUM_M}",
+            "0.05",
         ),
-        ("${NAV_SHADOW_UNVALIDATED_OBSTACLE_HEIGHT_MAXIMUM_M}", "1.5"),
+        (
+            "${NAV_SHADOW_UNVALIDATED_OBSTACLE_FLOOR_HEIGHT_MAXIMUM_M}",
+            "1.5",
+        ),
+        (
+            "${NAV_SHADOW_UNVALIDATED_OBSTACLE_BASE_Z_MINIMUM_M}",
+            "-0.25",
+        ),
+        ("${NAV_SHADOW_UNVALIDATED_OBSTACLE_BASE_Z_MAXIMUM_M}", "1.2"),
         ("${NAV_SHADOW_UNVALIDATED_FOOTPRINT_RADIUS_M}", "0.2"),
     ];
 
@@ -121,8 +129,10 @@ fn gate_a_navigation_does_not_request_pre_wheel_physical_plant_claims() {
             "${CALIBRATION_PREPARER_REPLACES_RAW_IMU_CALIBRATION}",
             "${CALIBRATION_PREPARER_REPLACES_TRACKING_CAMERA_TO_BASE}",
             "${NAV_SHADOW_UNVALIDATED_FOOTPRINT_RADIUS_M}",
-            "${NAV_SHADOW_UNVALIDATED_OBSTACLE_HEIGHT_MAXIMUM_M}",
-            "${NAV_SHADOW_UNVALIDATED_OBSTACLE_HEIGHT_MINIMUM_M}",
+            "${NAV_SHADOW_UNVALIDATED_OBSTACLE_BASE_Z_MAXIMUM_M}",
+            "${NAV_SHADOW_UNVALIDATED_OBSTACLE_BASE_Z_MINIMUM_M}",
+            "${NAV_SHADOW_UNVALIDATED_OBSTACLE_FLOOR_HEIGHT_MAXIMUM_M}",
+            "${NAV_SHADOW_UNVALIDATED_OBSTACLE_FLOOR_HEIGHT_MINIMUM_M}",
             "${NAV_SHADOW_UNVALIDATED_WORLD_TO_OCCUPANCY_ROTATION_F64_MATRIX}",
             "${NAV_SHADOW_UNVALIDATED_WORLD_TO_OCCUPANCY_TRANSLATION_M_F64_ARRAY}",
         ])
@@ -137,7 +147,7 @@ fn gate_a_shadow_plant_has_a_realizable_candidate_service_period() {
     use kiko_slam::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
     use kiko_slam::navigation::mpc::PlantEvidenceV1;
     use kiko_slam::navigation::{
-        MAX_WHEELS_OFF_CANDIDATE_RUNTIME_SERVICE_INTERVAL, ShadowNavigationConfigV1,
+        MAX_WHEELS_OFF_CANDIDATE_RUNTIME_SERVICE_INTERVAL, ShadowNavigationConfigV2,
     };
     use kiko_slam::{FrameDimensions, PinholeIntrinsics};
     use robot_protocol::v2::{
@@ -153,7 +163,7 @@ fn gate_a_shadow_plant_has_a_realizable_candidate_service_period() {
     );
     let plant = kiko_slam::navigation::mpc::PlantModelV1::parse_json(SHADOW_PLANT.as_bytes())
         .expect("checked-in Gate-A plant must parse");
-    let parsed = ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+    let parsed = ShadowNavigationConfigV2::parse_json_bound_to_plant_artifact(
         materialize_test_only_navigation().as_bytes(),
         camera,
         plant,
@@ -162,6 +172,20 @@ fn gate_a_shadow_plant_has_a_realizable_candidate_service_period() {
     let parsed_plant = parsed.mpc_solver().model();
     let mpc = parsed.mpc_solver().config();
 
+    assert_eq!(
+        (
+            parsed.global_occupancy_height_range().minimum_m(),
+            parsed.global_occupancy_height_range().maximum_m(),
+        ),
+        (0.05, 1.5)
+    );
+    assert_eq!(
+        (
+            parsed.local_costmap().obstacle_base_z_range().minimum_m(),
+            parsed.local_costmap().obstacle_base_z_range().maximum_m(),
+        ),
+        (-0.25, 1.2)
+    );
     assert!(matches!(
         parsed_plant.evidence(),
         PlantEvidenceV1::SyntheticFixture { .. }

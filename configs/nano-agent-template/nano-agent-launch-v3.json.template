@@ -6,7 +6,7 @@
     "sha256_hex": "${AGENT_POLICY_SHA256}"
   },
   "navigation_shadow_config_asset": {
-    "relative_path": "navigation-shadow-v1.json",
+    "relative_path": "navigation-shadow-v2.json",
     "maximum_bytes": ${NAVIGATION_SHADOW_MAXIMUM_BYTES},
     "sha256_hex": "${NAVIGATION_SHADOW_SHA256}"
   },

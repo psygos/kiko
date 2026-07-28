@@ -1691,7 +1691,7 @@ mod tests {
         NavigationClockEpoch, NavigationIngressCapacity, NavigationIngressLog,
         NavigationRecordingId, OperatorConsoleIntent, OperatorConsoleLimits,
         OperatorConsoleSnapshot, PathReferenceBuilderV1, PendingVisualAttemptIngress,
-        PlanarOdometry, ShadowNavigationConfigV1, ShadowNavigationCoordinator,
+        PlanarOdometry, ShadowNavigationConfigV2, ShadowNavigationCoordinator,
         ShadowSafetySupervisor, VisualAdmission, VisualAdmissionOutcome, VisualAttemptOutcome,
         operator_console,
     };
@@ -2107,8 +2107,8 @@ mod tests {
             dimensions,
             DepthToTrackingCamera::new(Pose::identity()),
         );
-        let parsed = ShadowNavigationConfigV1::parse_json(
-            include_bytes!("../../../../configs/navigation-shadow-v1.example.json"),
+        let parsed = ShadowNavigationConfigV2::parse_json(
+            include_bytes!("../../../../configs/navigation-shadow-v2.example.json"),
             camera,
         )
         .expect("navigation policy");

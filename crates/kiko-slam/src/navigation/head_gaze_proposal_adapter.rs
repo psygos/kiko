@@ -254,29 +254,29 @@ impl std::error::Error for HeadGazeFaceProposalError {
     }
 }
 
-/// Allocation-free proposal adapter for one parsed policy and RGB camera
-/// calibration.
+/// Allocation-free proposal adapter for one parsed policy.
 ///
 /// Construction validates only the proposal-silence bound. It deliberately
 /// does not activate either lifecycle claim and cannot construct a head
-/// controller or actuator command.
+/// controller or actuator command. The exact projection is supplied for every
+/// evaluation so a caller cannot accidentally reuse calibration from a
+/// different delivered OAK pixel grid.
 #[derive(Debug)]
-pub struct HeadGazeFaceProposalAdapter<'policy> {
-    policy: &'policy HeadGazePolicyV1,
-    projection: RgbFacePinholeProjection,
+pub struct HeadGazeFaceProposalAdapter {
+    policy: HeadGazePolicyV1,
     return_trigger: HeadGazeReturnTriggerBound,
 }
 
-impl<'policy> HeadGazeFaceProposalAdapter<'policy> {
-    pub fn try_new(
-        policy: &'policy HeadGazePolicyV1,
-        projection: RgbFacePinholeProjection,
-    ) -> Result<Self, HeadGazeFaceProposalAdapterError> {
+impl HeadGazeFaceProposalAdapter {
+    /// Consume one already-parsed declaration and validate its invariant once.
+    ///
+    /// Owning the policy lets the production face thread retain one adapter
+    /// without a self-referential allocation or repeated TTL validation.
+    pub fn try_new(policy: HeadGazePolicyV1) -> Result<Self, HeadGazeFaceProposalAdapterError> {
         let return_trigger =
             HeadGazeReturnTriggerBound::try_new(policy.controller().timing().proposal_ttl())?;
         Ok(Self {
             policy,
-            projection,
             return_trigger,
         })
     }
@@ -295,12 +295,13 @@ impl<'policy> HeadGazeFaceProposalAdapter<'policy> {
         &self,
         update: FaceTrackingUpdate,
         evaluated_at: MonotonicTimestamp,
+        projection: RgbFacePinholeProjection,
     ) -> Result<HeadGazeFaceProposalOutcome, HeadGazeFaceProposalError> {
         let face = match admit_fresh_current_face(update, evaluated_at, self.return_trigger) {
             Ok(face) => face,
             Err(reason) => return Ok(HeadGazeFaceProposalOutcome::Withheld(reason)),
         };
-        let camera_ray = self.projection.ray_for(face)?;
+        let camera_ray = projection.ray_for(face)?;
         let target = self
             .policy
             .mapping()
@@ -504,16 +505,16 @@ mod tests {
                     }
                 },
                 "natural_encoder_position_ticks": {
-                    "bow_ticks": 2155,
-                    "curl_ticks": 2545,
-                    "yaw_ticks": 2943,
-                    "roll_ticks": 2876
+                    "bow_ticks": 2174,
+                    "curl_ticks": 2570,
+                    "yaw_ticks": 1637,
+                    "roll_ticks": 3047
                 },
                 "hard_encoder_envelopes_ticks": {
-                    "bow": {"minimum_ticks": 1955, "maximum_ticks": 2355},
-                    "curl": {"minimum_ticks": 2345, "maximum_ticks": 2745},
-                    "yaw": {"minimum_ticks": 2743, "maximum_ticks": 3143},
-                    "roll": {"minimum_ticks": 2776, "maximum_ticks": 2976}
+                    "bow": {"minimum_ticks": 1974, "maximum_ticks": 2374},
+                    "curl": {"minimum_ticks": 2370, "maximum_ticks": 2770},
+                    "yaw": {"minimum_ticks": 1437, "maximum_ticks": 1837},
+                    "roll": {"minimum_ticks": 2847, "maximum_ticks": 3247}
                 },
                 "encoder_tick_offsets_per_radian": {
                     "pitch_down_rad": {
@@ -581,9 +582,17 @@ mod tests {
         )
     }
 
-    fn adapter(policy: &HeadGazePolicyV1) -> HeadGazeFaceProposalAdapter<'_> {
-        HeadGazeFaceProposalAdapter::try_new(policy, projection(400.0, layout(640, 400)))
+    fn adapter(policy: &HeadGazePolicyV1) -> HeadGazeFaceProposalAdapter {
+        HeadGazeFaceProposalAdapter::try_new(policy.clone())
             .expect("test policy has bounded return trigger")
+    }
+
+    fn evaluate(
+        adapter: &HeadGazeFaceProposalAdapter,
+        update: FaceTrackingUpdate,
+        evaluated_at: MonotonicTimestamp,
+    ) -> Result<HeadGazeFaceProposalOutcome, HeadGazeFaceProposalError> {
+        adapter.evaluate(update, evaluated_at, projection(400.0, layout(640, 400)))
     }
 
     #[test]
@@ -599,23 +608,22 @@ mod tests {
         let mut tracker = FaceTracker::new(FaceTrackingConfig::default());
         let acquiring = update(&mut tracker, 1, &[target]);
         assert_eq!(
-            adapter
-                .evaluate(
-                    acquiring,
-                    MonotonicTimestamp::from_nanos_since_epoch(RESULT_PERIOD_NS)
-                )
-                .expect("withholding cannot fail"),
+            evaluate(
+                &adapter,
+                acquiring,
+                MonotonicTimestamp::from_nanos_since_epoch(RESULT_PERIOD_NS),
+            )
+            .expect("withholding cannot fail"),
             HeadGazeFaceProposalOutcome::Withheld(HeadGazeFaceProposalWithheld::Acquiring)
         );
 
         let tracked = update(&mut tracker, 2, &[target]);
-        let HeadGazeFaceProposalOutcome::Proposed(proposal) = adapter
-            .evaluate(
-                tracked,
-                MonotonicTimestamp::from_nanos_since_epoch(2 * RESULT_PERIOD_NS),
-            )
-            .expect("center face maps")
-        else {
+        let HeadGazeFaceProposalOutcome::Proposed(proposal) = evaluate(
+            &adapter,
+            tracked,
+            MonotonicTimestamp::from_nanos_since_epoch(2 * RESULT_PERIOD_NS),
+        )
+        .expect("center face maps") else {
             panic!("fresh tracked face must propose");
         };
         assert_eq!(
@@ -649,12 +657,12 @@ mod tests {
         let mut empty_tracker = FaceTracker::new(FaceTrackingConfig::default());
         let no_target = update(&mut empty_tracker, 1, &[]);
         assert_eq!(
-            adapter
-                .evaluate(
-                    no_target,
-                    MonotonicTimestamp::from_nanos_since_epoch(RESULT_PERIOD_NS)
-                )
-                .unwrap(),
+            evaluate(
+                &adapter,
+                no_target,
+                MonotonicTimestamp::from_nanos_since_epoch(RESULT_PERIOD_NS),
+            )
+            .unwrap(),
             HeadGazeFaceProposalOutcome::Withheld(HeadGazeFaceProposalWithheld::NoTarget)
         );
 
@@ -663,21 +671,24 @@ mod tests {
         let _ = update(&mut tracker, 2, &[target]);
         let coasting = update(&mut tracker, 3, &[]);
         assert_eq!(
-            adapter
-                .evaluate(
-                    coasting,
-                    MonotonicTimestamp::from_nanos_since_epoch(3 * RESULT_PERIOD_NS)
-                )
-                .unwrap(),
+            evaluate(
+                &adapter,
+                coasting,
+                MonotonicTimestamp::from_nanos_since_epoch(3 * RESULT_PERIOD_NS),
+            )
+            .unwrap(),
             HeadGazeFaceProposalOutcome::Withheld(HeadGazeFaceProposalWithheld::Coasting)
         );
 
         let lost_at = 2_300_000_000;
         let lost = update_at(&mut tracker, 4, lost_at, lost_at, &[]);
         assert_eq!(
-            adapter
-                .evaluate(lost, MonotonicTimestamp::from_nanos_since_epoch(lost_at))
-                .unwrap(),
+            evaluate(
+                &adapter,
+                lost,
+                MonotonicTimestamp::from_nanos_since_epoch(lost_at),
+            )
+            .unwrap(),
             HeadGazeFaceProposalOutcome::Withheld(HeadGazeFaceProposalWithheld::Lost)
         );
     }
@@ -694,12 +705,12 @@ mod tests {
         let deadline = observed_at + 150_000_000;
 
         assert_eq!(
-            adapter
-                .evaluate(
-                    tracked,
-                    MonotonicTimestamp::from_nanos_since_epoch(deadline)
-                )
-                .unwrap(),
+            evaluate(
+                &adapter,
+                tracked,
+                MonotonicTimestamp::from_nanos_since_epoch(deadline),
+            )
+            .unwrap(),
             HeadGazeFaceProposalOutcome::Withheld(HeadGazeFaceProposalWithheld::TrackedNotFresh {
                 observed_at: MonotonicTimestamp::from_nanos_since_epoch(observed_at),
                 valid_until_exclusive: MonotonicTimestamp::from_nanos_since_epoch(deadline),
@@ -727,13 +738,12 @@ mod tests {
         }
         let switched = update(&mut tracker, 7, &[closer, current]);
 
-        let HeadGazeFaceProposalOutcome::Proposed(proposal) = adapter
-            .evaluate(
-                switched,
-                MonotonicTimestamp::from_nanos_since_epoch(7 * RESULT_PERIOD_NS),
-            )
-            .expect("switched face maps")
-        else {
+        let HeadGazeFaceProposalOutcome::Proposed(proposal) = evaluate(
+            &adapter,
+            switched,
+            MonotonicTimestamp::from_nanos_since_epoch(7 * RESULT_PERIOD_NS),
+        )
+        .expect("switched face maps") else {
             panic!("fresh switched face must propose");
         };
         assert_eq!(
@@ -749,10 +759,7 @@ mod tests {
     fn policy_above_four_hundred_milliseconds_is_rejected_before_use() {
         let policy = policy(400_000_001);
         assert!(matches!(
-            HeadGazeFaceProposalAdapter::try_new(
-                &policy,
-                projection(400.0, layout(640, 400))
-            ),
+            HeadGazeFaceProposalAdapter::try_new(policy),
             Err(
                 HeadGazeFaceProposalAdapterError::ReturnTriggerDelayAboveMaximum {
                     actual,
@@ -772,19 +779,14 @@ mod tests {
         let tracked = update(&mut tracker, 2, &[target]);
         let evaluated_at = MonotonicTimestamp::from_nanos_since_epoch(2 * RESULT_PERIOD_NS);
 
-        let wrong_grid =
-            HeadGazeFaceProposalAdapter::try_new(&policy, projection(400.0, layout(320, 200)))
-                .unwrap();
+        let adapter = HeadGazeFaceProposalAdapter::try_new(policy).unwrap();
         assert!(matches!(
-            wrong_grid.evaluate(tracked, evaluated_at),
+            adapter.evaluate(tracked, evaluated_at, projection(400.0, layout(320, 200))),
             Err(HeadGazeFaceProposalError::ProjectionLayoutMismatch { .. })
         ));
 
-        let extreme_projection =
-            HeadGazeFaceProposalAdapter::try_new(&policy, projection(100.0, layout(640, 400)))
-                .unwrap();
         assert!(matches!(
-            extreme_projection.evaluate(tracked, evaluated_at),
+            adapter.evaluate(tracked, evaluated_at, projection(100.0, layout(640, 400))),
             Err(HeadGazeFaceProposalError::Mapping(_))
         ));
     }

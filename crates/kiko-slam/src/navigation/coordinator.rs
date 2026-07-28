@@ -2867,10 +2867,11 @@ mod tests {
 
     use super::*;
     use crate::dense::occupancy::{
-        DepthCameraModel, DepthRangeMeters, DepthToTrackingCamera, HeightRangeMeters,
-        OccupancyCell, OccupancyGridGeometry, WorldToOccupancy,
+        DepthCameraModel, DepthRangeMeters, DepthToTrackingCamera, OccupancyCell,
+        OccupancyGridGeometry, WorldToOccupancy,
     };
     use crate::map::{MapSnapshot, SlamMap};
+    use crate::navigation::local_costmap::BaseZRangeMeters;
     use crate::{
         DepthImage, DepthObservation, Frame, FrameDimensions, FrameId, PairingWindowNs,
         PinholeIntrinsics, Pose, SensorAccuracy, SensorId, StereoObservation, StereoPair,
@@ -2997,7 +2998,7 @@ mod tests {
                 .expect("bounded local grid"),
             camera,
             TrackingCameraToBase::new(Pose::identity()),
-            HeightRangeMeters::try_new(0.1, 1.0).expect("obstacle height range"),
+            BaseZRangeMeters::try_new(0.1, 1.0).expect("base z obstacle range"),
             DepthRangeMeters::try_new(0.1, 4.0).expect("metric depth range"),
             1,
             0.05,

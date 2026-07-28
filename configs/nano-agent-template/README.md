@@ -49,10 +49,11 @@ A qualified deployment must:
    qualification;
 9. set every `occupancy` field from the reviewed global-map resource envelope.
    This section owns only grid extent, maximum retained evidence, and snapshot
-   cadence. The exact `navigation-shadow-v1.json` owns the level
-   optical-world/camera-height transform, runtime rectified-left depth camera
-   and intrinsics, height/depth ranges, and sampling block; do not duplicate
-   or override them with environment variables;
+   cadence. The exact `navigation-shadow-v2.json` owns the explicit, reviewed
+   world-to-floor-occupancy transform, runtime rectified-left depth camera and
+   intrinsics, the floor-relative global obstacle-height range, the
+   axle-relative local obstacle-`z` range, the depth range, and sampling block;
+   do not duplicate or override them with environment variables;
 10. select inference backends only as requested providers. A selection is not
    a claim of availability, compatibility, latency, throughput, or speedup;
 11. set `maximum_map_snapshot_bytes` from the largest reviewed encoded map and
@@ -118,6 +119,14 @@ two retained full-stream Nano qualifications at that transport, while
 explicit `SUPER_PLUS/SUPER` startup was not reliable. Retained launch
 documents with that exact policy remain parseable and retain their request;
 fresh rendering does not silently select or relabel it.
+
+The renderer also admits only the superseding bow/curl/yaw/roll head policy:
+target `[2174,2570,1637,3047]`, start bounds
+`[2133,2550,1617,3023]..[2194,2660,1852,3067]`, software travel caps
+`[48,96,224,32]`, and torque limits `[600,400,400,400]`. These values and
+their deliberately narrow claim boundary are recorded in
+`docs/nano-head-neutral-policy-2026-07-29.md`. They do not replace the
+attended wheels-off return-and-hold test.
 
 Do not expand these templates with shell substitution. Feed exact discovery
 and reviewed source paths to `kiko-nano-bundle-renderer`; it emits the agent

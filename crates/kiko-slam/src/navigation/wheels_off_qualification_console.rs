@@ -1021,6 +1021,7 @@ struct CachedSubmission {
 struct QualificationSession {
     source: ConsoleSourceKind,
     capability: ConsoleSessionCapability,
+    motion_authority_generation_at_open: Option<NonZeroU64>,
     last_source_sequence: Option<ConsoleSourceSequence>,
     idempotency: VecDeque<CachedSubmission>,
 }
@@ -1039,7 +1040,7 @@ struct QualificationState {
     pending_terminal: Option<CandidateMotionTerminalEvent>,
     terminal_in_flight: Option<CandidateMotionTerminalEvent>,
     safety_stop_event_id: Option<WheelsOffQualificationEventId>,
-    motion_authority_enabled: bool,
+    motion_authority_generation: Option<NonZeroU64>,
     software_safety_stop_latched: bool,
     frontend_state: WheelsOffQualificationFrontendState,
     runtime_ingress_state: WheelsOffQualificationRuntimeIngressState,
@@ -1189,7 +1190,7 @@ pub fn wheels_off_qualification_console_with_limits(
             pending_terminal: None,
             terminal_in_flight: None,
             safety_stop_event_id: None,
-            motion_authority_enabled: false,
+            motion_authority_generation: None,
             software_safety_stop_latched: false,
             frontend_state: WheelsOffQualificationFrontendState::AwaitingConnection,
             runtime_ingress_state: WheelsOffQualificationRuntimeIngressState::Connected,
@@ -1266,11 +1267,11 @@ impl WheelsOffQualificationConsoleHandle {
     /// Open the manual candidate boundary exactly once, after the attended
     /// motion attestation has been created and the stopped runtime owner is
     /// ready to consume requests.
-    pub fn enable_motion_authority(
+    pub(super) fn enable_motion_authority(
         &self,
     ) -> Result<(), WheelsOffQualificationMotionAuthorityEnableError> {
         let mut state = self.lock_state();
-        if state.motion_authority_enabled {
+        if state.motion_authority_generation.is_some() {
             return Err(WheelsOffQualificationMotionAuthorityEnableError::AlreadyEnabled);
         }
         match state.frontend_state {
@@ -1301,7 +1302,7 @@ impl WheelsOffQualificationConsoleHandle {
             .checked_add(1)
             .and_then(NonZeroU64::new)
             .ok_or(WheelsOffQualificationMotionAuthorityEnableError::RevisionExhausted)?;
-        state.motion_authority_enabled = true;
+        state.motion_authority_generation = Some(revision);
         state.revision = revision;
         Ok(())
     }
@@ -1333,11 +1334,13 @@ impl WheelsOffQualificationConsoleHandle {
         state.next_session_id = raw.get().checked_add(1).and_then(NonZeroU64::new);
         let session_id =
             ConsoleSessionId::parse(raw.get()).expect("allocated session ID is nonzero");
+        let motion_authority_generation_at_open = state.motion_authority_generation;
         state.sessions.insert(
             session_id,
             QualificationSession {
                 source,
                 capability,
+                motion_authority_generation_at_open,
                 last_source_sequence: None,
                 idempotency: VecDeque::new(),
             },
@@ -1419,10 +1422,20 @@ impl WheelsOffQualificationConsoleHandle {
             }
             return Err(WheelsOffQualificationSubmitError::SoftwareSafetyStopLatched);
         }
-        if !state.motion_authority_enabled
-            && request.intent != WheelsOffQualificationIntent::SoftwareSafetyStop
-        {
-            return Err(WheelsOffQualificationSubmitError::MotionAuthorityNotEnabled);
+        // Both stop intents are cross-generation ingress. They can only clear
+        // authority and candidate work, and keeping them available means an
+        // authenticated pending-era session never loses a reduction-only
+        // action while the browser establishes its post-attestation session.
+        if !matches!(
+            request.intent,
+            WheelsOffQualificationIntent::Stop | WheelsOffQualificationIntent::SoftwareSafetyStop
+        ) {
+            let current_generation = state
+                .motion_authority_generation
+                .ok_or(WheelsOffQualificationSubmitError::MotionAuthorityNotEnabled)?;
+            if session.motion_authority_generation_at_open != Some(current_generation) {
+                return Err(WheelsOffQualificationSubmitError::MotionAuthorityNotEnabled);
+            }
         }
         if state.stop_barrier_pending()
             && !matches!(
@@ -1744,7 +1757,7 @@ impl WheelsOffQualificationConsoleHandle {
             last_terminal_stop: state.last_terminal_stop,
             last_terminal_completion: state.last_terminal_completion,
             stop_barrier_pending: state.stop_barrier_pending(),
-            motion_authority_enabled: state.motion_authority_enabled,
+            motion_authority_enabled: state.motion_authority_generation.is_some(),
             software_safety_stop_latched: state.software_safety_stop_latched,
             frontend_state: state.frontend_state,
             runtime_ingress_state: state.runtime_ingress_state,
@@ -2131,18 +2144,31 @@ mod tests {
 
     #[test]
     fn motion_authority_stays_closed_until_the_owner_enables_it_once() {
-        let (console, _receiver) = connected_console();
+        let (console, mut receiver) = connected_console();
         let session = console
             .open_session(ConsoleSourceKind::Operator, capability(1))
             .unwrap();
         assert!(!console.snapshot().motion_authority_enabled);
+        for intent in [
+            WheelsOffQualificationIntent::BeginManual,
+            WheelsOffQualificationIntent::ManualPwm(pwm(10, 10)),
+            WheelsOffQualificationIntent::ReleaseManual,
+        ] {
+            assert_eq!(
+                console.submit(
+                    request(session, 1, 1, intent),
+                    capability(1),
+                    HostMonotonicTimestamp::from_nanos(1),
+                ),
+                Err(WheelsOffQualificationSubmitError::MotionAuthorityNotEnabled)
+            );
+        }
+        let pending = console.snapshot();
+        assert!(!pending.motion_authority_enabled);
+        assert!(pending.last_requested.is_none());
         assert_eq!(
-            console.submit(
-                request(session, 1, 1, WheelsOffQualificationIntent::BeginManual),
-                capability(1),
-                HostMonotonicTimestamp::from_nanos(1),
-            ),
-            Err(WheelsOffQualificationSubmitError::MotionAuthorityNotEnabled)
+            receiver.try_recv(),
+            Err(WheelsOffQualificationReceiveError::Empty)
         );
         console.enable_motion_authority().unwrap();
         assert!(console.snapshot().motion_authority_enabled);
@@ -2150,13 +2176,114 @@ mod tests {
             console.enable_motion_authority(),
             Err(WheelsOffQualificationMotionAuthorityEnableError::AlreadyEnabled)
         );
-        console
-            .submit(
+        assert_eq!(
+            console.submit(
                 request(session, 1, 1, WheelsOffQualificationIntent::BeginManual),
                 capability(1),
                 HostMonotonicTimestamp::from_nanos(2),
+            ),
+            Err(WheelsOffQualificationSubmitError::MotionAuthorityNotEnabled),
+            "a request built under the pending generation cannot cross enablement"
+        );
+        let enabled_session = console
+            .open_session(ConsoleSourceKind::Operator, capability(2))
+            .unwrap();
+        console
+            .submit(
+                request(
+                    enabled_session,
+                    1,
+                    1,
+                    WheelsOffQualificationIntent::BeginManual,
+                ),
+                capability(2),
+                HostMonotonicTimestamp::from_nanos(3),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn ordinary_stop_remains_available_before_and_across_motion_generation() {
+        let (pending_console, mut pending_receiver) = connected_console();
+        let pending_session = pending_console
+            .open_session(ConsoleSourceKind::Operator, capability(1))
+            .unwrap();
+        assert!(matches!(
+            pending_console
+                .submit(
+                    request(pending_session, 1, 1, WheelsOffQualificationIntent::Stop,),
+                    capability(1),
+                    HostMonotonicTimestamp::from_nanos(1),
+                )
+                .unwrap(),
+            WheelsOffQualificationSubmitOutcome::TerminalStopQueued { .. }
+        ));
+        assert!(matches!(
+            pending_receiver.try_recv(),
+            Ok(WheelsOffQualificationIngressEvent::TerminalStop(_))
+        ));
+        assert!(!pending_console.snapshot().motion_authority_enabled);
+
+        let (enabled_console, mut enabled_receiver) = connected_console();
+        let stale_session = enabled_console
+            .open_session(ConsoleSourceKind::Operator, capability(2))
+            .unwrap();
+        enabled_console.enable_motion_authority().unwrap();
+        assert!(matches!(
+            enabled_console
+                .submit(
+                    request(stale_session, 1, 1, WheelsOffQualificationIntent::Stop,),
+                    capability(2),
+                    HostMonotonicTimestamp::from_nanos(2),
+                )
+                .unwrap(),
+            WheelsOffQualificationSubmitOutcome::TerminalStopQueued { .. }
+        ));
+        assert!(matches!(
+            enabled_receiver.try_recv(),
+            Ok(WheelsOffQualificationIngressEvent::TerminalStop(_))
+        ));
+    }
+
+    #[test]
+    fn concurrent_enable_and_pending_generation_request_never_admit_motion() {
+        let (console, mut receiver) = connected_console();
+        let pending_session = console
+            .open_session(ConsoleSourceKind::Operator, capability(1))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let enable_console = console.clone();
+        let enable_barrier = Arc::clone(&barrier);
+        let enable = std::thread::spawn(move || {
+            enable_barrier.wait();
+            enable_console.enable_motion_authority()
+        });
+        let submit_console = console.clone();
+        let submit_barrier = Arc::clone(&barrier);
+        let submit = std::thread::spawn(move || {
+            submit_barrier.wait();
+            submit_console.submit(
+                request(
+                    pending_session,
+                    1,
+                    1,
+                    WheelsOffQualificationIntent::BeginManual,
+                ),
+                capability(1),
+                HostMonotonicTimestamp::from_nanos(1),
+            )
+        });
+        barrier.wait();
+
+        assert_eq!(enable.join().unwrap(), Ok(()));
+        assert_eq!(
+            submit.join().unwrap(),
+            Err(WheelsOffQualificationSubmitError::MotionAuthorityNotEnabled)
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Err(WheelsOffQualificationReceiveError::Empty)
+        );
     }
 
     #[test]

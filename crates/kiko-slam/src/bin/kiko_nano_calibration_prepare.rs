@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use clap::Parser;
 use kiko_slam::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
 use kiko_slam::navigation::{
-    NanoCalibrationArtifactV1, RawImuCalibration, ShadowNavigationConfigV1,
+    NanoCalibrationArtifactV1, RawImuCalibration, ShadowNavigationConfigV2,
 };
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use rustix::io::Errno;
@@ -39,7 +39,7 @@ const SHA256_HEX_BYTES: usize = 64;
 
 const INPUT_FILE: &str = "calibration-preparation-input-v1.json";
 const ARTIFACT_FILE: &str = "calibration-artifact-v1.json";
-const NAVIGATION_FILE: &str = "navigation-shadow-v1.json";
+const NAVIGATION_FILE: &str = "navigation-shadow-v2.json";
 const MAX_STAGING_NAME_ATTEMPTS: u64 = 128;
 const TEMPLATE_TOKEN_PREFIX: &[u8; 2] = b"${";
 const TRACKING_CAMERA_TO_BASE_REPLACEMENT_MARKER: &str =
@@ -59,7 +59,7 @@ struct Cli {
     #[arg(long)]
     input: PathBuf,
 
-    /// Complete navigation-shadow V1 JSON whose calibration fields are replaced.
+    /// Complete navigation-shadow V2 JSON whose calibration fields are replaced.
     #[arg(long)]
     navigation_template: PathBuf,
 
@@ -755,7 +755,7 @@ fn prepare(
         DepthToTrackingCamera::identity(),
     );
     let parsed_navigation =
-        ShadowNavigationConfigV1::parse_json(&navigation_json, runtime_depth_camera)
+        ShadowNavigationConfigV2::parse_json(&navigation_json, runtime_depth_camera)
             .map_err(PrepareError::NavigationParse)?;
     parsed_artifact
         .require_navigation(&parsed_navigation)
@@ -1530,7 +1530,7 @@ mod tests {
         FIXTURE
             .get_or_init(|| {
                 let mut fixture: Value = serde_json::from_slice(include_bytes!(
-                    "../../../../configs/navigation-shadow-v1.example.json"
+                    "../../../../configs/navigation-shadow-v2.example.json"
                 ))
                 .expect("synthetic navigation fixture");
                 fixture["coordinate_frames"]["tracking_camera_to_base"] =
@@ -1554,7 +1554,7 @@ mod tests {
             stereo.dimensions(),
             DepthToTrackingCamera::identity(),
         );
-        let navigation = ShadowNavigationConfigV1::parse_json(&prepared.navigation_json, camera)
+        let navigation = ShadowNavigationConfigV2::parse_json(&prepared.navigation_json, camera)
             .expect("navigation");
         artifact
             .require_navigation(&navigation)
@@ -1976,7 +1976,7 @@ mod tests {
     #[test]
     fn qualification_navigation_preparation_template_is_sentinelized_and_shadow_only() {
         let template = include_str!(
-            "../../../../configs/nano-wheels-off-qualification-template/navigation-shadow-preparation-v1.json.template"
+            "../../../../configs/nano-wheels-off-qualification-template/navigation-shadow-preparation-v2.json.template"
         );
         assert!(template.contains("${NAV_SHADOW_UNVALIDATED_"));
         assert!(template.contains("${CALIBRATION_PREPARER_REPLACES_TRACKING_CAMERA_TO_BASE}"));

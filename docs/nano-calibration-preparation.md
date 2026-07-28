@@ -2,7 +2,7 @@
 
 `kiko-nano-calibration-prepare` is an offline, fail-closed assembler for the
 canonical `NanoCalibrationArtifactV1` and the two duplicated calibration
-sections in `navigation-shadow-v1.json`. It opens no hardware, performs no
+sections in `navigation-shadow-v2.json`. It opens no hardware, performs no
 calibration, and grants no motion authority.
 
 The input template is
@@ -12,7 +12,7 @@ is copied into the new output directory beside the generated files so the
 source claims and transformation values are retained for review.
 
 The recommended navigation input is
-`configs/nano-wheels-off-qualification-template/navigation-shadow-preparation-v1.json.template`.
+`configs/nano-wheels-off-qualification-template/navigation-shadow-preparation-v2.json.template`.
 It covers the complete shadow-navigation schema, fixes the schema versions,
 the fail-closed `blocked` unknown-space policy, and the exact checked-in
 qualification-only synthetic shadow plant. That plant is deliberately not
@@ -24,10 +24,13 @@ plant/MPC/control periods, a 100 ms shadow lease, candidate-compatible
 costmap freshness, and explicit solver/journal limits. Those values are
 software admission choices, not tuned navigation or performance evidence.
 
-Only five physically dependent `NAV_SHADOW_UNVALIDATED_*` leaves remain:
-world-to-occupancy rotation and translation, footprint radius, and the minimum
-and maximum obstacle heights. Render those five from retained physical
-evidence before invoking the assembler. Leave the two quoted
+Only seven physically dependent `NAV_SHADOW_UNVALIDATED_*` leaves remain:
+world-to-occupancy rotation and translation, footprint radius, the minimum
+and maximum floor-relative global occupancy heights, and the minimum and
+maximum axle-relative base-frame obstacle `z` values. Render those seven from
+retained physical evidence before invoking the assembler. Do not copy one
+height pair into the other: the base origin is the drive-wheel axle midpoint,
+not the floor. Leave the two quoted
 `CALIBRATION_PREPARER_REPLACES_*` placeholders in place: the assembler
 replaces those complete values before the production parser sees the
 navigation document. They must be the exact complete string values at
@@ -35,9 +38,36 @@ navigation document. They must be the exact complete string values at
 `odometry.raw_imu_calibration`; already-filled values are rejected rather than
 silently overwritten.
 
-`configs/navigation-shadow-v1.example.json` is a synthetic parser/test fixture.
+`configs/navigation-shadow-v2.example.json` is a synthetic parser/test fixture.
 It is not a recommended preparation input and must not be used for a
 qualification or deployment render.
+
+Navigation V1 is not accepted by the live parser or qualification path.
+Its single `local_costmap.obstacle_height_{minimum,maximum}_m` pair did not
+declare whether zero meant the floor or the axle-centred base origin, and the
+runtime consumed it in both frames. Migrate only from the retained physical
+measurement record:
+
+- write floor-relative bounds to
+  `global_occupancy.obstacle_floor_height_{minimum,maximum}_m`; and
+- write axle-midpoint-base-frame bounds to
+  `local_costmap.obstacle_base_z_{minimum,maximum}_m`.
+
+There is deliberately no compatibility fallback that duplicates the old
+numbers into both fields.
+
+Both obstacle slabs are closed intervals: an endpoint exactly equal to either
+the minimum or maximum is classified as an obstacle. A measured floor plane is
+therefore not a valid minimum by itself. Select each minimum above the highest
+plausible floor return in that field's own frame, including retained depth
+noise, extrinsic uncertainty, floor unevenness, and the intended low-obstacle
+clearance margin. In particular,
+`local_costmap.obstacle_base_z_minimum_m` must be greater than the most
+positive plausible floor `z` in the axle-midpoint base frame; setting it equal
+to nominal floor `z` makes nominal floor endpoints occupied. Retain the
+measurement, uncertainty calculation, and chosen margin. Apply the same
+evidence discipline to the maximum so over-robot points are excluded without
+excluding obstacles Kiko can collide with.
 
 Run the assembler only after replacing every required preparation and
 navigation token:
@@ -106,7 +136,7 @@ fails, the error says that a complete output is already visible but its
 directory-entry durability is unconfirmed. Existing output paths are never
 replaced.
 
-## Retained Nano evidence and the baseline defect
+## Retained Nano evidence and baseline selection
 
 Read-only audit on 2026-07-27 found these relevant retained sources:
 
@@ -138,6 +168,27 @@ summary has SHA-256
 `e2d9e048508762f968810ca0eea0613a78344047e94ec22f9f4507937780f53a`.
 That tenfold disagreement is rejected by the assembler and the affected
 conversion summary must not be used as canonical baseline evidence.
+
+Fresh evidence on 2026-07-29 supersedes that defective conversion as the
+selected baseline pair:
+
+- live rectified stereo:
+  `/home/makerspace/kiko-native-evidence/4238f14-calibration-stereo-20260729T001905+0530/calibration.json`,
+  SHA-256
+  `13cdf7c81036b9983f4f12f51b4353295468b88de896ec0d7bd3a37a1147503e`,
+  baseline `0.07503394 m`; and
+- independent static OAK-D S2 board design:
+  `/home/makerspace/kiko-native-evidence/4238f14-oak-s2-board-baseline-20260729T005342+0530/OAK-D-S2.json`,
+  SHA-256
+  `b6c50050a9d45bd28d76102cfc44ff399591f10f5518b0eedc47d15b83c28281`,
+  baseline `0.075 m`.
+
+The design declaration comes from clean `depthai-boards` commit
+`1dda9d332864c9139616282d63b043cab0ee65fa` and is not a re-export of the
+connected device's EEPROM/API value. Exact decimal arithmetic gives a relative
+discrepancy of `0.045232864%`; the preparer's parsed `f32` inputs give
+`0.0452294%`. Both are below its 2% gate. Exact interpretation and claim
+limits are recorded in `docs/nano-oak-s2-baseline-evidence-2026-07-29.md`.
 
 ## Exact live-capture-to-preparer transaction
 
@@ -191,12 +242,12 @@ left-rectification matrix has no asserted transform direction. Neither may be
 silently relabelled into the two physical transforms required by the
 preparer.
 
-Create a second retained measurement record for the stereo baseline using a
-derivation independent of the OAK EEPROM/live calibration API, for example a
-documented physical optical-centre measurement. Its exact bytes, identifier,
-method, units, uncertainty, date, assembly identity, and SHA-256 populate the
-corroborating baseline fields. Re-exporting, reformatting, or renaming the live
-OAK value is not independent evidence.
+Use the retained static OAK-D S2 board declaration above as the corroborating
+baseline source. Its exact bytes, identifier, design method, centimetre units,
+source revisions, operator model identification, and SHA-256 populate the
+corroborating fields. The preparer relationship remains
+`independently_derived`; re-exporting, reformatting, or renaming the live OAK
+value would not satisfy that relationship.
 
 The current preparer retains caller-supplied provenance declarations but does
 not reopen the source files. Therefore the release review must recompute both

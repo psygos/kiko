@@ -4403,6 +4403,7 @@ mod tests {
         WorldToOccupancy,
     };
     use crate::map::SlamMap;
+    use crate::navigation::local_costmap::BaseZRangeMeters;
     use crate::{
         DepthImage, DepthObservation, FrameDimensions, FrameId, PinholeIntrinsics, Pose, Timestamp,
     };
@@ -4588,7 +4589,7 @@ mod tests {
             geometry,
             camera(9, 5),
             optical_to_base(),
-            HeightRangeMeters::try_new(0.1, 1.5).expect("obstacle height"),
+            BaseZRangeMeters::try_new(0.1, 1.5).expect("base z obstacle range"),
             DepthRangeMeters::try_new(0.1, 8.0).expect("local depth"),
             1,
             0.1,

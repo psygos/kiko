@@ -14,13 +14,13 @@ use super::{
     ActuationConfigParseError, NanoCalibrationArtifactV1, NanoCalibrationBindingError,
     NavigationActuationConfigV1, ProductionNavigationControllerBindingError,
     ProductionNavigationControllerBindingV1, ProductionNavigationControllerContractV1,
-    ShadowNavigationConfigParseError, ShadowNavigationConfigV1,
+    ShadowNavigationConfigParseError, ShadowNavigationConfigV2,
 };
 use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
 
 /// Parsed shadow-only deployment graph used by wheels-off qualification.
 pub struct OfflineShadowNavigationGraphV1 {
-    navigation: ShadowNavigationConfigV1,
+    navigation: ShadowNavigationConfigV2,
 }
 
 impl OfflineShadowNavigationGraphV1 {
@@ -39,7 +39,7 @@ impl OfflineShadowNavigationGraphV1 {
             stereo.dimensions(),
             DepthToTrackingCamera::identity(),
         );
-        let navigation = ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+        let navigation = ShadowNavigationConfigV2::parse_json_bound_to_plant_artifact(
             navigation_bytes,
             depth_camera,
             plant,
@@ -51,7 +51,7 @@ impl OfflineShadowNavigationGraphV1 {
         Ok(Self { navigation })
     }
 
-    pub const fn navigation(&self) -> &ShadowNavigationConfigV1 {
+    pub const fn navigation(&self) -> &ShadowNavigationConfigV2 {
         &self.navigation
     }
 }
@@ -114,7 +114,7 @@ impl OfflineProductionNavigationGraphV1 {
         })
     }
 
-    pub const fn navigation(&self) -> &ShadowNavigationConfigV1 {
+    pub const fn navigation(&self) -> &ShadowNavigationConfigV2 {
         self.shadow.navigation()
     }
 

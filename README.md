@@ -62,7 +62,7 @@ KIKO_LIVE_DEPTH=true \
 KIKO_DENSE=true \
 cargo run --locked -p kiko-slam --features record -- live \
   --imu-rate-hz 200 \
-  --navigation-config configs/navigation-shadow-v1.example.json \
+  --navigation-config configs/navigation-shadow-v2.example.json \
   --navigation-goal 2.0,1.0 \
   --navigation-record recordings/shadow-example
 ```

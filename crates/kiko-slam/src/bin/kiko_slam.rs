@@ -6,6 +6,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 use std::io::{BufRead, IsTerminal, Write};
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+use std::os::unix::fs::OpenOptionsExt;
 
 #[cfg(all(feature = "nano-agent", unix))]
 use kiko_expression_core::{ChannelOrder, ImagePoint, StreamEpochId};
@@ -123,12 +125,12 @@ use kiko_slam::navigation::{
     ConsoleRerunDiagnosticsUrl, ConsoleSnapshotRevision, ConsoleSourceKind, ConsoleStopCertainty,
     ConsoleSubsystemHealth, ConsoleTerminalReason, ConsoleTerminalState, LiveMotionAuthorityState,
     LiveMotionAuthorityStateError, NanoAccessoryComponentHealth, NanoAccessoryHealthStatusError,
-    NanoOperatorConsoleFrontend, NanoOperatorConsoleFrontendShutdownEvidence,
-    NanoOperatorConsoleFrontendStartError, OperatorConsoleIngressDisposition,
-    OperatorConsoleLimits, OperatorConsoleProcessDisposition, OperatorConsoleRetainedAuthorityKind,
-    OperatorConsoleRuntimeAdapter, OperatorConsoleRuntimeAdapterError,
-    OperatorConsoleRuntimeIngressError, OperatorConsoleSnapshot, OperatorConsoleSnapshotError,
-    operator_console,
+    NanoAccessoryRuntimeHealth, NanoOperatorConsoleFrontend,
+    NanoOperatorConsoleFrontendShutdownEvidence, NanoOperatorConsoleFrontendStartError,
+    OperatorConsoleIngressDisposition, OperatorConsoleLimits, OperatorConsoleProcessDisposition,
+    OperatorConsoleRetainedAuthorityKind, OperatorConsoleRuntimeAdapter,
+    OperatorConsoleRuntimeAdapterError, OperatorConsoleRuntimeIngressError,
+    OperatorConsoleSnapshot, OperatorConsoleSnapshotError, operator_console,
 };
 #[cfg(feature = "record")]
 use kiko_slam::navigation::{
@@ -141,26 +143,28 @@ use kiko_slam::navigation::{
     SafetyDecisionOutcome, ShadowNavigationCoordinator, VisualAdmission, VisualAdmissionError,
     VisualAttemptOutcome,
 };
-#[cfg(all(feature = "record", feature = "actuation"))]
-use kiko_slam::navigation::{
-    LiveMpcControlDriver, LiveMpcControlError, NavigationActuationConfigV1,
-};
 #[cfg(all(feature = "nano-agent", unix))]
 use kiko_slam::navigation::{
-    MAX_NANO_WARM_SELECTION_BYTES, NANO_ACCESSORY_TERMINAL_PUBLICATION_TIMEOUT,
-    NanoAccessoryFaultWaitError, NanoAccessoryFrameSubmitOutcome, NanoAccessoryShutdownEvidence,
-    NanoAccessoryTerminalFault, NanoAccessoryWorker, NanoAccessoryWorkerExit,
-    NanoAccessoryWorkerJoinError, NanoBootstrapRequest, NanoBootstrapRoots,
-    NanoBootstrapStereoEvidence, NanoDatasetReplayRequired, NanoFaceDiagnosticFrame,
-    NanoFaceDiagnosticReceiver, NanoFaceDiagnosticStatsHandle, NanoFacePerceptionShutdownClass,
+    HeadGazeFaceProposalOutcome, MAX_NANO_WARM_SELECTION_BYTES,
+    NANO_ACCESSORY_TERMINAL_PUBLICATION_TIMEOUT, NanoAccessoryFaultWaitError,
+    NanoAccessoryFrameSubmitOutcome, NanoAccessoryShutdownEvidence, NanoAccessoryTerminalFault,
+    NanoAccessoryWorker, NanoAccessoryWorkerExit, NanoAccessoryWorkerJoinError,
+    NanoBootstrapRequest, NanoBootstrapRoots, NanoBootstrapStereoEvidence,
+    NanoDatasetReplayRequired, NanoFaceDiagnosticFrame, NanoFaceDiagnosticReceiver,
+    NanoFaceDiagnosticStatsHandle, NanoFacePerceptionShutdownClass,
     NanoFacePerceptionShutdownEvidence, NanoFacePerceptionStageStatsHandle,
-    NanoFinalizedJournalMapIdentity, NanoLaunchInference, NanoLaunchOccupancy, NanoLaunchRerun,
-    NanoLaunchStorage, NanoMapPersistenceConfig, NanoMapPersistenceOwner,
-    NanoMapPersistencePathError, NanoMapSaveCommandError, NanoMapSnapshotRetentionError,
-    NanoMapWarmStartLoad, NanoOakStreamGraph, NanoStateQuotaAdmissionError, NanoStateQuotaOwner,
+    NanoFinalizedJournalMapIdentity, NanoHeadGazeActuationAvailability, NanoHeadGazeDiagnostic,
+    NanoLaunchInference, NanoLaunchOccupancy, NanoLaunchRerun, NanoLaunchStorage,
+    NanoMapPersistenceConfig, NanoMapPersistenceOwner, NanoMapPersistencePathError,
+    NanoMapSaveCommandError, NanoMapSnapshotRetentionError, NanoMapWarmStartLoad,
+    NanoOakStreamGraph, NanoStateQuotaAdmissionError, NanoStateQuotaOwner,
     NanoWarmCheckpointCommandError, NanoWarmStartRelocalizationError,
     NanoWarmStartRelocalizationTransition, NanoWarmStartReplayConfig, ParsedNanoLiveConfiguration,
     PreparedNanoBootstrap, bootstrap_nano_production, replay_nano_warm_start,
+};
+#[cfg(all(feature = "record", feature = "actuation"))]
+use kiko_slam::navigation::{
+    LiveMpcControlDriver, LiveMpcControlError, NavigationActuationConfigV1,
 };
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 use kiko_slam::navigation::{
@@ -4748,6 +4752,18 @@ enum LivePhysicalStateVizPublishError {
     feature = "agent-runtime",
     unix
 ))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveNavigationVizPublishOutcome {
+    AcceptedByBoundedQueue,
+    ConsumerUnavailable,
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
 impl std::fmt::Display for LivePhysicalStateVizPublishError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(
@@ -4773,15 +4789,17 @@ impl std::error::Error for LivePhysicalStateVizPublishError {}
 fn publish_live_navigation_viz_message(
     sender: &mut Option<DropSender<LiveNavigationVizMsg>>,
     message: LiveNavigationVizMsg,
-) -> Result<(), LivePhysicalStateVizPublishError> {
+) -> Result<LiveNavigationVizPublishOutcome, LivePhysicalStateVizPublishError> {
     let Some(active_sender) = sender.as_ref() else {
-        return Ok(());
+        return Ok(LiveNavigationVizPublishOutcome::ConsumerUnavailable);
     };
     match active_sender.try_send(message) {
-        SendOutcome::Enqueued | SendOutcome::DroppedOldest => Ok(()),
+        SendOutcome::Enqueued | SendOutcome::DroppedOldest => {
+            Ok(LiveNavigationVizPublishOutcome::AcceptedByBoundedQueue)
+        }
         SendOutcome::Disconnected => {
             *sender = None;
-            Ok(())
+            Ok(LiveNavigationVizPublishOutcome::ConsumerUnavailable)
         }
         SendOutcome::DroppedNewest => Err(LivePhysicalStateVizPublishError::DroppedNewest),
     }
@@ -4828,6 +4846,7 @@ fn publish_live_physical_state_viz(
         ),
     };
     publish_live_navigation_viz_message(sender, message.with_control_tick_timing(timing))
+        .map(|_| ())
 }
 
 #[cfg(feature = "record")]
@@ -5497,6 +5516,109 @@ fn live_face_detection_label(detection: FaceDetection) -> String {
 }
 
 #[cfg(all(feature = "record", feature = "nano-agent", unix))]
+fn log_live_head_gaze_diagnostic(
+    recording: &rerun::RecordingStream,
+    diagnostic: NanoHeadGazeDiagnostic,
+) -> Result<(), VizLogError> {
+    let actuation = NanoHeadGazeActuationAvailability::UnavailableWithoutBaseZeroExclusiveLease;
+    debug_assert_eq!(diagnostic.actuation(), actuation);
+    match diagnostic {
+        NanoHeadGazeDiagnostic::DisabledNoPolicy { actuation } => {
+            recording.log(
+                "diagnostics/head_gaze/status",
+                &rerun::TextLog::new(format!(
+                    "policy=absent proposal=disabled actuation={actuation:?}"
+                )),
+            )?;
+            recording.log(
+                "diagnostics/head_gaze/proposal_target_ticks",
+                &rerun::Clear::flat(),
+            )?;
+            recording.log(
+                "diagnostics/head_gaze/camera_ray_unit_direction",
+                &rerun::Clear::flat(),
+            )?;
+        }
+        NanoHeadGazeDiagnostic::ProposalOnly {
+            evaluated_at,
+            projection,
+            outcome,
+            actuation,
+        } => {
+            let [fx, fy, cx, cy] = projection.coefficients_px();
+            let [width, height] = projection.dimensions_px();
+            recording.log(
+                "diagnostics/head_gaze/rgb_intrinsics_px",
+                &rerun::Scalars::new([f64::from(fx), f64::from(fy), f64::from(cx), f64::from(cy)]),
+            )?;
+            match outcome {
+                Ok(HeadGazeFaceProposalOutcome::Proposed(proposal)) => {
+                    let positions = proposal.target().positions();
+                    recording.log(
+                        "diagnostics/head_gaze/status",
+                        &rerun::TextLog::new(format!(
+                            "policy=proposal_only outcome=proposed evaluated_at_accessory_ns={} rgb_grid={}x{} track_id=0x{:016x} transition={:?} actuation={actuation:?}",
+                            evaluated_at.nanos_since_epoch(),
+                            width,
+                            height,
+                            proposal.face().track_id().get(),
+                            proposal.face().transition(),
+                        )),
+                    )?;
+                    recording.log(
+                        "diagnostics/head_gaze/proposal_target_ticks",
+                        &rerun::Scalars::new(positions.map(|position| f64::from(position.get()))),
+                    )?;
+                    recording.log(
+                        "diagnostics/head_gaze/camera_ray_unit_direction",
+                        &rerun::Scalars::new(proposal.camera_ray().unit_direction()),
+                    )?;
+                }
+                Ok(HeadGazeFaceProposalOutcome::Withheld(reason)) => {
+                    recording.log(
+                        "diagnostics/head_gaze/status",
+                        &rerun::TextLog::new(format!(
+                            "policy=proposal_only outcome=withheld reason={reason:?} evaluated_at_accessory_ns={} rgb_grid={}x{} actuation={actuation:?}",
+                            evaluated_at.nanos_since_epoch(),
+                            width,
+                            height,
+                        )),
+                    )?;
+                    recording.log(
+                        "diagnostics/head_gaze/proposal_target_ticks",
+                        &rerun::Clear::flat(),
+                    )?;
+                    recording.log(
+                        "diagnostics/head_gaze/camera_ray_unit_direction",
+                        &rerun::Clear::flat(),
+                    )?;
+                }
+                Err(source) => {
+                    recording.log(
+                        "diagnostics/head_gaze/status",
+                        &rerun::TextLog::new(format!(
+                            "policy=proposal_only outcome=rejected source={source:?} evaluated_at_accessory_ns={} rgb_grid={}x{} actuation={actuation:?}",
+                            evaluated_at.nanos_since_epoch(),
+                            width,
+                            height,
+                        )),
+                    )?;
+                    recording.log(
+                        "diagnostics/head_gaze/proposal_target_ticks",
+                        &rerun::Clear::flat(),
+                    )?;
+                    recording.log(
+                        "diagnostics/head_gaze/camera_ray_unit_direction",
+                        &rerun::Clear::flat(),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "record", feature = "nano-agent", unix))]
 fn log_live_face_viz_message(
     recording: &rerun::RecordingStream,
     message: NanoFaceDiagnosticFrame,
@@ -5520,7 +5642,7 @@ fn log_live_face_viz_message(
         recording.log_static(
             "diagnostics/face/contract",
             &rerun::TextLog::new(
-                "Face rectangles are best-effort expression/gaze diagnostics from a classical Haar detector. opaque_rank is not confidence, probability, identity, range, occupancy, collision evidence, or navigation authority. Accessory monotonic timestamps use a distinct process-local clock origin and are never subtracted from OAK or navigation clocks.",
+                "Face rectangles and head-gaze proposals are best-effort diagnostics from a classical Haar detector. A proposal-only policy never actuates the head: physical servicing remains unavailable without the sole-base-owner exact-zero exclusive lease. opaque_rank is not confidence, probability, identity, range, occupancy, collision evidence, or navigation authority. Accessory monotonic timestamps use a distinct process-local clock origin and are never subtracted from OAK or navigation clocks.",
             ),
         )?;
         *context_logged = true;
@@ -5565,6 +5687,7 @@ fn log_live_face_viz_message(
         "diagnostics/face/detector_truncated_count",
         &rerun::Scalars::single(f64::from(batch.detector_truncated_count())),
     )?;
+    log_live_head_gaze_diagnostic(recording, message.head_gaze())?;
 
     let overlay_matched = last_logged_rgb == Some(validated.frame_key);
     recording.log(
@@ -6648,6 +6771,18 @@ enum LiveNavigationWorkerError {
         source: Box<kiko_slam::navigation::WheelsOffQualificationRuntimeError>,
     },
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationAttestation {
+        source: FreshAttendedMotionAttestationWorkerError,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationAttestationCleanup {
+        source: FreshAttendedMotionAttestationWorkerError,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    WheelsOffQualificationMotionAuthorityEnable {
+        source: kiko_slam::navigation::WheelsOffQualificationMotionAuthorityEnableFailure,
+    },
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     WheelsOffQualificationAppliedStepBoundary {
         source: NavigationIngressBoundaryError,
     },
@@ -6853,6 +6988,17 @@ impl std::fmt::Display for LiveNavigationWorkerError {
             Self::WheelsOffQualificationStart { source } => source.fmt(formatter),
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
             Self::WheelsOffQualificationRuntime { source } => source.fmt(formatter),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationAttestation { source } => {
+                write!(formatter, "wheels-off qualification attestation failed: {source}")
+            }
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationAttestationCleanup { source } => write!(
+                formatter,
+                "wheels-off qualification attestation cleanup failed: {source}"
+            ),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationMotionAuthorityEnable { source } => source.fmt(formatter),
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
             Self::WheelsOffQualificationAppliedStepBoundary { source } => write!(
                 formatter,
@@ -7061,6 +7207,11 @@ impl std::error::Error for LiveNavigationWorkerError {
             Self::WheelsOffQualificationStart { source } => Some(source.as_ref()),
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
             Self::WheelsOffQualificationRuntime { source } => Some(source.as_ref()),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationAttestation { source }
+            | Self::WheelsOffQualificationAttestationCleanup { source } => Some(source),
+            #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+            Self::WheelsOffQualificationMotionAuthorityEnable { source } => Some(source),
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
             Self::WheelsOffQualificationAppliedStepBoundary { source } => Some(source),
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
@@ -7278,6 +7429,8 @@ struct LiveWheelsOffQualificationMotionRuntime {
     coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
     controller: Option<kiko_slam::navigation::WheelsOffQualificationRuntime>,
     frontend: Option<kiko_slam::navigation::WheelsOffQualificationFrontend>,
+    attestation_gate: Option<FreshAttendedMotionAttestationGate>,
+    process_running: Arc<AtomicBool>,
     telemetry: kiko_slam::navigation::WheelsOffQualificationTelemetryStore,
     observation: LiveConsoleNavigationObservation,
     initial_health: ConsoleSubsystemHealth,
@@ -7308,11 +7461,18 @@ impl LiveWheelsOffQualificationMotionRuntime {
             .expect("qualification frontend exists until terminal shutdown")
     }
 
+    fn attestation_gate_mut(&mut self) -> &mut FreshAttendedMotionAttestationGate {
+        self.attestation_gate
+            .as_mut()
+            .expect("qualification attestation gate exists until terminal shutdown")
+    }
+
     fn take_terminal_parts(
         &mut self,
     ) -> (
         kiko_slam::navigation::WheelsOffQualificationRuntime,
         kiko_slam::navigation::WheelsOffQualificationFrontend,
+        FreshAttendedMotionAttestationGate,
     ) {
         (
             self.controller
@@ -7321,6 +7481,9 @@ impl LiveWheelsOffQualificationMotionRuntime {
             self.frontend
                 .take()
                 .expect("qualification frontend transfers once"),
+            self.attestation_gate
+                .take()
+                .expect("qualification attestation gate transfers once"),
         )
     }
 }
@@ -7910,16 +8073,8 @@ type LiveWheelsOffQualificationMotionStartFailure = Box<(
 enum LiveWheelsOffQualificationMotionStartPrimary {
     Receipt(ConsoleReceiptProjectionError),
     Telemetry(kiko_slam::navigation::WheelsOffQualificationTelemetryError),
-    Attestation {
-        source: FreshAttendedMotionAttestationError,
-        frontend_shutdown: kiko_slam::navigation::WheelsOffQualificationFrontendShutdownEvidence,
-    },
     Runtime {
         source: kiko_slam::navigation::WheelsOffQualificationRuntimeStartError,
-        frontend_shutdown: kiko_slam::navigation::WheelsOffQualificationFrontendShutdownEvidence,
-    },
-    MotionAuthorityEnable {
-        source: kiko_slam::navigation::WheelsOffQualificationMotionAuthorityEnableError,
         frontend_shutdown: kiko_slam::navigation::WheelsOffQualificationFrontendShutdownEvidence,
     },
     FrontendExited {
@@ -7934,21 +8089,7 @@ impl std::fmt::Display for LiveWheelsOffQualificationMotionStartPrimary {
         match self {
             Self::Receipt(source) => source.fmt(formatter),
             Self::Telemetry(source) => source.fmt(formatter),
-            Self::Attestation {
-                source,
-                frontend_shutdown,
-            } => write!(
-                formatter,
-                "{source}; already-bound frontend shutdown evidence: {frontend_shutdown:?}"
-            ),
             Self::Runtime {
-                source,
-                frontend_shutdown,
-            } => write!(
-                formatter,
-                "{source}; already-bound frontend shutdown evidence: {frontend_shutdown:?}"
-            ),
-            Self::MotionAuthorityEnable {
                 source,
                 frontend_shutdown,
             } => write!(
@@ -7970,9 +8111,7 @@ impl std::error::Error for LiveWheelsOffQualificationMotionStartPrimary {
         match self {
             Self::Receipt(source) => Some(source),
             Self::Telemetry(source) => Some(source),
-            Self::Attestation { source, .. } => Some(source),
             Self::Runtime { source, .. } => Some(source),
-            Self::MotionAuthorityEnable { source, .. } => Some(source),
             Self::FrontendExited { .. } => None,
             Self::Frontend(source) => Some(source),
         }
@@ -8066,6 +8205,7 @@ fn start_wheels_off_qualification_motion_runtime(
     coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
     mut input: LiveWheelsOffQualificationMotionInput,
     actual_runtime_service_interval: Duration,
+    process_running: Arc<AtomicBool>,
 ) -> Result<LiveWheelsOffQualificationMotionRuntime, LiveWheelsOffQualificationMotionStartFailure> {
     let (
         stopped_controller,
@@ -8120,9 +8260,9 @@ fn start_wheels_off_qualification_motion_runtime(
         }
     };
     // Bind the loopback UI while the console's motion boundary is still
-    // closed. Requests other than the one-way safety stop fail with
-    // `motion_attestation_pending` until the stopped runtime owner and the
-    // fresh attended attestation are both ready.
+    // closed. Motion-capable requests fail with `motion_attestation_pending`
+    // until the stopped runtime owner and fresh attended attestation are both
+    // ready; ordinary Stop and the one-way safety stop remain available.
     let mut frontend = match kiko_slam::navigation::WheelsOffQualificationFrontend::start(
         &frontend_config,
         console.clone(),
@@ -8147,21 +8287,6 @@ fn start_wheels_off_qualification_motion_runtime(
         limits.manual_test_magnitude_timer_pwm_percent(),
         limits.manual_deadman().as_millis(),
     );
-    let attestation = match require_fresh_attended_motion_attestation(preflight) {
-        Ok(attestation) => attestation,
-        Err(source) => {
-            let frontend_shutdown = frontend.shutdown();
-            return Err(fail_wheels_off_qualification_before_runtime(
-                coordinator,
-                LiveWheelsOffQualificationMotionStartPrimary::Attestation {
-                    source,
-                    frontend_shutdown,
-                },
-                boot_id,
-                stop_request_id,
-            ));
-        }
-    };
     if let Some(frontend_shutdown) = frontend.poll_unexpected_exit() {
         return Err(fail_wheels_off_qualification_before_runtime(
             coordinator,
@@ -8170,14 +8295,13 @@ fn start_wheels_off_qualification_motion_runtime(
             stop_request_id,
         ));
     }
-    let mut controller = match kiko_slam::navigation::WheelsOffQualificationRuntime::try_new(
+    let mut controller = match kiko_slam::navigation::WheelsOffQualificationRuntime::try_new_pending(
         stopped_controller,
         initial_zero,
         initial_stop,
         limits,
         admitted_runtime_service_interval,
         actual_runtime_service_interval,
-        attestation,
         console.clone(),
         receiver,
     ) {
@@ -8209,29 +8333,22 @@ fn start_wheels_off_qualification_motion_runtime(
             },
         )));
     }
-    if let Err(source) = console.enable_motion_authority() {
-        let frontend_shutdown = frontend.shutdown();
-        let controller_stop = controller.shutdown().map_err(Box::new);
-        return Err(Box::new((
-            coordinator,
-            LiveWheelsOffQualificationMotionStartError {
-                primary: LiveWheelsOffQualificationMotionStartPrimary::MotionAuthorityEnable {
-                    source,
-                    frontend_shutdown,
-                },
-                controller_stop: LiveWheelsOffQualificationStartStop::RuntimeShutdown(
-                    controller_stop,
-                ),
-            },
-        )));
-    }
+    let attestation_gate = FreshAttendedMotionAttestationGate::AwaitingReadOnlyCycle(
+        FreshAttendedMotionAttestationInput {
+            preflight,
+            console: console.clone(),
+            process_running: Arc::clone(&process_running),
+        },
+    );
     eprintln!(
-        "wheels-off qualification manual motion boundary enabled from the fresh attended attestation"
+        "wheels-off qualification stopped runtime is live; OAK SLAM, occupancy, Rerun, accessories, console, and exact applied-zero STM32 evidence are starting while fresh attended motion attestation remains locked"
     );
     Ok(LiveWheelsOffQualificationMotionRuntime {
         coordinator,
         controller: Some(controller),
         frontend: Some(frontend),
+        attestation_gate: Some(attestation_gate),
+        process_running,
         telemetry,
         observation: LiveConsoleNavigationObservation {
             next_snapshot_revision: Some(2),
@@ -8695,10 +8812,25 @@ const fn console_health_from_accessory(health: NanoAccessoryComponentHealth) -> 
     unix
 ))]
 fn refresh_console_accessory_health(
-    mut health: ConsoleSubsystemHealth,
+    health: ConsoleSubsystemHealth,
     observer: &NanoAccessoryHealthObserver,
 ) -> Result<ConsoleSubsystemHealth, NanoAccessoryHealthStatusError> {
     let accessory = observer.snapshot()?;
+    Ok(project_console_accessory_health(health, accessory))
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    feature = "nano-agent",
+    feature = "operator-console",
+    unix
+))]
+fn project_console_accessory_health(
+    mut health: ConsoleSubsystemHealth,
+    accessory: NanoAccessoryRuntimeHealth,
+) -> ConsoleSubsystemHealth {
     health.head = Some(console_health_from_accessory(accessory.head));
     health.eyes = Some(console_health_from_accessory(
         match (accessory.eyes, accessory.rgb_expression) {
@@ -8711,7 +8843,7 @@ fn refresh_console_accessory_health(
             }
         },
     ));
-    Ok(health)
+    health
 }
 
 #[cfg(all(
@@ -9035,7 +9167,7 @@ fn publish_wheels_off_qualification_snapshot(
     runtime: &mut LiveWheelsOffQualificationMotionRuntime,
     snapshot_clock: &InstantHostClock,
     tick_timing: LiveControlTickTiming,
-) -> Result<(), LiveNavigationWorkerError> {
+) -> Result<NanoAccessoryRuntimeHealth, LiveNavigationWorkerError> {
     observe_wheels_off_qualification_controller(runtime)?;
     let revision = runtime.observation.next_snapshot_revision.take().ok_or(
         LiveNavigationWorkerError::WheelsOffQualificationProjection {
@@ -9124,13 +9256,12 @@ fn publish_wheels_off_qualification_snapshot(
     snapshot.last_applied = runtime.observation.last_applied;
     snapshot.stop_certainty = runtime.observation.stop_certainty;
     snapshot.rerun_diagnostics_url = Some(runtime.observation.rerun_diagnostics_url);
-    snapshot.health =
-        refresh_console_accessory_health(runtime.initial_health, &runtime.accessory_health)
-            .map_err(
-                |source| LiveNavigationWorkerError::WheelsOffQualificationProjection {
-                    source: LiveProductionConsoleProjectionError::AccessoryHealth(source),
-                },
-            )?;
+    let accessory_health = runtime.accessory_health.snapshot().map_err(|source| {
+        LiveNavigationWorkerError::WheelsOffQualificationProjection {
+            source: LiveProductionConsoleProjectionError::AccessoryHealth(source),
+        }
+    })?;
+    snapshot.health = project_console_accessory_health(runtime.initial_health, accessory_health);
     if matches!(snapshot.runtime, Some(AgentRuntimeStateV1::Faulted)) {
         snapshot.health.stm32 = Some(ConsoleHealth::Faulted);
     }
@@ -9147,7 +9278,216 @@ fn publish_wheels_off_qualification_snapshot(
     runtime
         .telemetry
         .publish_observational_base(snapshot)
-        .map_err(|source| LiveNavigationWorkerError::WheelsOffQualificationTelemetry { source })
+        .map_err(|source| LiveNavigationWorkerError::WheelsOffQualificationTelemetry { source })?;
+    Ok(accessory_health)
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelsOffQualificationAttestationReadinessBlocker {
+    FreshVisualDepthImuUnavailable,
+    AccessoryNotReady,
+    PublishedOccupancyRevisionUnavailable,
+    CoordinatorMotionStartNotReady,
+    NavigationVisualizationNotAccepted,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn classify_wheels_off_qualification_attestation_readiness(
+    fresh_visual_depth_imu: bool,
+    accessory_ready: bool,
+    published_occupancy_revision: bool,
+    coordinator_motion_start_ready: bool,
+    navigation_visualization_accepted: bool,
+) -> Result<(), WheelsOffQualificationAttestationReadinessBlocker> {
+    if !fresh_visual_depth_imu {
+        return Err(
+            WheelsOffQualificationAttestationReadinessBlocker::FreshVisualDepthImuUnavailable,
+        );
+    }
+    if !accessory_ready {
+        return Err(WheelsOffQualificationAttestationReadinessBlocker::AccessoryNotReady);
+    }
+    if !published_occupancy_revision {
+        return Err(
+            WheelsOffQualificationAttestationReadinessBlocker::PublishedOccupancyRevisionUnavailable,
+        );
+    }
+    if !coordinator_motion_start_ready {
+        return Err(
+            WheelsOffQualificationAttestationReadinessBlocker::CoordinatorMotionStartNotReady,
+        );
+    }
+    if !navigation_visualization_accepted {
+        return Err(
+            WheelsOffQualificationAttestationReadinessBlocker::NavigationVisualizationNotAccepted,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn wheels_off_qualification_accessory_is_ready(health: NanoAccessoryRuntimeHealth) -> bool {
+    health.head == NanoAccessoryComponentHealth::Ready
+        && health.eyes == NanoAccessoryComponentHealth::Ready
+        && health.rgb_expression == NanoAccessoryComponentHealth::Ready
+        && health.successful_rgb_expression_frames > 0
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn current_wheels_off_qualification_attestation_readiness(
+    runtime: &LiveWheelsOffQualificationMotionRuntime,
+    observed_at: HostMonotonicTimestamp,
+    accessory_health: NanoAccessoryRuntimeHealth,
+    navigation_viz: LiveNavigationVizPublishOutcome,
+) -> Result<(), WheelsOffQualificationAttestationReadinessBlocker> {
+    let published_occupancy_revision = runtime.map_revision.is_some_and(|revision| {
+        runtime
+            .observation
+            .map
+            .as_ref()
+            .is_some_and(|map| map.revision == revision && map.grid.is_some())
+    });
+    classify_wheels_off_qualification_attestation_readiness(
+        runtime.sensor_health.console_health(observed_at) == ConsoleHealth::Ready,
+        wheels_off_qualification_accessory_is_ready(accessory_health),
+        published_occupancy_revision,
+        runtime
+            .coordinator
+            .motion_start_readiness_at(observed_at)
+            .is_ok(),
+        navigation_viz == LiveNavigationVizPublishOutcome::AcceptedByBoundedQueue,
+    )
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn advance_wheels_off_qualification_motion_attestation_after_read_only_tick(
+    runtime: &mut LiveWheelsOffQualificationMotionRuntime,
+    snapshot_clock: &InstantHostClock,
+    accessory_health: NanoAccessoryRuntimeHealth,
+    navigation_viz: LiveNavigationVizPublishOutcome,
+) -> Result<(), LiveNavigationWorkerError> {
+    if runtime.controller().motion_authority_state()
+        == kiko_slam::navigation::WheelsOffQualificationMotionAuthorityState::Enabled
+    {
+        return Ok(());
+    }
+    let process_running = Arc::clone(&runtime.process_running);
+    if !process_running.load(Ordering::SeqCst) {
+        runtime
+            .attestation_gate_mut()
+            .close_without_enablement(FreshAttendedMotionAttestationClosure::ProcessNotRunning)
+            .map_err(|source| {
+                LiveNavigationWorkerError::WheelsOffQualificationAttestationCleanup { source }
+            })?;
+        return Ok(());
+    }
+    if runtime
+        .controller()
+        .console_snapshot()
+        .software_safety_stop_latched
+    {
+        let already_closed = runtime.attestation_gate_mut().is_closed();
+        runtime
+            .attestation_gate_mut()
+            .close_without_enablement(
+                FreshAttendedMotionAttestationClosure::SoftwareSafetyStopLatched,
+            )
+            .map_err(|source| {
+                LiveNavigationWorkerError::WheelsOffQualificationAttestationCleanup { source }
+            })?;
+        if !already_closed {
+            eprintln!(
+                "wheels-off qualification motion-attestation gate closed without enablement because the process-lifetime software safety stop is latched"
+            );
+        }
+        return Ok(());
+    }
+    let prompt_observed_at = snapshot_clock
+        .checked_now()
+        .map_err(LiveNavigationWorkerError::HostClock)?;
+    if let Err(blocker) = current_wheels_off_qualification_attestation_readiness(
+        runtime,
+        prompt_observed_at,
+        accessory_health,
+        navigation_viz,
+    ) {
+        if runtime.attestation_gate_mut().has_started_prompt() {
+            runtime
+                .attestation_gate_mut()
+                .close_without_enablement(FreshAttendedMotionAttestationClosure::ReadinessLost(
+                    blocker,
+                ))
+                .map_err(|source| {
+                    LiveNavigationWorkerError::WheelsOffQualificationAttestationCleanup { source }
+                })?;
+            eprintln!(
+                "wheels-off qualification motion-attestation gate closed without enablement because integrated readiness was lost: {blocker:?}"
+            );
+        }
+        return Ok(());
+    }
+    let poll = runtime
+        .attestation_gate_mut()
+        .advance_after_read_only_runtime_tick(process_running.as_ref())
+        .map_err(
+            |source| LiveNavigationWorkerError::WheelsOffQualificationAttestation { source },
+        )?;
+    let FreshAttendedMotionAttestationWorkerPoll::Ready(attestation) = poll else {
+        return Ok(());
+    };
+    if !process_running.load(Ordering::SeqCst) {
+        runtime
+            .attestation_gate_mut()
+            .close_without_enablement(FreshAttendedMotionAttestationClosure::ProcessNotRunning)
+            .map_err(|source| {
+                LiveNavigationWorkerError::WheelsOffQualificationAttestationCleanup { source }
+            })?;
+        return Ok(());
+    }
+    let final_accessory_health = runtime.accessory_health.snapshot().map_err(|source| {
+        LiveNavigationWorkerError::WheelsOffQualificationProjection {
+            source: LiveProductionConsoleProjectionError::AccessoryHealth(source),
+        }
+    })?;
+    let enable_observed_at = snapshot_clock
+        .checked_now()
+        .map_err(LiveNavigationWorkerError::HostClock)?;
+    if let Err(blocker) = current_wheels_off_qualification_attestation_readiness(
+        runtime,
+        enable_observed_at,
+        final_accessory_health,
+        navigation_viz,
+    ) {
+        runtime
+            .attestation_gate_mut()
+            .close_without_enablement(FreshAttendedMotionAttestationClosure::ReadinessLost(
+                blocker,
+            ))
+            .map_err(|source| {
+                LiveNavigationWorkerError::WheelsOffQualificationAttestationCleanup { source }
+            })?;
+        return Ok(());
+    }
+    if !process_running.load(Ordering::SeqCst) {
+        runtime
+            .attestation_gate_mut()
+            .close_without_enablement(FreshAttendedMotionAttestationClosure::ProcessNotRunning)
+            .map_err(|source| {
+                LiveNavigationWorkerError::WheelsOffQualificationAttestationCleanup { source }
+            })?;
+        return Ok(());
+    }
+    runtime
+        .controller_mut()
+        .enable_motion_authority(attestation)
+        .map_err(|source| {
+            LiveNavigationWorkerError::WheelsOffQualificationMotionAuthorityEnable { source }
+        })?;
+    eprintln!(
+        "wheels-off qualification manual motion boundary enabled exactly once from the fresh attended attestation"
+    );
+    Ok(())
 }
 
 #[cfg(all(
@@ -9688,6 +10028,7 @@ fn run_live_navigation_worker(
                 coordinator,
                 *input,
                 control_period.as_duration(),
+                Arc::clone(&running),
             ) {
                 Ok(runtime) => LiveNavigationRuntime::WheelsOffQualification(Box::new(runtime)),
                 Err(failure) => {
@@ -10250,7 +10591,7 @@ fn run_live_navigation_worker(
                                     }
                                     SafetyDecisionOutcome::Stopped(_) => None,
                                 };
-                            publish_wheels_off_qualification_snapshot(
+                            let accessory_health = publish_wheels_off_qualification_snapshot(
                                 qualification,
                                 &clock,
                                 tick_timing,
@@ -10258,7 +10599,7 @@ fn run_live_navigation_worker(
                             // The candidate controller is intentionally absent
                             // from this diagnostic builder: this is the MPC
                             // shadow decision, never a physical-output claim.
-                            publish_live_navigation_viz_message(
+                            let navigation_viz = publish_live_navigation_viz_message(
                                 &mut navigation_viz_tx,
                                 build_live_navigation_viz_message(
                                     &qualification.coordinator,
@@ -10272,6 +10613,12 @@ fn run_live_navigation_worker(
                             .map_err(|source| {
                                 LiveNavigationWorkerError::PhysicalStateVisualization { source }
                             })?;
+                            advance_wheels_off_qualification_motion_attestation_after_read_only_tick(
+                                qualification,
+                                &clock,
+                                accessory_health,
+                                navigation_viz,
+                            )?;
                         }
                     }
                 }
@@ -10741,7 +11088,13 @@ fn run_live_navigation_worker(
                 );
             }
             qualification.frontend_mut().request_shutdown();
-            let (mut controller, mut frontend) = qualification.take_terminal_parts();
+            let (mut controller, mut frontend, mut attestation_gate) =
+                qualification.take_terminal_parts();
+            if let Err(source) = attestation_gate.cancel_and_join() {
+                failures.push(
+                    LiveNavigationWorkerError::WheelsOffQualificationAttestationCleanup { source },
+                );
+            }
             if let Err(source) = controller.shutdown() {
                 failures.push(LiveNavigationWorkerError::WheelsOffQualificationRuntime {
                     source: Box::new(source),
@@ -12939,6 +13292,12 @@ const MAX_QUALIFICATION_ATTESTATION_LINE_BYTES: usize = 128;
 const QUALIFICATION_ATTESTATION_CHALLENGE_BYTES: usize = 16;
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+const QUALIFICATION_ATTESTATION_TTY: &str = "/dev/tty";
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+const QUALIFICATION_ATTESTATION_POLL_SLICE: Duration = Duration::from_millis(10);
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 #[derive(Debug)]
 struct InitialMotorPowerDisconnectedClaim;
 
@@ -12952,6 +13311,9 @@ struct AttendedWheelsOffPreflight {
 #[derive(Debug)]
 enum AttendedWheelsOffAttestationError {
     TtyRequired,
+    Interrupted,
+    OpenControllingTty(std::io::Error),
+    DiscardPendingInput(std::io::Error),
     ChallengeEntropy(getrandom::Error),
     Input(std::io::Error),
     Output(std::io::Error),
@@ -12967,6 +13329,18 @@ impl std::fmt::Display for AttendedWheelsOffAttestationError {
         match self {
             Self::TtyRequired => formatter
                 .write_str("wheels-off qualification requires attended terminal input and output"),
+            Self::Interrupted => {
+                formatter.write_str("wheels-off qualification attestation was cancelled")
+            }
+            Self::OpenControllingTty(source) => {
+                write!(formatter, "could not open the controlling TTY: {source}")
+            }
+            Self::DiscardPendingInput(source) => {
+                write!(
+                    formatter,
+                    "could not discard pending controlling-TTY input: {source}"
+                )
+            }
             Self::ChallengeEntropy(source) => write!(
                 formatter,
                 "could not create a fresh qualification confirmation challenge: {source}"
@@ -13000,9 +13374,13 @@ impl std::fmt::Display for AttendedWheelsOffAttestationError {
 impl std::error::Error for AttendedWheelsOffAttestationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Input(source) | Self::Output(source) => Some(source),
+            Self::OpenControllingTty(source)
+            | Self::DiscardPendingInput(source)
+            | Self::Input(source)
+            | Self::Output(source) => Some(source),
             Self::ChallengeEntropy(source) => Some(source),
             Self::TtyRequired
+            | Self::Interrupted
             | Self::EndOfInput
             | Self::LineTooLong { .. }
             | Self::InvalidUtf8
@@ -13034,6 +13412,310 @@ impl std::error::Error for FreshAttendedMotionAttestationError {
         match self {
             Self::Terminal(source) => Some(source),
             Self::Domain(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+enum FreshAttendedMotionAttestationWorkerError {
+    Spawn(std::io::Error),
+    Dialog(FreshAttendedMotionAttestationError),
+    Panicked { detail: String },
+    JoinedWithoutGateTransition,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::fmt::Display for FreshAttendedMotionAttestationWorkerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(source) => {
+                write!(
+                    formatter,
+                    "could not start attended motion-attestation worker: {source}"
+                )
+            }
+            Self::Dialog(source) => source.fmt(formatter),
+            Self::Panicked { detail } => {
+                write!(
+                    formatter,
+                    "attended motion-attestation worker panicked: {detail}"
+                )
+            }
+            Self::JoinedWithoutGateTransition => formatter.write_str(
+                "attended motion-attestation worker was already joined without enabling its gate",
+            ),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl std::error::Error for FreshAttendedMotionAttestationWorkerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(source) => Some(source),
+            Self::Dialog(source) => Some(source),
+            Self::Panicked { .. } | Self::JoinedWithoutGateTransition => None,
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshAttendedMotionAttestationWorkerPoll {
+    Pending,
+    Ready(kiko_slam::navigation::OperatorClaimedWheelsOffAttestation),
+    Completed,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshAttendedMotionAttestationWorkerShutdown {
+    AlreadyJoined,
+    Cancelled,
+    CompletedBeforeCancellation,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+struct FreshAttendedMotionAttestationInput {
+    preflight: AttendedWheelsOffPreflight,
+    console: kiko_slam::navigation::WheelsOffQualificationConsoleHandle,
+    process_running: Arc<AtomicBool>,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshAttendedMotionAttestationClosure {
+    SoftwareSafetyStopLatched,
+    ProcessNotRunning,
+    ReadinessLost(WheelsOffQualificationAttestationReadinessBlocker),
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+enum FreshAttendedMotionAttestationGate {
+    AwaitingReadOnlyCycle(FreshAttendedMotionAttestationInput),
+    WaitingForOperator(FreshAttendedMotionAttestationWorker),
+    Completed,
+    Closed(FreshAttendedMotionAttestationClosure),
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl FreshAttendedMotionAttestationGate {
+    const fn is_closed(&self) -> bool {
+        self.closure().is_some()
+    }
+
+    const fn closure(&self) -> Option<FreshAttendedMotionAttestationClosure> {
+        match self {
+            Self::Closed(reason) => Some(*reason),
+            Self::AwaitingReadOnlyCycle(_) | Self::WaitingForOperator(_) | Self::Completed => None,
+        }
+    }
+
+    const fn has_started_prompt(&self) -> bool {
+        matches!(self, Self::WaitingForOperator(_))
+    }
+
+    fn advance_after_read_only_runtime_tick(
+        &mut self,
+        process_running: &AtomicBool,
+    ) -> Result<FreshAttendedMotionAttestationWorkerPoll, FreshAttendedMotionAttestationWorkerError>
+    {
+        if !process_running.load(Ordering::SeqCst) {
+            self.close_without_enablement(
+                FreshAttendedMotionAttestationClosure::ProcessNotRunning,
+            )?;
+            return Ok(FreshAttendedMotionAttestationWorkerPoll::Completed);
+        }
+        if matches!(self, Self::AwaitingReadOnlyCycle(_)) {
+            let previous = std::mem::replace(self, Self::Completed);
+            let Self::AwaitingReadOnlyCycle(input) = previous else {
+                unreachable!("matching gate phase is transferred exactly once");
+            };
+            let worker = FreshAttendedMotionAttestationWorker::spawn(input)
+                .map_err(FreshAttendedMotionAttestationWorkerError::Spawn)?;
+            *self = Self::WaitingForOperator(worker);
+            return Ok(FreshAttendedMotionAttestationWorkerPoll::Pending);
+        }
+        match self {
+            Self::WaitingForOperator(worker) => match worker.poll()? {
+                FreshAttendedMotionAttestationWorkerPoll::Pending => {
+                    Ok(FreshAttendedMotionAttestationWorkerPoll::Pending)
+                }
+                FreshAttendedMotionAttestationWorkerPoll::Ready(attestation) => {
+                    if !process_running.load(Ordering::SeqCst) {
+                        *self =
+                            Self::Closed(FreshAttendedMotionAttestationClosure::ProcessNotRunning);
+                        return Ok(FreshAttendedMotionAttestationWorkerPoll::Completed);
+                    }
+                    *self = Self::Completed;
+                    Ok(FreshAttendedMotionAttestationWorkerPoll::Ready(attestation))
+                }
+                FreshAttendedMotionAttestationWorkerPoll::Completed => {
+                    unreachable!("a worker cannot report a gate-owned completed state")
+                }
+            },
+            Self::Completed => Ok(FreshAttendedMotionAttestationWorkerPoll::Completed),
+            Self::Closed(_) => Ok(FreshAttendedMotionAttestationWorkerPoll::Completed),
+            Self::AwaitingReadOnlyCycle(_) => {
+                unreachable!("awaiting phase returns after spawning its worker")
+            }
+        }
+    }
+
+    fn close_without_enablement(
+        &mut self,
+        reason: FreshAttendedMotionAttestationClosure,
+    ) -> Result<
+        FreshAttendedMotionAttestationWorkerShutdown,
+        FreshAttendedMotionAttestationWorkerError,
+    > {
+        let shutdown = match self {
+            Self::WaitingForOperator(worker) => worker.cancel_and_join()?,
+            Self::AwaitingReadOnlyCycle(_) | Self::Completed | Self::Closed(_) => {
+                FreshAttendedMotionAttestationWorkerShutdown::AlreadyJoined
+            }
+        };
+        *self = Self::Closed(reason);
+        Ok(shutdown)
+    }
+
+    fn cancel_and_join(
+        &mut self,
+    ) -> Result<
+        FreshAttendedMotionAttestationWorkerShutdown,
+        FreshAttendedMotionAttestationWorkerError,
+    > {
+        match self {
+            Self::AwaitingReadOnlyCycle(_) | Self::Completed | Self::Closed(_) => {
+                Ok(FreshAttendedMotionAttestationWorkerShutdown::AlreadyJoined)
+            }
+            Self::WaitingForOperator(worker) => worker.cancel_and_join(),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+struct FreshAttendedMotionAttestationWorker {
+    cancellation_requested: Arc<AtomicBool>,
+    handle: Option<
+        std::thread::JoinHandle<
+            Result<
+                kiko_slam::navigation::OperatorClaimedWheelsOffAttestation,
+                FreshAttendedMotionAttestationError,
+            >,
+        >,
+    >,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl FreshAttendedMotionAttestationWorker {
+    fn spawn(input: FreshAttendedMotionAttestationInput) -> Result<Self, std::io::Error> {
+        let cancellation_requested = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation_requested);
+        let handle = std::thread::Builder::new()
+            .name("kiko-motion-attestation".to_owned())
+            .spawn(move || {
+                let FreshAttendedMotionAttestationInput {
+                    preflight,
+                    console,
+                    process_running,
+                } = input;
+                let cancellation = ConsoleAwareFreshAttendedMotionCancellation {
+                    local: worker_cancellation.as_ref(),
+                    console: &console,
+                    process_running: process_running.as_ref(),
+                };
+                run_real_fresh_attended_motion_attestation(preflight, &cancellation)
+            })?;
+        Ok(Self {
+            cancellation_requested,
+            handle: Some(handle),
+        })
+    }
+
+    #[cfg(test)]
+    fn spawn_with(
+        preflight: AttendedWheelsOffPreflight,
+        worker: impl FnOnce(
+            AttendedWheelsOffPreflight,
+            &AtomicBool,
+        ) -> Result<
+            kiko_slam::navigation::OperatorClaimedWheelsOffAttestation,
+            FreshAttendedMotionAttestationError,
+        > + Send
+        + 'static,
+    ) -> Result<Self, std::io::Error> {
+        let cancellation_requested = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation_requested);
+        let handle = std::thread::Builder::new()
+            .name("kiko-motion-attestation".to_owned())
+            .spawn(move || worker(preflight, worker_cancellation.as_ref()))?;
+        Ok(Self {
+            cancellation_requested,
+            handle: Some(handle),
+        })
+    }
+
+    fn poll(
+        &mut self,
+    ) -> Result<FreshAttendedMotionAttestationWorkerPoll, FreshAttendedMotionAttestationWorkerError>
+    {
+        let Some(handle) = self.handle.as_ref() else {
+            return Err(FreshAttendedMotionAttestationWorkerError::JoinedWithoutGateTransition);
+        };
+        if !handle.is_finished() {
+            return Ok(FreshAttendedMotionAttestationWorkerPoll::Pending);
+        }
+        let handle = self
+            .handle
+            .take()
+            .expect("finished attestation handle is still retained");
+        match handle.join() {
+            Ok(Ok(attestation)) => Ok(FreshAttendedMotionAttestationWorkerPoll::Ready(attestation)),
+            Ok(Err(source)) => Err(FreshAttendedMotionAttestationWorkerError::Dialog(source)),
+            Err(payload) => Err(FreshAttendedMotionAttestationWorkerError::Panicked {
+                detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+            }),
+        }
+    }
+
+    fn cancel_and_join(
+        &mut self,
+    ) -> Result<
+        FreshAttendedMotionAttestationWorkerShutdown,
+        FreshAttendedMotionAttestationWorkerError,
+    > {
+        self.cancellation_requested.store(true, Ordering::Release);
+        let Some(handle) = self.handle.take() else {
+            return Ok(FreshAttendedMotionAttestationWorkerShutdown::AlreadyJoined);
+        };
+        match handle.join() {
+            Ok(Ok(_attestation)) => {
+                Ok(FreshAttendedMotionAttestationWorkerShutdown::CompletedBeforeCancellation)
+            }
+            Ok(Err(FreshAttendedMotionAttestationError::Terminal(
+                AttendedWheelsOffAttestationError::Interrupted,
+            ))) => Ok(FreshAttendedMotionAttestationWorkerShutdown::Cancelled),
+            Ok(Err(source)) => Err(FreshAttendedMotionAttestationWorkerError::Dialog(source)),
+            Err(payload) => Err(FreshAttendedMotionAttestationWorkerError::Panicked {
+                detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+            }),
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl Drop for FreshAttendedMotionAttestationWorker {
+    fn drop(&mut self) {
+        self.cancellation_requested.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take()
+            && let Err(payload) = handle.join()
+        {
+            eprintln!(
+                "attended motion-attestation worker panicked during drop: {}",
+                kiko_slam::panic_payload_to_string(payload.as_ref())
+            );
         }
     }
 }
@@ -13212,30 +13894,233 @@ fn require_attended_wheels_off_preflight()
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
-fn read_fresh_attended_motion_attestation(
-    preflight: AttendedWheelsOffPreflight,
-    input: &mut impl BufRead,
-    output: &mut impl Write,
+trait FreshAttendedMotionCancellation {
+    fn is_cancelled(&self) -> bool;
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl FreshAttendedMotionCancellation for AtomicBool {
+    fn is_cancelled(&self) -> bool {
+        self.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+struct ConsoleAwareFreshAttendedMotionCancellation<'a> {
+    local: &'a AtomicBool,
+    console: &'a kiko_slam::navigation::WheelsOffQualificationConsoleHandle,
+    process_running: &'a AtomicBool,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn fresh_motion_attestation_must_cancel(
+    local_cancellation_requested: bool,
+    process_running: bool,
+    snapshot: &kiko_slam::navigation::WheelsOffQualificationSnapshot,
+) -> bool {
+    local_cancellation_requested
+        || !process_running
+        || snapshot.software_safety_stop_latched
+        || snapshot.frontend_state
+            != kiko_slam::navigation::WheelsOffQualificationFrontendState::Connected
+        || snapshot.runtime_ingress_state
+            != kiko_slam::navigation::WheelsOffQualificationRuntimeIngressState::Connected
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl FreshAttendedMotionCancellation for ConsoleAwareFreshAttendedMotionCancellation<'_> {
+    fn is_cancelled(&self) -> bool {
+        let snapshot = self.console.snapshot();
+        fresh_motion_attestation_must_cancel(
+            self.local.load(Ordering::Acquire),
+            self.process_running.load(Ordering::SeqCst),
+            &snapshot,
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+trait FreshAttendedMotionTerminal {
+    fn is_terminal(&self) -> bool;
+    fn discard_pending_input(&mut self) -> std::io::Result<()>;
+    fn write_prompt(&mut self, prompt: &str) -> std::io::Result<()>;
+    fn read_bounded_line(
+        &mut self,
+        cancellation: &dyn FreshAttendedMotionCancellation,
+    ) -> Result<String, AttendedWheelsOffAttestationError>;
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix, test))]
+struct BufferedFreshAttendedMotionTerminal<'a, R, W> {
+    input: &'a mut R,
+    output: &'a mut W,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix, test))]
+impl<R: BufRead, W: Write> FreshAttendedMotionTerminal
+    for BufferedFreshAttendedMotionTerminal<'_, R, W>
+{
+    fn is_terminal(&self) -> bool {
+        true
+    }
+
+    fn discard_pending_input(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn write_prompt(&mut self, prompt: &str) -> std::io::Result<()> {
+        self.output
+            .write_all(prompt.as_bytes())
+            .and_then(|()| self.output.flush())
+    }
+
+    fn read_bounded_line(
+        &mut self,
+        cancellation: &dyn FreshAttendedMotionCancellation,
+    ) -> Result<String, AttendedWheelsOffAttestationError> {
+        if cancellation.is_cancelled() {
+            return Err(AttendedWheelsOffAttestationError::Interrupted);
+        }
+        read_bounded_tty_line(self.input)
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+struct RealFreshAttendedMotionTerminal {
+    file: File,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl RealFreshAttendedMotionTerminal {
+    fn open() -> Result<Self, AttendedWheelsOffAttestationError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(QUALIFICATION_ATTESTATION_TTY)
+            .map_err(AttendedWheelsOffAttestationError::OpenControllingTty)?;
+        Ok(Self { file })
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+impl FreshAttendedMotionTerminal for RealFreshAttendedMotionTerminal {
+    fn is_terminal(&self) -> bool {
+        self.file.is_terminal()
+    }
+
+    fn discard_pending_input(&mut self) -> std::io::Result<()> {
+        rustix::termios::tcflush(&self.file, rustix::termios::QueueSelector::IFlush)
+            .map_err(|source| std::io::Error::from_raw_os_error(source.raw_os_error()))
+    }
+
+    fn write_prompt(&mut self, prompt: &str) -> std::io::Result<()> {
+        self.file
+            .write_all(prompt.as_bytes())
+            .and_then(|()| self.file.flush())
+    }
+
+    fn read_bounded_line(
+        &mut self,
+        cancellation: &dyn FreshAttendedMotionCancellation,
+    ) -> Result<String, AttendedWheelsOffAttestationError> {
+        let mut output = Vec::with_capacity(64);
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(AttendedWheelsOffAttestationError::Interrupted);
+            }
+            let mut byte = [0_u8; 1];
+            match self.file.read(&mut byte) {
+                Ok(0) => return Err(AttendedWheelsOffAttestationError::EndOfInput),
+                Ok(1) if byte[0] == b'\n' => {
+                    if output.last() == Some(&b'\r') {
+                        output.pop();
+                    }
+                    return String::from_utf8(output)
+                        .map_err(|_| AttendedWheelsOffAttestationError::InvalidUtf8);
+                }
+                Ok(1) => {
+                    if output.len() == MAX_QUALIFICATION_ATTESTATION_LINE_BYTES {
+                        return Err(AttendedWheelsOffAttestationError::LineTooLong {
+                            maximum_bytes: MAX_QUALIFICATION_ATTESTATION_LINE_BYTES,
+                        });
+                    }
+                    output.push(byte[0]);
+                }
+                Ok(_) => unreachable!("one-byte reads return at most one byte"),
+                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(QUALIFICATION_ATTESTATION_POLL_SLICE);
+                }
+                Err(source) => return Err(AttendedWheelsOffAttestationError::Input(source)),
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn prompt_fresh_attended_motion_phrase(
+    terminal: &mut impl FreshAttendedMotionTerminal,
     challenges: &mut impl WheelsOffAttestationChallengeSource,
+    cancellation: &dyn FreshAttendedMotionCancellation,
+    explanation: &str,
+    phrase: &'static str,
+) -> Result<(), AttendedWheelsOffAttestationError> {
+    if cancellation.is_cancelled() {
+        return Err(AttendedWheelsOffAttestationError::Interrupted);
+    }
+    terminal
+        .discard_pending_input()
+        .map_err(AttendedWheelsOffAttestationError::DiscardPendingInput)?;
+    let challenge = challenges.next_challenge()?;
+    if cancellation.is_cancelled() {
+        return Err(AttendedWheelsOffAttestationError::Interrupted);
+    }
+    let expected = format!("{phrase} {}", lower_hex_qualification_challenge(&challenge));
+    let prompt = format!("{explanation}\nType {expected:?}: ");
+    if cancellation.is_cancelled() {
+        return Err(AttendedWheelsOffAttestationError::Interrupted);
+    }
+    terminal
+        .write_prompt(&prompt)
+        .map_err(AttendedWheelsOffAttestationError::Output)?;
+    let actual = terminal.read_bounded_line(cancellation)?;
+    if actual != expected {
+        return Err(AttendedWheelsOffAttestationError::PhraseMismatch { expected });
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn run_fresh_attended_motion_attestation(
+    preflight: AttendedWheelsOffPreflight,
+    terminal: &mut impl FreshAttendedMotionTerminal,
+    challenges: &mut impl WheelsOffAttestationChallengeSource,
+    cancellation: &dyn FreshAttendedMotionCancellation,
 ) -> Result<
     kiko_slam::navigation::OperatorClaimedWheelsOffAttestation,
     FreshAttendedMotionAttestationError,
 > {
+    if !terminal.is_terminal() {
+        return Err(FreshAttendedMotionAttestationError::Terminal(
+            AttendedWheelsOffAttestationError::TtyRequired,
+        ));
+    }
     let AttendedWheelsOffPreflight {
         motor_power_disconnected: _initial_motor_power_disconnected,
     } = preflight;
-    prompt_fresh_attended_phrase(
-        input,
-        output,
+    prompt_fresh_attended_motion_phrase(
+        terminal,
         challenges,
-        "The full software stack is stopped and ready. Confirm that motor power remained physically disconnected throughout device acquisition, zero/disarm, and every fallible setup step.",
+        cancellation,
+        "The drive controller has exact applied-zero and disarm receipts. With nonzero authority still locked, one stopped runtime tick had fresh visual/depth/IMU observations, ready accessory health, a published occupancy revision, coordinator motion-start readiness, and a navigation diagnostic accepted by the bounded visualization queue. This does not claim that Rerun consumed or displayed that diagnostic. Confirm that motor power remained physically disconnected throughout device acquisition, zero/disarm, and this stopped runtime-readiness boundary.",
         "MOTOR POWER REMAINED PHYSICALLY DISCONNECTED THROUGH SETUP",
     )
     .map_err(FreshAttendedMotionAttestationError::Terminal)?;
-    prompt_fresh_attended_phrase(
-        input,
-        output,
+    prompt_fresh_attended_motion_phrase(
+        terminal,
         challenges,
+        cancellation,
         "Only now physically reconnect motor power. Keep both wheels removed, keep the head supported, and keep the independent power cut immediately reachable throughout the bounded motion window.",
         "MOTOR POWER RECONNECTED WHEELS OFF HEAD SUPPORTED POWER CUT READY",
     )
@@ -13251,27 +14136,33 @@ fn read_fresh_attended_motion_attestation(
     .map_err(FreshAttendedMotionAttestationError::Domain)
 }
 
-#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
-fn require_fresh_attended_motion_attestation(
+#[cfg(all(feature = "nano-wheels-off-qualification", unix, test))]
+fn read_fresh_attended_motion_attestation(
     preflight: AttendedWheelsOffPreflight,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    challenges: &mut impl WheelsOffAttestationChallengeSource,
 ) -> Result<
     kiko_slam::navigation::OperatorClaimedWheelsOffAttestation,
     FreshAttendedMotionAttestationError,
 > {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    if !stdin.is_terminal() || !stdout.is_terminal() {
-        return Err(FreshAttendedMotionAttestationError::Terminal(
-            AttendedWheelsOffAttestationError::TtyRequired,
-        ));
-    }
+    let mut terminal = BufferedFreshAttendedMotionTerminal { input, output };
+    let cancellation = AtomicBool::new(false);
+    run_fresh_attended_motion_attestation(preflight, &mut terminal, challenges, &cancellation)
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn run_real_fresh_attended_motion_attestation(
+    preflight: AttendedWheelsOffPreflight,
+    cancellation: &dyn FreshAttendedMotionCancellation,
+) -> Result<
+    kiko_slam::navigation::OperatorClaimedWheelsOffAttestation,
+    FreshAttendedMotionAttestationError,
+> {
+    let mut terminal = RealFreshAttendedMotionTerminal::open()
+        .map_err(FreshAttendedMotionAttestationError::Terminal)?;
     let mut challenges = OsWheelsOffAttestationChallengeSource;
-    read_fresh_attended_motion_attestation(
-        preflight,
-        &mut stdin.lock(),
-        &mut stdout.lock(),
-        &mut challenges,
-    )
+    run_fresh_attended_motion_attestation(preflight, &mut terminal, &mut challenges, cancellation)
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
@@ -13334,7 +14225,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
         assets,
         manifest: _,
         policy,
-        head_gaze_policy: _,
+        head_gaze_policy,
         calibration: _,
         plant: _,
         artifact_hashes: _,
@@ -13367,11 +14258,17 @@ fn prepare_nano_wheels_off_qualification_live_session(
     // model stack; every later failure retains the bootstrap stop evidence.
     let accessory_config = (|| -> Result<NanoAccessoryWorkerConfig, Box<dyn std::error::Error>> {
         let health_period = NanoAccessoryHealthPeriod::try_from_duration(Duration::from_secs(1))?;
-        Ok(NanoAccessoryWorkerConfig::from_manifest_bound_policy(
+        let config = NanoAccessoryWorkerConfig::from_manifest_bound_policy(
             &policy,
             stream_epoch,
             health_period,
-        )?)
+        )?;
+        match head_gaze_policy {
+            Some(policy) => {
+                Ok(config.with_proposal_only_head_gaze_diagnostics(policy.into_policy())?)
+            }
+            None => Ok(config),
+        }
     })();
     let accessory_config = match accessory_config {
         Ok(config) => config,
@@ -15811,9 +16708,13 @@ fn run_prepared_live_session(
         if let Some(handle) = face_stage_stats_handle.as_ref() {
             let stats = handle.snapshot();
             eprintln!(
-                "face perception stage stats: final={} results_produced={} handoff_enqueued={} handoff_replaced_older={} handoff_terminal_pending={} handoff_terminal_fault_latched={} handoff_disconnected={} handoff_channel_poisoned={}",
+                "face perception stage stats: final={} results_produced={} head_gaze_disabled_no_policy={} head_gaze_proposed={} head_gaze_withheld={} head_gaze_rejected={} handoff_enqueued={} handoff_replaced_older={} handoff_terminal_pending={} handoff_terminal_fault_latched={} handoff_disconnected={} handoff_channel_poisoned={}",
                 face_stage_stats_final.unwrap_or(false),
                 stats.results_produced,
+                stats.head_gaze_disabled_no_policy,
+                stats.head_gaze_proposed,
+                stats.head_gaze_withheld,
+                stats.head_gaze_rejected,
                 stats.handoff_enqueued,
                 stats.handoff_replaced_older,
                 stats.handoff_terminal_pending,
@@ -16150,11 +17051,19 @@ mod tests {
     use super::LiveNavigationWorkerMotion;
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     use super::{
-        AttendedWheelsOffAttestationError, FreshAttendedMotionAttestationError,
+        AttendedWheelsOffAttestationError, AttendedWheelsOffPreflight,
+        BufferedFreshAttendedMotionTerminal, FreshAttendedMotionAttestationClosure,
+        FreshAttendedMotionAttestationError, FreshAttendedMotionAttestationGate,
+        FreshAttendedMotionAttestationInput, FreshAttendedMotionAttestationWorker,
+        FreshAttendedMotionAttestationWorkerError, FreshAttendedMotionAttestationWorkerPoll,
+        FreshAttendedMotionAttestationWorkerShutdown, InitialMotorPowerDisconnectedClaim,
         MAX_QUALIFICATION_ATTESTATION_LINE_BYTES, NanoLiveMotionKind,
         QUALIFICATION_ATTESTATION_CHALLENGE_BYTES, WheelsOffAttestationChallengeSource,
         WheelsOffQualificationAndMotorPowerDisconnectError,
-        finish_attended_wheels_off_qualification, lower_hex_qualification_challenge,
+        WheelsOffQualificationAttestationReadinessBlocker,
+        classify_wheels_off_qualification_attestation_readiness,
+        finish_attended_wheels_off_qualification, fresh_motion_attestation_must_cancel,
+        lower_hex_qualification_challenge, prompt_fresh_attended_motion_phrase,
         read_attended_wheels_off_preflight, read_bounded_tty_line,
         read_fresh_attended_motion_attestation, read_post_run_motor_power_disconnected,
     };
@@ -16255,11 +17164,66 @@ mod tests {
     }
 
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    struct CancellingWheelsOffChallenge<'a> {
+        cancellation: &'a AtomicBool,
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    impl WheelsOffAttestationChallengeSource for CancellingWheelsOffChallenge<'_> {
+        fn next_challenge(
+            &mut self,
+        ) -> Result<
+            [u8; QUALIFICATION_ATTESTATION_CHALLENGE_BYTES],
+            AttendedWheelsOffAttestationError,
+        > {
+            self.cancellation.store(true, Ordering::Release);
+            Ok([0x5a; QUALIFICATION_ATTESTATION_CHALLENGE_BYTES])
+        }
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     fn challenged_wheels_off_phrase(phrase: &str, byte: u8) -> String {
         format!(
             "{phrase} {}",
             lower_hex_qualification_challenge(&[byte; QUALIFICATION_ATTESTATION_CHALLENGE_BYTES])
         )
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    fn test_wheels_off_preflight() -> AttendedWheelsOffPreflight {
+        AttendedWheelsOffPreflight {
+            motor_power_disconnected: InitialMotorPowerDisconnectedClaim,
+        }
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    fn test_wheels_off_attestation() -> kiko_slam::navigation::OperatorClaimedWheelsOffAttestation {
+        kiko_slam::navigation::OperatorClaimedWheelsOffAttestation::try_new(
+            true,
+            true,
+            true,
+            true,
+            true,
+            Instant::now(),
+        )
+        .expect("explicit test attestation")
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    fn poll_test_attestation_gate(
+        gate: &mut FreshAttendedMotionAttestationGate,
+    ) -> Result<FreshAttendedMotionAttestationWorkerPoll, FreshAttendedMotionAttestationWorkerError>
+    {
+        let process_running = AtomicBool::new(true);
+        for _ in 0..100 {
+            match gate.advance_after_read_only_runtime_tick(&process_running) {
+                Ok(FreshAttendedMotionAttestationWorkerPoll::Pending) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                outcome => return outcome,
+            }
+        }
+        panic!("test attestation worker did not complete");
     }
     #[cfg(feature = "record")]
     use std::time::Instant;
@@ -16347,6 +17311,41 @@ mod tests {
         assert_eq!(
             health.console_health(first),
             kiko_slam::navigation::ConsoleHealth::Faulted
+        );
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn attestation_enable_boundary_rejects_samples_that_expired_during_a_delayed_tick() {
+        let mut health = LiveSensorStreamHealth::awaiting_first_samples();
+        let sample = kiko_slam::HostMonotonicTimestamp::from_nanos(100);
+        for stream in [
+            LiveSensorStream::Visual,
+            LiveSensorStream::Depth,
+            LiveSensorStream::Imu,
+        ] {
+            health.observe(stream, sample);
+        }
+        let tick_started = kiko_slam::HostMonotonicTimestamp::from_nanos(
+            sample.as_nanos() + super::LIVE_SENSOR_CONSOLE_MAX_SAMPLE_AGE_NS,
+        );
+        assert_eq!(
+            health.console_health(tick_started),
+            kiko_slam::navigation::ConsoleHealth::Ready
+        );
+
+        let enable_boundary =
+            kiko_slam::HostMonotonicTimestamp::from_nanos(tick_started.as_nanos() + 1);
+        assert_eq!(
+            classify_wheels_off_qualification_attestation_readiness(
+                health.console_health(enable_boundary)
+                    == kiko_slam::navigation::ConsoleHealth::Ready,
+                true,
+                true,
+                true,
+                true,
+            ),
+            Err(WheelsOffQualificationAttestationReadinessBlocker::FreshVisualDepthImuUnavailable)
         );
     }
 
@@ -18556,6 +19555,322 @@ mod tests {
             read_bounded_tty_line(&mut invalid),
             Err(AttendedWheelsOffAttestationError::InvalidUtf8)
         ));
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn integrated_attestation_readiness_requires_every_current_evidence_class() {
+        let cases = [
+            (
+                [false, true, true, true, true],
+                WheelsOffQualificationAttestationReadinessBlocker::FreshVisualDepthImuUnavailable,
+            ),
+            (
+                [true, false, true, true, true],
+                WheelsOffQualificationAttestationReadinessBlocker::AccessoryNotReady,
+            ),
+            (
+                [true, true, false, true, true],
+                WheelsOffQualificationAttestationReadinessBlocker::PublishedOccupancyRevisionUnavailable,
+            ),
+            (
+                [true, true, true, false, true],
+                WheelsOffQualificationAttestationReadinessBlocker::CoordinatorMotionStartNotReady,
+            ),
+            (
+                [true, true, true, true, false],
+                WheelsOffQualificationAttestationReadinessBlocker::NavigationVisualizationNotAccepted,
+            ),
+        ];
+        for (evidence, expected) in cases {
+            assert_eq!(
+                classify_wheels_off_qualification_attestation_readiness(
+                    evidence[0],
+                    evidence[1],
+                    evidence[2],
+                    evidence[3],
+                    evidence[4],
+                ),
+                Err(expected)
+            );
+        }
+        assert_eq!(
+            classify_wheels_off_qualification_attestation_readiness(true, true, true, true, true,),
+            Ok(())
+        );
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn cancellation_after_fresh_challenge_prevents_prompt_output() {
+        let cancellation = AtomicBool::new(false);
+        let mut challenges = CancellingWheelsOffChallenge {
+            cancellation: &cancellation,
+        };
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let mut terminal = BufferedFreshAttendedMotionTerminal {
+            input: &mut input,
+            output: &mut output,
+        };
+
+        assert!(matches!(
+            prompt_fresh_attended_motion_phrase(
+                &mut terminal,
+                &mut challenges,
+                &cancellation,
+                "synthetic boundary",
+                "SYNTHETIC PHRASE",
+            ),
+            Err(AttendedWheelsOffAttestationError::Interrupted)
+        ));
+        assert!(output.is_empty());
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn process_shutdown_after_valid_reply_discards_attestation_before_enablement() {
+        let attestation = test_wheels_off_attestation();
+        let (reply_ready_tx, reply_ready_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = FreshAttendedMotionAttestationWorker::spawn_with(
+            test_wheels_off_preflight(),
+            move |_preflight, _cancellation| {
+                reply_ready_tx.send(()).expect("reply readiness receiver");
+                Ok(attestation)
+            },
+        )
+        .expect("test attestation worker");
+        reply_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("valid reply constructed");
+        let mut gate = FreshAttendedMotionAttestationGate::WaitingForOperator(worker);
+        let process_running = AtomicBool::new(false);
+
+        assert_eq!(
+            gate.advance_after_read_only_runtime_tick(&process_running)
+                .expect("shutdown closes the gate"),
+            FreshAttendedMotionAttestationWorkerPoll::Completed
+        );
+        assert_eq!(
+            gate.closure(),
+            Some(FreshAttendedMotionAttestationClosure::ProcessNotRunning)
+        );
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn pending_attestation_poll_is_nonblocking_and_shutdown_joins_its_worker() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = FreshAttendedMotionAttestationWorker::spawn_with(
+            test_wheels_off_preflight(),
+            move |_preflight, cancellation| {
+                started_tx.send(()).expect("test start receiver");
+                while !cancellation.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(FreshAttendedMotionAttestationError::Terminal(
+                    AttendedWheelsOffAttestationError::Interrupted,
+                ))
+            },
+        )
+        .expect("test attestation worker");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker entered its pending dialog");
+        let mut gate = FreshAttendedMotionAttestationGate::WaitingForOperator(worker);
+        let process_running = AtomicBool::new(true);
+
+        assert_eq!(
+            gate.advance_after_read_only_runtime_tick(&process_running)
+                .expect("pending poll"),
+            FreshAttendedMotionAttestationWorkerPoll::Pending
+        );
+        let (sensor_tx, sensor_rx) = crossbeam_channel::bounded(4);
+        for stream in ["visual", "depth", "imu", "map"] {
+            sensor_tx.send(stream).expect("bounded sensor fixture");
+        }
+        assert_eq!(
+            sensor_rx.try_iter().collect::<Vec<_>>(),
+            ["visual", "depth", "imu", "map"],
+            "pending operator input does not block the caller's sensor work"
+        );
+        assert_eq!(
+            gate.cancel_and_join().expect("bounded cancellation join"),
+            FreshAttendedMotionAttestationWorkerShutdown::Cancelled
+        );
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn readiness_loss_during_operator_delay_cancels_and_closes_the_gate() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = FreshAttendedMotionAttestationWorker::spawn_with(
+            test_wheels_off_preflight(),
+            move |_preflight, cancellation| {
+                started_tx.send(()).expect("test start receiver");
+                while !cancellation.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(FreshAttendedMotionAttestationError::Terminal(
+                    AttendedWheelsOffAttestationError::Interrupted,
+                ))
+            },
+        )
+        .expect("test attestation worker");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker entered its pending dialog");
+        let mut gate = FreshAttendedMotionAttestationGate::WaitingForOperator(worker);
+        let blocker =
+            WheelsOffQualificationAttestationReadinessBlocker::CoordinatorMotionStartNotReady;
+
+        assert_eq!(
+            gate.close_without_enablement(FreshAttendedMotionAttestationClosure::ReadinessLost(
+                blocker
+            ),)
+                .expect("readiness loss joins the worker"),
+            FreshAttendedMotionAttestationWorkerShutdown::Cancelled
+        );
+        assert_eq!(
+            gate.closure(),
+            Some(FreshAttendedMotionAttestationClosure::ReadinessLost(
+                blocker
+            ))
+        );
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn shutdown_or_safety_stop_before_the_first_read_only_cycle_spawns_no_worker() {
+        let profile =
+            kiko_slam::navigation::WheelsOffQualificationControlProfile::parse(30, 10, 250)
+                .expect("test profile");
+        let (console, _receiver) = kiko_slam::navigation::wheels_off_qualification_console(profile);
+        let input = FreshAttendedMotionAttestationInput {
+            preflight: test_wheels_off_preflight(),
+            console,
+            process_running: Arc::new(AtomicBool::new(true)),
+        };
+        let mut gate = FreshAttendedMotionAttestationGate::AwaitingReadOnlyCycle(input);
+
+        assert_eq!(
+            gate.close_without_enablement(
+                FreshAttendedMotionAttestationClosure::SoftwareSafetyStopLatched,
+            )
+            .expect("no worker exists to cancel"),
+            FreshAttendedMotionAttestationWorkerShutdown::AlreadyJoined
+        );
+        assert!(gate.is_closed());
+        let process_running = AtomicBool::new(true);
+        assert_eq!(
+            gate.advance_after_read_only_runtime_tick(&process_running)
+                .expect("closed gate remains terminal"),
+            FreshAttendedMotionAttestationWorkerPoll::Completed
+        );
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn software_stop_or_owner_loss_cancels_a_waiting_attestation_without_a_tick() {
+        let profile =
+            kiko_slam::navigation::WheelsOffQualificationControlProfile::parse(30, 10, 250)
+                .expect("test profile");
+        let (console, _receiver) = kiko_slam::navigation::wheels_off_qualification_console(profile);
+        let mut snapshot = console.snapshot();
+        snapshot.frontend_state =
+            kiko_slam::navigation::WheelsOffQualificationFrontendState::Connected;
+        snapshot.runtime_ingress_state =
+            kiko_slam::navigation::WheelsOffQualificationRuntimeIngressState::Connected;
+
+        assert!(!fresh_motion_attestation_must_cancel(
+            false, true, &snapshot
+        ));
+        snapshot.software_safety_stop_latched = true;
+        assert!(fresh_motion_attestation_must_cancel(false, true, &snapshot));
+        snapshot.software_safety_stop_latched = false;
+        snapshot.frontend_state =
+            kiko_slam::navigation::WheelsOffQualificationFrontendState::Disconnected;
+        assert!(fresh_motion_attestation_must_cancel(false, true, &snapshot));
+        snapshot.frontend_state =
+            kiko_slam::navigation::WheelsOffQualificationFrontendState::Connected;
+        assert!(fresh_motion_attestation_must_cancel(true, true, &snapshot));
+        assert!(fresh_motion_attestation_must_cancel(
+            false, false, &snapshot
+        ));
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn completed_attestation_gate_is_one_way_and_cannot_replay_its_token() {
+        let attestation = test_wheels_off_attestation();
+        let worker = FreshAttendedMotionAttestationWorker::spawn_with(
+            test_wheels_off_preflight(),
+            move |_preflight, _cancellation| Ok(attestation),
+        )
+        .expect("test attestation worker");
+        let mut gate = FreshAttendedMotionAttestationGate::WaitingForOperator(worker);
+
+        assert_eq!(
+            poll_test_attestation_gate(&mut gate).expect("successful worker"),
+            FreshAttendedMotionAttestationWorkerPoll::Ready(attestation)
+        );
+        assert_eq!(
+            gate.advance_after_read_only_runtime_tick(&AtomicBool::new(true))
+                .expect("completed gate remains terminal"),
+            FreshAttendedMotionAttestationWorkerPoll::Completed
+        );
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn attestation_eof_remains_a_typed_worker_failure() {
+        let worker = FreshAttendedMotionAttestationWorker::spawn_with(
+            test_wheels_off_preflight(),
+            |_preflight, _cancellation| {
+                Err(FreshAttendedMotionAttestationError::Terminal(
+                    AttendedWheelsOffAttestationError::EndOfInput,
+                ))
+            },
+        )
+        .expect("test attestation worker");
+        let mut gate = FreshAttendedMotionAttestationGate::WaitingForOperator(worker);
+
+        assert!(matches!(
+            poll_test_attestation_gate(&mut gate),
+            Err(FreshAttendedMotionAttestationWorkerError::Dialog(
+                FreshAttendedMotionAttestationError::Terminal(
+                    AttendedWheelsOffAttestationError::EndOfInput
+                )
+            ))
+        ));
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn attestation_worker_drop_cancels_and_joins_before_returning() {
+        let joined = Arc::new(AtomicBool::new(false));
+        let worker_joined = Arc::clone(&joined);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = FreshAttendedMotionAttestationWorker::spawn_with(
+            test_wheels_off_preflight(),
+            move |_preflight, cancellation| {
+                started_tx.send(()).expect("test start receiver");
+                while !cancellation.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                worker_joined.store(true, Ordering::Release);
+                Err(FreshAttendedMotionAttestationError::Terminal(
+                    AttendedWheelsOffAttestationError::Interrupted,
+                ))
+            },
+        )
+        .expect("test attestation worker");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker entered its pending dialog");
+
+        drop(worker);
+        assert!(joined.load(Ordering::Acquire));
     }
 
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]

@@ -53,7 +53,7 @@ use super::{
     NanoWheelsOffNativeRuntimeV1, NanoWheelsOffNativeRuntimeVerificationError,
     NanoWheelsOffQualificationAssetRole, NanoWheelsOffQualificationLaunchLoadError,
     NanoWheelsOffQualificationLaunchV4, NanoWheelsOffQualificationV4AssetRole,
-    ParsedNanoLiveConfiguration, ShadowNavigationConfigParseError, ShadowNavigationConfigV1,
+    ParsedNanoLiveConfiguration, ShadowNavigationConfigParseError, ShadowNavigationConfigV2,
     StoppedWheelsOffCandidateController, VerifiedNanoWheelsOffMappedImages,
     VerifiedNanoWheelsOffNativeRuntimeDependencies, WheelsOffCandidateActuationSession,
     WheelsOffCandidateControllerBinding, WheelsOffCandidateControllerBindingError,
@@ -482,6 +482,12 @@ impl QualificationHeadGazeProposalOnlyPolicy {
     pub const fn policy(&self) -> &HeadGazePolicyV1 {
         &self.policy
     }
+
+    /// Consume the lifecycle-checked wrapper for the non-actuating diagnostic
+    /// adapter. This does not grant physical head authority.
+    pub fn into_policy(self) -> HeadGazePolicyV1 {
+        self.policy
+    }
 }
 
 impl TryFrom<HeadGazePolicyV1> for QualificationHeadGazeProposalOnlyPolicy {
@@ -684,7 +690,7 @@ pub async fn bootstrap_nano_wheels_off_qualification(
         expected_rectified_stereo.dimensions(),
         DepthToTrackingCamera::identity(),
     );
-    let navigation = ShadowNavigationConfigV1::parse_json_bound_to_plant_artifact(
+    let navigation = ShadowNavigationConfigV2::parse_json_bound_to_plant_artifact(
         assets.navigation_shadow_config.bytes(),
         expected_depth_camera,
         plant_artifact_model,
@@ -994,7 +1000,7 @@ struct ConnectedQualificationOak {
     usb_transport: oak_sys::UsbTransportAdmissionEvidence,
     depthai_build_metadata: DepthAiBuildMetadata,
     stereo: NanoBootstrapStereoEvidence,
-    navigation: ShadowNavigationConfigV1,
+    navigation: ShadowNavigationConfigV2,
     occupancy_host_policy: LiveOccupancyHostPolicy,
     candidate_runtime_service_interval: WheelsOffCandidateRuntimeServiceInterval,
 }
@@ -1003,7 +1009,7 @@ fn prepare_oak(
     oak: &mut Device,
     launch: &NanoWheelsOffQualificationLaunchV4,
     calibration: &NanoCalibrationArtifactV1,
-    navigation: ShadowNavigationConfigV1,
+    navigation: ShadowNavigationConfigV2,
     candidate_runtime_service_interval: WheelsOffCandidateRuntimeServiceInterval,
     running: &AtomicBool,
 ) -> Result<ConnectedQualificationOak, QualificationBootstrapPrimaryError> {
