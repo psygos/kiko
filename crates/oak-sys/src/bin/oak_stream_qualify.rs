@@ -6,6 +6,8 @@
 //!
 //! Successful stdout is one JSON document. Native sequence gaps describe
 //! missing host deliveries only; they do not attribute loss to USB.
+//! The measured window begins at a bounded candidate instant recorded before
+//! every enabled queue is observed empty by one nonblocking check.
 
 use oak_sys::{
     CloseError, ConnectedDeviceIdentityError, DepthAlignment, DepthConfig, DepthError, Device,
@@ -37,6 +39,8 @@ const DEPTH_PAYLOAD_BYTES: u64 = 640 * 400 * 2;
 const MAXIMUM_FRAMES_PER_STREAM: u32 = IMAGE_RATE_HZ * 60 * 60;
 const MAXIMUM_DURATION_SECONDS: u64 = 60 * 60;
 const IDLE_POLL_SLEEP: Duration = Duration::from_millis(1);
+const EMPTY_EPOCH_MAXIMUM_DURATION: Duration = Duration::from_secs(5);
+const EMPTY_EPOCH_MAXIMUM_CANDIDATES: u64 = 100_000;
 
 fn main() -> ExitCode {
     match Command::parse(std::env::args_os()) {
@@ -266,6 +270,7 @@ fn qualify(
         maximum_duration_seconds: arguments.maximum_duration_seconds,
         elapsed: attempt.elapsed,
         required_minimum_imu_samples: attempt.required_minimum_imu_samples,
+        empty_queue_epoch: attempt.empty_queue_epoch,
         stats: attempt.stats,
     };
     if let Some(source) = attempt.failure {
@@ -302,11 +307,25 @@ struct CaptureAttempt {
     stats: CaptureStats,
     elapsed: Duration,
     required_minimum_imu_samples: u64,
+    empty_queue_epoch: EmptyQueueEpochStats,
     failure: Option<CaptureError>,
 }
 
 fn capture(device: &mut Device, arguments: &Arguments) -> CaptureAttempt {
-    let started = Instant::now();
+    let epoch = match establish_empty_queue_epoch(device) {
+        Ok(epoch) => epoch,
+        Err(failure) => {
+            return CaptureAttempt {
+                stats: CaptureStats::default(),
+                elapsed: Duration::ZERO,
+                required_minimum_imu_samples: 0,
+                empty_queue_epoch: failure.stats,
+                failure: Some(CaptureError::EmptyQueueEpoch(failure.source)),
+            };
+        }
+    };
+    let started = epoch.measurement_started;
+    let empty_queue_epoch = epoch.stats;
     let mut stats = CaptureStats::default();
     let target = u64::from(arguments.frames_per_image_stream);
 
@@ -319,6 +338,7 @@ fn capture(device: &mut Device, arguments: &Arguments) -> CaptureAttempt {
                 stats,
                 elapsed,
                 required_minimum_imu_samples,
+                empty_queue_epoch,
                 failure: None,
             };
         }
@@ -327,6 +347,7 @@ fn capture(device: &mut Device, arguments: &Arguments) -> CaptureAttempt {
                 stats,
                 elapsed,
                 required_minimum_imu_samples,
+                empty_queue_epoch,
                 failure: None,
             };
         }
@@ -335,7 +356,12 @@ fn capture(device: &mut Device, arguments: &Arguments) -> CaptureAttempt {
         match poll_image(device.rgb(0), ImageContract::rgb(), &mut stats.rgb) {
             Ok(delivered) => delivered_anything |= delivered,
             Err(source) => {
-                return failed_attempt(stats, started.elapsed(), CaptureError::Rgb(source));
+                return failed_attempt(
+                    stats,
+                    started.elapsed(),
+                    empty_queue_epoch,
+                    CaptureError::Rgb(source),
+                );
             }
         }
         match poll_image(
@@ -345,7 +371,12 @@ fn capture(device: &mut Device, arguments: &Arguments) -> CaptureAttempt {
         ) {
             Ok(delivered) => delivered_anything |= delivered,
             Err(source) => {
-                return failed_attempt(stats, started.elapsed(), CaptureError::MonoLeft(source));
+                return failed_attempt(
+                    stats,
+                    started.elapsed(),
+                    empty_queue_epoch,
+                    CaptureError::MonoLeft(source),
+                );
             }
         }
         match poll_image(
@@ -355,13 +386,23 @@ fn capture(device: &mut Device, arguments: &Arguments) -> CaptureAttempt {
         ) {
             Ok(delivered) => delivered_anything |= delivered,
             Err(source) => {
-                return failed_attempt(stats, started.elapsed(), CaptureError::MonoRight(source));
+                return failed_attempt(
+                    stats,
+                    started.elapsed(),
+                    empty_queue_epoch,
+                    CaptureError::MonoRight(source),
+                );
             }
         }
         match poll_depth(device.depth(0), &mut stats.depth) {
             Ok(delivered) => delivered_anything |= delivered,
             Err(source) => {
-                return failed_attempt(stats, started.elapsed(), CaptureError::Depth(source));
+                return failed_attempt(
+                    stats,
+                    started.elapsed(),
+                    empty_queue_epoch,
+                    CaptureError::Depth(source),
+                );
             }
         }
         match device.imu() {
@@ -378,6 +419,7 @@ fn capture(device: &mut Device, arguments: &Arguments) -> CaptureAttempt {
                         return failed_attempt(
                             stats,
                             started.elapsed(),
+                            empty_queue_epoch,
                             CaptureError::Accounting(AccountingError::CounterOverflow {
                                 counter: "imu.samples",
                             }),
@@ -392,6 +434,7 @@ fn capture(device: &mut Device, arguments: &Arguments) -> CaptureAttempt {
                     return failed_attempt(
                         stats,
                         started.elapsed(),
+                        empty_queue_epoch,
                         CaptureError::Accounting(AccountingError::CounterOverflow {
                             counter: "imu.empty_polls",
                         }),
@@ -399,7 +442,12 @@ fn capture(device: &mut Device, arguments: &Arguments) -> CaptureAttempt {
                 }
             }
             Err(source) => {
-                return failed_attempt(stats, started.elapsed(), CaptureError::Imu(source));
+                return failed_attempt(
+                    stats,
+                    started.elapsed(),
+                    empty_queue_epoch,
+                    CaptureError::Imu(source),
+                );
             }
         }
 
@@ -410,12 +458,253 @@ fn capture(device: &mut Device, arguments: &Arguments) -> CaptureAttempt {
     }
 }
 
-fn failed_attempt(stats: CaptureStats, elapsed: Duration, failure: CaptureError) -> CaptureAttempt {
+fn failed_attempt(
+    stats: CaptureStats,
+    elapsed: Duration,
+    empty_queue_epoch: EmptyQueueEpochStats,
+    failure: CaptureError,
+) -> CaptureAttempt {
     CaptureAttempt {
         stats,
         elapsed,
         required_minimum_imu_samples: minimum_imu_samples_for_elapsed(elapsed),
+        empty_queue_epoch,
         failure: Some(failure),
+    }
+}
+
+#[derive(Debug)]
+struct EmptyQueueEpoch {
+    /// Recorded before all five queue checks whose empty result admitted it.
+    measurement_started: Instant,
+    stats: EmptyQueueEpochStats,
+}
+
+#[derive(Debug)]
+struct EmptyQueueEpochFailure {
+    stats: EmptyQueueEpochStats,
+    source: Box<EmptyQueueEpochError>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EmptyQueueEpochStats {
+    candidate_epochs: u64,
+    discarded_rgb_frames: u64,
+    discarded_mono_left_frames: u64,
+    discarded_mono_right_frames: u64,
+    discarded_depth_frames: u64,
+    discarded_imu_samples: u64,
+    elapsed: Duration,
+    accepted: bool,
+}
+
+impl EmptyQueueEpochStats {
+    fn begin_candidate(&mut self) -> Result<(), AccountingError> {
+        self.candidate_epochs =
+            self.candidate_epochs
+                .checked_add(1)
+                .ok_or(AccountingError::CounterOverflow {
+                    counter: "empty_queue_epoch.candidate_epochs",
+                })?;
+        Ok(())
+    }
+
+    fn record_discarded(
+        &mut self,
+        rgb_delivered: bool,
+        mono_left_delivered: bool,
+        mono_right_delivered: bool,
+        depth_delivered: bool,
+        imu_samples: Option<u64>,
+    ) -> Result<(), AccountingError> {
+        for (counter, delivered) in [
+            (&mut self.discarded_rgb_frames, rgb_delivered),
+            (&mut self.discarded_mono_left_frames, mono_left_delivered),
+            (&mut self.discarded_mono_right_frames, mono_right_delivered),
+            (&mut self.discarded_depth_frames, depth_delivered),
+        ] {
+            if delivered {
+                *counter = counter
+                    .checked_add(1)
+                    .ok_or(AccountingError::CounterOverflow {
+                        counter: "empty_queue_epoch.discarded_image_frames",
+                    })?;
+            }
+        }
+        if let Some(samples) = imu_samples {
+            self.discarded_imu_samples = self.discarded_imu_samples.checked_add(samples).ok_or(
+                AccountingError::CounterOverflow {
+                    counter: "empty_queue_epoch.discarded_imu_samples",
+                },
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn establish_empty_queue_epoch(
+    device: &mut Device,
+) -> Result<EmptyQueueEpoch, EmptyQueueEpochFailure> {
+    let phase_started = Instant::now();
+    let mut stats = EmptyQueueEpochStats::default();
+
+    loop {
+        if phase_started.elapsed() >= EMPTY_EPOCH_MAXIMUM_DURATION {
+            return Err(empty_epoch_failure(
+                stats,
+                phase_started,
+                EmptyQueueEpochError::MaximumDuration {
+                    maximum_milliseconds: EMPTY_EPOCH_MAXIMUM_DURATION.as_millis(),
+                },
+            ));
+        }
+        if stats.candidate_epochs >= EMPTY_EPOCH_MAXIMUM_CANDIDATES {
+            return Err(empty_epoch_failure(
+                stats,
+                phase_started,
+                EmptyQueueEpochError::MaximumCandidates {
+                    maximum: EMPTY_EPOCH_MAXIMUM_CANDIDATES,
+                },
+            ));
+        }
+        if let Err(source) = stats.begin_candidate() {
+            return Err(empty_epoch_failure(
+                stats,
+                phase_started,
+                EmptyQueueEpochError::Accounting(source),
+            ));
+        }
+
+        // This instant precedes every nonblocking check. If an earlier queue
+        // becomes nonempty after its check, that data is still post-candidate
+        // and belongs to the subsequently measured window.
+        let candidate = Instant::now();
+        let rgb_delivered = drain_image_for_empty_epoch(device.rgb(0), ImageContract::rgb())
+            .map_err(|source| {
+                empty_epoch_failure(stats, phase_started, EmptyQueueEpochError::Rgb(source))
+            })?;
+        if let Err(source) = stats.record_discarded(rgb_delivered, false, false, false, None) {
+            return Err(empty_epoch_failure(
+                stats,
+                phase_started,
+                EmptyQueueEpochError::Accounting(source),
+            ));
+        }
+        let mono_left_delivered = drain_image_for_empty_epoch(
+            device.mono_left(0),
+            ImageContract::mono_left(),
+        )
+        .map_err(|source| {
+            empty_epoch_failure(stats, phase_started, EmptyQueueEpochError::MonoLeft(source))
+        })?;
+        if let Err(source) = stats.record_discarded(false, mono_left_delivered, false, false, None)
+        {
+            return Err(empty_epoch_failure(
+                stats,
+                phase_started,
+                EmptyQueueEpochError::Accounting(source),
+            ));
+        }
+        let mono_right_delivered =
+            drain_image_for_empty_epoch(device.mono_right(0), ImageContract::mono_right())
+                .map_err(|source| {
+                    empty_epoch_failure(
+                        stats,
+                        phase_started,
+                        EmptyQueueEpochError::MonoRight(source),
+                    )
+                })?;
+        if let Err(source) = stats.record_discarded(false, false, mono_right_delivered, false, None)
+        {
+            return Err(empty_epoch_failure(
+                stats,
+                phase_started,
+                EmptyQueueEpochError::Accounting(source),
+            ));
+        }
+        let depth_delivered = drain_depth_for_empty_epoch(device.depth(0)).map_err(|source| {
+            empty_epoch_failure(stats, phase_started, EmptyQueueEpochError::Depth(source))
+        })?;
+        if let Err(source) = stats.record_discarded(false, false, false, depth_delivered, None) {
+            return Err(empty_epoch_failure(
+                stats,
+                phase_started,
+                EmptyQueueEpochError::Accounting(source),
+            ));
+        }
+        let imu_samples = match device.imu() {
+            Ok(samples) if samples.is_empty() => {
+                return Err(empty_epoch_failure(
+                    stats,
+                    phase_started,
+                    EmptyQueueEpochError::EmptySuccessfulImuBatch,
+                ));
+            }
+            Ok(samples) => Some(u64::try_from(samples.len()).map_err(|_| {
+                empty_epoch_failure(
+                    stats,
+                    phase_started,
+                    EmptyQueueEpochError::Accounting(AccountingError::CounterOverflow {
+                        counter: "empty_queue_epoch.imu_batch_samples",
+                    }),
+                )
+            })?),
+            Err(ImuError::Empty) => None,
+            Err(source) => {
+                return Err(empty_epoch_failure(
+                    stats,
+                    phase_started,
+                    EmptyQueueEpochError::Imu(source),
+                ));
+            }
+        };
+        if let Err(source) = stats.record_discarded(false, false, false, false, imu_samples) {
+            return Err(empty_epoch_failure(
+                stats,
+                phase_started,
+                EmptyQueueEpochError::Accounting(source),
+            ));
+        }
+        stats.elapsed = phase_started.elapsed();
+        if stats.elapsed >= EMPTY_EPOCH_MAXIMUM_DURATION {
+            return Err(EmptyQueueEpochFailure {
+                stats,
+                source: Box::new(EmptyQueueEpochError::MaximumDuration {
+                    maximum_milliseconds: EMPTY_EPOCH_MAXIMUM_DURATION.as_millis(),
+                }),
+            });
+        }
+
+        if candidate_is_empty_epoch([
+            rgb_delivered,
+            mono_left_delivered,
+            mono_right_delivered,
+            depth_delivered,
+            imu_samples.is_some(),
+        ]) {
+            stats.accepted = true;
+            return Ok(EmptyQueueEpoch {
+                measurement_started: candidate,
+                stats,
+            });
+        }
+    }
+}
+
+/// Pure admission predicate for one ordered set of candidate-epoch checks.
+fn candidate_is_empty_epoch(delivered: [bool; 5]) -> bool {
+    delivered.into_iter().all(|was_delivered| !was_delivered)
+}
+
+fn empty_epoch_failure(
+    mut stats: EmptyQueueEpochStats,
+    phase_started: Instant,
+    source: EmptyQueueEpochError,
+) -> EmptyQueueEpochFailure {
+    stats.elapsed = phase_started.elapsed();
+    EmptyQueueEpochFailure {
+        stats,
+        source: Box::new(source),
     }
 }
 
@@ -501,6 +790,46 @@ impl ImageContract {
             });
         }
         Ok(())
+    }
+}
+
+fn drain_image_for_empty_epoch(
+    result: Result<ImageFrame, ImageError>,
+    contract: ImageContract,
+) -> Result<bool, CaptureImageError> {
+    match result {
+        Ok(frame) => {
+            let payload_bytes = u64::try_from(frame.pixels().len()).map_err(|_| {
+                AccountingError::CounterOverflow {
+                    counter: "empty_queue_epoch.image_payload_bytes",
+                }
+            })?;
+            contract.validate(&frame, payload_bytes)?;
+            Ok(true)
+        }
+        Err(ImageError::QueueEmpty) => Ok(false),
+        // A zero-timeout native check must report QueueEmpty, not Timeout.
+        Err(source) => Err(CaptureImageError::Acquisition(source)),
+    }
+}
+
+fn drain_depth_for_empty_epoch(
+    result: Result<oak_sys::DepthFrame, DepthError>,
+) -> Result<bool, CaptureDepthError> {
+    match result {
+        Ok(frame) => {
+            let payload_bytes = u64::try_from(frame.depth_mm().len())
+                .ok()
+                .and_then(|samples| samples.checked_mul(2))
+                .ok_or(AccountingError::CounterOverflow {
+                    counter: "empty_queue_epoch.depth_payload_bytes",
+                })?;
+            validate_depth_contract(&frame, payload_bytes)?;
+            Ok(true)
+        }
+        Err(DepthError::QueueEmpty) => Ok(false),
+        // A zero-timeout native check must report QueueEmpty, not Timeout.
+        Err(source) => Err(CaptureDepthError::Acquisition(source)),
     }
 }
 
@@ -781,6 +1110,7 @@ struct QualificationReport {
     maximum_duration_seconds: u64,
     elapsed: Duration,
     required_minimum_imu_samples: u64,
+    empty_queue_epoch: EmptyQueueEpochStats,
     stats: CaptureStats,
 }
 
@@ -817,6 +1147,12 @@ impl fmt::Display for QualificationJson<'_> {
              \"depth\":{{\"width\":{RGB_WIDTH},\"height\":{RGB_HEIGHT},\"rate_hz\":{IMAGE_RATE_HZ},\"alignment\":\"RECTIFIED_LEFT\",\"unit\":\"millimetres_u16\",\"invalid_value\":0}},\
              \"imu\":{{\"rate_hz\":{IMU_RATE_HZ}}},\"queue\":{{\"size\":{QUEUE_SIZE},\"blocking\":false}}}},\
              \"limits\":{{\"frames_per_image_stream\":{},\"maximum_duration_seconds\":{}}},\
+             \"empty_queue_epoch\":{{\"accepted\":{},\"candidate_epochs\":{},\
+             \"elapsed_seconds\":{:.9},\"maximum_duration_milliseconds\":{},\
+             \"maximum_candidate_epochs\":{EMPTY_EPOCH_MAXIMUM_CANDIDATES},\
+             \"discarded\":{{\"rgb_frames\":{},\"mono_left_frames\":{},\
+             \"mono_right_frames\":{},\"depth_frames\":{},\"imu_samples\":{}}},\
+             \"measurement_start_semantics\":\"candidate monotonic instant recorded before one empty nonblocking check of every queue\"}},\
              \"elapsed_seconds\":{elapsed_seconds:.9},\"image_streams\":{{",
             JsonString(self.status),
             JsonString(&report.connected_mxid),
@@ -825,6 +1161,15 @@ impl fmt::Display for QualificationJson<'_> {
             JsonString(report.observed_usb_speed.as_depthai_name()),
             report.frames_per_image_stream,
             report.maximum_duration_seconds,
+            report.empty_queue_epoch.accepted,
+            report.empty_queue_epoch.candidate_epochs,
+            report.empty_queue_epoch.elapsed.as_secs_f64(),
+            EMPTY_EPOCH_MAXIMUM_DURATION.as_millis(),
+            report.empty_queue_epoch.discarded_rgb_frames,
+            report.empty_queue_epoch.discarded_mono_left_frames,
+            report.empty_queue_epoch.discarded_mono_right_frames,
+            report.empty_queue_epoch.discarded_depth_frames,
+            report.empty_queue_epoch.discarded_imu_samples,
         )?;
         write_image_stream(formatter, "rgb", report.stats.rgb, elapsed_seconds)?;
         formatter.write_str(",")?;
@@ -997,7 +1342,31 @@ enum CaptureDepthError {
 }
 
 #[derive(Error, Debug)]
+enum EmptyQueueEpochError {
+    #[error("RGB drain check failed: {0}")]
+    Rgb(#[source] CaptureImageError),
+    #[error("rectified-left mono drain check failed: {0}")]
+    MonoLeft(#[source] CaptureImageError),
+    #[error("rectified-right mono drain check failed: {0}")]
+    MonoRight(#[source] CaptureImageError),
+    #[error("rectified-left-aligned depth drain check failed: {0}")]
+    Depth(#[source] CaptureDepthError),
+    #[error("IMU drain check failed: {0}")]
+    Imu(#[source] ImuError),
+    #[error("IMU returned a successful but empty batch during the drain check")]
+    EmptySuccessfulImuBatch,
+    #[error("no all-empty queue epoch was established within {maximum_milliseconds} milliseconds")]
+    MaximumDuration { maximum_milliseconds: u128 },
+    #[error("no all-empty queue epoch was established within {maximum} candidate epochs")]
+    MaximumCandidates { maximum: u64 },
+    #[error("empty-queue epoch accounting failed: {0}")]
+    Accounting(#[source] AccountingError),
+}
+
+#[derive(Error, Debug)]
 enum CaptureError {
+    #[error("bounded empty-queue epoch establishment failed: {0}")]
+    EmptyQueueEpoch(#[source] Box<EmptyQueueEpochError>),
     #[error("RGB stream failed: {0}")]
     Rgb(#[source] CaptureImageError),
     #[error("rectified-left mono stream failed: {0}")]
@@ -1010,6 +1379,20 @@ enum CaptureError {
     Imu(#[source] ImuError),
     #[error("qualification accounting failed: {0}")]
     Accounting(#[source] AccountingError),
+}
+
+impl CaptureError {
+    const fn status(&self) -> &'static str {
+        match self {
+            Self::EmptyQueueEpoch(_) => "empty_queue_epoch_error",
+            Self::Rgb(_)
+            | Self::MonoLeft(_)
+            | Self::MonoRight(_)
+            | Self::Depth(_)
+            | Self::Imu(_)
+            | Self::Accounting(_) => "capture_error",
+        }
+    }
 }
 
 #[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1048,7 +1431,7 @@ impl OperationError {
     fn status(&self) -> &'static str {
         match self {
             Self::DurationLimit { .. } => "duration_limit",
-            Self::Capture(_) => "capture_error",
+            Self::Capture(source) => source.status(),
             Self::NativeSequenceAnomalies { .. } => "native_sequence_anomaly",
             Self::Identity(_) | Self::UsbTransport(_) => "evidence_error",
         }
@@ -1123,6 +1506,7 @@ impl ProgramError {
             Self::OperationAndClose { operation, .. } => match operation.source.status() {
                 "duration_limit" => "duration_limit_and_close_error",
                 "capture_error" => "capture_and_close_error",
+                "empty_queue_epoch_error" => "empty_queue_epoch_and_close_error",
                 "native_sequence_anomaly" => "native_sequence_anomaly_and_close_error",
                 _ => "evidence_and_close_error",
             },
@@ -1173,6 +1557,16 @@ mod tests {
             maximum_duration_seconds: 10,
             elapsed: Duration::from_secs(2),
             required_minimum_imu_samples: 320,
+            empty_queue_epoch: EmptyQueueEpochStats {
+                candidate_epochs: 3,
+                discarded_rgb_frames: 1,
+                discarded_mono_left_frames: 1,
+                discarded_mono_right_frames: 1,
+                discarded_depth_frames: 1,
+                discarded_imu_samples: 12,
+                elapsed: Duration::from_millis(4),
+                accepted: true,
+            },
             stats: CaptureStats {
                 rgb: image_stats(2, RGB_PAYLOAD_BYTES, 10),
                 mono_left: image_stats(2, MONO_PAYLOAD_BYTES, 20),
@@ -1262,6 +1656,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_epoch_requires_every_nonblocking_check_to_report_empty() {
+        assert!(candidate_is_empty_epoch([false; 5]));
+        for delivered_index in 0..5 {
+            let mut delivered = [false; 5];
+            delivered[delivered_index] = true;
+            assert!(
+                !candidate_is_empty_epoch(delivered),
+                "queue {delivered_index} delivered data"
+            );
+        }
+    }
+
+    #[test]
     fn complete_json_round_trips_and_escapes_exact_mxid() {
         let mxid = "mxid\"with\\escapes\nand\u{1}control";
         let report = complete_report(mxid);
@@ -1275,6 +1682,9 @@ mod tests {
         assert_eq!(parsed["usb_transport"]["requested_maximum"], "SUPER_PLUS");
         assert_eq!(parsed["usb_transport"]["required_minimum"], "SUPER");
         assert_eq!(parsed["usb_transport"]["observed"], "SUPER_PLUS");
+        assert_eq!(parsed["empty_queue_epoch"]["accepted"], true);
+        assert_eq!(parsed["empty_queue_epoch"]["candidate_epochs"], 3);
+        assert_eq!(parsed["empty_queue_epoch"]["discarded"]["imu_samples"], 12);
         assert_eq!(
             parsed["imu"]["minimum_delivery_rate_fraction"]["numerator"],
             4
