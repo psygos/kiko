@@ -173,6 +173,39 @@ impl NanoBaseCommissioningPolicyV1 {
         self.fit
     }
 
+    /// Stable model identity copied into an independently reviewed plant.
+    pub fn model_id(&self) -> &str {
+        self.model_id.as_str()
+    }
+
+    pub const fn model_version(self) -> NonZeroU32 {
+        self.model_version
+    }
+
+    pub const fn lateral_holdout_stride(self) -> NonZeroU16 {
+        self.lateral.holdout_stride
+    }
+
+    pub const fn lateral_minimum_training_samples(self) -> NonZeroU32 {
+        self.lateral.minimum_training_samples
+    }
+
+    pub const fn lateral_minimum_holdout_samples(self) -> NonZeroU32 {
+        self.lateral.minimum_holdout_samples
+    }
+
+    pub const fn lateral_bound_margin_mps(self) -> f64 {
+        self.lateral.bound_margin_mps
+    }
+
+    pub const fn lateral_maximum_accepted_bound_mps(self) -> f64 {
+        self.lateral.maximum_accepted_bound_mps
+    }
+
+    pub fn lateral_scope_label(&self) -> &str {
+        self.lateral.scope_label.as_str()
+    }
+
     pub const fn maximum_sample_gap_ns(self) -> NonZeroU64 {
         self.maximum_sample_gap_ns
     }
@@ -467,6 +500,7 @@ impl AdmittedAttendedCommissioning {
     /// Construct the scoped authority after the immutable controller profile
     /// and one-shot attended physical attestation have both been verified and
     /// consumed.
+    #[cfg(any(feature = "nano-base-commissioning", test))]
     pub(super) fn from_verified_attended_admission(
         controller_session_id: BoundedId,
         controller_profile_sha256: [u8; CONTENT_DIGEST_BYTES],
@@ -2670,6 +2704,7 @@ mod tests {
         records: u64,
         fail_after: Option<u64>,
         fail_finalize: bool,
+        shared_bytes: Option<Arc<Mutex<Vec<u8>>>>,
     }
 
     #[derive(Debug)]
@@ -2691,6 +2726,12 @@ mod tests {
                 return Err(MemoryJournalError);
             }
             self.bytes.extend_from_slice(record);
+            if let Some(shared) = &self.shared_bytes {
+                shared
+                    .lock()
+                    .expect("shared journal bytes")
+                    .extend_from_slice(record);
+            }
             self.records += 1;
             Ok(())
         }
@@ -2824,14 +2865,25 @@ mod tests {
         left_gain: f64,
         right_gain: f64,
     ) -> NanoBaseCommissioningSession<FakeActuator, MemoryJournal> {
-        let (actuator, _) = FakeActuator::new();
-        let mut session = NanoBaseCommissioningSession::start(
+        complete_synthetic_session_with(
             policy,
             authority(policy),
-            actuator,
             MemoryJournal::default(),
+            left_gain,
+            right_gain,
         )
-        .expect("session starts");
+    }
+
+    fn complete_synthetic_session_with(
+        policy: NanoBaseCommissioningPolicyV1,
+        authority: AdmittedAttendedCommissioning,
+        journal: MemoryJournal,
+        left_gain: f64,
+        right_gain: f64,
+    ) -> NanoBaseCommissioningSession<FakeActuator, MemoryJournal> {
+        let (actuator, _) = FakeActuator::new();
+        let mut session = NanoBaseCommissioningSession::start(policy, authority, actuator, journal)
+            .expect("session starts");
         let mut now_ns = 0_u64;
         let mut left_velocity_mps = 0.0_f64;
         let mut right_velocity_mps = 0.0_f64;
@@ -3340,6 +3392,161 @@ mod tests {
             Value::String(canonical_sha256(proposal.proposed_plant.content_sha256))
         );
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(feature = "nano-plant-promotion")]
+    #[test]
+    fn offline_promotion_reuses_completed_proposal_and_rejects_digest_link_and_approval_faults() {
+        use crate::navigation::nano_plant_promotion::{PlantPromotionError, promote_review_file};
+
+        let root = test_directory("offline-promotion");
+        let proposal_directory = root.join("proposal");
+        fs::create_dir(&proposal_directory).expect("proposal directory");
+        fs::set_permissions(&proposal_directory, Permissions::from_mode(0o700))
+            .expect("proposal mode");
+        let output_root = root.join("output");
+        fs::create_dir(&output_root).expect("output root");
+        fs::set_permissions(&output_root, Permissions::from_mode(0o700)).expect("output mode");
+
+        let policy_bytes = policy_json();
+        let policy_path = root.join("policy.json");
+        fs::write(&policy_path, &policy_bytes).expect("policy");
+        let profile_bytes = b"{\"fixture\":\"commissioning-profile\"}\n";
+        let profile_path = root.join("controller-profile.json");
+        fs::write(&profile_path, profile_bytes).expect("profile");
+        let attestation_bytes = b"{\"fixture\":\"attended-attestation\"}\n";
+        let attestation_path = root.join("attestation.json");
+        fs::write(&attestation_path, attestation_bytes).expect("attestation");
+        let policy = NanoBaseCommissioningPolicyV1::parse_json(&policy_bytes).expect("policy");
+        let exact_authority = AdmittedAttendedCommissioning::from_verified_attended_admission(
+            policy.commissioning().expected_controller_session_id(),
+            sha256(profile_bytes),
+            sha256(attestation_bytes),
+            policy.commissioning().max_abs_pwm_percent().get(),
+            0,
+            100_000_000_000,
+        )
+        .expect("authority");
+        let shared_journal = Arc::new(Mutex::new(Vec::new()));
+        let session = complete_synthetic_session_with(
+            policy,
+            exact_authority,
+            MemoryJournal {
+                shared_bytes: Some(Arc::clone(&shared_journal)),
+                ..MemoryJournal::default()
+            },
+            LEFT_GAIN,
+            RIGHT_GAIN,
+        );
+        let admitted_directory = CommissioningArtifactDirectory::inspect(&proposal_directory)
+            .expect("proposal publication directory");
+        let proposal = session
+            .publish_proposal(&admitted_directory)
+            .expect("proposal");
+        let journal_bytes = shared_journal.lock().expect("journal").clone();
+        let journal_path = root.join("commissioning-evidence-v1.ndjson");
+        fs::write(&journal_path, &journal_bytes).expect("journal");
+
+        let binding = |path: &Path| {
+            let bytes = fs::read(path).expect("bound bytes");
+            json!({
+                "path": path,
+                "sha256_hex": lower_hex(sha256(&bytes)),
+                "bytes": bytes.len()
+            })
+        };
+        let mut review = json!({
+            "schema_version": 1,
+            "promotion_id": "promotion-test-1",
+            "reviewer_id": "reviewer-test",
+            "approval_id": "approval-test-1",
+            "approver_id": "approver-test",
+            "commissioning_session_id": "commissioning-test-1",
+            "sources": {
+                "policy": binding(&policy_path),
+                "controller_profile": binding(&profile_path),
+                "attended_attestation": binding(&attestation_path),
+                "journal": {
+                    "artifact": binding(&journal_path),
+                    "records": proposal.journal.record_count()
+                },
+                "dataset": binding(&proposal.dataset.path),
+                "proposed_plant": binding(&proposal.proposed_plant.path),
+                "proposal_evidence": binding(&proposal.proposal_evidence.path)
+            },
+            "physical_review": {
+                "complete_journal": "reviewed_and_accepted",
+                "dataset_and_reproduced_fit": "reviewed_and_accepted",
+                "repeated_run_consistency": "reviewed_and_accepted",
+                "wheel_wiring_and_signed_motion": "reviewed_and_accepted",
+                "units_and_base_body_flu_frame": "reviewed_and_accepted",
+                "surface_payload_and_envelope": "reviewed_and_accepted",
+                "default_off_driver_enable": "reviewed_and_accepted",
+                "driver_fault_and_estop_feedback": "reviewed_and_accepted",
+                "reset_brownout_and_hard_fault": "reviewed_and_accepted",
+                "independent_power_cut": "reviewed_and_accepted",
+                "verified_physical_stop_semantics": "coast_verified"
+            },
+            "calibrations": {
+                "imu_calibration_id": "oak-imu-calibration-1",
+                "stereo_calibration_id": "oak-stereo-calibration-1",
+                "tracking_camera_to_base_calibration_id": "oak-to-base-calibration-1"
+            },
+            "renderer": {
+                "plant_artifact_id": "reviewed-plant-test-1",
+                "plant_destination_relative_path":
+                    "artifacts/reviewed-plant-test-1.json"
+            }
+        });
+        let review_path = root.join("review.json");
+        let write_review = |review: &Value| {
+            fs::write(
+                &review_path,
+                serde_json::to_vec(review).expect("review JSON"),
+            )
+            .expect("review");
+        };
+        write_review(&review);
+        let promoted = promote_review_file(&review_path, &output_root).expect("promotion");
+        assert_eq!(
+            fs::read(&promoted.production_plant.path).expect("promoted plant"),
+            fs::read(&proposal.proposed_plant.path).expect("proposed plant")
+        );
+        assert!(promoted.completion_marker.path.is_file());
+
+        review["sources"]["dataset"]["sha256_hex"] = json!("00".repeat(32));
+        write_review(&review);
+        assert!(matches!(
+            promote_review_file(&review_path, &output_root),
+            Err(PlantPromotionError::Rejected(_))
+        ));
+        review["sources"]["dataset"] = binding(&proposal.dataset.path);
+
+        let mut bad_evidence: Value = serde_json::from_slice(
+            &fs::read(&proposal.proposal_evidence.path).expect("proposal evidence"),
+        )
+        .expect("proposal evidence JSON");
+        bad_evidence["proposed_plant_artifact_sha256"] = json!(canonical_sha256([0x44; 32]));
+        let bad_evidence_path = root.join("bad-proposal-evidence.json");
+        fs::write(
+            &bad_evidence_path,
+            serde_json::to_vec(&bad_evidence).expect("bad evidence"),
+        )
+        .expect("bad evidence");
+        review["sources"]["proposal_evidence"] = binding(&bad_evidence_path);
+        write_review(&review);
+        assert!(matches!(
+            promote_review_file(&review_path, &output_root),
+            Err(PlantPromotionError::Rejected(_))
+        ));
+
+        review["approval_id"] = json!("");
+        write_review(&review);
+        assert!(matches!(
+            promote_review_file(&review_path, &output_root),
+            Err(PlantPromotionError::Invalid("approval_id"))
+        ));
+        fs::remove_dir_all(root).expect("remove test directory");
     }
 
     #[test]

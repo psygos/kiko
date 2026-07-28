@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "promotion_id": "${HUMAN_ASSIGNED_PROMOTION_ID}",
+  "reviewer_id": "${HUMAN_REVIEWER_ID}",
+  "approval_id": "${HUMAN_ASSIGNED_APPROVAL_ID}",
+  "approver_id": "${HUMAN_APPROVER_ID}",
+  "commissioning_session_id": "${COMMISSIONING_SESSION_ID}",
+  "sources": {
+    "policy": {
+      "path": "${ABSOLUTE_POLICY_PATH}",
+      "sha256_hex": "${POLICY_SHA256_HEX}",
+      "bytes": ${POLICY_BYTES}
+    },
+    "controller_profile": {
+      "path": "${ABSOLUTE_COMMISSIONING_CONTROLLER_PROFILE_PATH}",
+      "sha256_hex": "${COMMISSIONING_CONTROLLER_PROFILE_SHA256_HEX}",
+      "bytes": ${COMMISSIONING_CONTROLLER_PROFILE_BYTES}
+    },
+    "attended_attestation": {
+      "path": "${ABSOLUTE_ATTENDED_ATTESTATION_PATH}",
+      "sha256_hex": "${ATTENDED_ATTESTATION_SHA256_HEX}",
+      "bytes": ${ATTENDED_ATTESTATION_BYTES}
+    },
+    "journal": {
+      "artifact": {
+        "path": "${ABSOLUTE_COMMISSIONING_JOURNAL_PATH}",
+        "sha256_hex": "${COMMISSIONING_JOURNAL_SHA256_HEX}",
+        "bytes": ${COMMISSIONING_JOURNAL_BYTES}
+      },
+      "records": ${COMMISSIONING_JOURNAL_RECORDS}
+    },
+    "dataset": {
+      "path": "${ABSOLUTE_IDENTIFICATION_DATASET_PATH}",
+      "sha256_hex": "${IDENTIFICATION_DATASET_SHA256_HEX}",
+      "bytes": ${IDENTIFICATION_DATASET_BYTES}
+    },
+    "proposed_plant": {
+      "path": "${ABSOLUTE_PROPOSED_PLANT_PATH}",
+      "sha256_hex": "${PROPOSED_PLANT_SHA256_HEX}",
+      "bytes": ${PROPOSED_PLANT_BYTES}
+    },
+    "proposal_evidence": {
+      "path": "${ABSOLUTE_PROPOSAL_EVIDENCE_PATH}",
+      "sha256_hex": "${PROPOSAL_EVIDENCE_SHA256_HEX}",
+      "bytes": ${PROPOSAL_EVIDENCE_BYTES}
+    }
+  },
+  "physical_review": {
+    "complete_journal": "${COMPLETE_JOURNAL_REVIEW_DECLARATION}",
+    "dataset_and_reproduced_fit": "${DATASET_AND_FIT_REVIEW_DECLARATION}",
+    "repeated_run_consistency": "${REPEATED_RUN_CONSISTENCY_DECLARATION}",
+    "wheel_wiring_and_signed_motion": "${WHEEL_WIRING_AND_SIGN_REVIEW_DECLARATION}",
+    "units_and_base_body_flu_frame": "${UNITS_AND_FRAME_REVIEW_DECLARATION}",
+    "surface_payload_and_envelope": "${SURFACE_PAYLOAD_ENVELOPE_REVIEW_DECLARATION}",
+    "default_off_driver_enable": "${DEFAULT_OFF_ENABLE_REVIEW_DECLARATION}",
+    "driver_fault_and_estop_feedback": "${DRIVER_FAULT_ESTOP_REVIEW_DECLARATION}",
+    "reset_brownout_and_hard_fault": "${RESET_BROWNOUT_HARD_FAULT_REVIEW_DECLARATION}",
+    "independent_power_cut": "${INDEPENDENT_POWER_CUT_REVIEW_DECLARATION}",
+    "verified_physical_stop_semantics": "${VERIFIED_PHYSICAL_STOP_SEMANTICS}"
+  },
+  "calibrations": {
+    "imu_calibration_id": "${IMU_CALIBRATION_ID}",
+    "stereo_calibration_id": "${STEREO_CALIBRATION_ID}",
+    "tracking_camera_to_base_calibration_id": "${TRACKING_CAMERA_TO_BASE_CALIBRATION_ID}"
+  },
+  "renderer": {
+    "plant_artifact_id": "${PRODUCTION_PLANT_ARTIFACT_ID}",
+    "plant_destination_relative_path": "artifacts/${PRODUCTION_PLANT_ARTIFACT_RELATIVE_PATH}"
+  }
+}

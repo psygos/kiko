@@ -162,3 +162,45 @@ explicitly released.
 
 See `docs/nano-base-commissioning.md` for the boundary, event contract,
 failure semantics, and post-run review requirements.
+
+## Offline plant review and promotion
+
+Commissioning output remains inactive until a human completes
+`plant-promotion-review-v1.json.template`. Do not prefill its declarations.
+Each review declaration must be deliberately replaced with
+`reviewed_and_accepted`; stop semantics must be either `coast_verified` or
+`brake_verified` from physical evidence. Reviewer, approver, promotion, and
+approval IDs have no defaults.
+
+The offline command opens no hardware and grants no motion authority:
+
+```sh
+mkdir -m 0700 /var/lib/kiko/plant-promotions
+cargo run --locked --release -p kiko-slam \
+  --features nano-plant-promotion \
+  --bin kiko-nano-plant-promote -- \
+  --review /absolute/path/plant-promotion-review-v1.json \
+  --output-root /var/lib/kiko/plant-promotions
+```
+
+It content-checks all seven source artifacts, verifies the dataset/proposal
+digest graph, re-runs the existing typed dataset parser and deterministic
+fitter, re-derives the lateral envelope, and re-parses the proposed plant with
+the MPC domain constructor. The journal stays an opaque immutable artifact:
+the command binds its exact digest and byte count, retains the operator-claimed
+session ID and record count with that label, but
+does not replace the required complete human journal review with a second
+software interpretation.
+
+A successful create-new directory contains:
+
+- the exact reviewed plant bytes under a production filename;
+- immutable promotion evidence;
+- `nano-agent-renderer-values-v1-*.json`, which supplies the existing
+  production profile/renderer plant and physical-approval fields; and
+- a completion marker written last.
+
+The renderer-values file is a substitution fragment, not a complete production
+controller profile or bundle render input. Controller identity, timing
+budgets, live-mode policy, discovered hardware, native libraries, and all other
+bundle fields still require their independently reviewed inputs.

@@ -223,3 +223,46 @@ consistency, verify polarity and units, compare holdout residuals, validate
 support/envelopes on the actual surface and payload, and separately qualify
 the production controller/firmware path. Activation belongs to a later,
 explicit admission process.
+
+## Explicit offline promotion boundary
+
+`kiko-nano-plant-promote` implements the non-actuating boundary between a
+completed proposal and the existing production bundle renderer. Its strict V1
+review input binds the exact policy, commissioning controller profile,
+attended attestation, journal, dataset, proposed plant, and proposal evidence
+by absolute path, byte count, and lowercase SHA-256.
+
+The command:
+
+1. parses the review once and requires human-supplied reviewer, approver,
+   promotion, and approval IDs;
+2. requires an explicit `reviewed_and_accepted` declaration for the complete
+   journal, repeated-run consistency, wiring/signs, units/frame, actual
+   surface/payload envelope, default-off enable, driver-fault/E-stop feedback,
+   reset/brownout/hard-fault behavior, independent cut, and the production
+   controller path;
+3. verifies the dataset and proposal cross-artifact digest graph;
+4. reuses the commissioning policy parser, identification-dataset parser,
+   deterministic fitter, and MPC plant parser;
+5. re-derives the lateral holdout envelope and checks the proposal against the
+   reproduced plant within a documented `1e-12` mixed absolute/relative
+   serialization-refit tolerance, without widening the retained plant
+   envelope; and
+6. publishes a create-new, content-addressed directory whose status remains
+   `reviewed_bundle_input_motion_authority_withheld`.
+
+The tool does not parse the journal into a parallel protocol implementation.
+It binds the exact journal bytes and digest, retains the reviewer-claimed
+record count as such, and records the mandatory human review declaration. The
+commissioning session ID is likewise explicitly operator-claimed; the exact
+attestation bytes remain the content-bound source of truth. The tool never
+invents a calibration ID, controller
+identity, physical stop result, timing budget, or live-mode permission.
+
+Use
+`configs/nano-base-commissioning-template/plant-promotion-review-v1.json.template`.
+The emitted renderer-values JSON fills only the plant asset and
+`operator_claimed_physical_approval` portions of the existing production
+templates. A separately reviewed production controller profile, complete
+bundle render, deployment qualification, cold-start admission, and attended
+fault/stop qualification are still required before motion.

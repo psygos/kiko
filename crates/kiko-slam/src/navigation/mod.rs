@@ -47,7 +47,10 @@ mod nano_accessory_worker;
     unix
 ))]
 mod nano_agent_launch;
-#[cfg(all(feature = "nano-base-commissioning", unix))]
+#[cfg(all(
+    any(feature = "nano-base-commissioning", feature = "nano-plant-promotion"),
+    unix
+))]
 pub mod nano_base_commissioning;
 #[cfg(all(feature = "nano-base-commissioning", unix))]
 pub mod nano_base_commissioning_bootstrap;
@@ -70,6 +73,8 @@ mod nano_map_persistence;
 mod nano_observed_inventory;
 #[cfg(all(feature = "nano-agent", unix))]
 mod nano_operator_console_service;
+#[cfg(all(feature = "nano-plant-promotion", unix))]
+pub mod nano_plant_promotion;
 #[cfg(all(
     feature = "agent-runtime",
     feature = "actuation",
