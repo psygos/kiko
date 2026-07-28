@@ -477,24 +477,33 @@ ImageFrameResult OakDevice::try_get_rgb(uint32_t timeout_ms) {
 }
 
 ImageFrameResult OakDevice::try_get_mono_left(uint32_t timeout_ms) {
+    // StereoDepth documents both rectified outputs as RAW8. Direct camera
+    // grayscale output is GRAY8, so the expected wire type must follow the
+    // graph selected at the parsed DeviceConfig boundary.
+    const auto expected_type = mono_rectified_
+        ? dai::ImgFrame::Type::RAW8
+        : dai::ImgFrame::Type::GRAY8;
     return try_get_image(
         StreamId::MonoLeft,
         mono_enabled_,
         mono_left_queue_,
         mono_left_seq_,
-        dai::ImgFrame::Type::GRAY8,
+        expected_type,
         1,
         timeout_ms
     );
 }
 
 ImageFrameResult OakDevice::try_get_mono_right(uint32_t timeout_ms) {
+    const auto expected_type = mono_rectified_
+        ? dai::ImgFrame::Type::RAW8
+        : dai::ImgFrame::Type::GRAY8;
     return try_get_image(
         StreamId::MonoRight,
         mono_enabled_,
         mono_right_queue_,
         mono_right_seq_,
-        dai::ImgFrame::Type::GRAY8,
+        expected_type,
         1,
         timeout_ms
     );
