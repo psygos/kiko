@@ -71,23 +71,33 @@ The retained failed-start evidence directories are:
 The subsequently built `94d4f15` binary then ran the unchanged graph twice
 with an explicit `SUPER/SUPER` policy. Both runs connected on their first
 controlled attempt, read back `SUPER`, and observed the owned OAK at kernel
-`5000M` in 11 samples.
+`5000M` in 11 samples. After the production cap was committed, the native
+qualifier was rebuilt from `4e6cb2f` and the same graph completed once more on
+its first controlled attempt with the same exact transport evidence.
 
 | evidence directory | elapsed (s) | each image stream | native sequences | IMU delivered / required | measured IMU delivery |
 |---|---:|---:|---|---:|---:|
 | `94d4f15-oak-SUPER-a1-20260728T215339+0530` | 10.007847785 | 150 / 150 | 0–149; 0 gaps, duplicates, regressions | 1959 / 1602 | 195.746382 Hz |
 | `94d4f15-oak-SUPER-a1-20260728T215459+0530` | 10.000549404 | 150 / 150 | 0–149; 0 gaps, duplicates, regressions | 1967 / 1601 | 196.689194 Hz |
+| `4e6cb2f-oak-SUPER-a1-20260728T221403+0530` | 10.008523375 | 150 / 150 | 0–149; 0 gaps, duplicates, regressions | 1973 / 1602 | 197.131977 Hz |
 
 The table basenames resolve below
-`/home/makerspace/kiko-native-evidence/`; both directories retain the complete
+`/home/makerspace/kiko-native-evidence/`; all three directories retain the complete
 report, raw stdout, stderr, USB topology timeline, source commit, executable
 hash, promotion decision, and evidence manifest.
 
 Each run delivered exactly 115,200,000 RGB bytes, 38,400,000 bytes from each
 rectified mono stream, and 76,800,000 depth bytes. The combined measured host
-payload was therefore about 26.86 and 26.88 MB/s respectively. These are
+payload was therefore about 26.86, 26.88, and 26.86 MB/s respectively. These are
 host-delivery measurements for this graph, not USB line-capacity, latency, or
 thermal claims.
+
+The final Nano native release binaries built from `4e6cb2f` have SHA-256
+identities
+`7ba87dacc9fdedbe5bbb6a5b065ed13a9ab388c47026bb02441f4e12e1911c0b`
+for `oak_stream_qualify` and
+`26ee1441d98428cbadf785f2d1f6a7fcc882f90f558a827e4b57189774569742`
+for `kiko-slam`.
 
 Freshly rendered production now requests and requires `SUPER`: explicit 5
 Gbit/s USB 3, with no USB2 or automatic `SUPER_PLUS` fallback. Retained
