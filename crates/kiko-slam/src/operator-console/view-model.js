@@ -27,6 +27,11 @@
   ]);
   const AUTHORITY_MODES = new Set(["manual", "frontier_explore", "point_goal"]);
   const AUTHORITY_SOURCES = new Set(["operator", "agent"]);
+  const RUNTIME_AUTHORITY_KINDS = new Set([
+    "production_external_interlocks",
+    "attended_navigation_trial",
+    "wheels_off_qualification",
+  ]);
   const PHYSICAL_STOPS = new Set(["released", "engaged", "unavailable", "faulted"]);
   const STOP_CERTAINTY = new Set([
     "confirmed_applied_zero",
@@ -388,9 +393,14 @@
 
   function parseConsoleSnapshot(raw) {
     const snapshot = object(raw, "snapshot");
-    if (snapshot.schema_version !== 3) {
+    if (snapshot.schema_version !== 4) {
       throw new Error("unsupported snapshot schema");
     }
+    const authorityKind = enumValue(
+      snapshot.authority_kind,
+      RUNTIME_AUTHORITY_KINDS,
+      "snapshot.authority_kind",
+    );
     exactString(snapshot.revision, DECIMAL_ID, "snapshot.revision");
     if (snapshot.telemetry_observed_at_host_monotonic_ns != null) {
       exactString(
@@ -425,8 +435,21 @@
     const qualificationMotionGate = parseQualificationMotionGate(
       snapshot.wheels_off_qualification,
     );
+    if (authorityKind === "wheels_off_qualification"
+      && qualificationMotionGate == null) {
+      throw new Error(
+        "wheels-off authority requires wheels_off_qualification evidence",
+      );
+    }
+    if (authorityKind !== "wheels_off_qualification"
+      && qualificationMotionGate != null) {
+      throw new Error(
+        "wheels_off_qualification evidence contradicts snapshot.authority_kind",
+      );
+    }
     return {
       ...snapshot,
+      authority_kind: authorityKind,
       rerun_diagnostics_url: parseRerunDiagnosticsUrl(
         snapshot.rerun_diagnostics_url,
       ),

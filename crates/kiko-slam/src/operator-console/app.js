@@ -17,6 +17,9 @@
     "/api/v1/wheels-off-qualification/intents";
   const QUALIFICATION_BANNER =
     "WHEELS-OFF QUALIFICATION — RAW TIMER DUTY ONLY — AUTONOMOUS ACTUATION DISABLED";
+  const PRODUCTION_AUTHORITY_KIND = "production_external_interlocks";
+  const ATTENDED_TRIAL_AUTHORITY_KIND = "attended_navigation_trial";
+  const WHEELS_OFF_AUTHORITY_KIND = "wheels_off_qualification";
   // Production publishes every control period and the browser polls every
   // 300 ms. Five unchanged polls are treated as stale observational state.
   const SNAPSHOT_STALE_AFTER_MILLISECONDS = 1500;
@@ -288,6 +291,18 @@
     return state.controlProfile?.kind === QUALIFICATION_CONTROL_PROFILE_KIND
       ? state.controlProfile
       : null;
+  }
+
+  function runtimeAuthorityKind() {
+    return state.snapshot?.authority_kind || null;
+  }
+
+  function productionAuthority() {
+    return runtimeAuthorityKind() === PRODUCTION_AUTHORITY_KIND;
+  }
+
+  function wheelsOffAuthority() {
+    return runtimeAuthorityKind() === WHEELS_OFF_AUTHORITY_KIND;
   }
 
   function intentEndpoint() {
@@ -790,15 +805,21 @@
 
   function parsedControlProfile(snapshot) {
     const raw = snapshot.control_profile;
-    if (raw == null) {
-      // Compatibility with the already-published production schema. A
-      // qualification process is never allowed to omit its explicit profile.
+    if (snapshot.authority_kind === PRODUCTION_AUTHORITY_KIND) {
+      if (raw != null && raw.kind !== PRODUCTION_CONTROL_PROFILE_KIND) {
+        throw new Error("production authority contradicts its control profile");
+      }
       return Object.freeze({ kind: PRODUCTION_CONTROL_PROFILE_KIND });
     }
-    if (raw.kind === PRODUCTION_CONTROL_PROFILE_KIND) {
-      return Object.freeze({ kind: PRODUCTION_CONTROL_PROFILE_KIND });
+    if (snapshot.authority_kind === ATTENDED_TRIAL_AUTHORITY_KIND) {
+      throw new Error(
+        "attended navigation trial controls are not implemented in this console build",
+      );
     }
-    if (raw.kind !== QUALIFICATION_CONTROL_PROFILE_KIND
+    if (snapshot.authority_kind !== WHEELS_OFF_AUTHORITY_KIND) {
+      throw new Error("unsupported runtime authority kind");
+    }
+    if (raw?.kind !== QUALIFICATION_CONTROL_PROFILE_KIND
       || raw.banner !== QUALIFICATION_BANNER
       || raw.command_units !== "signed_timer_duty_percent"
       || raw.required_wheel_state !== "removed"
@@ -910,13 +931,16 @@
   }
 
   function qualificationMotionReady() {
-    if (!qualificationProfile()) return true;
+    if (!wheelsOffAuthority()) return productionAuthority();
+    if (!qualificationProfile()) return false;
     return state.snapshot?.qualification_motion_gate?.ready === true
       && state.sessionMotionAuthorityCurrent;
   }
 
   async function refreshQualificationMotionSession(snapshot) {
-    const qualification = qualificationProfile() != null;
+    const qualification =
+      snapshot.authority_kind === WHEELS_OFF_AUTHORITY_KIND
+      && qualificationProfile() != null;
     const motionReady = snapshot.qualification_motion_gate?.ready === true;
     if (qualification && !motionReady) {
       state.sessionMotionAuthorityCurrent = false;
@@ -956,7 +980,7 @@
   function updateControlAvailability() {
     const qualificationReady = qualificationMotionReady();
     const terminal = state.snapshot?.terminal != null;
-    const production = qualificationProfile() == null;
+    const production = productionAuthority();
     const sensorMotionReady = !production
       || state.snapshot?.health?.oak === "ready";
     const enabled = !terminal
@@ -1398,9 +1422,11 @@
   }
 
   canvas.addEventListener("click", async (event) => {
-    if (qualificationProfile()) {
+    if (!productionAuthority()) {
       toast(
-        "Qualification profile keeps autonomous actuation disabled; map, path, and MPC remain observational.",
+        runtimeAuthorityKind() === WHEELS_OFF_AUTHORITY_KIND
+          ? "Qualification keeps autonomous actuation disabled; map, path, and MPC remain observational."
+          : "This console build has no admitted autonomous controls for the reported runtime authority.",
         true,
       );
       return;

@@ -315,6 +315,7 @@ impl WheelsOffQualificationTelemetryStore {
         let signal_state = qualification_signal_state(&qualification);
         let projection = QualificationSnapshotProjection {
             schema_version: state.base.schema_version,
+            authority_kind: state.base.authority_kind,
             revision: projection_revision,
             telemetry_observed_at_host_monotonic_ns: &state
                 .base
@@ -361,10 +362,13 @@ fn bump_projection_revision(
 fn validate_observational_base(
     snapshot: &OperatorConsoleSnapshot,
 ) -> Result<(), WheelsOffQualificationTelemetryError> {
-    if snapshot.schema_version != super::OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V3 {
+    if snapshot.schema_version != super::OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V4 {
         return Err(WheelsOffQualificationTelemetryError::UnsupportedBaseSchema(
             snapshot.schema_version,
         ));
+    }
+    if snapshot.authority_kind != super::ConsoleRuntimeAuthorityKind::WheelsOffQualification {
+        return Err(WheelsOffQualificationTelemetryError::ProfileMismatch);
     }
     if snapshot.requested_owner.is_some()
         || snapshot.actual_authority.is_some()
@@ -453,6 +457,7 @@ impl std::error::Error for WheelsOffQualificationTelemetryError {
 #[derive(Serialize)]
 struct QualificationSnapshotProjection<'a> {
     schema_version: u32,
+    authority_kind: super::ConsoleRuntimeAuthorityKind,
     revision: ConsoleSnapshotRevision,
     telemetry_observed_at_host_monotonic_ns: &'a Option<ConsoleHostTimestampNs>,
     runtime: &'a Option<super::AgentRuntimeStateV1>,
@@ -2108,7 +2113,10 @@ mod tests {
         }
         let telemetry = WheelsOffQualificationTelemetryStore::parse(
             profile,
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+            ),
             console.snapshot(),
         )
         .unwrap();
@@ -2207,7 +2215,10 @@ mod tests {
     fn telemetry_projection_preserves_typed_rerun_configuration() {
         let profile = profile();
         let (console, _receiver) = super::super::wheels_off_qualification_console(profile);
-        let mut base = OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap());
+        let mut base = OperatorConsoleSnapshot::unknown(
+            ConsoleSnapshotRevision::parse(1).unwrap(),
+            super::super::ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+        );
         base.rerun_diagnostics_url = Some(
             super::super::ConsoleRerunDiagnosticsUrl::from_admitted_forwarded_port(
                 std::num::NonZeroU16::new(9_876).unwrap(),
@@ -2607,7 +2618,10 @@ mod tests {
         assert!(matches!(
             WheelsOffQualificationTelemetryStore::parse(
                 profile(),
-                OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+                OperatorConsoleSnapshot::unknown(
+                    ConsoleSnapshotRevision::parse(1).unwrap(),
+                    super::super::ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+                ),
                 legacy_schema,
             ),
             Err(WheelsOffQualificationTelemetryError::UnsupportedQualificationSchema(1))
@@ -2617,7 +2631,10 @@ mod tests {
         assert!(matches!(
             WheelsOffQualificationTelemetryStore::parse(
                 profile(),
-                OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+                OperatorConsoleSnapshot::unknown(
+                    ConsoleSnapshotRevision::parse(1).unwrap(),
+                    super::super::ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+                ),
                 wrong_schema,
             ),
             Err(WheelsOffQualificationTelemetryError::UnsupportedQualificationSchema(99))
@@ -2652,8 +2669,10 @@ mod tests {
             &[0, 1, 2, 2]
         );
 
-        let mut unsafe_base =
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(2).unwrap());
+        let mut unsafe_base = OperatorConsoleSnapshot::unknown(
+            ConsoleSnapshotRevision::parse(2).unwrap(),
+            super::super::ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+        );
         unsafe_base.software_safety_stop_latched = true;
         unsafe_base.software_safety_signal_state = ConsoleSafetySignalState::CompletedFaultLatched;
         assert!(matches!(
@@ -2795,7 +2814,10 @@ mod tests {
         let (console, _receiver) = super::super::wheels_off_qualification_console(profile);
         let telemetry = WheelsOffQualificationTelemetryStore::parse(
             profile,
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+            ),
             console.snapshot(),
         )
         .unwrap();
@@ -2865,7 +2887,10 @@ mod tests {
         let (console, _receiver) = super::super::wheels_off_qualification_console(profile);
         let telemetry = WheelsOffQualificationTelemetryStore::parse(
             profile,
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+            ),
             console.snapshot(),
         )
         .unwrap();
@@ -2908,7 +2933,10 @@ mod tests {
         let (console, _receiver) = super::super::wheels_off_qualification_console(profile);
         let telemetry = WheelsOffQualificationTelemetryStore::parse(
             profile,
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+            ),
             console.snapshot(),
         )
         .unwrap();

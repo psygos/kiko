@@ -5,7 +5,8 @@ const model = require("./view-model.js");
 
 function snapshot() {
   return {
-    schema_version: 3,
+    schema_version: 4,
+    authority_kind: "production_external_interlocks",
     revision: "9",
     telemetry_observed_at_host_monotonic_ns: "1000",
     runtime: { kind: "active", mode: "frontier_explore" },
@@ -77,6 +78,7 @@ assert.equal(model.parseConsoleSnapshot(snapshot()).revision, "9");
 
 function qualificationSnapshot(motionAuthorityEnabled) {
   const value = snapshot();
+  value.authority_kind = "wheels_off_qualification";
   value.wheels_off_qualification = {
     schema_version: 2,
     motion_authority_enabled: motionAuthorityEnabled,
@@ -230,11 +232,38 @@ for (const invalid of [undefined, null, "false", 0, 1]) {
 
 {
   const legacy = snapshot();
-  legacy.schema_version = 2;
+  legacy.schema_version = 3;
   assert.throws(
     () => model.parseConsoleSnapshot(legacy),
     /unsupported snapshot schema/,
-    "V2 diagnostics were browser URLs; V3 must not reinterpret that wire field",
+    "V3 omitted the authority class and must not be inferred as production",
+  );
+}
+
+{
+  const missing = snapshot();
+  delete missing.authority_kind;
+  assert.throws(
+    () => model.parseConsoleSnapshot(missing),
+    /snapshot.authority_kind is unsupported/,
+  );
+}
+
+{
+  const contradictory = qualificationSnapshot(true);
+  contradictory.authority_kind = "production_external_interlocks";
+  assert.throws(
+    () => model.parseConsoleSnapshot(contradictory),
+    /contradicts snapshot.authority_kind/,
+  );
+}
+
+{
+  const missingEvidence = snapshot();
+  missingEvidence.authority_kind = "wheels_off_qualification";
+  assert.throws(
+    () => model.parseConsoleSnapshot(missingEvidence),
+    /requires wheels_off_qualification evidence/,
   );
 }
 

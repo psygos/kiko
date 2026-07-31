@@ -73,6 +73,11 @@ pub const OPERATOR_CONSOLE_SCHEMA_V1: u32 = 1;
 pub const OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V2: u32 = 2;
 /// Snapshot schema whose diagnostics field is a canonical Rerun proxy URI.
 pub const OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V3: u32 = 3;
+/// Snapshot schema with an explicit, deny-by-default runtime authority class.
+///
+/// V4 prevents a client from inferring production authority from the absence
+/// of a qualification-only field.
+pub const OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V4: u32 = 4;
 pub const MAX_OPERATOR_CONSOLE_REQUEST_BYTES: usize = 8 * 1_024;
 pub const MAX_OPERATOR_CONSOLE_SESSIONS: usize = 32;
 pub const MAX_OPERATOR_CONSOLE_QUEUE_CAPACITY: usize = 256;
@@ -2612,6 +2617,17 @@ pub enum ConsoleTerminalState {
     },
 }
 
+/// The only motion-authority policy under which a console snapshot was
+/// produced. Clients must match this field explicitly; the absence of a
+/// mode-specific extension is never evidence of production authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleRuntimeAuthorityKind {
+    ProductionExternalInterlocks,
+    AttendedNavigationTrial,
+    WheelsOffQualification,
+}
+
 /// Immutable latest-only observational state. `None` means unknown, never a
 /// guessed default.
 ///
@@ -2622,6 +2638,7 @@ pub enum ConsoleTerminalState {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct OperatorConsoleSnapshot {
     pub schema_version: u32,
+    pub authority_kind: ConsoleRuntimeAuthorityKind,
     pub revision: ConsoleSnapshotRevision,
     pub telemetry_observed_at_host_monotonic_ns: Option<ConsoleHostTimestampNs>,
     pub runtime: Option<AgentRuntimeStateV1>,
@@ -2649,9 +2666,13 @@ pub struct OperatorConsoleSnapshot {
 }
 
 impl OperatorConsoleSnapshot {
-    pub fn unknown(revision: ConsoleSnapshotRevision) -> Self {
+    pub fn unknown(
+        revision: ConsoleSnapshotRevision,
+        authority_kind: ConsoleRuntimeAuthorityKind,
+    ) -> Self {
         Self {
-            schema_version: OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V3,
+            schema_version: OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V4,
+            authority_kind,
             revision,
             telemetry_observed_at_host_monotonic_ns: None,
             runtime: None,
@@ -3900,7 +3921,10 @@ mod tests {
     ) -> (OperatorConsoleHandle, OperatorConsoleIngressReceiver) {
         operator_console(
             limits,
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+            ),
         )
     }
 
@@ -3959,9 +3983,15 @@ mod tests {
 
     #[test]
     fn snapshot_exposes_rerun_only_when_a_serve_target_is_supplied() {
-        let mut snapshot =
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap());
-        assert_eq!(snapshot.schema_version, OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V3);
+        let mut snapshot = OperatorConsoleSnapshot::unknown(
+            ConsoleSnapshotRevision::parse(1).unwrap(),
+            ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+        );
+        assert_eq!(snapshot.schema_version, OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V4);
+        assert_eq!(
+            snapshot.authority_kind,
+            ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks
+        );
         assert_ne!(
             snapshot.schema_version, OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V2,
             "a canonical Rerun proxy URI must not silently reuse V2 browser-URL semantics"
@@ -4627,6 +4657,7 @@ mod tests {
             handle
                 .publish_snapshot(OperatorConsoleSnapshot::unknown(
                     ConsoleSnapshotRevision::parse(revision).unwrap(),
+                    ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
                 ))
                 .unwrap();
         }
@@ -4638,8 +4669,10 @@ mod tests {
     #[test]
     fn telemetry_timestamp_does_not_claim_later_live_arbitration_overlays() {
         let (handle, _receiver) = fixture();
-        let mut telemetry =
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(2).unwrap());
+        let mut telemetry = OperatorConsoleSnapshot::unknown(
+            ConsoleSnapshotRevision::parse(2).unwrap(),
+            ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+        );
         telemetry.telemetry_observed_at_host_monotonic_ns =
             Some(ConsoleHostTimestampNs::from_host(at_ms(10)));
         handle.publish_snapshot(telemetry).unwrap();
@@ -4670,7 +4703,11 @@ mod tests {
         let json = serde_json::to_value(overlaid.as_ref()).unwrap();
         assert_eq!(
             json["schema_version"],
-            serde_json::Value::from(OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V3)
+            serde_json::Value::from(OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V4)
+        );
+        assert_eq!(
+            json["authority_kind"],
+            serde_json::json!("production_external_interlocks")
         );
         assert!(
             json.get("telemetry_observed_at_host_monotonic_ns")
@@ -4684,8 +4721,10 @@ mod tests {
 
     #[test]
     fn terminal_checkpoint_wire_state_cannot_claim_current_camera_localization() {
-        let mut snapshot =
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap());
+        let mut snapshot = OperatorConsoleSnapshot::unknown(
+            ConsoleSnapshotRevision::parse(1).unwrap(),
+            ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+        );
         snapshot.runtime = Some(AgentRuntimeStateV1::ShuttingDown);
         snapshot.terminal = Some(ConsoleTerminalState::ControlEnding {
             reason: ConsoleTerminalReason::FinalizingWarmRestartCheckpoint,

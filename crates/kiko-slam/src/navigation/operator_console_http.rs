@@ -1780,7 +1780,10 @@ mod tests {
     fn real_listener_requires_capabilities_and_shuts_down_with_evidence() {
         let (console, receiver) = operator_console(
             OperatorConsoleLimits::default(),
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+            ),
         );
         let access = OperatorConsoleAccessCapability::parse([0x33; 32]).unwrap();
         let origin = super::super::AgentControlMonotonicOrigin::new(
@@ -1906,7 +1909,10 @@ mod tests {
     fn save_map_completion_is_http_observed_only_by_its_owning_session() {
         let (console, receiver) = operator_console(
             OperatorConsoleLimits::default(),
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+            ),
         );
         let access = OperatorConsoleAccessCapability::parse([0x45; 32]).unwrap();
         let origin = super::super::AgentControlMonotonicOrigin::new(
@@ -2031,7 +2037,10 @@ mod tests {
     fn foreign_session_observes_latched_stop_without_receiving_its_response_id() {
         let (console, _receiver) = operator_console(
             OperatorConsoleLimits::default(),
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+            ),
         );
         let access = OperatorConsoleAccessCapability::parse([0x34; 32]).unwrap();
         let origin = super::super::AgentControlMonotonicOrigin::new(
@@ -2366,9 +2375,16 @@ mod tests {
             );
         }
         assert!(VIEW_MODEL_JS.contains("function parseConsoleSnapshot(raw)"));
+        assert!(VIEW_MODEL_JS.contains("snapshot.schema_version !== 4"));
+        assert!(VIEW_MODEL_JS.contains("snapshot.authority_kind"));
         assert!(VIEW_MODEL_JS.contains("map.grid geometry contract is unsupported"));
         assert!(VIEW_MODEL_JS.contains("function authorityView(snapshot, sessionId)"));
         assert!(VIEW_MODEL_JS.contains("function readinessView(snapshot)"));
+        assert!(APP_JS.contains("const production = productionAuthority();"));
+        assert!(
+            !APP_JS.contains("qualificationProfile() == null"),
+            "absence of a qualification field must never imply production authority"
+        );
         assert!(VIEW_MODEL_JS.contains("function mpcView(snapshot)"));
         assert!(VIEW_MODEL_JS.contains("function physicalStopView(snapshot)"));
         assert!(VIEW_MODEL_JS.contains("function faultView(snapshot)"));
@@ -2481,7 +2497,10 @@ mod tests {
     fn hanging_request_is_forcibly_cancelled_with_bounded_join_evidence() {
         let (console, _receiver) = operator_console(
             OperatorConsoleLimits::default(),
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+            ),
         );
         let access = OperatorConsoleAccessCapability::parse([0x44; 32]).unwrap();
         let origin = super::super::AgentControlMonotonicOrigin::new(
@@ -2529,7 +2548,10 @@ mod tests {
     fn join_timeout_retains_http_owner_for_retry() {
         let (console, _receiver) = operator_console(
             OperatorConsoleLimits::default(),
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+            ),
         );
         let access = OperatorConsoleAccessCapability::parse([0x45; 32]).unwrap();
         let origin = super::super::AgentControlMonotonicOrigin::new(

@@ -2209,7 +2209,10 @@ mod tests {
         );
         let (handle, console_receiver) = operator_console(
             OperatorConsoleLimits::default(),
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+            ),
         );
         let capability = ConsoleSessionCapability::from_bytes([0x5a; 32]);
         let session = handle

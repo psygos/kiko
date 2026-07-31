@@ -346,7 +346,10 @@ mod tests {
         );
         let (handle, _receiver) = operator_console(
             OperatorConsoleLimits::default(),
-            OperatorConsoleSnapshot::unknown(ConsoleSnapshotRevision::parse(1).unwrap()),
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+            ),
         );
         let clock = AgentControlMonotonicOrigin::new(
             Instant::now(),

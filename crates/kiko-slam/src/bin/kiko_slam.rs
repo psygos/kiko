@@ -7959,6 +7959,7 @@ fn start_production_motion_runtime(
         let mut initial_snapshot = OperatorConsoleSnapshot::unknown(
             ConsoleSnapshotRevision::parse(1)
                 .expect("the static initial console revision is nonzero"),
+            ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
         );
         initial_snapshot.rerun_diagnostics_url = Some(rerun_diagnostics_url);
         initial_snapshot.manual_command_envelope = manual_command_envelope;
@@ -8237,6 +8238,7 @@ fn start_wheels_off_qualification_motion_runtime(
     let stop_certainty = ConsoleStopCertainty::from_verified_disarm(&initial_stop);
     let mut initial_base = OperatorConsoleSnapshot::unknown(
         ConsoleSnapshotRevision::parse(1).expect("static qualification revision is nonzero"),
+        ConsoleRuntimeAuthorityKind::WheelsOffQualification,
     );
     initial_base.runtime = Some(AgentRuntimeStateV1::ReadyStopped);
     initial_base.health = initial_health;
@@ -9221,7 +9223,10 @@ fn publish_wheels_off_qualification_snapshot(
             );
         }
     };
-    let mut snapshot = OperatorConsoleSnapshot::unknown(revision);
+    let mut snapshot = OperatorConsoleSnapshot::unknown(
+        revision,
+        ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+    );
     snapshot.runtime = Some(match (
         runtime.controller().state(),
         runtime.controller().controller_state(),
