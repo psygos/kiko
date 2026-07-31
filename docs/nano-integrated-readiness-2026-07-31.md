@@ -153,17 +153,16 @@ at 5,000 Mbit/s. This confirms current USB3 enumeration, not full
 canonical-stream delivery at this source revision. Earlier bounded full-stream
 evidence remains in `docs/nano-live-readiness-2026-07-29.md`.
 
-## STM32 state and blocking fault
+## STM32 motor-inert transport qualification
 
 The installed STM32 image reports ABI 2, build `131074`, fingerprint
 `KIKO-NO-ACT-V1!!`, capability bits `319`, maximum PWM `0%`, outputs disabled,
 and no motion authority. Its identity is deliberately motor-inert.
 
-A fresh 20 Hz transport qualification was attempted against this non-actuating
-image and rejected before its timed run because the idle heartbeat reported
-controller fault bits `0x00000001` (`SERIAL_INTEGRITY`). The 50 Hz stage was
-not run. This failure is preserved rather than cleared, retried, or converted
-into a readiness claim.
+A first 20 Hz transport qualification against this non-actuating image was
+rejected before its timed run because the idle heartbeat reported controller
+fault bits `0x00000001` (`SERIAL_INTEGRITY`). That failure remains preserved as
+evidence rather than being omitted or converted into a readiness claim.
 
 The source audit narrows the meaning of this observation. Candidate admission
 checks an exact Hello and idle-safe Heartbeat before writing its first
@@ -174,9 +173,7 @@ clear path. `SERIAL_INTEGRITY` can represent RX queue invalidation, a decode or
 oversize-record failure, an unsupported host-direction message, or an
 unavailable transmit/report path. The latched bit does not retain which one
 occurred. Given the prior interactive history, the source cannot identify a
-root cause from the present Heartbeat alone. A controlled fresh boot with a
-quiescent serial path and retained boot ID is required to distinguish a
-historical sticky fault from a reproducible transport failure.
+root cause from that Heartbeat alone.
 
 Follow-up commit `e6e6b5c87c73ddd8cd4e58460b08add65fc44f1e`
 made that phase boundary explicit in the qualifier's typed error without
@@ -192,38 +189,106 @@ read-only candidate admission rejected controller fault bits 0x00000001
 before any diagnostic probe bytes were written
 ```
 
-This confirms error provenance; it does not clear or qualify the controller.
+This confirms error provenance; it did not by itself clear or qualify the
+controller.
 
-The current image cannot drive or calibrate the wheels. The motion-capable
-commissioning image must be flashed only under the documented attended
-preconditions with motor power physically disconnected, then must prove exact
-identity, applied-zero, disarm, watchdog, restart, disconnect, and fault
-behavior before wheel attachment.
+With wheels removed, motor power physically disconnected, the head supported,
+and an independent stop available, the controller was then reset once through
+the exact ST-Link serial `066EFF313946303143221230`. OpenOCD reported target
+voltage `3.249012 V` and completed normally. A read-only identity probe after
+reset returned the same exact motor-inert contract and no controller fault.
+The boot ID also repeated. That is expected for this deliberately motor-inert
+image because it has no session-unique boot-ID source; it must not be reported
+as proof of a restart.
+
+The clean boot separated the historical sticky fault from a currently
+reproducible transport fault. Fresh-nonce timed qualifications then passed:
+
+| Rate | Run ID | Planned/completed/unique | Missing/duplicate/reordered | Host or writer skips | Late writes | Max in flight | Max host RTT | Max controller service | Max RX/TX queue | Max heartbeat gap | Final idle-safe |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 20 Hz | `2852397741463210674` | 200/200/200 | 0/0/0 | 0 | 0 | 1 | 20,886,967 ns | 0 ms | 0/80 B | 257,657,711 ns | yes |
+| 50 Hz | `3656527987827278333` | 500/500/500 | 0/0/0 | 0 | 0 | 2 | 25,541,436 ns | 1 ms | 0/91 B | 259,643,269 ns | yes |
+
+Both runs remained motor-inert: maximum PWM was `0%`, actuation stayed
+disabled, and the final Heartbeat was idle-safe after the last write. The
+heartbeat-gap acceptance bound was `375 ms`; both observed maxima were below
+it. These runs prove this transport test under the stated conditions. They do
+not prove powered motor behavior, closed-loop control quality, SLAM throughput,
+or a general performance improvement.
+
+## Journal provisioning and wheels-off candidate installation
+
+After both motor-inert rates passed, the complete installed 512 KiB flash was
+read back before any write. It has SHA-256
+`dfda9a32a6dede174ce55a29acfb59fc754277c421d23db886c8155d0f40dd55`;
+its 384 KiB motor-inert main prefix has SHA-256
+`270e553f5c18a53393f0234f334d3ccc71be32ac7827240b54c939c6d6def38d`.
+The sector-7 parser rejected the original 128 KiB suffix as `HeaderErased`, so
+journal-capable firmware was not started against an invented or malformed
+identity source.
+
+A fresh journal was generated with the repository tool. Its initial sector
+image has SHA-256
+`13673248185cbb7ea60f945839940bc1468f69a8383f79bfe77b298e6c8a4862`,
+seed `3ea1f8bf266d75f2`, zero committed records, and a planned first record at
+byte offset 32. The complete motor-inert-main-plus-journal image was written
+and the 524,288-byte readback compared byte-for-byte; both have SHA-256
+`df58f846c0b1590717d5f40da0ad22b5f0d883d63e56e7eaed2792747c7f2e8d`.
+The motor-inert identity remained exact after that operation.
+
+The operator-supervised wheels-off candidate was then built twice in distinct
+clean Nano checkouts from source commit
+`beb9441435f598cee9654bf6f0731114a27bdfab`, using Rust 1.88.0 and source-root
+remapping. Both ELFs were byte-identical with SHA-256
+`fcb0624f6422309f8cd4a383e31e6fd3596465a4efbb98317310d7febefa63e0`.
+Its final flash-backed byte ends at `0x0800beb4`, below the journal boundary at
+`0x08060000`; the padded 384 KiB main image has SHA-256
+`8b8fa6f2b7498ac9c7e5ad86d5e44d98a6fe8fb4d50035fb9ec9f6828b564424`.
+Strict target Clippy passed and the exact journal inspector passed 6/6 tests.
+
+With motor power still physically disconnected, only sectors 0 through 6
+were replaced. The complete candidate main readback matched byte-for-byte and
+sector 7 matched both its immediate pre-write and post-write snapshots. Two
+controlled run windows then produced exactly the two canonically planned
+16-byte journal appends. The next boot ID predicted from the second snapshot
+was `4513161801469097461`; the subsequent read-only UART identity reported
+that exact boot ID, UID `2c0018001750314242353320`, ABI 2, build `135169`,
+fingerprint `KIKO-4PWM-CAND1!`, capabilities `575`, a 30% hard cap, both-low
+neutral, unverified physical-stop semantics, and disabled output.
+
+This is now the installed image. It grants a bounded software motion class,
+but no command owner or serial writer was started, no motor command was sent,
+and motor power remained physically disconnected. The result proves image,
+journal, readback, and reported identity boundaries; it does not prove a PWM
+output, motor direction, physical stop, velocity, SLAM, or MPC behavior.
 
 ## Remaining evidence required before “attach the wheels”
 
 The next gate is finite:
 
-1. Resolve and explain the retained STM32 serial-integrity fault while the
-   controller remains non-actuating.
-2. Measure and retain the physical values that templates deliberately do not
+1. Measure and retain the physical values that templates deliberately do not
    invent: wheelbase, native-IMU-to-base rotation, tracking-camera-to-base
-   transform, footprint, obstacle-height frames, motion bounds, and plant-fit
-   acceptance limits.
-3. Render a sentinel-free immutable base-commissioning deployment that binds
-   those measurements, the exact controller contract/firmware, models,
-   cascades, calibration, runtime libraries, OAK MXID, and binary hashes.
-4. With wheels removed, motor power disconnected, head supported, attendance
-   confirmed, and the independent power cut reachable, flash and qualify the
-   exact motion-capable commissioning firmware.
-5. Perform one deliberate guardian-to-canonical handoff. Require live OAK
+   transform, footprint, distinct floor- and axle-frame obstacle slabs, motion
+   bounds, and plant-fit acceptance limits.
+2. Render a sentinel-free immutable wheels-off qualification deployment that
+   binds those measurements, the exact candidate contract, models, cascades,
+   calibration, runtime libraries, OAK MXID, and executable hashes.
+3. Perform one deliberate guardian-to-canonical handoff. Require live OAK
    SuperSpeed RGB/stereo/depth/IMU freshness, active natural neck hold, visible
    canonical expressions, face-gaze behavior, live SLAM, occupancy, Rerun,
-   console Stop/Disarm, and an exact applied-zero STM32 receipt.
-6. Exercise timeout, release, browser-loss, controller-disconnect, camera-loss,
-   and accessory-fault shutdown paths without nonzero motor power.
+   console Stop/Disarm, and an exact applied-zero/disarm STM32 receipt while
+   motor power remains physically disconnected.
+4. With wheels still removed and the independent cut reachable, complete the
+   attended candidate direction checks and the bounded timeout, release,
+   browser-loss, controller-disconnect, camera-loss, and accessory-fault
+   shutdown matrix. Retain uncertainty rather than promoting an incomplete
+   or ambiguous physical stop.
+5. Return motor power to disconnected, reproduce and install the distinct
+   attended wheel-on commissioning image while preserving the monotonic
+   journal, and require its exact identity and stopped output before asking
+   for wheel attachment.
 
-Only when all six items have retained evidence is the next truthful request:
+Only when all five items have retained evidence is the next truthful request:
 attach the wheels for attended polarity, velocity/PWM mapping, plant
 identification, map/localization, occupancy, manual control, autonomous
 map-click, and MPC acceptance.
