@@ -684,6 +684,9 @@ enum QualificationError {
     HeartbeatReportsFaults {
         bits: u32,
     },
+    ReadOnlyCandidateHeartbeatReportsFaults {
+        bits: u32,
+    },
     UnexpectedControllerMessage {
         kind: robot_protocol::v2::MessageKind,
     },
@@ -856,6 +859,11 @@ impl fmt::Display for QualificationError {
             Self::HeartbeatReportsFaults { bits } => write!(
                 formatter,
                 "Heartbeat is not idle-safe: controller fault bits are 0x{bits:08x}"
+            ),
+            Self::ReadOnlyCandidateHeartbeatReportsFaults { bits } => write!(
+                formatter,
+                "read-only candidate admission rejected controller fault bits \
+                 0x{bits:08x} before any diagnostic probe bytes were written"
             ),
             Self::UnexpectedControllerMessage { kind } => {
                 write!(formatter, "unexpected controller message {kind:?}")
@@ -1658,7 +1666,12 @@ where
                 hello = Some(value);
             }
             Message::Heartbeat(value) => {
-                validate_idle_heartbeat(exact, value)?;
+                validate_idle_heartbeat(exact, value).map_err(|error| match error {
+                    QualificationError::HeartbeatReportsFaults { bits } => {
+                        QualificationError::ReadOnlyCandidateHeartbeatReportsFaults { bits }
+                    }
+                    other => other,
+                })?;
                 saw_idle_heartbeat = true;
                 heartbeat = Some(value);
             }
@@ -5306,7 +5319,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn unsafe_candidate_propagates_typed_error_without_any_host_payload_write() {
+    async fn faulted_candidate_names_read_only_phase_without_any_host_payload_write() {
         let (mut serial, mut controller) = tokio::io::duplex(4_096);
         let controller_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -5323,10 +5336,9 @@ mod tests {
                 .await
                 .expect("candidate Hello write");
             let mut unsafe_heartbeat = heartbeat(1_000);
-            unsafe_heartbeat.readiness = ReadinessFlags::try_from_bits(
-                ReadinessFlags::WATCHDOG_RUNNING | ReadinessFlags::SESSION_ESTABLISHED,
-            )
-            .expect("known readiness bits");
+            unsafe_heartbeat.faults =
+                ControllerFaults::try_from_bits(ControllerFaults::SERIAL_INTEGRITY)
+                    .expect("known fault bit");
             controller
                 .write_all(
                     UartRecord::encode(Message::Heartbeat(unsafe_heartbeat))
@@ -5358,8 +5370,8 @@ mod tests {
 
         assert!(matches!(
             error,
-            QualificationError::HeartbeatNotIdleSafe {
-                detail: "heartbeat reports a session or armed deadline"
+            QualificationError::ReadOnlyCandidateHeartbeatReportsFaults {
+                bits: ControllerFaults::SERIAL_INTEGRITY
             }
         ));
         assert_eq!(
