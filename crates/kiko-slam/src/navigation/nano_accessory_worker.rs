@@ -40,9 +40,9 @@ use std::time::{Duration, Instant};
 use kiko_device_inventory::{
     ArtifactRelativePath, DeploymentAssetContentSha256, LoadedDeploymentAsset,
 };
-use kiko_expression_core::StreamEpochId;
 #[cfg(feature = "nano-agent")]
-use kiko_expression_core::{Deadline, MonotonicTimestamp, NonZeroDuration};
+use kiko_expression_core::{Deadline, NonZeroDuration};
+use kiko_expression_core::{MonotonicTimestamp, StreamEpochId};
 use kiko_expression_runtime::PreparedEyeIntent;
 #[cfg(feature = "nano-agent")]
 use kiko_expression_runtime::{FaceTrackingConfig, MAX_FACE_DETECTIONS};
@@ -52,7 +52,7 @@ use kiko_eye_runtime::{
     HandleRequestError as EyeHandleRequestError, MonotonicClock, OsEyeSessionMaterialError,
     OsEyeSessionMaterialGenerator, ReleaseReport, SerialConfigurationEvidence as EyeSerialEvidence,
     StartupEvidence as EyeStartupEvidence, StartupReceiptError as EyeStartupReceiptError,
-    StaticEyeRuntimeConfig, TokioClock,
+    StaticEyeRuntimeConfig,
 };
 use kiko_head_runtime::{
     ActorTermination as HeadActorTermination, HeadActorStartError, HeadCommandError,
@@ -116,6 +116,44 @@ pub const NANO_FACE_PERCEPTION_STARTUP_TIMEOUT: Duration = Duration::from_secs(1
 pub const NANO_FACE_PERCEPTION_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "nano-agent")]
 const NANO_FACE_PERCEPTION_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// One monotonic epoch shared by RGB observation, face tracking, expression,
+/// eye transport, and physical head-gaze control.
+///
+/// Keeping this as a local type lets it implement both runtime clock traits
+/// without translating timestamps between independently sampled origins.
+#[derive(Clone, Debug)]
+struct NanoAccessoryClock {
+    origin: tokio::time::Instant,
+}
+
+impl NanoAccessoryClock {
+    fn new() -> Self {
+        Self {
+            origin: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl MonotonicClock for NanoAccessoryClock {
+    fn now(&self) -> Result<MonotonicTimestamp, ClockError> {
+        let elapsed_nanoseconds = self.origin.elapsed().as_nanos();
+        let elapsed_nanoseconds = u64::try_from(elapsed_nanoseconds).map_err(|_| {
+            ClockError::ElapsedNanosecondsOutOfRange {
+                elapsed_nanoseconds,
+            }
+        })?;
+        Ok(MonotonicTimestamp::from_nanos_since_epoch(
+            elapsed_nanoseconds,
+        ))
+    }
+}
+
+impl kiko_head_runtime::MonotonicClock for NanoAccessoryClock {
+    fn now(&self) -> kiko_head_runtime::MonotonicTime {
+        kiko_head_runtime::MonotonicTime::from_duration_since_origin(self.origin.elapsed())
+    }
+}
 
 #[cfg(feature = "nano-agent")]
 const NANO_FACE_HAAR_SCALE_FACTOR: f64 = 1.15;
@@ -1632,7 +1670,7 @@ enum NanoAccessoryRgbProcessingError {
 #[must_use = "dropping the sole RGB ingress publishes a terminal disconnect fault"]
 struct NanoAccessoryRgbIngress {
     channel: Arc<LatestFrameChannel<NanoAccessoryRgbWork>>,
-    clock: TokioClock,
+    clock: NanoAccessoryClock,
     connected: bool,
 }
 
@@ -2473,7 +2511,7 @@ impl NanoAccessoryWorker {
     pub fn start_scene_motion_only(
         config: NanoAccessoryWorkerConfig,
     ) -> Result<Self, NanoAccessoryWorkerStartError> {
-        let expression_clock = TokioClock::new();
+        let expression_clock = NanoAccessoryClock::new();
         let channel = Arc::new(LatestFrameChannel::new());
         let ingress = NanoAccessoryRgbIngress {
             channel: Arc::clone(&channel),
@@ -2575,7 +2613,7 @@ impl NanoAccessoryWorker {
         let detector_config = canonical_nano_face_detector_config()
             .map_err(NanoAccessoryWorkerStartError::FacePerceptionConfig)?;
         let tracking_config = FaceTrackingConfig::default();
-        let expression_clock = TokioClock::new();
+        let expression_clock = NanoAccessoryClock::new();
         let channel = Arc::new(LatestFrameChannel::new());
         let face_output = Arc::new(LatestFrameChannel::with_shared_receipts(Arc::clone(
             &channel.counters.receipts,
@@ -3115,7 +3153,7 @@ fn run_face_perception_thread_catching_panics(
     tracking_config: FaceTrackingConfig,
     stream_epoch: StreamEpochId,
     freshness: NonZeroDuration,
-    clock: TokioClock,
+    clock: NanoAccessoryClock,
     input: Arc<LatestFrameChannel<NanoAccessoryRgbWork>>,
     output: Arc<LatestFrameChannel<NanoFacePerceptionWork>>,
     diagnostic_tx: DropSender<NanoFaceDiagnosticFrame>,
@@ -3167,7 +3205,7 @@ fn run_face_perception_thread(
     tracking_config: FaceTrackingConfig,
     stream_epoch: StreamEpochId,
     freshness: NonZeroDuration,
-    clock: TokioClock,
+    clock: NanoAccessoryClock,
     input: Arc<LatestFrameChannel<NanoAccessoryRgbWork>>,
     output: Arc<LatestFrameChannel<NanoFacePerceptionWork>>,
     diagnostic_tx: DropSender<NanoFaceDiagnosticFrame>,
@@ -3598,12 +3636,12 @@ struct ActiveEyeActor {
 
 struct SerialKep2EyePort {
     config: Option<EyeRuntimeConfig>,
-    clock: Option<TokioClock>,
+    clock: Option<NanoAccessoryClock>,
     active: Option<ActiveEyeActor>,
 }
 
 impl SerialKep2EyePort {
-    fn new(config: EyeRuntimeConfig, clock: TokioClock) -> Self {
+    fn new(config: EyeRuntimeConfig, clock: NanoAccessoryClock) -> Self {
         Self {
             config: Some(config),
             clock: Some(clock),
@@ -3842,7 +3880,9 @@ impl ReviewedNaturalHeadPort for SerialReviewedNaturalHeadPort {
     }
 }
 
-impl RgbBridgePort<IngressObservedRgbFrame<ImageFrame>> for RgbExpressionBridge<TokioClock> {
+impl RgbBridgePort<IngressObservedRgbFrame<ImageFrame>>
+    for RgbExpressionBridge<NanoAccessoryClock>
+{
     type Intent = PreparedEyeIntent;
     type Error = RgbExpressionBridgeError;
 
@@ -3868,7 +3908,7 @@ where
     }
 }
 
-impl RgbBridgePort<NanoAccessoryRgbWork> for RgbExpressionBridge<TokioClock> {
+impl RgbBridgePort<NanoAccessoryRgbWork> for RgbExpressionBridge<NanoAccessoryClock> {
     type Intent = PreparedEyeIntent;
     type Error = RgbExpressionBridgeError;
 
@@ -3882,7 +3922,7 @@ impl RgbBridgePort<NanoAccessoryRgbWork> for RgbExpressionBridge<TokioClock> {
     feature = "nano-base-commissioning",
     test
 ))]
-struct ProductionSceneRgbBridge(RgbExpressionBridge<TokioClock>);
+struct ProductionSceneRgbBridge(RgbExpressionBridge<NanoAccessoryClock>);
 
 #[cfg(any(
     feature = "nano-wheels-off-qualification",
@@ -3901,7 +3941,7 @@ impl RgbBridgePort<NanoAccessoryRgbWork> for ProductionSceneRgbBridge {
 }
 
 #[cfg(feature = "nano-agent")]
-struct ProductionFaceRgbBridge(RgbExpressionBridge<TokioClock>);
+struct ProductionFaceRgbBridge(RgbExpressionBridge<NanoAccessoryClock>);
 
 #[cfg(feature = "nano-agent")]
 impl RgbBridgePort<NanoFacePerceptionWork> for ProductionFaceRgbBridge {
@@ -3929,7 +3969,7 @@ fn run_production_worker(
     latest_head_health: Arc<Mutex<NanoAccessoryHeadHealthState>>,
     startup_tx: std::sync::mpsc::SyncSender<StartupSignal>,
     fault_tx: crossbeam_channel::Sender<NanoAccessoryTerminalFault>,
-    expression_clock: TokioClock,
+    expression_clock: NanoAccessoryClock,
     perception_ready: NanoAccessoryPerceptionReadyEvidence,
     lifecycle: Arc<NanoAccessoryOwnerLifecycle>,
 ) -> NanoAccessoryWorkerExit {
@@ -3962,7 +4002,7 @@ fn run_production_worker_with_face(
     latest_head_health: Arc<Mutex<NanoAccessoryHeadHealthState>>,
     startup_tx: std::sync::mpsc::SyncSender<StartupSignal>,
     fault_tx: crossbeam_channel::Sender<NanoAccessoryTerminalFault>,
-    expression_clock: TokioClock,
+    expression_clock: NanoAccessoryClock,
     perception_ready: NanoAccessoryPerceptionReadyEvidence,
     lifecycle: Arc<NanoAccessoryOwnerLifecycle>,
 ) -> NanoAccessoryWorkerExit {
@@ -3993,7 +4033,7 @@ fn run_production_worker_core<F, B, LatchFault>(
     latest_head_health: Arc<Mutex<NanoAccessoryHeadHealthState>>,
     startup_tx: std::sync::mpsc::SyncSender<StartupSignal>,
     fault_tx: crossbeam_channel::Sender<NanoAccessoryTerminalFault>,
-    expression_clock: TokioClock,
+    expression_clock: NanoAccessoryClock,
     bridge: B,
     perception_ready: NanoAccessoryPerceptionReadyEvidence,
     face_perception_enabled: bool,
