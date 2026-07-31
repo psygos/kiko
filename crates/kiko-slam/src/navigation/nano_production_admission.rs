@@ -204,6 +204,13 @@ impl PreparedNanoProductionRuntime {
         &self.initial_zero
     }
 
+    /// Borrow the cloneable request endpoint retained by this admitted base
+    /// owner. It mints no lease by itself and becomes permanently faulted when
+    /// the non-cloneable base interlock owner is dropped.
+    pub const fn head_gaze_lease_issuer(&self) -> &HeadGazeBaseZeroExclusiveLeaseIssuer {
+        &self.head_gaze_lease_issuer
+    }
+
     /// Consume an admitted runtime before a live owner has been constructed.
     ///
     /// This is the only truthful post-bootstrap cancellation path: the exact

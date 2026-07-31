@@ -334,7 +334,8 @@ pub use nano_accessory_worker::{
     NanoFacePerceptionShutdownEvidence, NanoFacePerceptionStageStats,
     NanoFacePerceptionStageStatsHandle, NanoFacePerceptionThreadExit,
     NanoHeadGazeActuationAvailability, NanoHeadGazeDiagnostic, NanoHeadGazeDiagnosticConfigError,
-    NanoHeadGazeDiagnosticError, NanoHeadGazeRgbProjectionEvidence,
+    NanoHeadGazeDiagnosticError, NanoHeadGazeLeaseBindError, NanoHeadGazeRgbProjectionEvidence,
+    NanoPhysicalHeadGazeConfigError, NanoPhysicalHeadGazeRuntimeError,
 };
 #[cfg(all(
     feature = "agent-runtime",

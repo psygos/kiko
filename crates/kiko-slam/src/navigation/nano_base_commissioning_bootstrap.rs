@@ -33,9 +33,10 @@ use kiko_device_inventory::{
     LoadedDeploymentAsset, MAX_MANIFEST_JSON_BYTES, ManifestLoadError, load_deployment_asset,
     load_expected_manifest_v3_from_slice,
 };
+#[cfg(feature = "nano-attended-navigation-trial")]
+use robot_command_client::AppliedCommandReceipt;
 use robot_command_client::{
-    AppliedCommandReceipt, ClientConfig, ConfigError as ClientConfigError, StopRecoveryPolicy,
-    TimeoutNs,
+    ClientConfig, ConfigError as ClientConfigError, StopRecoveryPolicy, TimeoutNs,
 };
 use robot_protocol::v2::{
     ControllerSafetyClass, ControllerSessionClass, PhysicalStopSemantics, TimerPwm,

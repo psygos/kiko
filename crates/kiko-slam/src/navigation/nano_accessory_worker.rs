@@ -24,6 +24,8 @@ use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(feature = "nano-agent")]
 use std::sync::Condvar;
+#[cfg(feature = "nano-agent")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(
@@ -54,6 +56,10 @@ use kiko_eye_runtime::{
     StartupEvidence as EyeStartupEvidence, StartupReceiptError as EyeStartupReceiptError,
     StaticEyeRuntimeConfig,
 };
+#[cfg(feature = "nano-agent")]
+use kiko_head_runtime::gaze_control::{
+    HeadGazeProposal, HeadGazeProposalId, HeadGazeProposalIdError,
+};
 use kiko_head_runtime::{
     ActorTermination as HeadActorTermination, HeadActorStartError, HeadCommandError,
     HeadHealthRequestError, HeadHoldTarget, HeadReturnError, HeadRuntimeError,
@@ -65,6 +71,11 @@ use kiko_head_runtime::{
     TensionPreservingHeadActorTask as HeadActorTask,
     TensionPreservingHeadReturnActorHandle as HeadReturnActorHandle, VerifiedHeadHealthEvidence,
     VerifiedHeadReturnEvidence, VerifiedNaturalHoldEvidence,
+};
+#[cfg(feature = "nano-agent")]
+use kiko_head_runtime::{
+    HeadGazeBaseInterlockError, HeadGazeBaseZeroExclusiveLeaseIssuer, HeadGazeProposalCommandError,
+    HeadGazeServiceError, TensionPreservingHeadGazeActorHandle as HeadGazeActorHandle,
 };
 use oak_sys::ImageFrame;
 #[cfg(feature = "nano-agent")]
@@ -81,9 +92,10 @@ use super::nano_face_perception::{
 };
 #[cfg(feature = "nano-agent")]
 use super::{
+    EvidenceBoundPhysicalHeadGazePolicy, EvidenceBoundPhysicalHeadGazePolicyError,
     HeadGazeFaceProposalAdapter, HeadGazeFaceProposalAdapterError, HeadGazeFaceProposalError,
     HeadGazeFaceProposalOutcome, HeadGazePolicyLifecycleClaim, HeadGazePolicyV1,
-    RgbFacePinholeProjection,
+    PhysicalHeadGazeFaceOutcome, RgbFacePinholeProjection,
 };
 use super::{
     ManifestBoundNanoAgentPolicyConfigV3, NanoRgbExpressionConfig, RgbExpressionBridge,
@@ -391,6 +403,8 @@ pub struct NanoAccessoryWorkerConfig {
     health_period: NanoAccessoryHealthPeriod,
     #[cfg(feature = "nano-agent")]
     head_gaze_diagnostics: Option<HeadGazeFaceProposalAdapter>,
+    #[cfg(feature = "nano-agent")]
+    physical_head_gaze: Option<NanoPhysicalHeadGazeConfig>,
 }
 
 impl NanoAccessoryWorkerConfig {
@@ -431,6 +445,8 @@ impl NanoAccessoryWorkerConfig {
             health_period,
             #[cfg(feature = "nano-agent")]
             head_gaze_diagnostics: None,
+            #[cfg(feature = "nano-agent")]
+            physical_head_gaze: None,
         })
     }
 
@@ -446,6 +462,9 @@ impl NanoAccessoryWorkerConfig {
         mut self,
         policy: HeadGazePolicyV1,
     ) -> Result<Self, NanoHeadGazeDiagnosticConfigError> {
+        if self.head_gaze_diagnostics.is_some() || self.physical_head_gaze.is_some() {
+            return Err(NanoHeadGazeDiagnosticConfigError::AlreadyConfigured);
+        }
         if !matches!(
             policy.lifecycle(),
             HeadGazePolicyLifecycleClaim::ProposalOnly(_)
@@ -458,11 +477,71 @@ impl NanoAccessoryWorkerConfig {
         );
         Ok(self)
     }
+
+    /// Attach one evidence-bound physical gaze policy to the canonical
+    /// single-owner head runtime.
+    ///
+    /// Admission reuses this config's exact manifest-bound return target and
+    /// transport timeout. The resulting runtime still cannot move until the
+    /// live STM32 owner binds its confirmed-zero lease issuer after startup.
+    #[cfg(feature = "nano-agent")]
+    pub fn with_evidence_bound_physical_head_gaze(
+        mut self,
+        policy: HeadGazePolicyV1,
+        review_evidence: &LoadedDeploymentAsset,
+    ) -> Result<Self, NanoPhysicalHeadGazeConfigError> {
+        if self.head_gaze_diagnostics.is_some() || self.physical_head_gaze.is_some() {
+            return Err(NanoPhysicalHeadGazeConfigError::AlreadyConfigured);
+        }
+        let policy =
+            EvidenceBoundPhysicalHeadGazePolicy::admit(policy, review_evidence, &self.head_return)
+                .map_err(NanoPhysicalHeadGazeConfigError::Admission)?;
+        self.physical_head_gaze = Some(NanoPhysicalHeadGazeConfig {
+            policy,
+            lease_issuer: Arc::new(OnceLock::new()),
+        });
+        Ok(self)
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Debug)]
+struct NanoPhysicalHeadGazeConfig {
+    policy: EvidenceBoundPhysicalHeadGazePolicy,
+    lease_issuer: Arc<OnceLock<HeadGazeBaseZeroExclusiveLeaseIssuer>>,
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NanoPhysicalHeadGazeConfigError {
+    AlreadyConfigured,
+    Admission(EvidenceBoundPhysicalHeadGazePolicyError),
+}
+
+#[cfg(feature = "nano-agent")]
+impl fmt::Display for NanoPhysicalHeadGazeConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "physical Nano head gaze is not configured: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl std::error::Error for NanoPhysicalHeadGazeConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Admission(source) => Some(source),
+            Self::AlreadyConfigured => None,
+        }
+    }
 }
 
 #[cfg(feature = "nano-agent")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NanoHeadGazeDiagnosticConfigError {
+    AlreadyConfigured,
     NotProposalOnly,
     Adapter(HeadGazeFaceProposalAdapterError),
 }
@@ -482,7 +561,7 @@ impl std::error::Error for NanoHeadGazeDiagnosticConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Adapter(source) => Some(source),
-            Self::NotProposalOnly => None,
+            Self::AlreadyConfigured | Self::NotProposalOnly => None,
         }
     }
 }
@@ -1071,6 +1150,27 @@ struct NanoFaceTrackedRgbFrame {
     frame: ParsedIngressRgbFrame,
     output: NanoFacePerceptionOutput,
 }
+
+trait NanoHeadGazeFrame {
+    #[cfg(feature = "nano-agent")]
+    fn tracked_face_frame(&self) -> Option<&NanoFaceTrackedRgbFrame> {
+        None
+    }
+}
+
+impl NanoHeadGazeFrame for NanoAccessoryRgbWork {}
+
+#[cfg(feature = "nano-agent")]
+impl NanoHeadGazeFrame for NanoFacePerceptionWork {
+    fn tracked_face_frame(&self) -> Option<&NanoFaceTrackedRgbFrame> {
+        self.as_ref().ok()
+    }
+}
+
+#[cfg(test)]
+impl NanoHeadGazeFrame for u64 {}
+#[cfg(test)]
+impl NanoHeadGazeFrame for Result<u64, ClockError> {}
 
 /// Exact same-frame RGB projection metadata used by one diagnostic proposal.
 #[cfg(feature = "nano-agent")]
@@ -1736,6 +1836,10 @@ pub enum NanoHeadHealthError {
         required: HeadHoldTarget,
         observed: HeadHoldTarget,
     },
+    #[cfg(feature = "nano-agent")]
+    GazeTargetOutsideAdmittedEnvelope {
+        observed: HeadHoldTarget,
+    },
 }
 
 impl fmt::Display for NanoHeadHealthError {
@@ -1749,13 +1853,69 @@ impl std::error::Error for NanoHeadHealthError {
         match self {
             Self::Request(source) => Some(source),
             Self::UnexpectedHoldTarget { .. } => None,
+            #[cfg(feature = "nano-agent")]
+            Self::GazeTargetOutsideAdmittedEnvelope { .. } => None,
         }
     }
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Debug, PartialEq)]
+pub enum NanoPhysicalHeadGazeRuntimeError {
+    ProjectionGridMismatch {
+        frame_width_px: u32,
+        frame_height_px: u32,
+        intrinsic_width_px: u32,
+        intrinsic_height_px: u32,
+    },
+    Intrinsics(IntrinsicsError),
+    Proposal(HeadGazeFaceProposalError),
+    ProposalSequenceExhausted {
+        detector_result_sequence: u64,
+    },
+    ProposalId(HeadGazeProposalIdError),
+    ProposalCommand(HeadCommandError),
+    ProposalRejected(HeadGazeProposalCommandError),
+    BaseInterlock(HeadGazeBaseInterlockError),
+    ServiceCommand(HeadCommandError),
+    Service(HeadGazeServiceError),
+}
+
+#[cfg(feature = "nano-agent")]
+impl fmt::Display for NanoPhysicalHeadGazeRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "physical head-gaze runtime failed: {self:?}")
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl std::error::Error for NanoPhysicalHeadGazeRuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Intrinsics(source) => Some(source),
+            Self::Proposal(source) => Some(source),
+            Self::ProposalId(source) => Some(source),
+            Self::ProposalCommand(source) => Some(source),
+            Self::ProposalRejected(source) => Some(source),
+            Self::BaseInterlock(source) => Some(source),
+            Self::ServiceCommand(source) => Some(source),
+            Self::Service(source) => Some(source),
+            Self::ProjectionGridMismatch { .. } | Self::ProposalSequenceExhausted { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NanoHeadGazePortError {
+    #[cfg(feature = "nano-agent")]
+    Physical(NanoPhysicalHeadGazeRuntimeError),
 }
 
 #[derive(Clone, Debug)]
 pub enum NanoAccessoryTerminalFault {
     HeadHealth(NanoHeadHealthError),
+    #[cfg(feature = "nano-agent")]
+    PhysicalHeadGaze(NanoPhysicalHeadGazeRuntimeError),
     HeadHealthStatusPoisoned,
     RgbHealthStatusPoisoned,
     ExpressionBridge(RgbExpressionBridgeError),
@@ -1777,6 +1937,8 @@ impl std::error::Error for NanoAccessoryTerminalFault {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::HeadHealth(source) => Some(source),
+            #[cfg(feature = "nano-agent")]
+            Self::PhysicalHeadGaze(source) => Some(source),
             Self::ExpressionBridge(source) => Some(source),
             #[cfg(feature = "nano-agent")]
             Self::FacePerception(source) => Some(source),
@@ -2043,6 +2205,8 @@ impl std::error::Error for NanoAccessoryWorkerExit {
 
 #[derive(Debug)]
 pub enum NanoAccessoryWorkerStartError {
+    #[cfg(feature = "nano-agent")]
+    PhysicalHeadGazeRequiresFacePerception,
     ThreadSpawn(std::io::Error),
     StartupFailed(Box<NanoAccessoryWorkerExit>),
     ThreadPanickedBeforeReadiness,
@@ -2094,6 +2258,8 @@ impl std::error::Error for NanoAccessoryWorkerStartError {
             Self::AccessoryThreadSpawnWithFace { source, .. } => Some(source),
             Self::StartupFailed(source) => Some(source.as_ref()),
             Self::ThreadPanickedBeforeReadiness => None,
+            #[cfg(feature = "nano-agent")]
+            Self::PhysicalHeadGazeRequiresFacePerception => None,
             #[cfg(feature = "nano-agent")]
             Self::FacePerceptionStartupFailed(source) => Some(source),
             #[cfg(feature = "nano-agent")]
@@ -2494,6 +2660,8 @@ pub struct NanoAccessoryWorker {
     face_diagnostics_active: Option<Arc<AtomicBool>>,
     #[cfg(feature = "nano-agent")]
     face_stage_counters: Option<Arc<NanoFacePerceptionStageCounters>>,
+    #[cfg(feature = "nano-agent")]
+    head_gaze_lease_issuer: Option<Arc<OnceLock<HeadGazeBaseZeroExclusiveLeaseIssuer>>>,
 }
 
 impl NanoAccessoryWorker {
@@ -2511,6 +2679,10 @@ impl NanoAccessoryWorker {
     pub fn start_scene_motion_only(
         config: NanoAccessoryWorkerConfig,
     ) -> Result<Self, NanoAccessoryWorkerStartError> {
+        #[cfg(feature = "nano-agent")]
+        if config.physical_head_gaze.is_some() {
+            return Err(NanoAccessoryWorkerStartError::PhysicalHeadGazeRequiresFacePerception);
+        }
         let expression_clock = NanoAccessoryClock::new();
         let channel = Arc::new(LatestFrameChannel::new());
         let ingress = NanoAccessoryRgbIngress {
@@ -2562,6 +2734,8 @@ impl NanoAccessoryWorker {
                 face_diagnostics_active: None,
                 #[cfg(feature = "nano-agent")]
                 face_stage_counters: None,
+                #[cfg(feature = "nano-agent")]
+                head_gaze_lease_issuer: None,
             }),
             Ok(StartupSignal::Failed) | Err(_) => {
                 drop(ingress);
@@ -2638,6 +2812,10 @@ impl NanoAccessoryWorker {
         let stream_epoch = config.stream_epoch;
         let freshness = config.rgb_expression.frame_freshness();
         let head_gaze_diagnostics = config.head_gaze_diagnostics.take();
+        let head_gaze_lease_issuer = config
+            .physical_head_gaze
+            .as_ref()
+            .map(|physical| Arc::clone(&physical.lease_issuer));
         let face_thread = thread::Builder::new()
             .name("kiko-nano-face-perception".into())
             .spawn(move || {
@@ -2756,6 +2934,7 @@ impl NanoAccessoryWorker {
                 )),
                 face_diagnostics_active: Some(face_diagnostics_active),
                 face_stage_counters: Some(face_stage_counters),
+                head_gaze_lease_issuer,
             }),
             Ok(StartupSignal::Failed) | Err(_) => {
                 channel.request_shutdown();
@@ -2786,6 +2965,24 @@ impl NanoAccessoryWorker {
 
     pub const fn readiness(&self) -> &NanoAccessoryReadyEvidence {
         &self.ready
+    }
+
+    /// Bind the sole live base owner's confirmed-zero lease issuer once.
+    ///
+    /// The issuer is cloned into the already-running head owner; cloning does
+    /// not mint a lease. A second bind is rejected, and a natural-hold or
+    /// proposal-only worker cannot accept an issuer.
+    #[cfg(feature = "nano-agent")]
+    pub fn bind_head_gaze_base_zero_lease_issuer(
+        &self,
+        issuer: &HeadGazeBaseZeroExclusiveLeaseIssuer,
+    ) -> Result<(), NanoHeadGazeLeaseBindError> {
+        let slot = self
+            .head_gaze_lease_issuer
+            .as_ref()
+            .ok_or(NanoHeadGazeLeaseBindError::PhysicalGazeNotConfigured)?;
+        slot.set(issuer.clone())
+            .map_err(|_| NanoHeadGazeLeaseBindError::AlreadyBound)
     }
 
     pub fn submit_rgb(&mut self, frame: ImageFrame) -> NanoAccessoryFrameSubmitOutcome {
@@ -2984,6 +3181,26 @@ impl NanoAccessoryWorker {
         }
     }
 }
+
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NanoHeadGazeLeaseBindError {
+    PhysicalGazeNotConfigured,
+    AlreadyBound,
+}
+
+#[cfg(feature = "nano-agent")]
+impl fmt::Display for NanoHeadGazeLeaseBindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "head-gaze base-zero lease issuer was not bound: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+impl std::error::Error for NanoHeadGazeLeaseBindError {}
 
 impl Drop for NanoAccessoryWorker {
     fn drop(&mut self) {
@@ -3418,15 +3635,19 @@ fn publish_face_diagnostic_if_active(
 // support and call `shutdown`; an accidental handle drop may not silently
 // remove neck torque.
 
-trait ReviewedNaturalHeadPort {
+trait ReviewedNaturalHeadPort<F> {
     type Ready;
     type StartError;
     type Health;
     type HealthError: Clone;
+    type GazeError: Clone;
     type Shutdown;
 
     async fn start(&mut self) -> Result<Self::Ready, Self::StartError>;
     async fn check_health(&mut self) -> Result<Self::Health, Self::HealthError>;
+    async fn process_gaze_frame(&mut self, _frame: &F) -> Result<(), Self::GazeError> {
+        Ok(())
+    }
     async fn shutdown(&mut self) -> Self::Shutdown;
 }
 
@@ -3449,8 +3670,9 @@ trait RgbBridgePort<F> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum CoreTerminalFault<H, B, E> {
+enum CoreTerminalFault<H, G, B, E> {
     HeadHealth(H),
+    HeadGaze(G),
     HeadHealthStatusPoisoned,
     RgbHealthStatusPoisoned,
     Bridge(B),
@@ -3460,14 +3682,14 @@ enum CoreTerminalFault<H, B, E> {
     ReadinessObserverDropped,
 }
 
-enum CoreExit<ES, HS, H, B, E, EyeShutdown, HeadShutdown> {
+enum CoreExit<ES, HS, H, G, B, E, EyeShutdown, HeadShutdown> {
     EyeStartupFailed(ES),
     HeadStartupFailed {
         source: HS,
         eye_shutdown: EyeShutdown,
     },
     Shutdown {
-        terminal_fault: Option<CoreTerminalFault<H, B, E>>,
+        terminal_fault: Option<CoreTerminalFault<H, G, B, E>>,
         eye_shutdown: EyeShutdown,
         head_shutdown: HeadShutdown,
     },
@@ -3491,19 +3713,20 @@ async fn run_accessory_core<F, H, E, B, Ready, RecordHealth, PublishFault, Latch
     E::StartError,
     H::StartError,
     H::HealthError,
+    H::GazeError,
     B::Error,
     E::ApplyError,
     E::Shutdown,
     H::Shutdown,
 >
 where
-    F: Send + 'static,
-    H: ReviewedNaturalHeadPort,
+    F: NanoHeadGazeFrame + Send + 'static,
+    H: ReviewedNaturalHeadPort<F>,
     E: Kep2EyePort<B::Intent>,
     B: RgbBridgePort<F>,
     Ready: FnOnce(H::Ready, E::Ready) -> bool,
     RecordHealth: FnMut(H::Health) -> bool,
-    PublishFault: FnMut(CoreTerminalFault<H::HealthError, B::Error, E::ApplyError>),
+    PublishFault: FnMut(CoreTerminalFault<H::HealthError, H::GazeError, B::Error, E::ApplyError>),
     LatchFault: FnMut(),
 {
     let CoreObservers {
@@ -3577,26 +3800,29 @@ where
             event = channel.next_event() => {
                 match event {
                     LatestFrameEvent::Frame(frame) => {
-                        match bridge.process(frame) {
-                            Ok(intent) => match eye.apply(intent).await {
-                                Ok(()) => {
-                                    match channel.counters.record_processed_successfully() {
-                                        Ok(()) => None,
-                                        Err(
-                                            NanoAccessoryHealthStatusError::Poisoned
-                                            | NanoAccessoryHealthStatusError::OwnerNotRunning {
-                                                ..
+                        match head.process_gaze_frame(&frame).await {
+                            Err(source) => Some(CoreTerminalFault::HeadGaze(source)),
+                            Ok(()) => match bridge.process(frame) {
+                                Ok(intent) => match eye.apply(intent).await {
+                                    Ok(()) => {
+                                        match channel.counters.record_processed_successfully() {
+                                            Ok(()) => None,
+                                            Err(
+                                                NanoAccessoryHealthStatusError::Poisoned
+                                                | NanoAccessoryHealthStatusError::OwnerNotRunning {
+                                                    ..
+                                                }
+                                                | NanoAccessoryHealthStatusError::IngressDisconnected
+                                                | NanoAccessoryHealthStatusError::ChannelPoisoned,
+                                            ) => {
+                                                Some(CoreTerminalFault::RgbHealthStatusPoisoned)
                                             }
-                                            | NanoAccessoryHealthStatusError::IngressDisconnected
-                                            | NanoAccessoryHealthStatusError::ChannelPoisoned,
-                                        ) => {
-                                            Some(CoreTerminalFault::RgbHealthStatusPoisoned)
                                         }
                                     }
-                                }
-                                Err(source) => Some(CoreTerminalFault::EyeApply(source)),
+                                    Err(source) => Some(CoreTerminalFault::EyeApply(source)),
+                                },
+                                Err(source) => Some(CoreTerminalFault::Bridge(source)),
                             },
-                            Err(source) => Some(CoreTerminalFault::Bridge(source)),
                         }
                     }
                     LatestFrameEvent::ShutdownRequested => break,
@@ -3714,11 +3940,57 @@ impl Kep2EyePort<PreparedEyeIntent> for SerialKep2EyePort {
     }
 }
 
+enum ActiveHeadHandle {
+    Natural(HeadReturnActorHandle),
+    #[cfg(feature = "nano-agent")]
+    Gaze(HeadGazeActorHandle),
+}
+
+impl ActiveHeadHandle {
+    async fn return_to_target(
+        &self,
+    ) -> Result<Result<VerifiedHeadReturnEvidence, HeadReturnError>, HeadCommandError> {
+        match self {
+            Self::Natural(handle) => handle.return_to_target().await,
+            #[cfg(feature = "nano-agent")]
+            Self::Gaze(handle) => handle.return_to_target().await,
+        }
+    }
+
+    async fn check_health(&self) -> Result<VerifiedHeadHealthEvidence, HeadHealthRequestError> {
+        match self {
+            Self::Natural(handle) => handle.check_health().await,
+            #[cfg(feature = "nano-agent")]
+            Self::Gaze(handle) => handle.check_health().await,
+        }
+    }
+
+    async fn release_ownership_preserving_hold(
+        self,
+    ) -> Result<HoldPreservingOwnershipReleaseEvidence, HeadShutdownError> {
+        match self {
+            Self::Natural(handle) => handle.release_ownership_preserving_hold().await,
+            #[cfg(feature = "nano-agent")]
+            Self::Gaze(handle) => handle.release_ownership_preserving_hold().await,
+        }
+    }
+
+    #[cfg(feature = "nano-agent")]
+    fn gaze(&self) -> Option<&HeadGazeActorHandle> {
+        match self {
+            Self::Natural(_) => None,
+            Self::Gaze(handle) => Some(handle),
+        }
+    }
+}
+
 struct ActiveHeadActor {
-    handle: HeadReturnActorHandle,
+    handle: ActiveHeadHandle,
     task: HeadActorTask,
     startup: VerifiedNaturalHoldEvidence,
     head_return: VerifiedHeadReturnEvidence,
+    #[cfg(feature = "nano-agent")]
+    physical_gaze: Option<NanoPhysicalHeadGazeConfig>,
 }
 
 struct SerialReviewedNaturalHeadPort {
@@ -3727,6 +3999,10 @@ struct SerialReviewedNaturalHeadPort {
     motion_consent: PhysicalHeadMotionConsent,
     takeover_consent: ProductionTensionPreservingTakeoverConsent,
     required_hold_target: HeadHoldTarget,
+    #[cfg(feature = "nano-agent")]
+    clock: NanoAccessoryClock,
+    #[cfg(feature = "nano-agent")]
+    physical_gaze: Option<NanoPhysicalHeadGazeConfig>,
     active: Option<ActiveHeadActor>,
 }
 
@@ -3737,6 +4013,7 @@ impl SerialReviewedNaturalHeadPort {
         motion_consent: PhysicalHeadMotionConsent,
         takeover_consent: ProductionTensionPreservingTakeoverConsent,
         required_hold_target: HeadHoldTarget,
+        #[cfg(feature = "nano-agent")] clock: NanoAccessoryClock,
     ) -> Self {
         Self {
             config: Some(config),
@@ -3744,8 +4021,18 @@ impl SerialReviewedNaturalHeadPort {
             motion_consent,
             takeover_consent,
             required_hold_target,
+            #[cfg(feature = "nano-agent")]
+            clock,
+            #[cfg(feature = "nano-agent")]
+            physical_gaze: None,
             active: None,
         }
+    }
+
+    #[cfg(feature = "nano-agent")]
+    fn with_physical_gaze(mut self, physical_gaze: Option<NanoPhysicalHeadGazeConfig>) -> Self {
+        self.physical_gaze = physical_gaze;
+        self
     }
 
     fn require_hold_target(
@@ -3754,33 +4041,188 @@ impl SerialReviewedNaturalHeadPort {
     ) -> Result<VerifiedHeadHealthEvidence, NanoHeadHealthError> {
         let observed = evidence.hold_target();
         if observed == self.required_hold_target {
-            Ok(evidence)
-        } else {
-            Err(NanoHeadHealthError::UnexpectedHoldTarget {
-                required: self.required_hold_target,
-                observed,
-            })
+            return Ok(evidence);
         }
+        #[cfg(feature = "nano-agent")]
+        if let HeadHoldTarget::ReviewedGaze(target) = observed
+            && let Some(physical) = self
+                .active
+                .as_ref()
+                .and_then(|active| active.physical_gaze.as_ref())
+        {
+            let limits = physical
+                .policy
+                .actuation_config()
+                .controller()
+                .motion_limits();
+            if kiko_head_protocol::HeadJoint::ALL.into_iter().all(|joint| {
+                let joint_limits = limits.joint(joint);
+                let position = target.position(joint);
+                position.get() >= joint_limits.minimum().get()
+                    && position.get() <= joint_limits.maximum().get()
+            }) {
+                return Ok(evidence);
+            }
+            return Err(NanoHeadHealthError::GazeTargetOutsideAdmittedEnvelope { observed });
+        }
+        Err(NanoHeadHealthError::UnexpectedHoldTarget {
+            required: self.required_hold_target,
+            observed,
+        })
+    }
+
+    #[cfg(feature = "nano-agent")]
+    async fn process_physical_gaze_frame(
+        &self,
+        frame: &NanoFaceTrackedRgbFrame,
+    ) -> Result<(), NanoPhysicalHeadGazeRuntimeError> {
+        let active = self
+            .active
+            .as_ref()
+            .expect("gaze frames are processed only after head readiness");
+        let Some(physical) = active.physical_gaze.as_ref() else {
+            return Ok(());
+        };
+        let Some(issuer) = physical.lease_issuer.get() else {
+            return Ok(());
+        };
+        let lease = match issuer.try_acquire() {
+            Ok(lease) => lease,
+            Err(
+                HeadGazeBaseInterlockError::BaseTransactionAlreadyActive
+                | HeadGazeBaseInterlockError::BaseMayMove
+                | HeadGazeBaseInterlockError::HeadGazeLeaseActive,
+            ) => return Ok(()),
+            Err(source) => {
+                return Err(NanoPhysicalHeadGazeRuntimeError::BaseInterlock(source));
+            }
+        };
+
+        let projection = physical_head_gaze_projection(frame)?;
+        let outcome = physical
+            .policy
+            .evaluate(
+                frame.output.tracking(),
+                frame.output.tracked_at(),
+                projection,
+            )
+            .map_err(NanoPhysicalHeadGazeRuntimeError::Proposal)?;
+        let handle = active
+            .handle
+            .gaze()
+            .expect("physical gaze policy and gaze actor are constructed together");
+        if let PhysicalHeadGazeFaceOutcome::Proposed(proposal) = outcome {
+            let detector_result_sequence = frame.output.tracking().detector_result_sequence().get();
+            let proposal_id = detector_result_sequence.checked_add(1).ok_or(
+                NanoPhysicalHeadGazeRuntimeError::ProposalSequenceExhausted {
+                    detector_result_sequence,
+                },
+            )?;
+            let proposal_id = HeadGazeProposalId::try_new(proposal_id)
+                .map_err(NanoPhysicalHeadGazeRuntimeError::ProposalId)?;
+            let observed_at = kiko_head_runtime::MonotonicTime::from_duration_since_origin(
+                Duration::from_nanos(frame.output.tracked_at().nanos_since_epoch()),
+            );
+            handle
+                .admit_gaze_proposal(HeadGazeProposal::new(
+                    proposal_id,
+                    observed_at,
+                    proposal.command_target(),
+                ))
+                .await
+                .map_err(NanoPhysicalHeadGazeRuntimeError::ProposalCommand)?
+                .map_err(NanoPhysicalHeadGazeRuntimeError::ProposalRejected)?;
+        }
+        handle
+            .service_gaze(lease)
+            .await
+            .map_err(NanoPhysicalHeadGazeRuntimeError::ServiceCommand)?
+            .map_err(NanoPhysicalHeadGazeRuntimeError::Service)?;
+        Ok(())
     }
 }
 
-impl ReviewedNaturalHeadPort for SerialReviewedNaturalHeadPort {
+#[cfg(feature = "nano-agent")]
+fn physical_head_gaze_projection(
+    frame: &NanoFaceTrackedRgbFrame,
+) -> Result<RgbFacePinholeProjection, NanoPhysicalHeadGazeRuntimeError> {
+    let observation = frame.frame.observation();
+    let layout = observation.layout();
+    let oak_intrinsics = frame.frame.frame().intrinsics();
+    if oak_intrinsics.width() != layout.width_px() || oak_intrinsics.height() != layout.height_px()
+    {
+        return Err(NanoPhysicalHeadGazeRuntimeError::ProjectionGridMismatch {
+            frame_width_px: layout.width_px(),
+            frame_height_px: layout.height_px(),
+            intrinsic_width_px: oak_intrinsics.width(),
+            intrinsic_height_px: oak_intrinsics.height(),
+        });
+    }
+    let intrinsics = PinholeIntrinsics::try_new(
+        oak_intrinsics.fx(),
+        oak_intrinsics.fy(),
+        oak_intrinsics.cx(),
+        oak_intrinsics.cy(),
+    )
+    .map_err(NanoPhysicalHeadGazeRuntimeError::Intrinsics)?;
+    Ok(RgbFacePinholeProjection::new(intrinsics, layout))
+}
+
+impl<F: NanoHeadGazeFrame> ReviewedNaturalHeadPort<F> for SerialReviewedNaturalHeadPort {
     type Ready = NanoHeadReadyEvidence;
     type StartError = NanoHeadActorStartupError;
     type Health = VerifiedHeadHealthEvidence;
     type HealthError = NanoHeadHealthError;
+    type GazeError = NanoHeadGazePortError;
     type Shutdown = NanoHeadShutdownEvidence;
 
     async fn start(&mut self) -> Result<Self::Ready, Self::StartError> {
         let config = self.config.take().expect("head starts exactly once");
-        let (serial, handle, receipt, task) =
-            kiko_head_runtime::start_serial_tension_preserving_head_return_actor(
-                config,
-                self.torque_consent,
-                self.motion_consent,
-                self.takeover_consent,
-            )
-            .map_err(NanoHeadActorStartupError::Start)?;
+        #[cfg(feature = "nano-agent")]
+        let physical_gaze = self.physical_gaze.take();
+        #[cfg(feature = "nano-agent")]
+        let physical_actuation = physical_gaze
+            .as_ref()
+            .map(|physical| physical.policy.actuation_config());
+        #[cfg(feature = "nano-agent")]
+        let (serial, handle, receipt, task) = match physical_actuation {
+            Some(actuation) => {
+                let (serial, handle, receipt, task) =
+                    kiko_head_runtime::start_serial_tension_preserving_head_gaze_actor(
+                        config,
+                        actuation,
+                        self.clock.clone(),
+                        self.torque_consent,
+                        self.motion_consent,
+                        self.takeover_consent,
+                    )
+                    .map_err(NanoHeadActorStartupError::Start)?;
+                (serial, ActiveHeadHandle::Gaze(handle), receipt, task)
+            }
+            None => {
+                let (serial, handle, receipt, task) =
+                    kiko_head_runtime::start_serial_tension_preserving_head_return_actor(
+                        config,
+                        self.torque_consent,
+                        self.motion_consent,
+                        self.takeover_consent,
+                    )
+                    .map_err(NanoHeadActorStartupError::Start)?;
+                (serial, ActiveHeadHandle::Natural(handle), receipt, task)
+            }
+        };
+        #[cfg(not(feature = "nano-agent"))]
+        let (serial, handle, receipt, task) = {
+            let (serial, handle, receipt, task) =
+                kiko_head_runtime::start_serial_tension_preserving_head_return_actor(
+                    config,
+                    self.torque_consent,
+                    self.motion_consent,
+                    self.takeover_consent,
+                )
+                .map_err(NanoHeadActorStartupError::Start)?;
+            (serial, ActiveHeadHandle::Natural(handle), receipt, task)
+        };
         let startup = match receipt.wait().await {
             Ok(Ok(startup)) => startup,
             Ok(Err(source)) => {
@@ -3844,6 +4286,8 @@ impl ReviewedNaturalHeadPort for SerialReviewedNaturalHeadPort {
             task,
             startup: startup.clone(),
             head_return: head_return.clone(),
+            #[cfg(feature = "nano-agent")]
+            physical_gaze,
         });
         Ok(NanoHeadReadyEvidence {
             serial,
@@ -3862,6 +4306,23 @@ impl ReviewedNaturalHeadPort for SerialReviewedNaturalHeadPort {
             .await
             .map_err(NanoHeadHealthError::Request)
             .and_then(|evidence| self.require_hold_target(evidence))
+    }
+
+    async fn process_gaze_frame(&mut self, frame: &F) -> Result<(), Self::GazeError> {
+        #[cfg(feature = "nano-agent")]
+        {
+            let Some(frame) = frame.tracked_face_frame() else {
+                return Ok(());
+            };
+            self.process_physical_gaze_frame(frame)
+                .await
+                .map_err(NanoHeadGazePortError::Physical)
+        }
+        #[cfg(not(feature = "nano-agent"))]
+        {
+            let _ = frame;
+            Ok(())
+        }
     }
 
     async fn shutdown(&mut self) -> Self::Shutdown {
@@ -4041,7 +4502,7 @@ fn run_production_worker_core<F, B, LatchFault>(
     lifecycle: Arc<NanoAccessoryOwnerLifecycle>,
 ) -> NanoAccessoryWorkerExit
 where
-    F: Send + 'static,
+    F: NanoHeadGazeFrame + Send + 'static,
     B: RgbBridgePort<F, Intent = PreparedEyeIntent, Error = NanoAccessoryRgbProcessingError>,
     LatchFault: FnMut(),
 {
@@ -4074,7 +4535,11 @@ where
         config.head_motion_consent,
         config.head_takeover_consent,
         config.required_hold_target,
+        #[cfg(feature = "nano-agent")]
+        expression_clock.clone(),
     );
+    #[cfg(feature = "nano-agent")]
+    let head = head.with_physical_gaze(config.physical_head_gaze);
     let stream_epoch = config.stream_epoch;
     let health_period = config.health_period;
     let rgb_frame_freshness =
@@ -4171,6 +4636,7 @@ where
 fn map_production_core_fault(
     fault: CoreTerminalFault<
         NanoHeadHealthError,
+        NanoHeadGazePortError,
         NanoAccessoryRgbProcessingError,
         EyeHandleRequestError,
     >,
@@ -4180,6 +4646,12 @@ fn map_production_core_fault(
     let _ = face_perception_enabled;
     match fault {
         CoreTerminalFault::HeadHealth(source) => NanoAccessoryTerminalFault::HeadHealth(source),
+        #[cfg(feature = "nano-agent")]
+        CoreTerminalFault::HeadGaze(NanoHeadGazePortError::Physical(source)) => {
+            NanoAccessoryTerminalFault::PhysicalHeadGaze(source)
+        }
+        #[cfg(not(feature = "nano-agent"))]
+        CoreTerminalFault::HeadGaze(source) => match source {},
         CoreTerminalFault::HeadHealthStatusPoisoned => {
             NanoAccessoryTerminalFault::HeadHealthStatusPoisoned
         }
@@ -5182,14 +5654,16 @@ mod tests {
         health_calls: Arc<AtomicUsize>,
         fail_start: bool,
         fail_return: bool,
+        fail_gaze: bool,
         fail_health_at: Option<usize>,
     }
 
-    impl ReviewedNaturalHeadPort for FakeHead {
+    impl<F> ReviewedNaturalHeadPort<F> for FakeHead {
         type Ready = &'static str;
         type StartError = &'static str;
         type Health = usize;
         type HealthError = &'static str;
+        type GazeError = &'static str;
         type Shutdown = &'static str;
 
         async fn start(&mut self) -> Result<Self::Ready, Self::StartError> {
@@ -5213,6 +5687,15 @@ mod tests {
                 Err("head_health")
             } else {
                 Ok(call)
+            }
+        }
+
+        async fn process_gaze_frame(&mut self, _frame: &F) -> Result<(), Self::GazeError> {
+            if self.fail_gaze {
+                self.log.lock().unwrap().push("head_gaze");
+                Err("head_gaze")
+            } else {
+                Ok(())
             }
         }
 
@@ -5319,6 +5802,7 @@ mod tests {
                 health_calls: Arc::clone(&health_calls),
                 fail_start: fail_head_start,
                 fail_return: false,
+                fail_gaze: false,
                 fail_health_at,
             },
             FakeEye {
@@ -5859,12 +6343,14 @@ mod tests {
     }
 
     async fn assert_fault_does_not_shutdown_head(
+        fail_head_gaze: bool,
         fail_bridge: bool,
         fail_eye_apply: bool,
-        expected: CoreTerminalFault<&'static str, &'static str, &'static str>,
+        expected: CoreTerminalFault<&'static str, &'static str, &'static str, &'static str>,
     ) {
-        let (head, eye, bridge, log, health_calls) =
+        let (mut head, eye, bridge, log, health_calls) =
             fakes(false, false, fail_bridge, fail_eye_apply, None);
+        head.fail_gaze = fail_head_gaze;
         let channel = Arc::new(LatestFrameChannel::new());
         let (fault_tx, mut fault_rx) = tokio::sync::mpsc::unbounded_channel();
         let task_channel = Arc::clone(&channel);
@@ -5891,6 +6377,12 @@ mod tests {
             NanoAccessoryFrameSubmitOutcome::Enqueued
         );
         assert_eq!(fault_rx.recv().await, Some(expected));
+        if fail_head_gaze {
+            let observed = log.lock().unwrap();
+            assert!(observed.contains(&"head_gaze"));
+            assert!(!observed.contains(&"bridge"));
+            assert!(!observed.contains(&"eye_apply"));
+        }
         tokio::time::sleep(Duration::from_millis(12)).await;
         assert!(!log.lock().unwrap().contains(&"head_shutdown"));
         assert!(health_calls.load(Ordering::SeqCst) >= 1);
@@ -5909,7 +6401,24 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn bridge_fault_is_published_without_implicit_head_teardown() {
-        assert_fault_does_not_shutdown_head(true, false, CoreTerminalFault::Bridge("bridge")).await;
+        assert_fault_does_not_shutdown_head(
+            false,
+            true,
+            false,
+            CoreTerminalFault::Bridge("bridge"),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn head_gaze_fault_precedes_eye_work_and_latches_without_releasing_hold() {
+        assert_fault_does_not_shutdown_head(
+            true,
+            false,
+            false,
+            CoreTerminalFault::HeadGaze("head_gaze"),
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5967,8 +6476,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn eye_fault_is_published_without_implicit_head_teardown() {
-        assert_fault_does_not_shutdown_head(false, true, CoreTerminalFault::EyeApply("eye_apply"))
-            .await;
+        assert_fault_does_not_shutdown_head(
+            false,
+            false,
+            true,
+            CoreTerminalFault::EyeApply("eye_apply"),
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]

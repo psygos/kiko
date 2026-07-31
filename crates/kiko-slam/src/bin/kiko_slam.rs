@@ -5934,6 +5934,15 @@ impl LiveProductionMotionInput {
         self.rerun_diagnostics_url
     }
 
+    #[cfg(feature = "nano-agent")]
+    fn head_gaze_lease_issuer(
+        &self,
+    ) -> Option<&kiko_head_runtime::HeadGazeBaseZeroExclusiveLeaseIssuer> {
+        self.prepared
+            .as_ref()
+            .map(PreparedNanoProductionRuntime::head_gaze_lease_issuer)
+    }
+
     fn take_for_owner(
         &mut self,
     ) -> (
@@ -12290,6 +12299,26 @@ impl NanoLiveSetupGuard {
             .expect("live setup transfers one motion selection")
     }
 
+    fn bind_production_head_gaze_lease_if_configured(
+        &self,
+    ) -> Result<(), kiko_slam::navigation::NanoHeadGazeLeaseBindError> {
+        let Some(PreparedLiveMotionSelection::Production(input)) = self.motion.as_ref() else {
+            return Ok(());
+        };
+        let (Some(accessory), Some(issuer)) =
+            (self.accessory.as_ref(), input.head_gaze_lease_issuer())
+        else {
+            return Ok(());
+        };
+        match accessory.bind_head_gaze_base_zero_lease_issuer(issuer) {
+            Ok(())
+            | Err(kiko_slam::navigation::NanoHeadGazeLeaseBindError::PhysicalGazeNotConfigured) => {
+                Ok(())
+            }
+            Err(source) => Err(source),
+        }
+    }
+
     fn take_production_state(&mut self) -> Option<NanoProductionStateOwners> {
         self.production_state.take()
     }
@@ -14966,6 +14995,8 @@ fn run_prepared_live_session(
     let operation = (|| -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(all(feature = "nano-agent", unix))]
         let mut nano_setup_guard = NanoLiveSetupGuard::new(motion, accessory, production_state);
+        #[cfg(all(feature = "nano-agent", unix))]
+        nano_setup_guard.bind_production_head_gaze_lease_if_configured()?;
         #[cfg(all(feature = "nano-agent", unix))]
         let face_stage_stats_handle = nano_setup_guard.face_perception_stage_stats_handle();
         #[cfg(all(feature = "nano-agent", unix))]
