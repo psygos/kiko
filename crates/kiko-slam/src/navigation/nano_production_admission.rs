@@ -13,6 +13,7 @@ use kiko_device_inventory::{
     ArtifactId, ArtifactRelativePath, InventoryMismatchReport, LoadedExpectedManifestV1,
     ManifestArtifactHashes, ObservedDeviceInventoryV1, admit_exact_inventory,
 };
+use kiko_head_runtime::HeadGazeBaseZeroExclusiveLeaseIssuer;
 use kiko_supervisor_core::ReadinessEpoch;
 use robot_command_client::{
     AppliedCommandReceipt, ControllerSession, DisarmReceipt, VerifiedControllerAcquisition,
@@ -125,6 +126,7 @@ pub struct PreparedNanoProductionRuntime {
     actuation: AdmittedNavigationActuationConfigV1,
     physical_driver: LiveMpcControlDriver,
     initial_zero: AppliedCommandReceipt,
+    head_gaze_lease_issuer: HeadGazeBaseZeroExclusiveLeaseIssuer,
 }
 
 impl PreparedNanoProductionRuntime {
@@ -141,10 +143,26 @@ impl PreparedNanoProductionRuntime {
         actuation_config: NavigationActuationConfigV1,
         plant_artifact_id: ArtifactId,
         plant_artifact_relative_path: ArtifactRelativePath,
-        pending_controller: PendingLiveMpcControlDriver,
+        mut pending_controller: PendingLiveMpcControlDriver,
         initial_zero: AppliedCommandReceipt,
         timeline: NanoProductionAdmissionTimeline,
     ) -> Result<Self, NanoProductionAdmissionError> {
+        let head_gaze_lease_issuer =
+            match pending_controller.install_head_gaze_base_interlock(&initial_zero) {
+                Ok(issuer) => issuer,
+                Err(source) => {
+                    let stop = match pending_controller.disarm() {
+                        Ok(receipt) => NanoProductionAdmissionStop::Confirmed(receipt),
+                        Err(stop) => NanoProductionAdmissionStop::Uncertain(stop),
+                    };
+                    return Err(NanoProductionAdmissionError::PrePromotion {
+                        primary: Box::new(NanoProductionAdmissionPrimaryError::HeadGazeInterlock(
+                            source,
+                        )),
+                        stop,
+                    });
+                }
+            };
         prepare_with_pending_controller(
             policy,
             loaded_manifest,
@@ -168,6 +186,7 @@ impl PreparedNanoProductionRuntime {
                 actuation,
                 physical_driver,
                 initial_zero,
+                head_gaze_lease_issuer,
             },
         )
         .map_err(NanoProductionAdmissionError::from_internal)
@@ -200,6 +219,7 @@ impl PreparedNanoProductionRuntime {
             actuation: self.actuation,
             physical_driver: self.physical_driver,
             initial_zero: self.initial_zero,
+            head_gaze_lease_issuer: self.head_gaze_lease_issuer,
         }
     }
 }
@@ -214,12 +234,14 @@ pub struct PreparedNanoProductionRuntimeParts {
     pub actuation: AdmittedNavigationActuationConfigV1,
     pub physical_driver: LiveMpcControlDriver,
     pub initial_zero: AppliedCommandReceipt,
+    pub head_gaze_lease_issuer: HeadGazeBaseZeroExclusiveLeaseIssuer,
 }
 
 /// Primary reason a pre-promotion production admission failed.
 #[derive(Debug)]
 pub enum NanoProductionAdmissionPrimaryError {
     ControllerEvidence(LiveActuationError),
+    HeadGazeInterlock(LiveActuationError),
     InitialZeroSessionMismatch {
         acquisition: ControllerSession,
         receipt: Box<AppliedCommandReceipt>,
@@ -245,7 +267,7 @@ impl fmt::Display for NanoProductionAdmissionPrimaryError {
 impl std::error::Error for NanoProductionAdmissionPrimaryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::ControllerEvidence(source) => Some(source),
+            Self::ControllerEvidence(source) | Self::HeadGazeInterlock(source) => Some(source),
             Self::ExactInventory(source) => Some(source),
             Self::Actuation(source) => Some(source),
             Self::Startup(source) => Some(source),

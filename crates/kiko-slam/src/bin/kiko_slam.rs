@@ -7812,6 +7812,7 @@ fn start_production_motion_runtime(
         actuation,
         mut physical_driver,
         initial_zero: _,
+        head_gaze_lease_issuer: _,
     } = prepared;
     let live_mode_policy: NanoLiveModePolicy = *startup.policy.live_mode_policy();
 
