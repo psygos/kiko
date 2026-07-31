@@ -118,6 +118,49 @@ expected help boundary. The promotion tool describes itself as offline with
 no motion authority. The 77 expression-runtime tests and its compile-fail
 documentation test also passed natively in the Nano's optimized test profile.
 
+### Fresh wheels-off executable boundary
+
+After the candidate was installed, the exact current Nano checkout at
+`84de38d69443310fcaf6b5d47de0f6766773ac54` was again clean and built natively
+with the full `nano-wheels-off-qualification` feature graph. The build used
+the retained DepthAI/OpenCV input declaration whose SHA-256 is
+`835761b1d37c5cb6d868c10e69af4a22525f14ef2aa057c84b76028b6777906e`.
+The optimized result was copied without modification to a qualification-only,
+read-only artifact path:
+
+```text
+binary:
+  /home/makerspace/kiko-native-evidence/84de38d-wheels-off-build-20260731/artifact/kiko-nano-wheels-off-qualification
+size and mode:
+  30126352 bytes, 0555
+SHA-256:
+  24807bfff99c61fd6e544231f754b5ef21122dcef6d246cd67e176b63d0bac43
+ELF build ID:
+  fee1cb0a5c175348557648aa1fe5337e522345ce
+```
+
+`file` identifies it as an aarch64 GNU/Linux PIE. `ldd` found no unresolved
+library under the retained seven-leaf native runtime plus the measured Orin
+system ABI. Both the top-level help and the device-free
+`nano-wheels-off-qualification --help` boundary loaded successfully; the
+latter exposed only the typed deployment root, relative launch document,
+state root, and one qualification fault-injection option. Neither help command
+opened a device.
+
+The exact retained model and face-cascade source identities for the future
+render are:
+
+| Leaf | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `sp.onnx` | 5,226,093 | `aaefb94ad6dd3624fe4300b39f0f1a77e8739ed6d5430162729fd6a72c265431` |
+| `lg.onnx` | 46,463,559 | `7fbb5814811dbc6d170de1c86bc0352a14691efa32cae33d952b6039258f74ef` |
+| `haarcascade_frontalface_default.xml` | 930,127 | `0f7d4527844eb514d4a4948e822da90fbb16a34a0bbbbc6adc6498747a5aafb0` |
+| `haarcascade_profileface.xml` | 828,514 | `b39a4a3be45539db146a7fc1d3e761a292c196eb88421185e6a615b3055e612d` |
+
+This closes the current native executable/loadability input to the renderer.
+It is not a rendered or installed bundle and is not evidence of live camera,
+SLAM, occupancy, expression, control-loop, or motor behavior.
+
 ## Live hardware ownership retained
 
 The existing `/home/makerspace/kiko-follow/engine-guardian.sh` and its one
@@ -146,6 +189,11 @@ Consequently, two different facts must not be conflated:
 Starting the canonical graph while the guardian owns the same devices would
 only recreate the observed `X_LINK_DEVICE_ALREADY_IN_USE` failure. A single,
 explicit handoff is required; running both is not integration.
+
+At `2026-07-31T20:09:21+05:30`, the same guardian and Python child remained
+alive and continued to own the OAK, `/dev/ttyACM1`, and `/dev/ttyACM2`.
+`/dev/ttyACM0` still had no process owner. The guardian was deliberately not
+displaced while the immutable canonical bundle remained incomplete.
 
 The OAK remained enumerated through a SuperSpeed path while the guardian was
 live: the Orin's 10,000 Mbit/s root and hub path reported the OAK vendor node
