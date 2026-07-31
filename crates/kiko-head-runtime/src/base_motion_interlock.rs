@@ -150,6 +150,15 @@ impl HeadGazeBaseMotionInterlock {
     }
 }
 
+impl Drop for HeadGazeBaseMotionInterlock {
+    fn drop(&mut self) {
+        // A surviving cloneable issuer is never authority after the sole base
+        // owner disappears. The shared state must become absorbing before the
+        // non-cloneable endpoint releases its final ownership evidence.
+        self.shared.fault();
+    }
+}
+
 impl HeadGazeBaseZeroExclusiveLeaseIssuer {
     pub fn phase(&self) -> HeadGazeBaseMotionPhase {
         self.shared.phase()
@@ -419,6 +428,19 @@ mod tests {
         assert!(matches!(
             duplicate.try_acquire(),
             Err(HeadGazeBaseInterlockError::HeadGazeLeaseActive)
+        ));
+    }
+
+    #[test]
+    fn dropping_sole_base_owner_revokes_every_retained_gaze_issuer() {
+        let (owner, issuer) = HeadGazeBaseMotionInterlock::from_confirmed_zero(confirmed_zero(1));
+        let retained = issuer.clone();
+        drop(owner);
+
+        assert_eq!(issuer.phase(), HeadGazeBaseMotionPhase::Faulted);
+        assert!(matches!(
+            retained.try_acquire(),
+            Err(HeadGazeBaseInterlockError::Faulted)
         ));
     }
 }
