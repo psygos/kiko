@@ -165,6 +165,35 @@ controller fault bits `0x00000001` (`SERIAL_INTEGRITY`). The 50 Hz stage was
 not run. This failure is preserved rather than cleared, retried, or converted
 into a readiness claim.
 
+The source audit narrows the meaning of this observation. Candidate admission
+checks an exact Hello and idle-safe Heartbeat before writing its first
+freshness challenge, so this failed attempt wrote no diagnostic probe bytes
+and did not create the reported fault. Firmware initializes the fault word
+only at boot and subsequently ORs fault bits into it; it has no in-session
+clear path. `SERIAL_INTEGRITY` can represent RX queue invalidation, a decode or
+oversize-record failure, an unsupported host-direction message, or an
+unavailable transmit/report path. The latched bit does not retain which one
+occurred. Given the prior interactive history, the source cannot identify a
+root cause from the present Heartbeat alone. A controlled fresh boot with a
+quiescent serial path and retained boot ID is required to distinguish a
+historical sticky fault from a reproducible transport failure.
+
+Follow-up commit `e6e6b5c87c73ddd8cd4e58460b08add65fc44f1e`
+made that phase boundary explicit in the qualifier's typed error without
+changing the firmware or attended runtime. The exact native aarch64
+`v2_transport_qualify` binary has SHA-256
+`3ca4bde44ca00683023575fa10c5b35c586297d107c4b2430c6228444907f283`
+and ELF build ID `7bf83043d8fc1c15bc9ac7dc0126edbcf251e44d`; it had no unresolved
+libraries and displayed the expected CLI boundary. Repeating the 20 Hz
+invocation produced:
+
+```text
+read-only candidate admission rejected controller fault bits 0x00000001
+before any diagnostic probe bytes were written
+```
+
+This confirms error provenance; it does not clear or qualify the controller.
+
 The current image cannot drive or calibrate the wheels. The motion-capable
 commissioning image must be flashed only under the documented attended
 preconditions with motor power physically disconnected, then must prove exact
