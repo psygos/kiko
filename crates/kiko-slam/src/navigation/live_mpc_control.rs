@@ -7,6 +7,8 @@
 use std::fmt;
 use std::time::Instant;
 
+#[cfg(feature = "agent-runtime")]
+use kiko_head_runtime::HeadGazeBaseZeroExclusiveLeaseIssuer;
 use robot_command_client::{AppliedCommandReceipt, DisarmReceipt, VerifiedControllerAcquisition};
 
 use super::actuation::{LiveActuationError, PhysicalActuationSession};
@@ -147,6 +149,17 @@ impl PendingLiveMpcControlDriver {
     /// Keep the pre-admission session at a newly acknowledged exact zero.
     pub fn apply_fresh_zero(&mut self) -> Result<AppliedCommandReceipt, LiveActuationError> {
         self.core.port.apply_fresh_zero()
+    }
+
+    /// Bind the acquisition zero to the shared head/base exclusion boundary
+    /// before this pending owner attempts any later base command.
+    pub fn install_head_gaze_base_interlock(
+        &mut self,
+        initial_zero: &AppliedCommandReceipt,
+    ) -> Result<HeadGazeBaseZeroExclusiveLeaseIssuer, LiveActuationError> {
+        self.core
+            .port
+            .install_head_gaze_base_interlock_from_initial_receipt(initial_zero)
     }
 
     /// Consume the pending session through a request-correlated stop.
@@ -304,6 +317,16 @@ impl LiveMpcControlDriver {
     /// host result to the supervisor which requested the zero.
     pub fn apply_fresh_zero(&mut self) -> Result<AppliedCommandReceipt, LiveActuationError> {
         self.core.port.apply_fresh_zero()
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    pub fn install_head_gaze_base_interlock(
+        &mut self,
+        initial_zero: &AppliedCommandReceipt,
+    ) -> Result<HeadGazeBaseZeroExclusiveLeaseIssuer, LiveActuationError> {
+        self.core
+            .port
+            .install_head_gaze_base_interlock_from_initial_receipt(initial_zero)
     }
 
     /// Acquisition-time controller identity for strict startup inventory.

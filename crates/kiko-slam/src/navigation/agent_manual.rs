@@ -1237,12 +1237,28 @@ pub fn classify_live_actuation_error(source: &LiveActuationError) -> AgentLiveAc
             let controller_stop = match stop {
                 LocalRejectionStop::Confirmed(_) => AgentControllerStopKnowledge::Confirmed,
                 LocalRejectionStop::DisarmFailed(failure) => failure.stop_knowledge().into(),
+                LocalRejectionStop::HeadGazeInterlockBlocked(
+                    kiko_head_runtime::HeadGazeBaseInterlockError::HeadGazeLeaseActive,
+                ) => AgentControllerStopKnowledge::Confirmed,
+                LocalRejectionStop::HeadGazeInterlockBlocked(_) => {
+                    AgentControllerStopKnowledge::Uncertain
+                }
                 LocalRejectionStop::SessionAlreadyConsumed => {
                     AgentControllerStopKnowledge::Uncertain
                 }
             };
             classify_local_decision_rejection(source, controller_stop)
         }
+        LiveActuationError::HeadGazeInterlockInstallation(_) => fault_disposition(
+            AgentLiveActuationFaultKind::HostInvariant,
+            AgentControllerStopKnowledge::Uncertain,
+        ),
+        LiveActuationError::HeadGazeInterlock(_)
+        | LiveActuationError::HeadGazeZeroEvidence(_)
+        | LiveActuationError::HeadGazeZeroTimestampOutOfRange { .. } => fault_disposition(
+            AgentLiveActuationFaultKind::HostInvariant,
+            AgentControllerStopKnowledge::Uncertain,
+        ),
         LiveActuationError::SessionConsumed => fault_disposition(
             AgentLiveActuationFaultKind::SessionConsumed,
             AgentControllerStopKnowledge::Uncertain,
@@ -2410,6 +2426,34 @@ mod tests {
         let exhausted = classified_fault(&exhausted, AgentControllerStopKnowledge::Confirmed);
         assert_eq!(exhausted.kind(), AgentLiveActuationFaultKind::HostInvariant);
         assert_eq!(exhausted.supervisor_fault(), FaultKind::InternalInvariant);
+    }
+
+    #[test]
+    fn head_base_interlock_failures_remain_host_invariants_with_exact_stop_knowledge() {
+        let installation = LiveActuationError::HeadGazeInterlockInstallation(
+            crate::navigation::actuation::HeadGazeInterlockInstallationError::AlreadyInstalled,
+        );
+        let AgentLiveActuationDisposition::LatchFault(installation) =
+            classify_live_actuation_error(&installation);
+        assert_eq!(
+            installation.kind(),
+            AgentLiveActuationFaultKind::HostInvariant
+        );
+        assert_eq!(
+            installation.controller_stop(),
+            AgentControllerStopKnowledge::Uncertain
+        );
+
+        let uncertain = LiveActuationError::HeadGazeInterlock(
+            kiko_head_runtime::HeadGazeBaseInterlockError::BaseMayMove,
+        );
+        let AgentLiveActuationDisposition::LatchFault(uncertain) =
+            classify_live_actuation_error(&uncertain);
+        assert_eq!(uncertain.kind(), AgentLiveActuationFaultKind::HostInvariant);
+        assert_eq!(
+            uncertain.controller_stop(),
+            AgentControllerStopKnowledge::Uncertain
+        );
     }
 
     #[test]

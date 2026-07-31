@@ -1126,12 +1126,21 @@ fn stop_knowledge_from_live_error(
             LocalRejectionStop::DisarmFailed(failure) => {
                 failure.stop_knowledge() == LatchedStopKnowledge::ConfirmedStop
             }
+            LocalRejectionStop::HeadGazeInterlockBlocked(
+                kiko_head_runtime::HeadGazeBaseInterlockError::HeadGazeLeaseActive,
+            ) => true,
+            LocalRejectionStop::HeadGazeInterlockBlocked(_) => false,
             LocalRejectionStop::SessionAlreadyConsumed => false,
         },
         LiveActuationError::Disarm(failure) => {
             failure.stop_knowledge() == LatchedStopKnowledge::ConfirmedStop
         }
-        LiveActuationError::TransportBuild(_) | LiveActuationError::SessionConsumed => false,
+        LiveActuationError::TransportBuild(_)
+        | LiveActuationError::HeadGazeInterlockInstallation(_)
+        | LiveActuationError::HeadGazeInterlock(_)
+        | LiveActuationError::HeadGazeZeroEvidence(_)
+        | LiveActuationError::HeadGazeZeroTimestampOutOfRange { .. }
+        | LiveActuationError::SessionConsumed => false,
     };
     if confirmed {
         WheelsOffQualificationFailClosedStop::ControllerConfirmedWithoutRetainedReceipt

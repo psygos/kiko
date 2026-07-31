@@ -13,6 +13,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
+#[cfg(feature = "agent-runtime")]
+use kiko_head_runtime::{
+    HeadGazeBaseCommandTransaction, HeadGazeBaseInterlockError, HeadGazeBaseMotionInterlock,
+    HeadGazeBaseZeroExclusiveLeaseIssuer,
+};
+#[cfg(feature = "agent-runtime")]
+use kiko_supervisor_core::{
+    ConfirmedBaseZero, MonotonicInstant as SupervisorMonotonicInstant, ZeroEvidenceError,
+};
 use robot_command_client::{
     AcquireFailure, AppliedCommandReceipt, ApplyFailure, ArmedCommandClient, ClientConfig,
     DisarmFailure, DisarmReceipt, MonotonicClock, MonotonicInstant, PendingPhysicalCommand,
@@ -300,6 +309,10 @@ pub struct PhysicalActuationSession {
     armed: Option<ConcreteArmed>,
     clock: ActuationMonotonicClock,
     timing: ActuationTiming,
+    #[cfg(feature = "agent-runtime")]
+    head_gaze_interlock: Option<HeadGazeBaseMotionInterlock>,
+    #[cfg(feature = "agent-runtime")]
+    head_gaze_interlock_installation_open: bool,
     #[cfg(feature = "nano-attended-navigation-trial")]
     attended_trial: Option<AttendedTrialActuationGuard>,
 }
@@ -427,6 +440,10 @@ impl StoppedCandidateActuationClient {
                 armed: Some(armed),
                 clock,
                 timing,
+                #[cfg(feature = "agent-runtime")]
+                head_gaze_interlock: None,
+                #[cfg(feature = "agent-runtime")]
+                head_gaze_interlock_installation_open: true,
                 #[cfg(feature = "nano-attended-navigation-trial")]
                 attended_trial: None,
             },
@@ -485,6 +502,10 @@ impl PhysicalActuationSession {
                 armed: Some(armed),
                 clock,
                 timing,
+                #[cfg(feature = "agent-runtime")]
+                head_gaze_interlock: None,
+                #[cfg(feature = "agent-runtime")]
+                head_gaze_interlock_installation_open: true,
                 #[cfg(feature = "nano-attended-navigation-trial")]
                 attended_trial: None,
             },
@@ -547,6 +568,61 @@ impl PhysicalActuationSession {
             self.reject_local_decision(source, stop_reason)
         })?;
         self.apply_pending(pending)
+    }
+
+    /// Install the shared head/base exclusion boundary exactly once, before
+    /// this session has attempted any post-acquisition base transaction.
+    ///
+    /// The supplied evidence must identify this exact acquired controller
+    /// boot and control epoch and must be the initial sequence. Callers derive
+    /// it by parsing the acquisition receipt once through
+    /// `ConfirmedBaseZero::try_from_host_command_result`.
+    #[cfg(feature = "agent-runtime")]
+    fn install_head_gaze_base_interlock(
+        &mut self,
+        initial_zero: ConfirmedBaseZero,
+    ) -> Result<HeadGazeBaseZeroExclusiveLeaseIssuer, LiveActuationError> {
+        if self.head_gaze_interlock.is_some() {
+            return Err(LiveActuationError::HeadGazeInterlockInstallation(
+                HeadGazeInterlockInstallationError::AlreadyInstalled,
+            ));
+        }
+        if !self.head_gaze_interlock_installation_open {
+            return Err(LiveActuationError::HeadGazeInterlockInstallation(
+                HeadGazeInterlockInstallationError::BaseTransactionAlreadyAttempted,
+            ));
+        }
+        let acquisition = self.verified_controller_acquisition()?;
+        if initial_zero.controller_uid() != acquisition.controller_uid()
+            || initial_zero.controller_boot_id() != acquisition.boot_id()
+            || initial_zero.control_epoch() != acquisition.control_epoch()
+        {
+            return Err(LiveActuationError::HeadGazeInterlockInstallation(
+                HeadGazeInterlockInstallationError::ControllerIdentityMismatch,
+            ));
+        }
+        if initial_zero.sequence().get() != 1 {
+            return Err(LiveActuationError::HeadGazeInterlockInstallation(
+                HeadGazeInterlockInstallationError::NotInitialZeroSequence {
+                    sequence: initial_zero.sequence().get(),
+                },
+            ));
+        }
+        let (interlock, issuer) = HeadGazeBaseMotionInterlock::from_confirmed_zero(initial_zero);
+        self.head_gaze_interlock = Some(interlock);
+        self.head_gaze_interlock_installation_open = false;
+        Ok(issuer)
+    }
+
+    /// Parse the verified acquisition receipt exactly once into the zero
+    /// evidence which seeds head/base exclusion.
+    #[cfg(feature = "agent-runtime")]
+    pub fn install_head_gaze_base_interlock_from_initial_receipt(
+        &mut self,
+        initial_zero: &AppliedCommandReceipt,
+    ) -> Result<HeadGazeBaseZeroExclusiveLeaseIssuer, LiveActuationError> {
+        let zero = confirmed_head_gaze_zero(initial_zero)?;
+        self.install_head_gaze_base_interlock(zero)
     }
 
     /// Bind a commissioning-class session to the non-bypassable attended
@@ -630,10 +706,20 @@ impl PhysicalActuationSession {
         &mut self,
         pending: PendingPhysicalCommand,
     ) -> Result<AppliedCommandReceipt, LiveActuationError> {
+        #[cfg(feature = "agent-runtime")]
+        let requested_zero = pending.requested_timer_pwm().is_zero();
+        #[cfg(feature = "agent-runtime")]
+        let head_gaze_transaction = self.begin_head_gaze_base_transaction()?;
         let armed = self.take_armed()?;
         match armed.apply(pending) {
             Ok((armed, receipt)) => {
                 self.armed = Some(armed);
+                #[cfg(feature = "agent-runtime")]
+                Self::commit_head_gaze_base_transaction(
+                    head_gaze_transaction,
+                    &receipt,
+                    requested_zero,
+                )?;
                 Ok(receipt)
             }
             Err(failure) => Err(LiveActuationError::Apply(failure)),
@@ -641,9 +727,15 @@ impl PhysicalActuationSession {
     }
 
     pub fn disarm(&mut self) -> Result<DisarmReceipt, LiveActuationError> {
+        #[cfg(feature = "agent-runtime")]
+        let head_gaze_transaction = self.begin_head_gaze_base_transaction()?;
         let armed = self.take_armed()?;
         match armed.disarm() {
-            Ok((_disarmed, receipt)) => Ok(receipt),
+            Ok((_disarmed, receipt)) => {
+                #[cfg(feature = "agent-runtime")]
+                drop(head_gaze_transaction);
+                Ok(receipt)
+            }
             Err(failure) => Err(LiveActuationError::Disarm(failure)),
         }
     }
@@ -652,16 +744,22 @@ impl PhysicalActuationSession {
     pub(super) fn stop_candidate(
         mut self,
     ) -> Result<(StoppedCandidateActuationClient, DisarmReceipt), LiveActuationError> {
+        #[cfg(feature = "agent-runtime")]
+        let head_gaze_transaction = self.begin_head_gaze_base_transaction()?;
         let armed = self.take_armed()?;
         match armed.disarm() {
-            Ok((disarmed, receipt)) => Ok((
-                StoppedCandidateActuationClient {
-                    disarmed,
-                    clock: self.clock,
-                    timing: self.timing,
-                },
-                receipt,
-            )),
+            Ok((disarmed, receipt)) => {
+                #[cfg(feature = "agent-runtime")]
+                drop(head_gaze_transaction);
+                Ok((
+                    StoppedCandidateActuationClient {
+                        disarmed,
+                        clock: self.clock,
+                        timing: self.timing,
+                    },
+                    receipt,
+                ))
+            }
             Err(failure) => Err(LiveActuationError::Disarm(failure)),
         }
     }
@@ -687,14 +785,67 @@ impl PhysicalActuationSession {
         self.armed.take().ok_or(LiveActuationError::SessionConsumed)
     }
 
+    #[cfg(feature = "agent-runtime")]
+    fn begin_head_gaze_base_transaction(
+        &mut self,
+    ) -> Result<Option<HeadGazeBaseCommandTransaction>, LiveActuationError> {
+        self.head_gaze_interlock_installation_open = false;
+        self.head_gaze_interlock
+            .as_mut()
+            .map(HeadGazeBaseMotionInterlock::begin_base_transaction)
+            .transpose()
+            .map_err(LiveActuationError::HeadGazeInterlock)
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    fn commit_head_gaze_base_transaction(
+        transaction: Option<HeadGazeBaseCommandTransaction>,
+        receipt: &AppliedCommandReceipt,
+        requested_zero: bool,
+    ) -> Result<(), LiveActuationError> {
+        let Some(transaction) = transaction else {
+            return Ok(());
+        };
+        if requested_zero {
+            let zero = confirmed_head_gaze_zero(receipt)?;
+            transaction
+                .commit_confirmed_zero(zero)
+                .map_err(LiveActuationError::HeadGazeInterlock)
+        } else {
+            transaction
+                .commit_verified_motion_application()
+                .map_err(LiveActuationError::HeadGazeInterlock)
+        }
+    }
+
     fn reject_local_decision(
         &mut self,
         source: PhysicalDecisionError,
         stop_reason: ForceStopReason,
     ) -> LiveActuationError {
+        #[cfg(feature = "agent-runtime")]
+        let head_gaze_transaction = match self.begin_head_gaze_base_transaction() {
+            Ok(transaction) => transaction,
+            Err(LiveActuationError::HeadGazeInterlock(interlock)) => {
+                return LiveActuationError::DecisionRejected {
+                    source,
+                    stop: LocalRejectionStop::HeadGazeInterlockBlocked(interlock),
+                };
+            }
+            Err(_) => {
+                return LiveActuationError::DecisionRejected {
+                    source,
+                    stop: LocalRejectionStop::SessionAlreadyConsumed,
+                };
+            }
+        };
         let stop = match self.armed.take() {
             Some(armed) => match armed.disarm_with_reason(stop_reason) {
-                Ok((_disarmed, receipt)) => LocalRejectionStop::Confirmed(receipt),
+                Ok((_disarmed, receipt)) => {
+                    #[cfg(feature = "agent-runtime")]
+                    drop(head_gaze_transaction);
+                    LocalRejectionStop::Confirmed(receipt)
+                }
                 Err(failure) => LocalRejectionStop::DisarmFailed(failure),
             },
             None => LocalRejectionStop::SessionAlreadyConsumed,
@@ -703,9 +854,26 @@ impl PhysicalActuationSession {
     }
 }
 
+#[cfg(feature = "agent-runtime")]
+fn confirmed_head_gaze_zero(
+    receipt: &AppliedCommandReceipt,
+) -> Result<ConfirmedBaseZero, LiveActuationError> {
+    let acknowledged_at_ns = u64::try_from(receipt.acknowledged_at().nanos_since_clock_start())
+        .map_err(|_| LiveActuationError::HeadGazeZeroTimestampOutOfRange {
+            acknowledged_at_ns: receipt.acknowledged_at().nanos_since_clock_start(),
+        })?;
+    ConfirmedBaseZero::try_from_host_command_result(
+        receipt.verified_host_result(),
+        SupervisorMonotonicInstant::from_nanos_since_process_start(acknowledged_at_ns),
+    )
+    .map_err(LiveActuationError::HeadGazeZeroEvidence)
+}
+
 pub enum LocalRejectionStop {
     Confirmed(DisarmReceipt),
     DisarmFailed(ConcreteDisarmFailure),
+    #[cfg(feature = "agent-runtime")]
+    HeadGazeInterlockBlocked(HeadGazeBaseInterlockError),
     SessionAlreadyConsumed,
 }
 
@@ -719,8 +887,40 @@ pub enum LiveActuationError {
     },
     Apply(ConcreteApplyFailure),
     Disarm(ConcreteDisarmFailure),
+    #[cfg(feature = "agent-runtime")]
+    HeadGazeInterlockInstallation(HeadGazeInterlockInstallationError),
+    #[cfg(feature = "agent-runtime")]
+    HeadGazeInterlock(HeadGazeBaseInterlockError),
+    #[cfg(feature = "agent-runtime")]
+    HeadGazeZeroEvidence(ZeroEvidenceError),
+    #[cfg(feature = "agent-runtime")]
+    HeadGazeZeroTimestampOutOfRange {
+        acknowledged_at_ns: u128,
+    },
     SessionConsumed,
 }
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadGazeInterlockInstallationError {
+    AlreadyInstalled,
+    BaseTransactionAlreadyAttempted,
+    ControllerIdentityMismatch,
+    NotInitialZeroSequence { sequence: u32 },
+}
+
+#[cfg(feature = "agent-runtime")]
+impl fmt::Display for HeadGazeInterlockInstallationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot install head/base motion interlock: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl std::error::Error for HeadGazeInterlockInstallationError {}
 
 impl fmt::Debug for LiveActuationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -766,6 +966,11 @@ impl fmt::Display for LiveActuationError {
                     stop_evidence_text(failure.stop_knowledge()),
                     failure.cause()
                 ),
+                #[cfg(feature = "agent-runtime")]
+                LocalRejectionStop::HeadGazeInterlockBlocked(interlock) => write!(
+                    formatter,
+                    "physical decision rejected before send ({source}); base stop was not sent because the head/base interlock rejected it: {interlock}"
+                ),
                 LocalRejectionStop::SessionAlreadyConsumed => write!(
                     formatter,
                     "physical decision rejected before send ({source}); session was already consumed"
@@ -783,6 +988,20 @@ impl fmt::Display for LiveActuationError {
                 stop_evidence_text(failure.stop_knowledge()),
                 failure.cause()
             ),
+            #[cfg(feature = "agent-runtime")]
+            Self::HeadGazeInterlockInstallation(source) => fmt::Display::fmt(source, formatter),
+            #[cfg(feature = "agent-runtime")]
+            Self::HeadGazeInterlock(source) => fmt::Display::fmt(source, formatter),
+            #[cfg(feature = "agent-runtime")]
+            Self::HeadGazeZeroEvidence(source) => write!(
+                formatter,
+                "applied base zero could not refresh the head/base interlock: {source}"
+            ),
+            #[cfg(feature = "agent-runtime")]
+            Self::HeadGazeZeroTimestampOutOfRange { acknowledged_at_ns } => write!(
+                formatter,
+                "applied base-zero acknowledgement time {acknowledged_at_ns} ns exceeds the head/base interlock time domain"
+            ),
             Self::SessionConsumed => {
                 formatter.write_str("physical actuation session is already consumed")
             }
@@ -798,6 +1017,14 @@ impl std::error::Error for LiveActuationError {
             Self::Preflight(failure) | Self::Apply(failure) => Some(failure.cause()),
             Self::DecisionRejected { source, .. } => Some(source),
             Self::Disarm(failure) => Some(failure.cause()),
+            #[cfg(feature = "agent-runtime")]
+            Self::HeadGazeInterlockInstallation(source) => Some(source),
+            #[cfg(feature = "agent-runtime")]
+            Self::HeadGazeInterlock(source) => Some(source),
+            #[cfg(feature = "agent-runtime")]
+            Self::HeadGazeZeroEvidence(source) => Some(source),
+            #[cfg(feature = "agent-runtime")]
+            Self::HeadGazeZeroTimestampOutOfRange { .. } => None,
             Self::SessionConsumed => None,
         }
     }
