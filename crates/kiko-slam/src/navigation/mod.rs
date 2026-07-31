@@ -26,6 +26,8 @@ mod frontier;
 mod global_planner;
 mod goal_input;
 #[cfg(feature = "agent-runtime")]
+mod head_gaze_physical_admission;
+#[cfg(feature = "agent-runtime")]
 mod head_gaze_policy;
 #[cfg(feature = "agent-runtime")]
 mod head_gaze_proposal_adapter;
@@ -229,6 +231,12 @@ pub use global_planner::{
 pub use goal_input::{
     MapPointGoalSelection, MapPointGoalSelectionDto, MapPointGoalSelectionParseError,
     NavigationGoalArg, NavigationGoalArgError, NavigationGoalAxis,
+};
+#[cfg(feature = "agent-runtime")]
+pub use head_gaze_physical_admission::{
+    AdmittedPhysicalHeadGazeFaceProposal, BoundHeadGazeReviewEvidence,
+    EvidenceBoundPhysicalHeadGazePolicy, EvidenceBoundPhysicalHeadGazePolicyError,
+    PhysicalHeadGazeFaceOutcome,
 };
 #[cfg(feature = "agent-runtime")]
 pub use head_gaze_policy::{

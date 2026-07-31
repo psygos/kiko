@@ -76,6 +76,29 @@ impl HeadGazeActuationConfig {
         reviewed_return_target: ExactHeadTargetPose,
         goal_register_transaction_timeout_ms: u64,
     ) -> Result<Self, HeadGazeActuationConfigError> {
+        let goal_register_transaction_timeout = OperationTimeout::parse(
+            "head_gaze_goal_register_transaction_timeout_ms",
+            goal_register_transaction_timeout_ms,
+        )
+        .map_err(HeadGazeActuationConfigError::TransactionTimeout)?;
+        Self::try_new_with_transaction_timeout(
+            controller,
+            reviewed_return_target,
+            goal_register_transaction_timeout,
+        )
+    }
+
+    /// Bind gaze to an already parsed transport timeout without converting
+    /// its unit back through a weak integer boundary.
+    ///
+    /// Production admission uses the exact timeout from the manifest-bound
+    /// reviewed-return transport. The millisecond constructor remains for
+    /// standalone configuration parsing and compatibility callers.
+    pub fn try_new_with_transaction_timeout(
+        controller: HeadGazeControlConfig,
+        reviewed_return_target: ExactHeadTargetPose,
+        goal_register_transaction_timeout: OperationTimeout,
+    ) -> Result<Self, HeadGazeActuationConfigError> {
         if controller.natural_pose() != reviewed_return_target {
             return Err(
                 HeadGazeActuationConfigError::NaturalPoseDoesNotMatchReviewedReturn {
@@ -84,11 +107,6 @@ impl HeadGazeActuationConfig {
                 },
             );
         }
-        let goal_register_transaction_timeout = OperationTimeout::parse(
-            "head_gaze_goal_register_transaction_timeout_ms",
-            goal_register_transaction_timeout_ms,
-        )
-        .map_err(HeadGazeActuationConfigError::TransactionTimeout)?;
         let control_period = controller.timing().control_period().get();
         if goal_register_transaction_timeout.get() > control_period {
             return Err(
