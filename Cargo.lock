@@ -2223,6 +2223,8 @@ name = "kiko-head-runtime"
 version = "0.1.0"
 dependencies = [
  "kiko-head-protocol",
+ "kiko-supervisor-core",
+ "robot-protocol",
  "serde",
  "serde_json",
  "tokio",

@@ -56,19 +56,7 @@ impl PhysicalHeadMotionConsent {
     }
 }
 
-/// Exclusive authority to service one physical head-gaze transaction while
-/// base motion is inhibited.
-///
-/// This type deliberately has no public constructor. A one-time "base is
-/// stopped" receipt is not sufficient: the eventual motion-owner integration
-/// must issue an owned lease which prevents nonzero base command admission
-/// until the complete head goal-write/readback transaction has returned and
-/// this value has been dropped. Until that shared lease exists, proposal
-/// admission is usable but physical gaze servicing is unavailable.
-#[derive(Debug)]
-pub struct HeadGazeBaseZeroExclusiveLease {
-    _private: (),
-}
+use crate::base_motion_interlock::HeadGazeBaseZeroExclusiveLease;
 
 /// Actor-local physical gaze configuration.
 ///
@@ -1935,7 +1923,7 @@ impl TensionPreservingHeadReturnActorHandle {
 ///
 /// Proposal time and controller time share the injected actor clock. Proposal
 /// admission is pure. Physical servicing additionally requires the opaque
-/// base-zero exclusive lease, for which no public issuer exists yet.
+/// base-zero exclusive lease minted by the shared base-motion interlock.
 pub struct TensionPreservingHeadGazeActorHandle {
     commands: mpsc::Sender<HeadCommand>,
 }

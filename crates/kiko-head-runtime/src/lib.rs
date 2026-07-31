@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod actor;
+mod base_motion_interlock;
 mod config;
 mod framing;
 pub mod gaze_control;
@@ -12,18 +13,18 @@ mod transport;
 pub use actor::{
     ActorExit, ActorTermination, ArmingFreshnessCheck, CancellationCause, FrameWriteError,
     HeadActorHandle, HeadActorSpawnError, HeadActorStartError, HeadActorTask, HeadCommandError,
-    HeadGazeActuationConfig, HeadGazeActuationConfigError, HeadGazeBaseZeroExclusiveLease,
-    HeadGazeHardwareApplication, HeadGazeProposalCommandError, HeadGazeServiceError,
-    HeadGazeServiceOutcome, HeadGoalRegisterBoundary, HeadGoalRegisterBoundaryEvidence,
-    HeadGoalRegisterError, HeadGoalRegisterFailure, HeadHealthCheckError, HeadHealthClockBoundary,
-    HeadHealthFailure, HeadHealthJointEvidence, HeadHealthObservationError, HeadHealthRequestError,
-    HeadHoldTarget, HeadReturnActorHandle, HeadReturnError, HeadRuntimeError,
-    HeadStartupTorqueEvidence, HeadTelemetrySetEvidence, HeadWaypointBatchFailure,
-    HeadWaypointBatchWriteError, HeadWaypointEvidence, HoldPreservingOwnershipReleaseEvidence,
-    InterruptedTelemetryRead, PhysicalHeadMotionConsent, PhysicalTorqueEnableConsent,
-    PositionObservationEvidence, ProductionTensionPreservingTakeoverConsent, ReadbackEvidence,
-    RequestError, ResponseEvidence, RuntimeStage, ShutdownError, StartupReceipt,
-    StartupReceiptError, TensionPreservingHeadActorExit, TensionPreservingHeadActorTask,
+    HeadGazeActuationConfig, HeadGazeActuationConfigError, HeadGazeHardwareApplication,
+    HeadGazeProposalCommandError, HeadGazeServiceError, HeadGazeServiceOutcome,
+    HeadGoalRegisterBoundary, HeadGoalRegisterBoundaryEvidence, HeadGoalRegisterError,
+    HeadGoalRegisterFailure, HeadHealthCheckError, HeadHealthClockBoundary, HeadHealthFailure,
+    HeadHealthJointEvidence, HeadHealthObservationError, HeadHealthRequestError, HeadHoldTarget,
+    HeadReturnActorHandle, HeadReturnError, HeadRuntimeError, HeadStartupTorqueEvidence,
+    HeadTelemetrySetEvidence, HeadWaypointBatchFailure, HeadWaypointBatchWriteError,
+    HeadWaypointEvidence, HoldPreservingOwnershipReleaseEvidence, InterruptedTelemetryRead,
+    PhysicalHeadMotionConsent, PhysicalTorqueEnableConsent, PositionObservationEvidence,
+    ProductionTensionPreservingTakeoverConsent, ReadbackEvidence, RequestError, ResponseEvidence,
+    RuntimeStage, ShutdownError, StartupReceipt, StartupReceiptError,
+    TensionPreservingHeadActorExit, TensionPreservingHeadActorTask,
     TensionPreservingHeadGazeActorHandle, TensionPreservingHeadReturnActorHandle,
     TorqueDisableJointOutcome, TorqueDisableReport, VerificationSample,
     VerifiedHeadGazeControlStep, VerifiedHeadGoalRegisterEvidence, VerifiedHeadHealthEvidence,
@@ -32,6 +33,10 @@ pub use actor::{
     spawn_tension_preserving_head_return_actor, start_serial_head_actor,
     start_serial_head_return_actor, start_serial_tension_preserving_head_gaze_actor,
     start_serial_tension_preserving_head_return_actor,
+};
+pub use base_motion_interlock::{
+    HeadGazeBaseCommandTransaction, HeadGazeBaseInterlockError, HeadGazeBaseMotionInterlock,
+    HeadGazeBaseMotionPhase, HeadGazeBaseZeroExclusiveLease, HeadGazeBaseZeroExclusiveLeaseIssuer,
 };
 pub use config::{
     ArmingFreshness, ConfigParseError, ConfiguredHeadPoseBound, ConfiguredHeadPoseBounds,

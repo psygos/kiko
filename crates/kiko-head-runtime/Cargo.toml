@@ -7,12 +7,14 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 kiko-head-protocol = { path = "../kiko-head-protocol" }
+kiko-supervisor-core = { path = "../kiko-supervisor-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.35", features = ["io-util", "macros", "rt", "signal", "sync", "time"] }
 tokio-serial = "5.4"
 
 [dev-dependencies]
+robot-protocol = { path = "../../comms/robot-protocol" }
 tokio = { version = "1.35", features = ["macros", "rt", "sync", "time"] }
 
 [lints]
