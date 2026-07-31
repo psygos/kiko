@@ -1,5 +1,9 @@
 # Attended Nano navigation trial
 
+The current target-native build, live device-owner, integrated expression,
+STM32 fault, and remaining wheel-gate evidence is recorded in
+[`nano-integrated-readiness-2026-07-31.md`](nano-integrated-readiness-2026-07-31.md).
+
 ## Purpose and claim boundary
 
 `kiko-slam nano-attended-navigation-trial` is the foreground, wheel-on bridge
