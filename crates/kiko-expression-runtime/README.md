@@ -85,6 +85,30 @@ The physical panel mounting sign is firmware calibration, not a value this
 host layer can infer. Exact firmware-build matching in the session prevents a
 calibrated polarity from silently crossing builds.
 
+## Autonomic character layer
+
+`AutonomicCharacterEngine` decorates each fresh, already typed eye reaction
+without extending or replacing its host freshness. It is a fixed-size state
+machine with no allocation, I/O, wall clock, or background task. One stream
+epoch seeds its local xorshift sequence, so the same seed, monotonic samples,
+face-presence sequence, and base intentions produce identical output.
+
+The retained modes are idle, greeting, tracking, lost, searching, and sleepy.
+The finite act vocabulary preserves all 19 named behaviors from the prior
+Nano expression process: curious tilt, double take, excited wiggle, lean in,
+nod, soft nod, happy squint, puppy eyes, shy dip, sparkle, blink flourish,
+look around, perk up, daydream, stretch, sweep scan, head bob, sneeze, and
+dance. Cooldowns, bounded durations, timed blinks, and micro-saccades are
+state, not sleeps. All output is reconstructed through KEP2's signed/unit
+domain constructors after explicit saturation to `[-1000,1000]` or
+`[0,1000]`; the frame path retains no untyped eye values.
+
+This layer animates the eyes only. Act names describe their character intent;
+they do not authorize matching servo choreography. Physical head following
+continues through the separately calibrated camera-to-head gaze mapping and
+single head actor. This deliberately avoids treating offsets copied from an
+older Python process as reviewed servo calibration.
+
 Semantic expressions project exhaustively:
 
 | Core | KEP2 |

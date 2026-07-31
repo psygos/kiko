@@ -22,8 +22,8 @@ use kiko_expression_core::{
     RgbObservation, StreamEpochId, TimeError,
 };
 use kiko_expression_runtime::{
-    AdaptError, CameraForwardDepthMeters, CameraToHeadGazeExtrinsics, EyeRenderStyle,
-    FaceTargetState, FaceTrackingUpdate, HeadGazeProjectionError, HeadRelativeGaze,
+    AdaptError, AutonomicCharacterEngine, CameraForwardDepthMeters, CameraToHeadGazeExtrinsics,
+    EyeRenderStyle, FaceTargetState, FaceTrackingUpdate, HeadGazeProjectionError, HeadRelativeGaze,
     MonotonicLatestAdmission, MonotonicLatestGap, OakCameraTargetPoint, OakCameraTargetRay,
     PreparedEyeIntent, RayHeadGazeProjectionError, SceneAnalysis, SceneMotionConfig,
     SceneMotionError, SceneMotionExtractor, adapt_reaction_output,
@@ -267,6 +267,7 @@ pub struct RgbExpressionBridge<C> {
     gaze_geometry: Option<CameraToHeadGazeExtrinsics>,
     extractor: SceneMotionExtractor,
     mixer: ReactionMixer,
+    character: Option<AutonomicCharacterEngine>,
     last_device_timestamp_ns: Option<i64>,
 }
 
@@ -278,14 +279,16 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
     /// clock adapters whose `Clone` implementation preserves the origin, such
     /// as [`kiko_eye_runtime::TokioClock`].
     pub fn new(stream_epoch: StreamEpochId, config: NanoRgbExpressionConfig, clock: C) -> Self {
-        Self::from_parts(
+        let mut bridge = Self::from_parts(
             stream_epoch,
             config.scene_motion(),
             config.frame_freshness(),
             config.render_style(),
             config.gaze_geometry(),
             clock,
-        )
+        );
+        bridge.character = Some(AutonomicCharacterEngine::new(stream_epoch.get()));
+        bridge
     }
 
     fn from_parts(
@@ -304,6 +307,7 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
             gaze_geometry,
             extractor: SceneMotionExtractor::new(scene_motion),
             mixer: ReactionMixer::new(RGB_EXPRESSION_HEAD_POLICY),
+            character: None,
             last_device_timestamp_ns: None,
         }
     }
@@ -468,6 +472,14 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         self.last_device_timestamp_ns = Some(frame.device_timestamp_ns);
 
         let scene = analysis.observation();
+        let face_present = face.is_some_and(|update| {
+            matches!(
+                update.state(),
+                FaceTargetState::Tracked(_)
+                    | FaceTargetState::Switched(_)
+                    | FaceTargetState::Coasting(_)
+            )
+        });
         let face_intent = face
             .map(face_attention_intent)
             .transpose()
@@ -485,6 +497,10 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         );
         let prepared = adapt_reaction_output(reaction, ExpressionKind::Curious, self.style, now)
             .map_err(RgbExpressionBridgeError::Adapt)?;
+        let prepared = match self.character.as_mut() {
+            Some(character) => character.render(now, face_present, prepared),
+            None => prepared,
+        };
 
         Ok(match admitted.admission() {
             MonotonicLatestAdmission::ColdStart => {
@@ -792,6 +808,33 @@ mod tests {
         assert_eq!(prepared.intent().brightness().get(), 500);
         assert_eq!(prepared.intent().color_rgb(), [4, 5, 6]);
         assert!(prepared.intent().flags().requests_blink());
+    }
+
+    #[test]
+    fn production_character_layer_decorates_without_retagging_frame_freshness() {
+        let mut baseline = bridge(TestClock::new(10));
+        let baseline = baseline
+            .process_borrowed(rgb(4, 1_000, &[0; 12]))
+            .expect("baseline cold start")
+            .into_prepared();
+        let mut decorated = bridge(TestClock::new(10));
+        decorated.character = Some(AutonomicCharacterEngine::new(stream_epoch().get()));
+
+        let outcome = decorated
+            .process_borrowed(rgb(4, 1_000, &[0; 12]))
+            .expect("autonomic cold start");
+        let prepared = outcome.into_prepared();
+        assert_eq!(prepared.generated_at(), baseline.generated_at());
+        assert_eq!(
+            prepared.valid_until_exclusive(),
+            baseline.valid_until_exclusive()
+        );
+        assert_eq!(prepared.intent().expression(), Expression::Neutral);
+        assert_ne!(
+            prepared.intent().color_rgb(),
+            [4, 5, 6],
+            "the production character layer, not the transport adapter, owns idle styling"
+        );
     }
 
     #[test]

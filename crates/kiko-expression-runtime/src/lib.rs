@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod autonomic;
 mod face_tracking;
 mod gaze_geometry;
 mod head_gaze_calibration;
@@ -29,6 +30,7 @@ pub use adapter::{
     AdaptError, EyeRenderStyle, PreparedEyeIntent, adapt_eye_intention, adapt_reaction_output,
     map_expression,
 };
+pub use autonomic::{AutonomicCharacterEngine, CharacterAct, CharacterMode};
 pub use face_tracking::{
     AcquiringFaceTarget, CloserFaceWidthRatio, CoastingFaceTarget, ConsecutiveFaceResults,
     DEFAULT_FACE_ACQUISITION_DISTANCE_PX, DEFAULT_FACE_ACQUISITION_RESULTS,

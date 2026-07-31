@@ -62,8 +62,32 @@ pub struct PreparedEyeIntent {
 }
 
 impl PreparedEyeIntent {
+    #[cfg(test)]
+    pub(crate) const fn from_parts(
+        intent: EyeIntent,
+        generated_at: MonotonicTimestamp,
+        valid_until_exclusive: Option<Deadline>,
+    ) -> Self {
+        Self {
+            intent,
+            generated_at,
+            valid_until_exclusive,
+        }
+    }
+
     pub const fn intent(self) -> EyeIntent {
         self.intent
+    }
+
+    /// Replace only the already parsed KEP2 rendering intent while preserving
+    /// the exact host freshness carried by this reaction.
+    ///
+    /// This is the narrow composition seam for deterministic autonomic eye
+    /// animation. [`EyeIntent`] construction has already made every numeric
+    /// field and protocol enum valid; callers cannot retag the source clock or
+    /// extend the reaction lifetime through this method.
+    pub const fn with_intent(self, intent: EyeIntent) -> Self {
+        Self { intent, ..self }
     }
 
     pub const fn generated_at(self) -> MonotonicTimestamp {
