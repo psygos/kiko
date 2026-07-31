@@ -76,6 +76,14 @@ function snapshot() {
 
 assert.equal(model.parseConsoleSnapshot(snapshot()).revision, "9");
 
+{
+  const attended = snapshot();
+  attended.authority_kind = "attended_navigation_trial";
+  const parsed = model.parseConsoleSnapshot(attended);
+  assert.equal(parsed.authority_kind, "attended_navigation_trial");
+  assert.equal(parsed.qualification_motion_gate, null);
+}
+
 function qualificationSnapshot(motionAuthorityEnabled) {
   const value = snapshot();
   value.authority_kind = "wheels_off_qualification";

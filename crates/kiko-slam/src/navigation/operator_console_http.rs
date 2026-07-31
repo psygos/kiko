@@ -2380,7 +2380,9 @@ mod tests {
         assert!(VIEW_MODEL_JS.contains("map.grid geometry contract is unsupported"));
         assert!(VIEW_MODEL_JS.contains("function authorityView(snapshot, sessionId)"));
         assert!(VIEW_MODEL_JS.contains("function readinessView(snapshot)"));
-        assert!(APP_JS.contains("const production = productionAuthority();"));
+        assert!(APP_JS.contains("function navigationAuthority()"));
+        assert!(APP_JS.contains("ATTENDED_TRIAL_AUTHORITY_KIND"));
+        assert!(!APP_JS.contains("attended navigation trial controls are not implemented"));
         assert!(
             !APP_JS.contains("qualificationProfile() == null"),
             "absence of a qualification field must never imply production authority"
@@ -2405,10 +2407,10 @@ mod tests {
             "&& [\"arm\", \"autonomous_frontier_explore\", \"save_map\"].includes(intent)"
         ));
         assert!(APP_JS.contains(
-            "production && !terminal && !state.driveSafety.localInhibit && mapAvailable"
+            "navigation && !terminal && !state.driveSafety.localInhibit && mapAvailable"
         ));
-        assert!(APP_JS.contains("disarm: production && !terminal"));
-        assert!(APP_JS.contains("autonomous_map_only: production && !terminal"));
+        assert!(APP_JS.contains("disarm: navigation && !terminal"));
+        assert!(APP_JS.contains("autonomous_map_only: navigation && !terminal"));
         assert!(APP_JS.contains("stop: !terminal"));
         let handler_start = APP_JS
             .find("document.querySelectorAll(\"[data-intent]\").forEach((button) => {")

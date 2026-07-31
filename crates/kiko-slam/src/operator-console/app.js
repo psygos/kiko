@@ -297,8 +297,11 @@
     return state.snapshot?.authority_kind || null;
   }
 
-  function productionAuthority() {
-    return runtimeAuthorityKind() === PRODUCTION_AUTHORITY_KIND;
+  function navigationAuthority() {
+    return [
+      PRODUCTION_AUTHORITY_KIND,
+      ATTENDED_TRIAL_AUTHORITY_KIND,
+    ].includes(runtimeAuthorityKind());
   }
 
   function wheelsOffAuthority() {
@@ -805,16 +808,12 @@
 
   function parsedControlProfile(snapshot) {
     const raw = snapshot.control_profile;
-    if (snapshot.authority_kind === PRODUCTION_AUTHORITY_KIND) {
+    if ([PRODUCTION_AUTHORITY_KIND, ATTENDED_TRIAL_AUTHORITY_KIND]
+      .includes(snapshot.authority_kind)) {
       if (raw != null && raw.kind !== PRODUCTION_CONTROL_PROFILE_KIND) {
-        throw new Error("production authority contradicts its control profile");
+        throw new Error("navigation authority contradicts its SI control profile");
       }
       return Object.freeze({ kind: PRODUCTION_CONTROL_PROFILE_KIND });
-    }
-    if (snapshot.authority_kind === ATTENDED_TRIAL_AUTHORITY_KIND) {
-      throw new Error(
-        "attended navigation trial controls are not implemented in this console build",
-      );
     }
     if (snapshot.authority_kind !== WHEELS_OFF_AUTHORITY_KIND) {
       throw new Error("unsupported runtime authority kind");
@@ -931,7 +930,7 @@
   }
 
   function qualificationMotionReady() {
-    if (!wheelsOffAuthority()) return productionAuthority();
+    if (!wheelsOffAuthority()) return navigationAuthority();
     if (!qualificationProfile()) return false;
     return state.snapshot?.qualification_motion_gate?.ready === true
       && state.sessionMotionAuthorityCurrent;
@@ -980,8 +979,8 @@
   function updateControlAvailability() {
     const qualificationReady = qualificationMotionReady();
     const terminal = state.snapshot?.terminal != null;
-    const production = productionAuthority();
-    const sensorMotionReady = !production
+    const navigation = navigationAuthority();
+    const sensorMotionReady = !navigation
       || state.snapshot?.health?.oak === "ready";
     const enabled = !terminal
       && !state.driveSafety.localInhibit
@@ -998,17 +997,17 @@
     // because they reduce motion. New authority/motion and persistence require
     // a fresh observation; Save Map also requires an exact published grid.
     const availability = {
-      arm: production && !terminal && !state.driveSafety.localInhibit,
-      disarm: production && !terminal,
-      autonomous_map_only: production && !terminal,
+      arm: navigation && !terminal && !state.driveSafety.localInhibit,
+      disarm: navigation && !terminal,
+      autonomous_map_only: navigation && !terminal,
       autonomous_frontier_explore:
-        production
+        navigation
         && !terminal
         && !state.driveSafety.localInhibit
         && sensorMotionReady
         && localizedMap,
       save_map:
-        production && !terminal && !state.driveSafety.localInhibit && mapAvailable,
+        navigation && !terminal && !state.driveSafety.localInhibit && mapAvailable,
       stop: !terminal,
     };
     document.querySelectorAll("[data-intent]").forEach((button) => {
@@ -1422,7 +1421,7 @@
   }
 
   canvas.addEventListener("click", async (event) => {
-    if (!productionAuthority()) {
+    if (!navigationAuthority()) {
       toast(
         runtimeAuthorityKind() === WHEELS_OFF_AUTHORITY_KIND
           ? "Qualification keeps autonomous actuation disabled; map, path, and MPC remain observational."
