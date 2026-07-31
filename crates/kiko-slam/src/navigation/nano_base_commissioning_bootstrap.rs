@@ -1902,7 +1902,7 @@ impl AdmittedNanoBaseCommissioningRun {
         let owner = V2ControllerOwner::start(self.server, self.profile.command_endpoint)
             .await
             .map_err(CommissioningControllerStartError::Owner)?;
-        let (physical, initial_zero) =
+        let (mut physical, initial_zero) =
             match PhysicalActuationSession::acquire_commissioning(client_config, clock_origin) {
                 Ok(value) => value,
                 Err(source) => {
@@ -1919,11 +1919,25 @@ impl AdmittedNanoBaseCommissioningRun {
                 owner_shutdown: owner_shutdown.map(Box::new),
             });
         }
+        let head_gaze_lease_issuer =
+            match physical.install_head_gaze_base_interlock_from_initial_receipt(&initial_zero) {
+                Ok(issuer) => issuer,
+                Err(source) => {
+                    let physical_stop = physical.disarm().err();
+                    let owner_shutdown = owner.shutdown(shutdown_timeout).await.err();
+                    return Err(CommissioningControllerStartError::AttendedTrialInterlock {
+                        source,
+                        physical_stop: physical_stop.map(Box::new),
+                        owner_shutdown: owner_shutdown.map(Box::new),
+                    });
+                }
+            };
         Ok(OwnedNanoAttendedNavigationTrialController {
             driver: Some(LiveMpcControlDriver::from_attended_commissioning(
                 physical, guard,
             )),
             initial_zero: Some(initial_zero),
+            head_gaze_lease_issuer: Some(head_gaze_lease_issuer),
             authority: self.authority,
             policy: self.policy,
             stream: self.stream,
@@ -1951,6 +1965,12 @@ pub enum CommissioningControllerStartError {
         maximum_abs_pwm_percent: u8,
         expires_at_ns: u64,
     },
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    AttendedTrialInterlock {
+        source: LiveActuationError,
+        physical_stop: Option<Box<LiveActuationError>>,
+        owner_shutdown: Option<Box<V2ControllerOwnerTerminationError>>,
+    },
 }
 
 impl fmt::Display for CommissioningControllerStartError {
@@ -1971,6 +1991,8 @@ impl std::error::Error for CommissioningControllerStartError {
             Self::InitialZeroNotExact { .. } => None,
             #[cfg(feature = "nano-attended-navigation-trial")]
             Self::AttendedTrialGuard { .. } => None,
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Self::AttendedTrialInterlock { source, .. } => Some(source),
         }
     }
 }
@@ -1982,6 +2004,7 @@ impl std::error::Error for CommissioningControllerStartError {
 pub struct OwnedNanoAttendedNavigationTrialController {
     driver: Option<LiveMpcControlDriver>,
     initial_zero: Option<AppliedCommandReceipt>,
+    head_gaze_lease_issuer: Option<kiko_head_runtime::HeadGazeBaseZeroExclusiveLeaseIssuer>,
     authority: AdmittedAttendedCommissioning,
     policy: NanoBaseCommissioningPolicyV1,
     stream: AdmittedCommissioningObservationStream,
@@ -1997,13 +2020,26 @@ impl OwnedNanoAttendedNavigationTrialController {
     /// attended evidence remain owned here for supervised terminal shutdown.
     pub fn take_motion_driver(
         &mut self,
-    ) -> Result<(LiveMpcControlDriver, AppliedCommandReceipt), AttendedTrialDriverTransferError>
-    {
-        match (self.driver.take(), self.initial_zero.take()) {
-            (Some(driver), Some(initial_zero)) => Ok((driver, initial_zero)),
-            (driver, initial_zero) => {
+    ) -> Result<
+        (
+            LiveMpcControlDriver,
+            AppliedCommandReceipt,
+            kiko_head_runtime::HeadGazeBaseZeroExclusiveLeaseIssuer,
+        ),
+        AttendedTrialDriverTransferError,
+    > {
+        match (
+            self.driver.take(),
+            self.initial_zero.take(),
+            self.head_gaze_lease_issuer.take(),
+        ) {
+            (Some(driver), Some(initial_zero), Some(head_gaze_lease_issuer)) => {
+                Ok((driver, initial_zero, head_gaze_lease_issuer))
+            }
+            (driver, initial_zero, head_gaze_lease_issuer) => {
                 self.driver = driver;
                 self.initial_zero = initial_zero;
+                self.head_gaze_lease_issuer = head_gaze_lease_issuer;
                 Err(AttendedTrialDriverTransferError)
             }
         }
@@ -2024,6 +2060,7 @@ impl OwnedNanoAttendedNavigationTrialController {
         let Self {
             driver: _,
             initial_zero: _,
+            head_gaze_lease_issuer: _,
             authority: _,
             policy,
             stream,
