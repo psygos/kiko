@@ -9,6 +9,8 @@ use std::io::{BufRead, IsTerminal, Write};
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 use std::os::unix::fs::OpenOptionsExt;
 
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+use kiko_device_inventory::ArtifactRelativePath;
 #[cfg(all(feature = "nano-agent", unix))]
 use kiko_expression_core::{ChannelOrder, ImagePoint, StreamEpochId};
 #[cfg(all(feature = "nano-agent", unix))]
@@ -34,6 +36,15 @@ use kiko_slam::dense::{
         TimedOccupancySnapshot,
     },
     ring_buffer::DepthRingBuffer,
+};
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+use kiko_slam::navigation::nano_base_commissioning_bootstrap::{
+    AttendedNavigationTrialMotionAdmission, CommissioningClockEpoch,
+    OwnedNanoAttendedNavigationTrialController, prepare_nano_base_commissioning,
+};
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+use kiko_slam::navigation::nano_base_commissioning_live::{
+    PreparedAttendedNavigationTrialLiveHardware, prepare_attended_navigation_trial_live_hardware,
 };
 use kiko_slam::{
     BackendConfig, DenseStats, DepthImage, DownscaleFactor, FrameDimensions, FrameId,
@@ -95,17 +106,17 @@ use kiko_slam::navigation::mpc::HostMonotonicClockReadError;
     unix
 ))]
 use kiko_slam::navigation::{
-    AgentControlDispatchResponseError, AgentControlDispatcher, AgentControlMonotonicOrigin,
-    AgentControlRejectionCodeV1, AgentControlSocketCleanupOutcome, AgentControlSocketTask,
-    AgentControlSocketTaskExit, AgentControlSocketTaskJoinError, AgentControlSocketTaskStartError,
-    AgentControllerStopKnowledge, AgentLiveActuationDisposition, AgentLocalizationStateV1,
-    AgentManualControlCore, AgentManualRuntimePolicy, AgentMapStateV1, CoordinatorMotionModeV1,
-    LiveLifecycleZeroApplied, LiveMotionActuationFaultEvidence, LiveMotionMapAdmissionError,
-    LiveMotionOperationError, LiveMotionOwner, LiveMotionOwnerError, LiveMotionOwnerOutcome,
-    LiveMotionTerminalStop, LivePhysicalStateEvent, NanoAccessoryHealthObserver,
-    NanoAgentControlConfig, NanoLiveModePolicy, NanoManualPlantBindingError,
-    PreparedNanoProductionRuntime, PreparedNanoProductionRuntimeParts, VisualAdmissionOutcome,
-    classify_live_actuation_error,
+    AgentAuthoritySupervisor, AgentControlDispatchResponseError, AgentControlDispatcher,
+    AgentControlMonotonicOrigin, AgentControlRejectionCodeV1, AgentControlSocketCleanupOutcome,
+    AgentControlSocketTask, AgentControlSocketTaskExit, AgentControlSocketTaskJoinError,
+    AgentControlSocketTaskStartError, AgentControllerStopKnowledge, AgentLiveActuationDisposition,
+    AgentLocalizationStateV1, AgentManualControlCore, AgentManualRuntimePolicy, AgentMapStateV1,
+    CoordinatorMotionModeV1, LiveLifecycleZeroApplied, LiveMotionActuationFaultEvidence,
+    LiveMotionMapAdmissionError, LiveMotionOperationError, LiveMotionOwner, LiveMotionOwnerError,
+    LiveMotionOwnerOutcome, LiveMotionTerminalStop, LivePhysicalStateEvent,
+    ManifestBoundNanoAgentPolicyConfigV3, NanoAccessoryHealthObserver, NanoLiveModePolicy,
+    NanoManualPlantBindingError, PreparedNanoProductionRuntime, PreparedNanoProductionRuntimeParts,
+    VisualAdmissionOutcome, classify_live_actuation_error,
 };
 #[cfg(all(
     feature = "record",
@@ -304,6 +315,8 @@ enum Command {
     NanoAgent(NanoAgentArgs),
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     NanoWheelsOffQualification(NanoWheelsOffQualificationArgs),
+    #[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+    NanoAttendedNavigationTrial(NanoAttendedNavigationTrialArgs),
     Viz(VizArgs),
     Bench(BenchArgs),
 }
@@ -840,6 +853,24 @@ struct NanoWheelsOffQualificationArgs {
     fault_injection: Option<kiko_slam::navigation::WheelsOffQualificationFaultInjection>,
 }
 
+/// Foreground-only wheel-on trial. The commissioning launch binds the
+/// candidate controller, OAK graph, accessories, navigation policy, and plant.
+/// Physical claims are accepted only through the fresh controlling-TTY
+/// ceremony; no flag or environment value can bypass it.
+#[derive(Args, Clone, Debug)]
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+struct NanoAttendedNavigationTrialArgs {
+    /// Root-owned directory containing the commissioning launch and all bound assets.
+    #[arg(long, value_name = "ABSOLUTE_DIRECTORY")]
+    deployment_root: PathBuf,
+    /// Canonical deployment-relative attended commissioning launch document.
+    #[arg(long, value_name = "RELATIVE_JSON")]
+    launch_config: String,
+    /// Persistent state root for live maps, datasets, and attended evidence.
+    #[arg(long, value_name = "ABSOLUTE_DIRECTORY")]
+    state_root: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BackendArg {
     #[value(name = "auto")]
@@ -1288,6 +1319,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::NanoAgent(args) => run_nano_agent(args),
         #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
         Command::NanoWheelsOffQualification(args) => run_nano_wheels_off_qualification(args),
+        #[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+        Command::NanoAttendedNavigationTrial(args) => run_nano_attended_navigation_trial(args),
         Command::Viz(args) => run_viz(args),
         Command::Bench(args) => run_bench(args),
     }
@@ -5886,8 +5919,75 @@ enum LiveNavigationWorkerMotion {
         reason = "constructed by the Nano launch owner once launch admission is wired"
     )]
     Production(Box<LiveProductionMotionInput>),
+    #[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+    AttendedNavigationTrial(Box<LiveAttendedNavigationTrialMotionInput>),
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     WheelsOffQualification(Box<LiveWheelsOffQualificationMotionInput>),
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+struct LiveAttendedNavigationTrialMotionInput {
+    admission: Option<AttendedNavigationTrialMotionAdmission>,
+    accessory_health: NanoAccessoryHealthObserver,
+    rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+impl LiveAttendedNavigationTrialMotionInput {
+    fn new(
+        admission: AttendedNavigationTrialMotionAdmission,
+        accessory_health: NanoAccessoryHealthObserver,
+        rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
+    ) -> Self {
+        Self {
+            admission: Some(admission),
+            accessory_health,
+            rerun_diagnostics_url,
+        }
+    }
+
+    fn head_gaze_lease_issuer(
+        &self,
+    ) -> Option<&kiko_head_runtime::HeadGazeBaseZeroExclusiveLeaseIssuer> {
+        self.admission
+            .as_ref()
+            .map(|admission| &admission.head_gaze_lease_issuer)
+    }
+
+    fn take_for_owner(
+        &mut self,
+    ) -> (
+        AttendedNavigationTrialMotionAdmission,
+        NanoAccessoryHealthObserver,
+        ConsoleRerunDiagnosticsUrl,
+    ) {
+        (
+            self.admission
+                .take()
+                .expect("attended motion admission transfers exactly once"),
+            self.accessory_health.clone(),
+            self.rerun_diagnostics_url,
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+impl Drop for LiveAttendedNavigationTrialMotionInput {
+    fn drop(&mut self) {
+        let Some(mut admission) = self.admission.take() else {
+            return;
+        };
+        match admission.driver.disarm() {
+            Ok(receipt) => eprintln!(
+                "unused attended navigation admission explicitly disarmed: boot_id={} request_id={}",
+                receipt.observed_boot_id().get(),
+                receipt.request_id().get(),
+            ),
+            Err(source) => eprintln!(
+                "unused attended navigation admission could not prove controller stop: {source}"
+            ),
+        }
+    }
 }
 
 #[cfg(all(
@@ -5898,7 +5998,6 @@ enum LiveNavigationWorkerMotion {
 ))]
 struct LiveProductionMotionInput {
     prepared: Option<PreparedNanoProductionRuntime>,
-    control: NanoAgentControlConfig,
     coordinator_actuation_config: NavigationActuationConfigV1,
     accessory_health: NanoAccessoryHealthObserver,
     #[cfg(all(feature = "nano-agent", feature = "operator-console"))]
@@ -5918,11 +6017,9 @@ impl LiveProductionMotionInput {
         accessory_health: NanoAccessoryHealthObserver,
         rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
     ) -> Self {
-        let control = prepared.startup().policy.control().clone();
         let coordinator_actuation_config = prepared.actuation().config().clone();
         Self {
             prepared: Some(prepared),
-            control,
             coordinator_actuation_config,
             accessory_health,
             rerun_diagnostics_url,
@@ -5943,21 +6040,28 @@ impl LiveProductionMotionInput {
             .map(PreparedNanoProductionRuntime::head_gaze_lease_issuer)
     }
 
-    fn take_for_owner(
-        &mut self,
-    ) -> (
-        PreparedNanoProductionRuntimeParts,
-        NanoAgentControlConfig,
-        NavigationActuationConfigV1,
-        NanoAccessoryHealthObserver,
-    ) {
+    fn take_for_owner(&mut self) -> (LiveAgentMotionStartInput, NanoAccessoryHealthObserver) {
+        let PreparedNanoProductionRuntimeParts {
+            startup,
+            actuation,
+            physical_driver,
+            initial_zero: _,
+            head_gaze_lease_issuer: _,
+        } = self
+            .prepared
+            .take()
+            .expect("production admission is transferred exactly once")
+            .into_parts();
+        let admitted_actuation_config = actuation.config().clone();
         (
-            self.prepared
-                .take()
-                .expect("production admission is transferred exactly once")
-                .into_parts(),
-            self.control.clone(),
-            self.coordinator_actuation_config.clone(),
+            LiveAgentMotionStartInput {
+                policy: startup.policy,
+                authority: startup.authority,
+                physical_driver,
+                admitted_actuation_config: Some(admitted_actuation_config),
+                coordinator_actuation_config: Some(self.coordinator_actuation_config.clone()),
+                kind: LiveAgentAuthorityKind::Production,
+            },
             self.accessory_health.clone(),
         )
     }
@@ -6107,9 +6211,53 @@ impl LiveNavigationWorkerMotion {
     feature = "agent-runtime",
     unix
 ))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveAgentAuthorityKind {
+    Production,
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    AttendedNavigationTrial,
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+impl LiveAgentAuthorityKind {
+    #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
+    const fn console(self) -> ConsoleRuntimeAuthorityKind {
+        match self {
+            Self::Production => ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Self::AttendedNavigationTrial => ConsoleRuntimeAuthorityKind::AttendedNavigationTrial,
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
+struct LiveAgentMotionStartInput {
+    policy: ManifestBoundNanoAgentPolicyConfigV3,
+    authority: AgentAuthoritySupervisor,
+    physical_driver: LiveMpcControlDriver,
+    admitted_actuation_config: Option<NavigationActuationConfigV1>,
+    coordinator_actuation_config: Option<NavigationActuationConfigV1>,
+    kind: LiveAgentAuthorityKind,
+}
+
+#[cfg(all(
+    feature = "record",
+    feature = "actuation",
+    feature = "agent-runtime",
+    unix
+))]
 #[derive(Debug)]
 enum LiveProductionOwnerStartPrimary {
-    ControlConfigMismatch,
     ClockEpochMismatch {
         coordinator_origin_ns: u64,
         supervisor_origin_ns: u64,
@@ -6137,22 +6285,19 @@ enum LiveProductionOwnerStartPrimary {
 impl std::fmt::Display for LiveProductionOwnerStartPrimary {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ControlConfigMismatch => formatter.write_str(
-                "production control config does not equal the config bound into startup admission",
-            ),
             Self::ClockEpochMismatch {
                 coordinator_origin_ns,
                 supervisor_origin_ns,
             } => write!(
                 formatter,
-                "production coordinator clock origin {coordinator_origin_ns} ns differs from supervisor origin {supervisor_origin_ns} ns"
+                "live-agent coordinator clock origin {coordinator_origin_ns} ns differs from supervisor origin {supervisor_origin_ns} ns"
             ),
             Self::ActuationConfigMismatch => formatter.write_str(
-                "production controller admission does not equal the actuation config bound to this coordinator",
+                "live-agent controller admission does not equal the actuation config bound to this coordinator",
             ),
             Self::CoordinatorNotMappingOnly { actual } => write!(
                 formatter,
-                "production owner must start mapping-only, but the coordinator starts in {actual:?}"
+                "live-agent owner must start mapping-only, but the coordinator starts in {actual:?}"
             ),
             Self::ManualPlantBinding(source) => source.fmt(formatter),
             Self::ControlSocket(source) => source.fmt(formatter),
@@ -6183,8 +6328,7 @@ impl std::error::Error for LiveProductionOwnerStartPrimary {
             Self::AccessoryHealth(source) => Some(source),
             #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
             Self::ConsoleFrontend(source) => Some(source),
-            Self::ControlConfigMismatch
-            | Self::ClockEpochMismatch { .. }
+            Self::ClockEpochMismatch { .. }
             | Self::ActuationConfigMismatch
             | Self::CoordinatorNotMappingOnly { .. } => None,
         }
@@ -6229,7 +6373,7 @@ impl std::fmt::Display for LiveProductionOwnerStartError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "production motion-owner startup failed: {}",
+            "live-agent motion-owner startup failed: {}",
             self.primary
         )?;
         match &self.controller_stop {
@@ -6575,10 +6719,10 @@ impl std::fmt::Display for LiveProductionMapStateError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BindingWithoutRevision => formatter.write_str(
-                "production map state has a coordinator binding without its admitted revision",
+                "live-agent map state has a coordinator binding without its admitted revision",
             ),
             Self::RevisionWithoutBinding => formatter.write_str(
-                "production map state has an admitted revision without a coordinator binding",
+                "live-agent map state has an admitted revision without a coordinator binding",
             ),
         }
     }
@@ -6684,21 +6828,21 @@ impl Drop for LiveProductionMotionRuntime {
             if let Some(adapter) = console.as_mut().and_then(|console| console.adapter.take()) {
                 let outcome = adapter.shutdown(&report);
                 if !outcome.controller_stop_confirmed || outcome.lifecycle_cleanup_failed {
-                    eprintln!("production console unwind terminalized fail-closed: {outcome:?}");
+                    eprintln!("live-agent console unwind terminalized fail-closed: {outcome:?}");
                 }
             }
             if let Some(source) = report.lifecycle_cleanup() {
                 eprintln!(
-                    "production motion owner unwound with lifecycle cleanup failure: {source}"
+                    "live-agent motion owner unwound with lifecycle cleanup failure: {source}"
                 );
             }
             match report.controller_stop() {
                 LiveMotionTerminalStop::Confirmed(_) => {}
                 LiveMotionTerminalStop::DisarmFailedStopConfirmed(source) => eprintln!(
-                    "production motion owner unwind disarm failed, but recovery proved controller stop: {source}"
+                    "live-agent motion owner unwind disarm failed, but recovery proved controller stop: {source}"
                 ),
                 LiveMotionTerminalStop::Uncertain(source) => eprintln!(
-                    "production motion owner unwind could not prove controller stop: {source}"
+                    "live-agent motion owner unwind could not prove controller stop: {source}"
                 ),
             }
         }
@@ -6710,7 +6854,7 @@ impl Drop for LiveProductionMotionRuntime {
             let evidence = frontend.shutdown();
             let retains_live_http_owner = evidence.retains_live_http_owner();
             if !evidence.is_clean() {
-                eprintln!("production console unwind cleanup was not clean: {evidence}");
+                eprintln!("live-agent console unwind cleanup was not clean: {evidence}");
             }
             if !retains_live_http_owner && let Some(console) = console.as_mut() {
                 console.frontend.take();
@@ -6721,7 +6865,7 @@ impl Drop for LiveProductionMotionRuntime {
         if let Some(socket_task) = self.socket_task.take()
             && let Err(source) = socket_task.shutdown()
         {
-            eprintln!("production control socket unwind cleanup failed: {source}");
+            eprintln!("live-agent control socket unwind cleanup failed: {source}");
         }
     }
 }
@@ -6972,7 +7116,7 @@ impl std::fmt::Display for LiveNavigationWorkerError {
             Self::ProductionMapAdmission { source } => {
                 write!(
                     formatter,
-                    "production global-map navigation admission failed: {source}"
+                    "live-agent global-map navigation admission failed: {source}"
                 )
             }
             #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
@@ -7056,7 +7200,7 @@ impl std::fmt::Display for LiveNavigationWorkerError {
             #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
             Self::ProductionConsoleFrontendExited { evidence } => write!(
                 formatter,
-                "operator-console HTTP owner exited before production shutdown; motion is being stopped: {evidence}"
+                "operator-console HTTP owner exited before live-agent shutdown; motion is being stopped: {evidence}"
             ),
             #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
             Self::ProductionConsoleProjection { source } => source.fmt(formatter),
@@ -7116,7 +7260,7 @@ impl std::fmt::Display for LiveNavigationWorkerError {
             ))]
             Self::ProductionSaveMapResponse { source } => write!(
                 formatter,
-                "unwired production map persistence was rejected but the response failed: {source}"
+                "unwired live-agent map persistence was rejected but the response failed: {source}"
             ),
             #[cfg(all(feature = "nano-agent", unix))]
             Self::MapPersistenceRetention { source } => source.fmt(formatter),
@@ -7125,23 +7269,23 @@ impl std::fmt::Display for LiveNavigationWorkerError {
                 .write_str("an admitted occupancy snapshot has no current coordinator map binding"),
             #[cfg(all(feature = "nano-agent", unix))]
             Self::ProductionMapPersistenceUnavailable { response: None } => formatter.write_str(
-                "production accepted a save-map request without a map persistence owner",
+                "live-agent runtime accepted a save-map request without a map persistence owner",
             ),
             #[cfg(all(feature = "nano-agent", unix))]
             Self::ProductionMapPersistenceUnavailable {
                 response: Some(source),
             } => write!(
                 formatter,
-                "production accepted a save-map request without a map persistence owner; rejection response also failed: {source}"
+                "live-agent runtime accepted a save-map request without a map persistence owner; rejection response also failed: {source}"
             ),
             #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
             Self::ProductionLifecycleCleanup { source } => {
-                write!(formatter, "production lifecycle cleanup failed: {source}")
+                write!(formatter, "live-agent lifecycle cleanup failed: {source}")
             }
             #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
             Self::ProductionControllerStop { source } => write!(
                 formatter,
-                "production shutdown could not prove controller stop: {source}"
+                "live-agent shutdown could not prove controller stop: {source}"
             ),
             #[cfg(all(feature = "actuation", feature = "agent-runtime", unix))]
             Self::ProductionSocketJoin { source } => source.fmt(formatter),
@@ -7808,31 +7952,26 @@ fn start_production_motion_runtime(
     coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
     coordinator_clock_epoch: NavigationClockEpoch,
     clock_origin: Instant,
-    prepared: PreparedNanoProductionRuntimeParts,
-    control: NanoAgentControlConfig,
-    coordinator_actuation_config: NavigationActuationConfigV1,
+    input: LiveAgentMotionStartInput,
     accessory_health: NanoAccessoryHealthObserver,
     #[cfg(all(feature = "operator-console", feature = "nano-agent"))]
     rerun_diagnostics_url: ConsoleRerunDiagnosticsUrl,
     running: Arc<AtomicBool>,
 ) -> Result<LiveProductionMotionRuntime, LiveProductionMotionStartFailure> {
-    let PreparedNanoProductionRuntimeParts {
-        startup,
-        actuation,
+    let LiveAgentMotionStartInput {
+        policy,
+        authority,
         mut physical_driver,
-        initial_zero: _,
-        head_gaze_lease_issuer: _,
-    } = prepared;
-    let live_mode_policy: NanoLiveModePolicy = *startup.policy.live_mode_policy();
+        admitted_actuation_config,
+        coordinator_actuation_config,
+        kind,
+    } = input;
+    #[cfg(not(all(feature = "operator-console", feature = "nano-agent")))]
+    let _ = kind;
+    let control = policy.control().clone();
+    let live_mode_policy: NanoLiveModePolicy = *policy.live_mode_policy();
 
-    if startup.policy.control() != &control {
-        let source = fail_production_owner_start(
-            LiveProductionOwnerStartPrimary::ControlConfigMismatch,
-            &mut physical_driver,
-        );
-        return Err(Box::new((coordinator, source)));
-    }
-    let supervisor_clock_epoch = startup.authority.clock_epoch();
+    let supervisor_clock_epoch = authority.clock_epoch();
     if supervisor_clock_epoch != coordinator_clock_epoch {
         let source = fail_production_owner_start(
             LiveProductionOwnerStartPrimary::ClockEpochMismatch {
@@ -7843,7 +7982,7 @@ fn start_production_motion_runtime(
         );
         return Err(Box::new((coordinator, source)));
     }
-    if actuation.config() != &coordinator_actuation_config {
+    if admitted_actuation_config != coordinator_actuation_config {
         let source = fail_production_owner_start(
             LiveProductionOwnerStartPrimary::ActuationConfigMismatch,
             &mut physical_driver,
@@ -7950,13 +8089,13 @@ fn start_production_motion_runtime(
     let dispatcher = AgentControlDispatcher::new_with_unified_console_authority(
         receiver,
         socket_clock,
-        AgentManualControlCore::new(startup.authority, manual_policy),
+        AgentManualControlCore::new(authority, manual_policy),
     );
     #[cfg(not(all(feature = "operator-console", feature = "nano-agent")))]
     let dispatcher = AgentControlDispatcher::new(
         receiver,
         socket_clock,
-        AgentManualControlCore::new(startup.authority, manual_policy),
+        AgentManualControlCore::new(authority, manual_policy),
     );
     let owner = LiveMotionOwner::new(
         dispatcher,
@@ -7970,7 +8109,7 @@ fn start_production_motion_runtime(
         let mut initial_snapshot = OperatorConsoleSnapshot::unknown(
             ConsoleSnapshotRevision::parse(1)
                 .expect("the static initial console revision is nonzero"),
-            ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+            kind.console(),
         );
         initial_snapshot.rerun_diagnostics_url = Some(rerun_diagnostics_url);
         initial_snapshot.manual_command_envelope = manual_command_envelope;
@@ -7983,8 +8122,7 @@ fn start_production_motion_runtime(
         initial_snapshot.health = ConsoleSubsystemHealth {
             stm32: Some(ConsoleHealth::Ready),
             head: Some(
-                if startup
-                    .policy
+                if policy
                     .head()
                     .return_to_natural_and_hold_continuously()
                     .is_some()
@@ -7994,7 +8132,7 @@ fn start_production_motion_runtime(
                     ConsoleHealth::Unavailable
                 },
             ),
-            eyes: Some(if startup.policy.eye().static_runtime().is_some() {
+            eyes: Some(if policy.eye().static_runtime().is_some() {
                 ConsoleHealth::Ready
             } else {
                 ConsoleHealth::Unavailable
@@ -10010,15 +10148,12 @@ fn run_live_navigation_worker(
             let mut input = *input;
             #[cfg(all(feature = "nano-agent", feature = "operator-console"))]
             let rerun_diagnostics_url = input.rerun_diagnostics_url();
-            let (prepared, control, coordinator_actuation_config, accessory_health) =
-                input.take_for_owner();
+            let (start_input, accessory_health) = input.take_for_owner();
             match start_production_motion_runtime(
                 coordinator,
                 coordinator_clock_epoch,
                 clock_origin,
-                prepared,
-                control,
-                coordinator_actuation_config,
+                start_input,
                 accessory_health,
                 #[cfg(all(feature = "nano-agent", feature = "operator-console"))]
                 rerun_diagnostics_url,
@@ -10035,6 +10170,47 @@ fn run_live_navigation_worker(
                     }
                     combine_live_navigation_failures(failures)?;
                     unreachable!("production startup retained at least one failure")
+                }
+            }
+        }
+        #[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+        LiveNavigationWorkerMotion::AttendedNavigationTrial(input) => {
+            let mut input = *input;
+            let (admission, accessory_health, rerun_diagnostics_url) = input.take_for_owner();
+            let AttendedNavigationTrialMotionAdmission {
+                startup,
+                driver,
+                initial_zero: _,
+                head_gaze_lease_issuer: _,
+            } = admission;
+            let start_input = LiveAgentMotionStartInput {
+                policy: startup.policy,
+                authority: startup.authority,
+                physical_driver: driver,
+                admitted_actuation_config: None,
+                coordinator_actuation_config: None,
+                kind: LiveAgentAuthorityKind::AttendedNavigationTrial,
+            };
+            match start_production_motion_runtime(
+                coordinator,
+                coordinator_clock_epoch,
+                clock_origin,
+                start_input,
+                accessory_health,
+                rerun_diagnostics_url,
+                Arc::clone(&running),
+            ) {
+                Ok(runtime) => LiveNavigationRuntime::Production(Box::new(runtime)),
+                Err(failure) => {
+                    let (coordinator, source) = *failure;
+                    let mut failures = vec![LiveNavigationWorkerError::ProductionStart {
+                        source: Box::new(source),
+                    }];
+                    if let Err(source) = finalize_live_navigation_coordinator(coordinator) {
+                        failures.push(source);
+                    }
+                    combine_live_navigation_failures(failures)?;
+                    unreachable!("attended navigation startup retained at least one failure")
                 }
             }
         }
@@ -10784,7 +10960,7 @@ fn run_live_navigation_worker(
             match controller_stop {
                 LiveMotionTerminalStop::Confirmed(receipt) => {
                     eprintln!(
-                        "production physical owner disarmed: boot_id={} request_id={} acknowledged_at_host_ns={}",
+                        "live-agent physical owner disarmed: boot_id={} request_id={} acknowledged_at_host_ns={}",
                         receipt.observed_boot_id().get(),
                         receipt.request_id().get(),
                         receipt.acknowledged_at().nanos_since_clock_start(),
@@ -12165,6 +12341,8 @@ enum PreparedLiveMotionSelection {
     Compatibility,
     #[cfg(all(feature = "nano-agent", unix))]
     Production(Box<LiveProductionMotionInput>),
+    #[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+    AttendedNavigationTrial(Box<LiveAttendedNavigationTrialMotionInput>),
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     WheelsOffQualification(Box<LiveWheelsOffQualificationMotionInput>),
 }
@@ -12179,6 +12357,8 @@ enum PreparedLiveMotionSelection {
 enum NanoLiveMotionKind {
     Compatibility,
     Production,
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    AttendedNavigationTrial,
     #[cfg(feature = "nano-wheels-off-qualification")]
     WheelsOffQualification,
 }
@@ -12191,14 +12371,12 @@ enum NanoLiveMotionKind {
 ))]
 impl NanoLiveMotionKind {
     const fn requires_navigation_stop_before_accessory_release(self) -> bool {
-        #[cfg(feature = "nano-wheels-off-qualification")]
-        {
-            matches!(self, Self::WheelsOffQualification)
-        }
-        #[cfg(not(feature = "nano-wheels-off-qualification"))]
-        {
-            let _ = self;
-            false
+        match self {
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Self::AttendedNavigationTrial => true,
+            #[cfg(feature = "nano-wheels-off-qualification")]
+            Self::WheelsOffQualification => true,
+            Self::Compatibility | Self::Production => false,
         }
     }
 }
@@ -12214,6 +12392,8 @@ impl PreparedLiveMotionSelection {
         match self {
             Self::Compatibility => NanoLiveMotionKind::Compatibility,
             Self::Production(_) => NanoLiveMotionKind::Production,
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Self::AttendedNavigationTrial(_) => NanoLiveMotionKind::AttendedNavigationTrial,
             #[cfg(feature = "nano-wheels-off-qualification")]
             Self::WheelsOffQualification(_) => NanoLiveMotionKind::WheelsOffQualification,
         }
@@ -12299,15 +12479,18 @@ impl NanoLiveSetupGuard {
             .expect("live setup transfers one motion selection")
     }
 
-    fn bind_production_head_gaze_lease_if_configured(
+    fn bind_head_gaze_lease_if_configured(
         &self,
     ) -> Result<(), kiko_slam::navigation::NanoHeadGazeLeaseBindError> {
-        let Some(PreparedLiveMotionSelection::Production(input)) = self.motion.as_ref() else {
-            return Ok(());
+        let issuer = match self.motion.as_ref() {
+            Some(PreparedLiveMotionSelection::Production(input)) => input.head_gaze_lease_issuer(),
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Some(PreparedLiveMotionSelection::AttendedNavigationTrial(input)) => {
+                input.head_gaze_lease_issuer()
+            }
+            _ => None,
         };
-        let (Some(accessory), Some(issuer)) =
-            (self.accessory.as_ref(), input.head_gaze_lease_issuer())
-        else {
+        let (Some(accessory), Some(issuer)) = (self.accessory.as_ref(), issuer) else {
             return Ok(());
         };
         match accessory.bind_head_gaze_base_zero_lease_issuer(issuer) {
@@ -14446,6 +14629,260 @@ fn prepare_nano_wheels_off_qualification_live_session(
     })
 }
 
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+#[derive(Debug)]
+struct NanoAttendedTrialLivePreparationError {
+    primary: Box<dyn std::error::Error>,
+    controller_shutdown: Option<Box<dyn std::error::Error>>,
+    accessory_shutdown: NanoPreOwnerAccessoryShutdown,
+    oak_close: NanoPreOwnerOakClose,
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+impl std::fmt::Display for NanoAttendedTrialLivePreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Nano attended navigation preparation failed: {}",
+            self.primary
+        )?;
+        if let Some(source) = self.controller_shutdown.as_ref() {
+            write!(
+                formatter,
+                "; controller-owner shutdown also failed: {source}"
+            )?;
+        }
+        write!(
+            formatter,
+            "; {}; OAK close: {:?}",
+            self.accessory_shutdown, self.oak_close
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+impl std::error::Error for NanoAttendedTrialLivePreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+fn fail_attended_trial_hardware<T>(
+    primary: Box<dyn std::error::Error>,
+    controller_shutdown: Option<Box<dyn std::error::Error>>,
+    accessory: NanoAccessoryWorker,
+    oak: Device,
+) -> Result<T, Box<dyn std::error::Error>> {
+    // No controller is active on the ordinary preparation failures. When a
+    // controller owner is supplied, its shutdown has already completed before
+    // this function is called. Close OAK before releasing the held head/eyes.
+    let oak_close = match oak.close() {
+        Ok(()) => NanoPreOwnerOakClose::Confirmed,
+        Err(source) => NanoPreOwnerOakClose::Uncertain(source),
+    };
+    let accessory_shutdown = shutdown_nano_pre_owner_accessory(accessory, false);
+    Err(Box::new(NanoAttendedTrialLivePreparationError {
+        primary,
+        controller_shutdown,
+        accessory_shutdown,
+        oak_close,
+    }))
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+fn fail_attended_trial_after_controller<T>(
+    primary: Box<dyn std::error::Error>,
+    controller: OwnedNanoAttendedNavigationTrialController,
+    async_runtime: &tokio::runtime::Runtime,
+    accessory: NanoAccessoryWorker,
+    oak: Device,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let controller_shutdown = async_runtime
+        .block_on(controller.shutdown_controller())
+        .err()
+        .map(|source| Box::new(source) as Box<dyn std::error::Error>);
+    fail_attended_trial_hardware(primary, controller_shutdown, accessory, oak)
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+#[derive(Clone, Copy)]
+struct NanoAttendedTrialEpochs {
+    stream: StreamEpochId,
+    capture_origin: Instant,
+    navigation: NavigationClockEpoch,
+    readiness: ReadinessEpoch,
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+fn prepare_nano_attended_navigation_trial_live_session(
+    roots: NanoBootstrapRoots,
+    prepared: kiko_slam::navigation::nano_base_commissioning_bootstrap::PreparedNanoBaseCommissioning,
+    hardware: PreparedAttendedNavigationTrialLiveHardware,
+    epochs: NanoAttendedTrialEpochs,
+    running: &Arc<AtomicBool>,
+    async_runtime: &tokio::runtime::Runtime,
+) -> Result<
+    (
+        PreparedLiveSession,
+        OwnedNanoAttendedNavigationTrialController,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let PreparedAttendedNavigationTrialLiveHardware {
+        stream,
+        stereo,
+        live,
+        accessory,
+        oak,
+    } = hardware;
+    let oak_provenance = match inspect_oak_runtime(&oak, "attended navigation") {
+        Ok(value) => value,
+        Err(source) => {
+            return fail_attended_trial_hardware(Box::new(source), None, accessory, oak);
+        }
+    };
+    let inputs = prepared.loaded_inputs();
+    let live_graph = prepared.live_graph();
+    let software = prepare_nano_common_live_software(
+        NanoCommonLiveSoftwareInput {
+            roots: &roots,
+            graph: live_graph.oak(),
+            storage: live_graph.storage(),
+            occupancy: live_graph.occupancy(),
+            inference_policy: live_graph.inference(),
+            rerun: live_graph.rerun(),
+            onnx_runtime: NanoOrtRuntimeInput::RetainedBytes(inputs.onnx_runtime_library.bytes()),
+            superpoint_model: inputs.superpoint_model.bytes(),
+            lightglue_model: inputs.lightglue_model.bytes(),
+            stereo,
+            live,
+            map_persistence: prepared.accessory_policy().map_persistence(),
+            stream_epoch: epochs.stream,
+        },
+        || {
+            if !running.load(Ordering::Acquire) {
+                return Err(Box::new(NanoLivePreparationInterrupted) as Box<dyn std::error::Error>);
+            }
+            match accessory.try_terminal_fault() {
+                Ok(None) => Ok(()),
+                Ok(Some(fault)) => Err(Box::new(LiveAccessoryError::TerminalFault(fault))
+                    as Box<dyn std::error::Error>),
+                Err(source) => Err(Box::new(LiveAccessoryError::FaultMonitor(source))
+                    as Box<dyn std::error::Error>),
+            }
+        },
+    );
+    let software = match software {
+        Ok(value) => value,
+        Err(primary) => {
+            return fail_attended_trial_hardware(primary, None, accessory, oak);
+        }
+    };
+
+    let admitted = match prepared.consume_fresh_attended_attestation(
+        stream,
+        epochs.capture_origin,
+        running.as_ref(),
+    ) {
+        Ok(value) => value,
+        Err(source) => {
+            return fail_attended_trial_hardware(Box::new(source), None, accessory, oak);
+        }
+    };
+    let mut controller = match async_runtime
+        .block_on(admitted.start_attended_navigation_trial_controller(epochs.capture_origin))
+    {
+        Ok(value) => value,
+        Err(source) => {
+            return fail_attended_trial_hardware(Box::new(source), None, accessory, oak);
+        }
+    };
+    let inventory_transition_at = match host_monotonic_since(epochs.capture_origin) {
+        Ok(timestamp) => timestamp,
+        Err(source) => {
+            return fail_attended_trial_after_controller(
+                Box::new(source),
+                controller,
+                async_runtime,
+                accessory,
+                oak,
+            );
+        }
+    };
+    let readiness_transition_at = match host_monotonic_since(epochs.capture_origin) {
+        Ok(timestamp) => timestamp,
+        Err(source) => {
+            return fail_attended_trial_after_controller(
+                Box::new(source),
+                controller,
+                async_runtime,
+                accessory,
+                oak,
+            );
+        }
+    };
+    let admission = match controller.take_live_motion_admission(
+        epochs.navigation,
+        epochs.readiness,
+        inventory_transition_at,
+        readiness_transition_at,
+    ) {
+        Ok(value) => value,
+        Err(source) => {
+            return fail_attended_trial_after_controller(
+                Box::new(source),
+                controller,
+                async_runtime,
+                accessory,
+                oak,
+            );
+        }
+    };
+
+    let accessory_health = accessory.health_observer();
+    Ok((
+        PreparedLiveSession {
+            device: oak,
+            device_session: software.device_session,
+            mono_config: software.mono_config,
+            depth_config: Some(software.depth_config),
+            imu_config: Some(software.imu_config),
+            depth_queue_capacity: Some(software.queue_capacity),
+            depth_ring_capacity: DepthRingCapacity::from_queue_capacity(software.queue_capacity),
+            imu_session: Some(software.device_session),
+            imu_queue_capacity: Some(software.queue_capacity),
+            dense_requested: true,
+            dense_data_capacity: software.queue_capacity,
+            dense_control_capacity: software.dense_control_capacity,
+            pairing_window: software.pairing_window,
+            pairer: software.pairer,
+            calibration: software.calibration,
+            rectified_left_intrinsics: software.rectified_left_intrinsics,
+            prepared_navigation_runtime: Some(software.navigation),
+            inference: software.inference,
+            tracker_initialization: PreparedTrackerInitialization::CanonicalNano,
+            pair_queue_depth: software.queue_size,
+            viz_queue_depth: software.queue_size,
+            rerun_decimation: software.rerun_decimation,
+            rerun_finish_timeout: software.rerun_finish_timeout,
+            rerun_target: software.rerun_target,
+            oak_provenance,
+            motion: PreparedLiveMotionSelection::AttendedNavigationTrial(Box::new(
+                LiveAttendedNavigationTrialMotionInput::new(
+                    admission,
+                    accessory_health,
+                    software.rerun_diagnostics_url,
+                ),
+            )),
+            accessory: Some(accessory),
+            production_state: Some(software.production_state),
+            warm_start_replay: software.warm_start_replay,
+        },
+        controller,
+    ))
+}
+
 #[cfg(all(feature = "nano-agent", unix))]
 fn prepare_nano_live_session(
     bootstrap: PreparedNanoBootstrap,
@@ -14637,6 +15074,94 @@ fn run_nano_wheels_off_qualification(
         finish_nano_controller_owner(operation, controller)
     })();
     finish_attended_wheels_off_qualification(operation, require_post_run_motor_power_disconnected())
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+#[derive(Debug)]
+struct NanoAttendedTrialOperationAndShutdownError {
+    operation: Box<dyn std::error::Error>,
+    shutdown: kiko_slam::navigation::nano_base_commissioning_bootstrap::AttendedTrialControllerShutdownError,
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+impl std::fmt::Display for NanoAttendedTrialOperationAndShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "attended navigation runtime failed: {}; controller-owner shutdown also failed: {}",
+            self.operation, self.shutdown
+        )
+    }
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+impl std::error::Error for NanoAttendedTrialOperationAndShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.operation.as_ref())
+    }
+}
+
+#[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+fn run_nano_attended_navigation_trial(
+    args: NanoAttendedNavigationTrialArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let running = install_live_shutdown_handler()?;
+    let capture_clock_origin = Instant::now();
+    let navigation_clock_epoch = NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(0));
+    let readiness_epoch = ReadinessEpoch::try_new(1)?;
+    let stream_epoch = fresh_nano_stream_epoch()?;
+    let roots = NanoBootstrapRoots::try_new(args.deployment_root.clone(), args.state_root.clone())?;
+    let launch = ArtifactRelativePath::parse(args.launch_config)?;
+    let mut prepared =
+        prepare_nano_base_commissioning(&args.deployment_root, launch, &args.state_root)?;
+    let mut clock_epoch_bytes = [0_u8; 16];
+    getrandom::fill(&mut clock_epoch_bytes)?;
+    let commissioning_clock_epoch = CommissioningClockEpoch::try_new(clock_epoch_bytes)?;
+    let async_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    let hardware = prepare_attended_navigation_trial_live_hardware(
+        &mut prepared,
+        Arc::clone(&running),
+        commissioning_clock_epoch,
+        stream_epoch,
+    )?;
+    let (session, controller) = prepare_nano_attended_navigation_trial_live_session(
+        roots,
+        prepared,
+        hardware,
+        NanoAttendedTrialEpochs {
+            stream: stream_epoch,
+            capture_origin: capture_clock_origin,
+            navigation: navigation_clock_epoch,
+            readiness: readiness_epoch,
+        },
+        &running,
+        &async_runtime,
+    )?;
+    eprintln!(
+        "attended navigation trial ready: one OAK/accessory/STM32 owner, full SLAM and occupancy enabled, loopback console enabled, controller disarmed; Arm still requires a fresh applied zero and every command remains capped by the attended profile and attestation deadline"
+    );
+    let operation = run_prepared_live_session(
+        session,
+        running,
+        capture_clock_origin,
+        navigation_clock_epoch,
+    );
+    let shutdown = async_runtime.block_on(controller.shutdown_controller());
+    drop(async_runtime);
+    match (operation, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Err(shutdown)) => Err(Box::new(shutdown)),
+        (Err(operation), Err(shutdown)) => {
+            Err(Box::new(NanoAttendedTrialOperationAndShutdownError {
+                operation,
+                shutdown,
+            }))
+        }
+    }
 }
 
 #[cfg(all(feature = "nano-agent", unix))]
@@ -14996,7 +15521,7 @@ fn run_prepared_live_session(
         #[cfg(all(feature = "nano-agent", unix))]
         let mut nano_setup_guard = NanoLiveSetupGuard::new(motion, accessory, production_state);
         #[cfg(all(feature = "nano-agent", unix))]
-        nano_setup_guard.bind_production_head_gaze_lease_if_configured()?;
+        nano_setup_guard.bind_head_gaze_lease_if_configured()?;
         #[cfg(all(feature = "nano-agent", unix))]
         let face_stage_stats_handle = nano_setup_guard.face_perception_stage_stats_handle();
         #[cfg(all(feature = "nano-agent", unix))]
@@ -15284,6 +15809,10 @@ fn run_prepared_live_session(
             #[cfg(all(feature = "nano-agent", unix))]
             PreparedLiveMotionSelection::Production(input) => {
                 LiveNavigationWorkerMotion::Production(input)
+            }
+            #[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+            PreparedLiveMotionSelection::AttendedNavigationTrial(input) => {
+                LiveNavigationWorkerMotion::AttendedNavigationTrial(input)
             }
             #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
             PreparedLiveMotionSelection::WheelsOffQualification(input) => {
@@ -15773,7 +16302,7 @@ fn run_prepared_live_session(
                     } => {
                         let address = bind.ip().to_string();
                         eprintln!(
-                            "rerun: serving production diagnostics on {bind} with memory_limit_bytes={memory_limit_bytes}"
+                            "rerun: serving live-agent diagnostics on {bind} with memory_limit_bytes={memory_limit_bytes}"
                         );
                         rerun::RecordingStreamBuilder::new("kiko-nano-agent").serve_grpc_opts(
                             &address,
@@ -17087,6 +17616,14 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 mod tests {
     #[cfg(all(feature = "record", feature = "actuation"))]
     use super::LiveNavigationWorkerMotion;
+    #[cfg(all(
+        unix,
+        any(
+            feature = "nano-attended-navigation-trial",
+            feature = "nano-wheels-off-qualification"
+        )
+    ))]
+    use super::NanoLiveMotionKind;
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     use super::{
         AttendedWheelsOffAttestationError, AttendedWheelsOffPreflight,
@@ -17095,9 +17632,8 @@ mod tests {
         FreshAttendedMotionAttestationInput, FreshAttendedMotionAttestationWorker,
         FreshAttendedMotionAttestationWorkerError, FreshAttendedMotionAttestationWorkerPoll,
         FreshAttendedMotionAttestationWorkerShutdown, InitialMotorPowerDisconnectedClaim,
-        MAX_QUALIFICATION_ATTESTATION_LINE_BYTES, NanoLiveMotionKind,
-        QUALIFICATION_ATTESTATION_CHALLENGE_BYTES, WheelsOffAttestationChallengeSource,
-        WheelsOffQualificationAndMotorPowerDisconnectError,
+        MAX_QUALIFICATION_ATTESTATION_LINE_BYTES, QUALIFICATION_ATTESTATION_CHALLENGE_BYTES,
+        WheelsOffAttestationChallengeSource, WheelsOffQualificationAndMotorPowerDisconnectError,
         WheelsOffQualificationAttestationReadinessBlocker,
         classify_wheels_off_qualification_attestation_readiness,
         finish_attended_wheels_off_qualification, fresh_motion_attestation_must_cancel,
@@ -19430,6 +19966,67 @@ mod tests {
         assert_eq!(args.deployment_root, Path::new("/opt/kiko/deployment"));
         assert_eq!(args.launch_config, "nano-agent-launch-v3.json");
         assert_eq!(args.state_root, Path::new("/var/lib/kiko-nano-agent"));
+    }
+
+    #[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+    #[test]
+    fn attended_navigation_cli_has_no_flag_bypass_for_physical_claims() {
+        let cli = Cli::try_parse_from([
+            "kiko-slam",
+            "nano-attended-navigation-trial",
+            "--deployment-root",
+            "/opt/kiko/deployment",
+            "--launch-config",
+            "commissioning/attended-navigation-launch-v1.json",
+            "--state-root",
+            "/var/lib/kiko-nano-attended-trial",
+        ])
+        .expect("attended command has only immutable deployment and state boundaries");
+        let Command::NanoAttendedNavigationTrial(args) = cli.command else {
+            panic!("expected attended navigation command");
+        };
+        assert_eq!(args.deployment_root, Path::new("/opt/kiko/deployment"));
+        assert_eq!(
+            args.launch_config,
+            "commissioning/attended-navigation-launch-v1.json"
+        );
+        assert_eq!(
+            args.state_root,
+            Path::new("/var/lib/kiko-nano-attended-trial")
+        );
+
+        for forbidden in [
+            "--wheels-attached",
+            "--motion-area-clear",
+            "--operator-attending",
+            "--power-cut-reachable",
+            "--maximum-pwm-percent",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "kiko-slam",
+                    "nano-attended-navigation-trial",
+                    "--deployment-root",
+                    "/opt/kiko/deployment",
+                    "--launch-config",
+                    "commissioning/attended-navigation-launch-v1.json",
+                    "--state-root",
+                    "/var/lib/kiko-nano-attended-trial",
+                    forbidden,
+                ])
+                .is_err(),
+                "physical claim or authority override {forbidden} must not exist"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "nano-attended-navigation-trial", unix))]
+    #[test]
+    fn attended_navigation_stops_base_before_releasing_accessories() {
+        assert!(
+            NanoLiveMotionKind::AttendedNavigationTrial
+                .requires_navigation_stop_before_accessory_release()
+        );
     }
 
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]

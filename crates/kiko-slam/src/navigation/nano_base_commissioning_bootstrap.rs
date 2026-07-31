@@ -34,6 +34,8 @@ use kiko_device_inventory::{
     load_expected_manifest_v3_from_slice,
 };
 #[cfg(feature = "nano-attended-navigation-trial")]
+use kiko_supervisor_core::{ReadinessBinding, ReadinessEpoch, Sha256Digest, SupervisorAction};
+#[cfg(feature = "nano-attended-navigation-trial")]
 use robot_command_client::AppliedCommandReceipt;
 use robot_command_client::{
     ClientConfig, ConfigError as ClientConfigError, StopRecoveryPolicy, TimeoutNs,
@@ -65,6 +67,8 @@ use super::nano_base_commissioning::{
     NanoBaseCommissioningPublishFailure, NanoBaseCommissioningSampleV1Dto,
     NanoBaseCommissioningSession, SoleCommissioningActuator,
 };
+#[cfg(feature = "nano-attended-navigation-trial")]
+use super::{AgentAuthoritySupervisor, NavigationClockEpoch};
 use super::{
     MAX_NANO_AGENT_LAUNCH_JSON_BYTES, MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES,
     ManifestBoundNanoAgentPolicyConfigV3, NanoAccessoryManifestBindingError,
@@ -73,6 +77,8 @@ use super::{
     NanoCalibrationBindingError, NanoFaceCascadeAssetRole, NanoLaunchAssetRole,
     NanoLaunchBoundAssetLoadError,
 };
+#[cfg(feature = "nano-attended-navigation-trial")]
+use crate::HostMonotonicTimestamp;
 use crate::dataset::Calibration;
 
 pub const NANO_BASE_COMMISSIONING_LAUNCH_V1: u32 = 1;
@@ -93,7 +99,7 @@ const ATTENDED_CONFIRMATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15)
 const ATTENDED_CONFIRMATION_POLL_SLICE: Duration = Duration::from_millis(25);
 const ATTENDED_CONFIRMATION_MAX_CONSUMPTION_DELAY: Duration = Duration::from_secs(5);
 const ATTENDED_CONFIRMATION_CHALLENGE_BYTES: usize = 16;
-const ATTENDED_CONFIRMATION_BOUND_ASSET_COUNT: usize = 11;
+const ATTENDED_CONFIRMATION_BOUND_ASSET_COUNT: usize = 13;
 const ATTENDED_CONFIRMATION_CHANNEL: &str =
     "fresh_controlling_tty_session_bound_nonce_exact_phrases_v2";
 
@@ -656,6 +662,20 @@ impl fmt::Display for CommissioningClockEpochError {
 
 impl std::error::Error for CommissioningClockEpochError {}
 
+#[cfg(feature = "nano-attended-navigation-trial")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttendedTrialFaceAssetsTransferError;
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl fmt::Display for AttendedTrialFaceAssetsTransferError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("attended navigation face assets were already transferred")
+    }
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl std::error::Error for AttendedTrialFaceAssetsTransferError {}
+
 /// Static same-owner stream admission. Runtime samples carry only values and
 /// timestamps; these identities cannot vary between samples.
 #[derive(Clone, Debug)]
@@ -813,10 +833,14 @@ pub struct LoadedNanoBaseCommissioningInputs {
     pub calibration_source: LoadedDeploymentAsset,
     pub live_graph_launch_source: LoadedDeploymentAsset,
     pub accessory_policy_source: LoadedDeploymentAsset,
+    pub navigation_shadow_config: LoadedDeploymentAsset,
+    pub plant_artifact: LoadedDeploymentAsset,
     pub onnx_runtime_library: LoadedDeploymentAsset,
     pub superpoint_model: LoadedDeploymentAsset,
     pub lightglue_model: LoadedDeploymentAsset,
+    #[cfg(not(feature = "nano-attended-navigation-trial"))]
     pub frontal_face_cascade: LoadedDeploymentAsset,
+    #[cfg(not(feature = "nano-attended-navigation-trial"))]
     pub profile_face_cascade: LoadedDeploymentAsset,
 }
 
@@ -833,6 +857,8 @@ pub struct PreparedNanoBaseCommissioning {
     live_graph: NanoAgentLaunchV3,
     accessory_policy: ManifestBoundNanoAgentPolicyConfigV3,
     inputs: LoadedNanoBaseCommissioningInputs,
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    attended_trial_face_assets: Option<(LoadedDeploymentAsset, LoadedDeploymentAsset)>,
 }
 
 impl PreparedNanoBaseCommissioning {
@@ -984,6 +1010,16 @@ impl PreparedNanoBaseCommissioning {
                     .content_sha256()
                     .as_bytes(),
             ),
+            navigation_shadow_config_sha256: canonical_sha256(
+                *self
+                    .inputs
+                    .navigation_shadow_config
+                    .content_sha256()
+                    .as_bytes(),
+            ),
+            plant_artifact_sha256: canonical_sha256(
+                *self.inputs.plant_artifact.content_sha256().as_bytes(),
+            ),
             onnx_runtime_sha256: canonical_sha256(
                 *self.inputs.onnx_runtime_library.content_sha256().as_bytes(),
             ),
@@ -1023,6 +1059,12 @@ impl PreparedNanoBaseCommissioning {
         .map_err(CommissioningAttestationError::Authority)?;
         Ok(AdmittedNanoBaseCommissioningRun {
             policy: self.policy,
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            live_policy: Some(self.accessory_policy),
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            hardware_manifest_sha256: *self.inputs.manifest_source.content_sha256().as_bytes(),
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            calibration_bundle_sha256: *self.inputs.calibration_source.content_sha256().as_bytes(),
             profile: self.profile,
             server: self.server,
             authority,
@@ -1062,6 +1104,12 @@ impl PreparedNanoBaseCommissioning {
                 .accessory_policy_source
                 .content_sha256()
                 .as_bytes(),
+            *self
+                .inputs
+                .navigation_shadow_config
+                .content_sha256()
+                .as_bytes(),
+            *self.inputs.plant_artifact.content_sha256().as_bytes(),
             *self.inputs.onnx_runtime_library.content_sha256().as_bytes(),
             *self.inputs.superpoint_model.content_sha256().as_bytes(),
             *self.inputs.lightglue_model.content_sha256().as_bytes(),
@@ -1098,6 +1146,16 @@ impl PreparedNanoBaseCommissioning {
 
     pub const fn loaded_inputs(&self) -> &LoadedNanoBaseCommissioningInputs {
         &self.inputs
+    }
+
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    pub(crate) fn take_attended_trial_face_assets(
+        &mut self,
+    ) -> Result<(LoadedDeploymentAsset, LoadedDeploymentAsset), AttendedTrialFaceAssetsTransferError>
+    {
+        self.attended_trial_face_assets
+            .take()
+            .ok_or(AttendedTrialFaceAssetsTransferError)
     }
 
     pub fn expected_visual_velocity_source_id(&self) -> BoundedId {
@@ -1544,6 +1602,8 @@ struct AttendedAttestationRecordV3<'a> {
     calibration_sha256: String,
     live_graph_launch_sha256: String,
     accessory_policy_sha256: String,
+    navigation_shadow_config_sha256: String,
+    plant_artifact_sha256: String,
     onnx_runtime_sha256: String,
     superpoint_model_sha256: String,
     lightglue_model_sha256: String,
@@ -1822,6 +1882,12 @@ impl std::error::Error for FreshAttendedCommissioningAdmissionError {
 
 pub struct AdmittedNanoBaseCommissioningRun {
     policy: NanoBaseCommissioningPolicyV1,
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    live_policy: Option<ManifestBoundNanoAgentPolicyConfigV3>,
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    hardware_manifest_sha256: [u8; 32],
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    calibration_bundle_sha256: [u8; 32],
     profile: NanoBaseCommissioningControllerProfileV1,
     server: ControllerServerConfigV3,
     authority: AdmittedAttendedCommissioning,
@@ -1941,6 +2007,9 @@ impl AdmittedNanoBaseCommissioningRun {
             head_gaze_lease_issuer: Some(head_gaze_lease_issuer),
             authority: self.authority,
             policy: self.policy,
+            live_policy: self.live_policy,
+            hardware_manifest_sha256: self.hardware_manifest_sha256,
+            calibration_bundle_sha256: self.calibration_bundle_sha256,
             stream: self.stream,
             journal: self.journal,
             artifact_directory: self.artifact_directory,
@@ -2008,6 +2077,9 @@ pub struct OwnedNanoAttendedNavigationTrialController {
     head_gaze_lease_issuer: Option<kiko_head_runtime::HeadGazeBaseZeroExclusiveLeaseIssuer>,
     authority: AdmittedAttendedCommissioning,
     policy: NanoBaseCommissioningPolicyV1,
+    live_policy: Option<ManifestBoundNanoAgentPolicyConfigV3>,
+    hardware_manifest_sha256: [u8; 32],
+    calibration_bundle_sha256: [u8; 32],
     stream: AdmittedCommissioningObservationStream,
     journal: FileCommissioningJournal,
     artifact_directory: CommissioningArtifactDirectory,
@@ -2050,6 +2122,90 @@ impl OwnedNanoAttendedNavigationTrialController {
         self.authority
     }
 
+    /// Bind the attended controller to the normal one-owner live authority
+    /// state machine without granting motion.
+    ///
+    /// The returned supervisor is exactly `Disarmed`. A later Arm request
+    /// must still cross the normal fresh-zero barrier before manual or
+    /// autonomous authority can exist. The controller, zero receipt, gaze
+    /// issuer, and policy transfer together or not at all.
+    #[allow(clippy::too_many_arguments)]
+    pub fn take_live_motion_admission(
+        &mut self,
+        clock_epoch: NavigationClockEpoch,
+        readiness_epoch: ReadinessEpoch,
+        inventory_transition_at: HostMonotonicTimestamp,
+        readiness_transition_at: HostMonotonicTimestamp,
+    ) -> Result<AttendedNavigationTrialMotionAdmission, AttendedTrialLiveAdmissionError> {
+        let policy = self
+            .live_policy
+            .as_ref()
+            .ok_or(AttendedTrialLiveAdmissionError::AlreadyTransferred)?;
+        let initial_zero = self
+            .initial_zero
+            .as_ref()
+            .ok_or(AttendedTrialLiveAdmissionError::AlreadyTransferred)?;
+        if self.driver.is_none() || self.head_gaze_lease_issuer.is_none() {
+            return Err(AttendedTrialLiveAdmissionError::AlreadyTransferred);
+        }
+        let controller = initial_zero.controller_session();
+        let hardware_manifest = Sha256Digest::try_new(self.hardware_manifest_sha256)
+            .map_err(AttendedTrialLiveAdmissionError::HardwareManifestDigest)?;
+        let calibration_bundle = Sha256Digest::try_new(self.calibration_bundle_sha256)
+            .map_err(AttendedTrialLiveAdmissionError::CalibrationBundleDigest)?;
+        let readiness = ReadinessBinding::new(
+            readiness_epoch,
+            controller.controller_uid(),
+            controller.boot_id(),
+            controller.control_epoch(),
+            hardware_manifest,
+            calibration_bundle,
+        );
+        let mut authority = AgentAuthoritySupervisor::new(policy.supervisor(), clock_epoch);
+        let action = authority
+            .begin_inventory(inventory_transition_at)
+            .map_err(AttendedTrialLiveAdmissionError::Authority)?;
+        if action != SupervisorAction::InventoryRequired {
+            return Err(AttendedTrialLiveAdmissionError::UnexpectedAction {
+                stage: AttendedTrialLiveAdmissionStage::BeginInventory,
+                expected: SupervisorAction::InventoryRequired,
+                actual: action,
+            });
+        }
+        let action = authority
+            .admit_readiness(readiness, readiness_transition_at)
+            .map_err(AttendedTrialLiveAdmissionError::Authority)?;
+        if action != SupervisorAction::Disarmed {
+            return Err(AttendedTrialLiveAdmissionError::UnexpectedAction {
+                stage: AttendedTrialLiveAdmissionStage::AdmitReadiness,
+                expected: SupervisorAction::Disarmed,
+                actual: action,
+            });
+        }
+
+        Ok(AttendedNavigationTrialMotionAdmission {
+            startup: AttendedNavigationTrialStartupParts {
+                policy: self
+                    .live_policy
+                    .take()
+                    .expect("live policy was checked before admission"),
+                authority,
+            },
+            driver: self
+                .driver
+                .take()
+                .expect("driver was checked before admission"),
+            initial_zero: self
+                .initial_zero
+                .take()
+                .expect("zero receipt was checked before admission"),
+            head_gaze_lease_issuer: self
+                .head_gaze_lease_issuer
+                .take()
+                .expect("gaze issuer was checked before admission"),
+        })
+    }
+
     pub async fn shutdown_controller(mut self) -> Result<(), AttendedTrialControllerShutdownError> {
         let motion_stop = self
             .driver
@@ -2064,6 +2220,9 @@ impl OwnedNanoAttendedNavigationTrialController {
             head_gaze_lease_issuer: _,
             authority: _,
             policy,
+            live_policy,
+            hardware_manifest_sha256: _,
+            calibration_bundle_sha256: _,
             stream,
             journal,
             artifact_directory,
@@ -2074,7 +2233,7 @@ impl OwnedNanoAttendedNavigationTrialController {
         // physical client has stopped. This slice does not yet publish a
         // navigation-trial terminal record, so dropping these owners makes no
         // stronger durability claim.
-        drop((policy, stream, journal, artifact_directory));
+        drop((policy, live_policy, stream, journal, artifact_directory));
         let owner_shutdown = owner.shutdown(shutdown_timeout).await.err();
         match (motion_stop, owner_shutdown) {
             (None, None) => Ok(()),
@@ -2082,6 +2241,65 @@ impl OwnedNanoAttendedNavigationTrialController {
                 motion_stop,
                 owner_shutdown: owner_shutdown.map(Box::new),
             }),
+        }
+    }
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+#[must_use = "the physical driver must enter the sole live owner or be explicitly disarmed"]
+pub struct AttendedNavigationTrialMotionAdmission {
+    pub startup: AttendedNavigationTrialStartupParts,
+    pub driver: LiveMpcControlDriver,
+    pub initial_zero: AppliedCommandReceipt,
+    pub head_gaze_lease_issuer: kiko_head_runtime::HeadGazeBaseZeroExclusiveLeaseIssuer,
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+pub struct AttendedNavigationTrialStartupParts {
+    pub policy: ManifestBoundNanoAgentPolicyConfigV3,
+    pub authority: AgentAuthoritySupervisor,
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttendedTrialLiveAdmissionStage {
+    BeginInventory,
+    AdmitReadiness,
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+#[derive(Debug)]
+pub enum AttendedTrialLiveAdmissionError {
+    AlreadyTransferred,
+    HardwareManifestDigest(kiko_supervisor_core::EvidenceValueError),
+    CalibrationBundleDigest(kiko_supervisor_core::EvidenceValueError),
+    Authority(super::AgentAuthorityError),
+    UnexpectedAction {
+        stage: AttendedTrialLiveAdmissionStage,
+        expected: SupervisorAction,
+        actual: SupervisorAction,
+    },
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl fmt::Display for AttendedTrialLiveAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "attended navigation trial live-authority admission failed: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl std::error::Error for AttendedTrialLiveAdmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HardwareManifestDigest(source) | Self::CalibrationBundleDigest(source) => {
+                Some(source)
+            }
+            Self::Authority(source) => Some(source),
+            Self::AlreadyTransferred | Self::UnexpectedAction { .. } => None,
         }
     }
 }
@@ -2596,6 +2814,9 @@ pub fn prepare_nano_base_commissioning(
     let accessory_policy = accessory_policy
         .bind_accessories_to_manifest(manifest.as_inventory())
         .map_err(NanoBaseCommissioningPreparationError::AccessoryManifestBinding)?;
+    let navigation_shadow_config =
+        load_live_graph_asset(NanoLaunchAssetRole::NavigationShadowConfig)?;
+    let plant_artifact = load_live_graph_asset(NanoLaunchAssetRole::PlantArtifact)?;
     let onnx_runtime_library = load_live_graph_asset(NanoLaunchAssetRole::OnnxRuntimeLibrary)?;
     let superpoint_model = load_live_graph_asset(NanoLaunchAssetRole::SuperpointModel)?;
     let lightglue_model = load_live_graph_asset(NanoLaunchAssetRole::LightglueModel)?;
@@ -2631,12 +2852,18 @@ pub fn prepare_nano_base_commissioning(
             calibration_source,
             live_graph_launch_source,
             accessory_policy_source,
+            navigation_shadow_config,
+            plant_artifact,
             onnx_runtime_library,
             superpoint_model,
             lightglue_model,
+            #[cfg(not(feature = "nano-attended-navigation-trial"))]
             frontal_face_cascade,
+            #[cfg(not(feature = "nano-attended-navigation-trial"))]
             profile_face_cascade,
         },
+        #[cfg(feature = "nano-attended-navigation-trial")]
+        attended_trial_face_assets: Some((frontal_face_cascade, profile_face_cascade)),
     })
 }
 

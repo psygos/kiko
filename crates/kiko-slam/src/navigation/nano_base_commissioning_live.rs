@@ -22,6 +22,8 @@ use oak_sys::{
 
 #[cfg(feature = "nano-agent")]
 use super::NanoFacePerceptionShutdownClass;
+#[cfg(feature = "nano-attended-navigation-trial")]
+use super::mpc::PlantModelV1;
 use super::nano_base_commissioning::CommissioningExternalSignal;
 use super::nano_base_commissioning_bootstrap::{
     AdmittedCommissioningObservationStream, CommissioningAlignedObservation,
@@ -36,7 +38,11 @@ use super::{
     NanoAccessoryWorkerConfigError, NanoAccessoryWorkerExit, NanoAccessoryWorkerJoinError,
     NanoAccessoryWorkerStartError,
 };
+#[cfg(feature = "nano-attended-navigation-trial")]
+use super::{NanoBootstrapStereoEvidence, ParsedNanoLiveConfiguration, ShadowNavigationConfigV2};
 use crate::dataset::{Calibration, CameraIntrinsics};
+#[cfg(feature = "nano-attended-navigation-trial")]
+use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
 use crate::{
     DownscaleFactor, KeyframePolicy, KeypointLimit, LightGlue, LmConfig, LocalBaConfig,
     LoopSubsystemConfig, OakImuAngularVelocity, PairingInputError, PairingWindowNs, Pose64,
@@ -57,6 +63,180 @@ const PAIRING_WINDOW_NS: u64 = 5_000_000;
 pub struct PreparedCommissioningLiveObservation {
     pub stream: AdmittedCommissioningObservationStream,
     pub source: NanoCommissioningLiveObservationSource,
+}
+
+/// One exact OAK/accessory owner prepared for the foreground attended
+/// navigation trial.
+///
+/// Unlike [`PreparedCommissioningLiveObservation`], this handoff does not
+/// construct a second sparse tracker. The canonical full-live owner consumes
+/// the retained bootstrap stereo frames and initializes SLAM, occupancy, and
+/// navigation exactly once.
+#[cfg(feature = "nano-attended-navigation-trial")]
+#[must_use = "the OAK and accessory owners require explicit live-runtime cleanup"]
+pub struct PreparedAttendedNavigationTrialLiveHardware {
+    pub stream: AdmittedCommissioningObservationStream,
+    pub stereo: NanoBootstrapStereoEvidence,
+    pub live: ParsedNanoLiveConfiguration,
+    pub accessory: NanoAccessoryWorker,
+    pub oak: Device,
+}
+
+/// Open and bind the one camera/accessory graph used by the attended
+/// navigation trial.
+///
+/// The face cascades move once from the immutable commissioning bundle into
+/// the accessory owner. Navigation is parsed from the same launch-bound plant,
+/// depth camera, calibration, and occupancy policy that the later full-live
+/// loop consumes. No controller is opened here.
+#[cfg(feature = "nano-attended-navigation-trial")]
+pub fn prepare_attended_navigation_trial_live_hardware(
+    prepared: &mut PreparedNanoBaseCommissioning,
+    running: Arc<AtomicBool>,
+    clock_epoch: super::nano_base_commissioning_bootstrap::CommissioningClockEpoch,
+    accessory_stream_epoch: StreamEpochId,
+) -> Result<PreparedAttendedNavigationTrialLiveHardware, CommissioningLiveOpenError> {
+    if !running.load(Ordering::Acquire) {
+        return Err(CommissioningLiveOpenError::before_oak(
+            CommissioningLiveOpenPrimaryError::Interrupted,
+        ));
+    }
+
+    let health_period = NanoAccessoryHealthPeriod::try_from_duration(ACCESSORY_HEALTH_PERIOD)
+        .map_err(CommissioningLiveOpenPrimaryError::AccessoryHealthPeriod)
+        .map_err(CommissioningLiveOpenError::before_oak)?;
+    let accessory_config = NanoAccessoryWorkerConfig::from_manifest_bound_policy(
+        prepared.accessory_policy(),
+        accessory_stream_epoch,
+        health_period,
+    )
+    .map_err(CommissioningLiveOpenPrimaryError::AccessoryConfig)
+    .map_err(CommissioningLiveOpenError::before_oak)?;
+    let (frontal_face_cascade, profile_face_cascade) = prepared
+        .take_attended_trial_face_assets()
+        .map_err(CommissioningLiveOpenPrimaryError::AttendedTrialFaceAssets)
+        .map_err(CommissioningLiveOpenError::before_oak)?;
+    let accessory = NanoAccessoryWorker::start_with_loaded_face_perception(
+        accessory_config,
+        frontal_face_cascade,
+        profile_face_cascade,
+    )
+    .map_err(CommissioningLiveOpenPrimaryError::AccessoryStart)
+    .map_err(CommissioningLiveOpenError::before_oak)?;
+    let mut accessory_guard = Some(accessory);
+
+    let calibration = prepared.calibration().clone();
+    let live_graph = prepared.live_graph();
+    let device = match Device::connect(
+        calibration.oak_mxid().as_str(),
+        live_graph.oak().device_config(),
+    ) {
+        Ok(device) => device,
+        Err(source) => {
+            let accessory_shutdown = accessory_guard.take().and_then(|worker| {
+                shutdown_accessory(worker, AccessoryTerminalReport::NotReported).err()
+            });
+            return Err(CommissioningLiveOpenError {
+                primary: Box::new(CommissioningLiveOpenPrimaryError::OakConnect(source)),
+                oak_close: None,
+                accessory_shutdown,
+            });
+        }
+    };
+    let mut device_guard = Some(device);
+
+    let admitted = (|| {
+        let device = device_guard
+            .as_mut()
+            .expect("connected OAK remains retained until attended live handoff");
+        let connected_mxid = device
+            .connected_identity()
+            .map_err(CommissioningLiveOpenPrimaryError::OakIdentity)?
+            .mxid()
+            .to_owned();
+        calibration
+            .require_connected_oak_mxid(&connected_mxid)
+            .map_err(CommissioningLiveOpenPrimaryError::Calibration)?;
+        device
+            .usb_transport_evidence()
+            .map_err(CommissioningLiveOpenPrimaryError::OakUsb)?;
+        oak_sys::depthai_build_metadata()
+            .map_err(CommissioningLiveOpenPrimaryError::DepthAiBuild)?;
+
+        let (left, right, observed_stereo) = bootstrap_stereo(
+            device,
+            live_graph.oak().rectified_stereo(),
+            running.as_ref(),
+        )?;
+        calibration
+            .require_observed_stereo(&observed_stereo)
+            .map_err(CommissioningLiveOpenPrimaryError::Calibration)?;
+        let rectified = RectifiedStereo::from_calibration(&observed_stereo)
+            .map_err(CommissioningLiveOpenPrimaryError::Stereo)?;
+        let runtime_depth_camera = DepthCameraModel::new(
+            rectified.left(),
+            rectified.dimensions(),
+            DepthToTrackingCamera::identity(),
+        );
+        let inputs = prepared.loaded_inputs();
+        let plant = PlantModelV1::parse_json(inputs.plant_artifact.bytes())
+            .map_err(CommissioningLiveOpenPrimaryError::Plant)?;
+        let navigation = ShadowNavigationConfigV2::parse_json_bound_to_plant_artifact(
+            inputs.navigation_shadow_config.bytes(),
+            runtime_depth_camera,
+            plant,
+        )
+        .map_err(CommissioningLiveOpenPrimaryError::Navigation)?;
+        calibration
+            .require_navigation(&navigation)
+            .map_err(CommissioningLiveOpenPrimaryError::Calibration)?;
+        let stream = prepared
+            .admit_same_owner_stream(
+                &connected_mxid,
+                &observed_stereo,
+                prepared.expected_visual_velocity_source_id().as_str(),
+                clock_epoch,
+            )
+            .map_err(CommissioningLiveOpenPrimaryError::StreamAdmission)?;
+        Ok((
+            stream,
+            NanoBootstrapStereoEvidence {
+                left,
+                right,
+                calibration: observed_stereo,
+                runtime_depth_camera,
+            },
+            ParsedNanoLiveConfiguration {
+                navigation,
+                occupancy_host_policy: live_graph.occupancy().host_policy(),
+            },
+        ))
+    })();
+
+    match admitted {
+        Ok((stream, stereo, live)) => Ok(PreparedAttendedNavigationTrialLiveHardware {
+            stream,
+            stereo,
+            live,
+            accessory: accessory_guard
+                .take()
+                .expect("successful handoff retains the accessory owner"),
+            oak: device_guard
+                .take()
+                .expect("successful handoff retains the OAK owner"),
+        }),
+        Err(primary) => {
+            let oak_close = device_guard.and_then(|device| device.close().err());
+            let accessory_shutdown = accessory_guard.take().and_then(|worker| {
+                shutdown_accessory(worker, AccessoryTerminalReport::NotReported).err()
+            });
+            Err(CommissioningLiveOpenError {
+                primary: Box::new(primary),
+                oak_close,
+                accessory_shutdown,
+            })
+        }
+    }
 }
 
 /// Open the exact launch-bound OAK and warm its visual/IMU source before any
@@ -1037,14 +1217,24 @@ impl std::error::Error for CommissioningLiveOpenError {
 pub enum CommissioningLiveOpenPrimaryError {
     Interrupted,
     Inference(crate::InferenceError),
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    AttendedTrialFaceAssets(
+        super::nano_base_commissioning_bootstrap::AttendedTrialFaceAssetsTransferError,
+    ),
     OakConnect(OakConnectionError),
     OakIdentity(oak_sys::ConnectedDeviceIdentityError),
     OakUsb(oak_sys::UsbTransportEvidenceError),
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    DepthAiBuild(oak_sys::DepthAiBuildMetadataError),
     OakLeft(OakImageError),
     OakRight(OakImageError),
     OakStereoCalibration(oak_sys::CalibrationError),
     Calibration(super::NanoCalibrationBindingError),
     Stereo(crate::RectifiedStereoError),
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    Plant(super::mpc::PlantModelJsonParseError),
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    Navigation(super::ShadowNavigationConfigParseError),
     StereoBootstrapTimedOut {
         received_left: bool,
         received_right: bool,
@@ -1091,13 +1281,21 @@ impl std::error::Error for CommissioningLiveOpenPrimaryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Inference(source) => Some(source),
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Self::AttendedTrialFaceAssets(source) => Some(source),
             Self::OakConnect(source) => Some(source),
             Self::OakIdentity(source) => Some(source),
             Self::OakUsb(source) => Some(source),
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Self::DepthAiBuild(source) => Some(source),
             Self::OakLeft(source) | Self::OakRight(source) => Some(source),
             Self::OakStereoCalibration(source) => Some(source),
             Self::Calibration(source) => Some(source),
             Self::Stereo(source) => Some(source),
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Self::Plant(source) => Some(source),
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Self::Navigation(source) => Some(source),
             Self::KeypointLimit(source) => Some(source),
             Self::Ransac(source) => Some(source),
             Self::Keyframe(source) => Some(source),
