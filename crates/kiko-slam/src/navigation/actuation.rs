@@ -24,6 +24,8 @@ use robot_protocol::v2::{DomainError, ForceStopReason, TimerPwm, V2CommandLeaseM
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 use super::WheelsOffQualificationHostClockFaultInjection;
 use super::actuation_config::NavigationActuationConfigV1;
+#[cfg(feature = "nano-attended-navigation-trial")]
+use super::nano_base_commissioning_bootstrap::MAX_WHEEL_ON_COMMISSIONING_PWM_PERCENT;
 use super::{SafetyDecision, SafetyDecisionOutcome, ShadowPwmPair};
 use crate::HostMonotonicTimestamp;
 
@@ -298,7 +300,103 @@ pub struct PhysicalActuationSession {
     armed: Option<ConcreteArmed>,
     clock: ActuationMonotonicClock,
     timing: ActuationTiming,
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    attended_trial: Option<AttendedTrialActuationGuard>,
 }
+
+/// Immutable second-line guard for the attended navigation trial.
+///
+/// The STM32 commissioning profile independently enforces the same PWM cap.
+/// Keeping the deadline and cap on the physical session also makes it
+/// impossible for an MPC call site to forget either check.
+#[cfg(feature = "nano-attended-navigation-trial")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AttendedTrialActuationGuard {
+    maximum_abs_pwm_percent: u8,
+    issued_at_ns: u64,
+    expires_at_ns: u64,
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl AttendedTrialActuationGuard {
+    pub(super) fn try_new(
+        maximum_abs_pwm_percent: u8,
+        issued_at_ns: u64,
+        expires_at_ns: u64,
+    ) -> Result<Self, AttendedTrialActuationGuardError> {
+        if maximum_abs_pwm_percent == 0
+            || maximum_abs_pwm_percent > MAX_WHEEL_ON_COMMISSIONING_PWM_PERCENT
+        {
+            return Err(AttendedTrialActuationGuardError::InvalidMaximumPwm(
+                maximum_abs_pwm_percent,
+            ));
+        }
+        if issued_at_ns == 0 || expires_at_ns <= issued_at_ns {
+            return Err(AttendedTrialActuationGuardError::InvalidLifetime {
+                issued_at_ns,
+                expires_at_ns,
+            });
+        }
+        Ok(Self {
+            maximum_abs_pwm_percent,
+            issued_at_ns,
+            expires_at_ns,
+        })
+    }
+
+    fn require_current(self, now: HostMonotonicTimestamp) -> Result<(), PhysicalDecisionError> {
+        if now.as_nanos() < self.issued_at_ns {
+            return Err(PhysicalDecisionError::AttendedTrialClockBeforeAttestation {
+                now,
+                issued_at_ns: self.issued_at_ns,
+            });
+        }
+        if now.as_nanos() >= self.expires_at_ns {
+            return Err(PhysicalDecisionError::AttendedTrialExpired {
+                now,
+                expires_at_ns: self.expires_at_ns,
+            });
+        }
+        Ok(())
+    }
+
+    fn require_pwm(self, pwm: ShadowPwmPair) -> Result<(), PhysicalDecisionError> {
+        let maximum = i16::from(self.maximum_abs_pwm_percent);
+        let left = pwm.left().get();
+        let right = pwm.right().get();
+        if i16::from(left).abs() > maximum || i16::from(right).abs() > maximum {
+            return Err(PhysicalDecisionError::AttendedTrialPwmAboveLimit {
+                left,
+                right,
+                maximum_abs_pwm_percent: self.maximum_abs_pwm_percent,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AttendedTrialActuationGuardError {
+    InvalidMaximumPwm(u8),
+    InvalidLifetime {
+        issued_at_ns: u64,
+        expires_at_ns: u64,
+    },
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl fmt::Display for AttendedTrialActuationGuardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid attended navigation trial actuation guard: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl std::error::Error for AttendedTrialActuationGuardError {}
 
 /// Linear ownership of one exactly stopped candidate transport.
 ///
@@ -329,6 +427,8 @@ impl StoppedCandidateActuationClient {
                 armed: Some(armed),
                 clock,
                 timing,
+                #[cfg(feature = "nano-attended-navigation-trial")]
+                attended_trial: None,
             },
             receipt,
         ))
@@ -385,6 +485,8 @@ impl PhysicalActuationSession {
                 armed: Some(armed),
                 clock,
                 timing,
+                #[cfg(feature = "nano-attended-navigation-trial")]
+                attended_trial: None,
             },
             receipt,
         ))
@@ -393,6 +495,17 @@ impl PhysicalActuationSession {
     /// Must run immediately before each MPC tick. This consumes and restores
     /// the armed type state only while the previous applied evidence is live.
     pub fn require_current_before_solve(&mut self) -> Result<(), LiveActuationError> {
+        #[cfg(feature = "nano-attended-navigation-trial")]
+        if let Some(guard) = self.attended_trial {
+            let now = self.clock.host_now().map_err(|source| {
+                let stop_reason = source.force_stop_reason();
+                self.reject_local_decision(source, stop_reason)
+            })?;
+            guard.require_current(now).map_err(|source| {
+                let stop_reason = source.force_stop_reason();
+                self.reject_local_decision(source, stop_reason)
+            })?;
+        }
         let armed = self.take_armed()?;
         match armed.require_current_applied_evidence() {
             Ok(armed) => {
@@ -411,6 +524,19 @@ impl PhysicalActuationSession {
             let stop_reason = source.force_stop_reason();
             self.reject_local_decision(source, stop_reason)
         })?;
+        #[cfg(feature = "nano-attended-navigation-trial")]
+        if let Some(guard) = self.attended_trial {
+            guard.require_current(now).map_err(|source| {
+                let stop_reason = source.force_stop_reason();
+                self.reject_local_decision(source, stop_reason)
+            })?;
+            guard
+                .require_pwm(decision.record().pwm())
+                .map_err(|source| {
+                    let stop_reason = source.force_stop_reason();
+                    self.reject_local_decision(source, stop_reason)
+                })?;
+        }
         let pending = pending_command(
             self.timing,
             PhysicalDecisionInput::from_safety(decision),
@@ -421,6 +547,17 @@ impl PhysicalActuationSession {
             self.reject_local_decision(source, stop_reason)
         })?;
         self.apply_pending(pending)
+    }
+
+    /// Bind a commissioning-class session to the non-bypassable attended
+    /// navigation trial cap and deadline before exposing it to MPC.
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    pub(super) fn bind_attended_navigation_trial(
+        mut self,
+        guard: AttendedTrialActuationGuard,
+    ) -> Self {
+        self.attended_trial = Some(guard);
+        self
     }
 
     /// Submit a newly sequenced zero command and retain its exact applied receipt.
@@ -679,6 +816,22 @@ pub enum PhysicalDecisionError {
         now: HostMonotonicTimestamp,
         collision_valid_through: HostMonotonicTimestamp,
     },
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    AttendedTrialClockBeforeAttestation {
+        now: HostMonotonicTimestamp,
+        issued_at_ns: u64,
+    },
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    AttendedTrialExpired {
+        now: HostMonotonicTimestamp,
+        expires_at_ns: u64,
+    },
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    AttendedTrialPwmAboveLimit {
+        left: i8,
+        right: i8,
+        maximum_abs_pwm_percent: u8,
+    },
     TimerPwm(DomainError),
 }
 
@@ -686,6 +839,11 @@ impl PhysicalDecisionError {
     const fn force_stop_reason(self) -> ForceStopReason {
         match self {
             Self::CollisionValidityExpired { .. } => ForceStopReason::LeaseExpired,
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Self::AttendedTrialExpired { .. } => ForceStopReason::LeaseExpired,
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Self::AttendedTrialClockBeforeAttestation { .. }
+            | Self::AttendedTrialPwmAboveLimit { .. } => ForceStopReason::TransportFault,
             Self::HostTimestampOutOfRange
             | Self::DeadlineArithmeticOverflow
             | Self::RecordedControllerPwmMismatch { .. }
@@ -735,6 +893,63 @@ mod tests {
             apply_ack_budget_ns: TimeoutNs::try_new(20_000_000).expect("valid budget").get(),
             lease: V2CommandLeaseMs::try_new(200).expect("valid lease"),
         }
+    }
+
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    #[test]
+    fn attended_trial_guard_rejects_invalid_lifetimes_caps_and_boundaries() {
+        for invalid in [0, MAX_WHEEL_ON_COMMISSIONING_PWM_PERCENT + 1] {
+            assert!(matches!(
+                AttendedTrialActuationGuard::try_new(invalid, 10, 20),
+                Err(AttendedTrialActuationGuardError::InvalidMaximumPwm(actual))
+                    if actual == invalid
+            ));
+        }
+        for (issued_at_ns, expires_at_ns) in [(0, 20), (10, 10), (20, 10)] {
+            assert!(matches!(
+                AttendedTrialActuationGuard::try_new(20, issued_at_ns, expires_at_ns),
+                Err(AttendedTrialActuationGuardError::InvalidLifetime {
+                    issued_at_ns: actual_issued,
+                    expires_at_ns: actual_expires,
+                }) if actual_issued == issued_at_ns && actual_expires == expires_at_ns
+            ));
+        }
+
+        let guard = AttendedTrialActuationGuard::try_new(20, 10, 20).unwrap();
+        assert!(matches!(
+            guard.require_current(HostMonotonicTimestamp::from_nanos(9)),
+            Err(PhysicalDecisionError::AttendedTrialClockBeforeAttestation {
+                issued_at_ns: 10,
+                ..
+            })
+        ));
+        assert!(
+            guard
+                .require_current(HostMonotonicTimestamp::from_nanos(10))
+                .is_ok()
+        );
+        assert!(
+            guard
+                .require_current(HostMonotonicTimestamp::from_nanos(19))
+                .is_ok()
+        );
+        assert!(matches!(
+            guard.require_current(HostMonotonicTimestamp::from_nanos(20)),
+            Err(PhysicalDecisionError::AttendedTrialExpired {
+                expires_at_ns: 20,
+                ..
+            })
+        ));
+
+        assert!(guard.require_pwm(pwm(-20, 20)).is_ok());
+        assert!(matches!(
+            guard.require_pwm(pwm(-21, 0)),
+            Err(PhysicalDecisionError::AttendedTrialPwmAboveLimit {
+                left: -21,
+                right: 0,
+                maximum_abs_pwm_percent: 20,
+            })
+        ));
     }
 
     #[test]

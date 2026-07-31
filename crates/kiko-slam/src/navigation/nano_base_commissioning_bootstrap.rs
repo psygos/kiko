@@ -34,7 +34,8 @@ use kiko_device_inventory::{
     load_expected_manifest_v3_from_slice,
 };
 use robot_command_client::{
-    ClientConfig, ConfigError as ClientConfigError, StopRecoveryPolicy, TimeoutNs,
+    AppliedCommandReceipt, ClientConfig, ConfigError as ClientConfigError, StopRecoveryPolicy,
+    TimeoutNs,
 };
 use robot_protocol::v2::{
     ControllerSafetyClass, ControllerSessionClass, PhysicalStopSemantics, TimerPwm,
@@ -51,6 +52,8 @@ use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "nano-attended-navigation-trial")]
+use super::LiveMpcControlDriver;
 use super::actuation::{LiveActuationError, PhysicalActuationSession};
 use super::nano_base_commissioning::{
     AdmittedAttendedCommissioning, CommissioningArtifactDirectory,
@@ -1875,6 +1878,61 @@ impl AdmittedNanoBaseCommissioningRun {
             shutdown_timeout,
         })
     }
+
+    /// Start the same attended, commissioning-class controller owner while
+    /// transferring the physical session into the guarded live MPC driver.
+    /// The normal production controller class remains unreachable.
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    pub async fn start_attended_navigation_trial_controller(
+        self,
+        clock_origin: Instant,
+    ) -> Result<OwnedNanoAttendedNavigationTrialController, CommissioningControllerStartError> {
+        let guard = self
+            .authority
+            .attended_navigation_trial_guard()
+            .map_err(|_| CommissioningControllerStartError::AttendedTrialGuard {
+                maximum_abs_pwm_percent: self.authority.maximum_abs_pwm_percent(),
+                expires_at_ns: self.authority.expires_at_ns(),
+            })?;
+        let shutdown_timeout = self.server.coordinated_shutdown_budget();
+        let client_config = self
+            .profile
+            .client_config(&self.server)
+            .map_err(CommissioningControllerStartError::ClientConfig)?;
+        let owner = V2ControllerOwner::start(self.server, self.profile.command_endpoint)
+            .await
+            .map_err(CommissioningControllerStartError::Owner)?;
+        let (physical, initial_zero) =
+            match PhysicalActuationSession::acquire_commissioning(client_config, clock_origin) {
+                Ok(value) => value,
+                Err(source) => {
+                    let owner_shutdown = owner.shutdown(shutdown_timeout).await.err();
+                    return Err(CommissioningControllerStartError::Acquire {
+                        source,
+                        owner_shutdown: owner_shutdown.map(Box::new),
+                    });
+                }
+            };
+        if !initial_zero.is_confirmed_zero() {
+            let owner_shutdown = owner.shutdown(shutdown_timeout).await.err();
+            return Err(CommissioningControllerStartError::InitialZeroNotExact {
+                owner_shutdown: owner_shutdown.map(Box::new),
+            });
+        }
+        Ok(OwnedNanoAttendedNavigationTrialController {
+            driver: Some(LiveMpcControlDriver::from_attended_commissioning(
+                physical, guard,
+            )),
+            initial_zero: Some(initial_zero),
+            authority: self.authority,
+            policy: self.policy,
+            stream: self.stream,
+            journal: self.journal,
+            artifact_directory: self.artifact_directory,
+            owner,
+            shutdown_timeout,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1887,6 +1945,11 @@ pub enum CommissioningControllerStartError {
     },
     InitialZeroNotExact {
         owner_shutdown: Option<Box<V2ControllerOwnerTerminationError>>,
+    },
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    AttendedTrialGuard {
+        maximum_abs_pwm_percent: u8,
+        expires_at_ns: u64,
     },
 }
 
@@ -1906,7 +1969,128 @@ impl std::error::Error for CommissioningControllerStartError {
             Self::Owner(source) => Some(source),
             Self::Acquire { source, .. } => Some(source),
             Self::InitialZeroNotExact { .. } => None,
+            #[cfg(feature = "nano-attended-navigation-trial")]
+            Self::AttendedTrialGuard { .. } => None,
         }
+    }
+}
+
+/// Retains the controller server and attended evidence after the guarded MPC
+/// driver moves into the sole live motion owner.
+#[cfg(feature = "nano-attended-navigation-trial")]
+#[must_use = "the attended controller owner must be shut down and inspected"]
+pub struct OwnedNanoAttendedNavigationTrialController {
+    driver: Option<LiveMpcControlDriver>,
+    initial_zero: Option<AppliedCommandReceipt>,
+    authority: AdmittedAttendedCommissioning,
+    policy: NanoBaseCommissioningPolicyV1,
+    stream: AdmittedCommissioningObservationStream,
+    journal: FileCommissioningJournal,
+    artifact_directory: CommissioningArtifactDirectory,
+    owner: V2ControllerOwner,
+    shutdown_timeout: Duration,
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl OwnedNanoAttendedNavigationTrialController {
+    /// Single-use transfer into the sole navigation owner. The server and all
+    /// attended evidence remain owned here for supervised terminal shutdown.
+    pub fn take_motion_driver(
+        &mut self,
+    ) -> Result<(LiveMpcControlDriver, AppliedCommandReceipt), AttendedTrialDriverTransferError>
+    {
+        match (self.driver.take(), self.initial_zero.take()) {
+            (Some(driver), Some(initial_zero)) => Ok((driver, initial_zero)),
+            (driver, initial_zero) => {
+                self.driver = driver;
+                self.initial_zero = initial_zero;
+                Err(AttendedTrialDriverTransferError)
+            }
+        }
+    }
+
+    pub const fn authority(&self) -> AdmittedAttendedCommissioning {
+        self.authority
+    }
+
+    pub async fn shutdown_controller(mut self) -> Result<(), AttendedTrialControllerShutdownError> {
+        let motion_stop = self
+            .driver
+            .as_mut()
+            .map(LiveMpcControlDriver::disarm)
+            .transpose()
+            .map(|_| ())
+            .err();
+        let Self {
+            driver: _,
+            initial_zero: _,
+            authority: _,
+            policy,
+            stream,
+            journal,
+            artifact_directory,
+            owner,
+            shutdown_timeout,
+        } = self;
+        // Retain the complete attended evidence ownership until after the
+        // physical client has stopped. This slice does not yet publish a
+        // navigation-trial terminal record, so dropping these owners makes no
+        // stronger durability claim.
+        drop((policy, stream, journal, artifact_directory));
+        let owner_shutdown = owner.shutdown(shutdown_timeout).await.err();
+        match (motion_stop, owner_shutdown) {
+            (None, None) => Ok(()),
+            (motion_stop, owner_shutdown) => Err(AttendedTrialControllerShutdownError {
+                motion_stop,
+                owner_shutdown: owner_shutdown.map(Box::new),
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttendedTrialDriverTransferError;
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl fmt::Display for AttendedTrialDriverTransferError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("attended navigation trial driver was already transferred")
+    }
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl std::error::Error for AttendedTrialDriverTransferError {}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+#[derive(Debug)]
+pub struct AttendedTrialControllerShutdownError {
+    pub motion_stop: Option<LiveActuationError>,
+    pub owner_shutdown: Option<Box<V2ControllerOwnerTerminationError>>,
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl fmt::Display for AttendedTrialControllerShutdownError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "attended navigation trial controller shutdown failed: motion_stop={:?}; owner_shutdown={:?}",
+            self.motion_stop, self.owner_shutdown
+        )
+    }
+}
+
+#[cfg(feature = "nano-attended-navigation-trial")]
+impl std::error::Error for AttendedTrialControllerShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.motion_stop
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| {
+                self.owner_shutdown
+                    .as_deref()
+                    .map(|source| source as &(dyn std::error::Error + 'static))
+            })
     }
 }
 

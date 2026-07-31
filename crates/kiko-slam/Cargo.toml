@@ -59,6 +59,14 @@ nano-base-commissioning = [
     "dep:robot-server",
     "dep:rustix",
 ]
+# Manually invoked, foreground-only navigation trial. It combines the
+# production SLAM/console graph with the separately admitted attended
+# wheel-on controller session; neither parent feature gains the other's
+# entry points.
+nano-attended-navigation-trial = [
+    "nano-agent",
+    "nano-base-commissioning",
+]
 # Offline-only review and publication boundary for completed commissioning
 # proposals. It has no controller, OAK, or live-runtime dependency and cannot
 # grant motion authority.

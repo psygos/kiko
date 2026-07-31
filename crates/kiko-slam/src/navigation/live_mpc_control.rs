@@ -261,6 +261,22 @@ impl LiveMpcControlDriver {
         ))
     }
 
+    /// Convert the separately admitted commissioning-class controller session
+    /// into the sole attended navigation-trial MPC port. The physical session
+    /// carries the deadline and PWM guard, so every point-goal and manual tick
+    /// crosses the same non-bypassable check.
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    pub(super) fn from_attended_commissioning(
+        session: PhysicalActuationSession,
+        guard: super::actuation::AttendedTrialActuationGuard,
+    ) -> Self {
+        Self {
+            core: MpcControlCore {
+                port: session.bind_attended_navigation_trial(guard),
+            },
+        }
+    }
+
     pub fn tick_point_goal<J, C>(
         &mut self,
         coordinator: &mut ShadowNavigationCoordinator<J>,

@@ -561,6 +561,30 @@ impl AdmittedAttendedCommissioning {
         }
         Ok(())
     }
+
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    pub(super) fn attended_navigation_trial_guard(
+        self,
+    ) -> Result<
+        super::actuation::AttendedTrialActuationGuard,
+        super::actuation::AttendedTrialActuationGuardError,
+    > {
+        super::actuation::AttendedTrialActuationGuard::try_new(
+            self.maximum_abs_pwm_percent,
+            self.issued_at_ns,
+            self.expires_at_ns,
+        )
+    }
+
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    pub const fn maximum_abs_pwm_percent(self) -> u8 {
+        self.maximum_abs_pwm_percent
+    }
+
+    #[cfg(feature = "nano-attended-navigation-trial")]
+    pub const fn expires_at_ns(self) -> u64 {
+        self.expires_at_ns
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
