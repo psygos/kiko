@@ -5,7 +5,7 @@
 use core::cell::RefCell;
 
 use embassy_executor::Spawner;
-use embassy_futures::join::join3;
+use embassy_futures::join::{join, join3};
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0, TRNG, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
@@ -21,7 +21,8 @@ use embassy_usb::{Builder, Config as UsbConfig};
 use kiko_eye_protocol::DeviceTimestampMs;
 use kiko_eyes_kep2_firmware::{
     EndpointEvent, EyeFrame, EyeRenderer, FRAME_RATE_HZ, FallbackCause, FirmwareIdentity,
-    Kep2Endpoint, LEDS_PER_EYE, MountingSign, OutputState,
+    Kep2Endpoint, LEDS_PER_EYE, MATRIX_BOOT_DURATION_MS, MatrixPanel, MountingSign, OutputState,
+    render_matrix_boot,
 };
 use panic_halt as _;
 use smart_leds::RGB8;
@@ -186,16 +187,17 @@ async fn main(spawner: Spawner) {
     // unrepresentable without substituting a deterministic fallback.
     let boot_id = trng.blocking_next_u64() | 1;
 
-    if let Ok(otp_uid) = embassy_rp::otp::get_private_random_number() {
+    let usb_serial_ascii = if let Ok(otp_uid) = embassy_rp::otp::get_private_random_number() {
         let uid = otp_uid.to_be_bytes();
         if let Ok(identity) = FirmwareIdentity::try_new(uid, FIRMWARE_BUILD_ID_BYTES, boot_id) {
             ENDPOINT.lock(|slot| *slot.borrow_mut() = Some(Kep2Endpoint::new(identity)));
-            match usb_task(UsbDriver::new(peripherals.USB, Irqs), uid_hex(uid)) {
-                Ok(task) => spawner.spawn(task),
-                Err(_) => latch_render_fault(device_now()),
-            }
+            Some(uid_hex(uid))
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     let Pio {
         mut common,
@@ -221,9 +223,38 @@ async fn main(spawner: Spawner) {
         &program,
     );
 
+    let black = RGB8::default();
+    let mut matrix_bank: EyeBank = [[black; LEDS_PER_EYE]; 2];
+    let matrix_started = Instant::now();
+    let mut matrix_ticker = Ticker::every(Duration::from_hz(u64::from(FRAME_RATE_HZ)));
+    loop {
+        let elapsed_ms = Instant::now().duration_since(matrix_started).as_millis();
+        if elapsed_ms >= MATRIX_BOOT_DURATION_MS {
+            break;
+        }
+        let (left, right) = matrix_bank.split_at_mut(1);
+        render_matrix_boot(elapsed_ms, MatrixPanel::Left, &mut left[0]);
+        render_matrix_boot(elapsed_ms, MatrixPanel::Right, &mut right[0]);
+        join(
+            left_panel.write(&matrix_bank[0]),
+            right_panel.write(&matrix_bank[1]),
+        )
+        .await;
+        matrix_ticker.next().await;
+    }
+
+    // KEP2 becomes externally available only after Matrix owns the panels.
+    // Therefore an AppliedNew acknowledgement can never describe pixels that
+    // the boot cue is still overriding.
+    if let Some(serial_ascii) = usb_serial_ascii {
+        match usb_task(UsbDriver::new(peripherals.USB, Irqs), serial_ascii) {
+            Ok(task) => spawner.spawn(task),
+            Err(_) => latch_render_fault(device_now()),
+        }
+    }
+
     let mut left_renderer = EyeRenderer::new(MountingSign::SameDirection);
     let mut right_renderer = EyeRenderer::new(RIGHT_EYE_MOUNTING);
-    let black = RGB8::default();
     let mut banks: [EyeBank; 2] = [[[black; LEDS_PER_EYE]; 2]; 2];
     render_bank(&mut left_renderer, &mut right_renderer, &mut banks[0]);
 

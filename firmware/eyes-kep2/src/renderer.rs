@@ -9,6 +9,9 @@ use crate::geometry::{EYE_POSITIONS, Position, UNITS_PER_MM};
 pub const LEDS_PER_EYE: usize = 56;
 pub const FRAME_RATE_HZ: u32 = 60;
 pub const BRIGHTNESS_CEILING: u8 = 56;
+/// Duration for which a freshly booted application owns the panels before
+/// exposing KEP2 USB control.
+pub const MATRIX_BOOT_DURATION_MS: u64 = 2_400;
 
 const GAZE_RANGE: i32 = 18 * UNITS_PER_MM;
 const GAZE_SLEW_UNITS_PER_SECOND: u32 = 400 * UNITS_PER_MM as u32;
@@ -23,8 +26,87 @@ const AUTONOMOUS_GAZE_PERIOD_MS: u64 = 8_000;
 const AUTONOMOUS_BREATHE_PERIOD_MS: u64 = 4_000;
 const KIKO_GREEN: [u8; 3] = [0xd4, 0xff, 0xa2];
 const PUPIL_COLOR: [u8; 3] = [0x04, 0x10, 0x02];
+const MATRIX_HEAD_HALF_HEIGHT: i32 = 52;
+const MATRIX_TAIL_HEIGHT: i32 = 410;
+const MATRIX_VERTICAL_SPAN: u64 = 1_500;
+const MATRIX_TOP: i32 = -750;
 
 pub type EyeFrame = [RGB8; LEDS_PER_EYE];
+
+/// Fixed phase separation for the two physical panels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatrixPanel {
+    Left,
+    Right,
+}
+
+impl MatrixPanel {
+    const fn phase_ms(self) -> u64 {
+        match self {
+            Self::Left => 0,
+            Self::Right => 173,
+        }
+    }
+}
+
+/// Render the boot/update Matrix cue without touching KEP2 controller state.
+///
+/// The RP2350 application calls this before USB enumeration, so no accepted
+/// KEP2 command can be visually ignored by the cue. `elapsed_ms` is relative
+/// to this boot animation, not the device/host protocol clock.
+pub fn render_matrix_boot(elapsed_ms: u64, panel: MatrixPanel, frame: &mut EyeFrame) {
+    let time = elapsed_ms.saturating_add(panel.phase_ms());
+    for (index, (pixel, position)) in frame.iter_mut().zip(EYE_POSITIONS).enumerate() {
+        let index = u64::try_from(index).expect("the fixed 56-pixel index fits u64");
+        let column = matrix_column(position.x);
+        let phase = time
+            .wrapping_mul(3)
+            .wrapping_add(u64::from(column) * 211)
+            .wrapping_add(index * 7);
+        let head_y = MATRIX_TOP
+            + i32::try_from(phase % MATRIX_VERTICAL_SPAN)
+                .expect("the 1,500-unit Matrix span fits i32");
+        let behind = head_y - position.y;
+        let glyph_on = ((time / 92)
+            .wrapping_add(u64::from(column) * 5)
+            .wrapping_add(index * 3)
+            & 0x3)
+            != 0;
+        let logical = if behind.abs() <= MATRIX_HEAD_HALF_HEIGHT {
+            [175, 255, 175]
+        } else if (1..=MATRIX_TAIL_HEIGHT).contains(&behind) && glyph_on {
+            let green = 220_i32 - behind * 150 / MATRIX_TAIL_HEIGHT;
+            [
+                0,
+                u8::try_from(green.clamp(0, 255)).expect("the clamped Matrix channel fits u8"),
+                18,
+            ]
+        } else {
+            [0, 5, 0]
+        };
+        *pixel = RGB8 {
+            r: power_limited_channel(logical[0], 760),
+            g: power_limited_channel(logical[1], 760),
+            b: power_limited_channel(logical[2], 760),
+        };
+    }
+}
+
+const fn matrix_column(x: i32) -> u8 {
+    if x < -416 {
+        0
+    } else if x < -208 {
+        1
+    } else if x < 0 {
+        2
+    } else if x < 208 {
+        3
+    } else if x < 416 {
+        4
+    } else {
+        5
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MountingSign {
@@ -363,6 +445,40 @@ mod tests {
             )
             .unwrap();
         assert!(frame.iter().any(|pixel| *pixel != RGB8::default()));
+        assert!(frame.iter().all(|pixel| {
+            pixel.r <= BRIGHTNESS_CEILING
+                && pixel.g <= BRIGHTNESS_CEILING
+                && pixel.b <= BRIGHTNESS_CEILING
+        }));
+    }
+
+    #[test]
+    fn matrix_boot_is_green_bounded_dynamic_and_panel_phased() {
+        let mut left_early = [RGB8::default(); LEDS_PER_EYE];
+        let mut left_later = [RGB8::default(); LEDS_PER_EYE];
+        let mut right_early = [RGB8::default(); LEDS_PER_EYE];
+        render_matrix_boot(0, MatrixPanel::Left, &mut left_early);
+        render_matrix_boot(317, MatrixPanel::Left, &mut left_later);
+        render_matrix_boot(0, MatrixPanel::Right, &mut right_early);
+
+        for frame in [&left_early, &left_later, &right_early] {
+            assert!(frame.iter().any(|pixel| *pixel != RGB8::default()));
+            assert!(frame.iter().all(|pixel| {
+                pixel.g >= pixel.r
+                    && pixel.g >= pixel.b
+                    && pixel.r <= BRIGHTNESS_CEILING
+                    && pixel.g <= BRIGHTNESS_CEILING
+                    && pixel.b <= BRIGHTNESS_CEILING
+            }));
+        }
+        assert_ne!(left_early, left_later);
+        assert_ne!(left_early, right_early);
+    }
+
+    #[test]
+    fn matrix_boot_time_arithmetic_is_total_at_u64_maximum() {
+        let mut frame = [RGB8::default(); LEDS_PER_EYE];
+        render_matrix_boot(u64::MAX, MatrixPanel::Right, &mut frame);
         assert!(frame.iter().all(|pixel| {
             pixel.r <= BRIGHTNESS_CEILING
                 && pixel.g <= BRIGHTNESS_CEILING

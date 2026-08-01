@@ -121,6 +121,21 @@ records the exact earlier UF2 identity and the operator-observed physical KEP2
 sequence. Rebuilding this source does not inherit that physical evidence or
 permit reuse of the earlier firmware build ID.
 
+Every successful application boot now renders a 2.4-second green Matrix cue
+before the USB KEP2 endpoint enumerates. Delaying enumeration is intentional:
+the firmware cannot truthfully acknowledge an applied eye intent while a boot
+animation is overriding the panels. This also provides a deterministic
+post-UF2-copy indication that the new application started.
+
+The RP2350 application is not executing while ROM BOOTSEL owns the board, so
+this firmware cannot animate the physical panels during the actual UF2 file
+copy. A host updater may show a separate progress animation and may request a
+pre-reset cue from an already running application, but it must label the
+BOOTSEL interval as bootloader-owned and must wait for the post-boot Matrix cue
+and exact KEP2 identity before reporting success. Continuous physical Matrix
+animation across that interval would require a reviewed custom bootloader or
+an independent display controller; this repository does not pretend otherwise.
+
 ## Evidence boundary before deployment
 
 Host tests and an RP2350 release link prove compilation and software state

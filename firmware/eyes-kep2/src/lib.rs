@@ -18,6 +18,7 @@ pub use controller::{
 };
 pub use endpoint::{EncodedResponse, EndpointEvent, EndpointFault, Kep2Endpoint};
 pub use renderer::{
-    BRIGHTNESS_CEILING, EyeFrame, EyeRenderer, FRAME_RATE_HZ, LEDS_PER_EYE, MountingSign,
-    MountingSignError, RenderError,
+    BRIGHTNESS_CEILING, EyeFrame, EyeRenderer, FRAME_RATE_HZ, LEDS_PER_EYE,
+    MATRIX_BOOT_DURATION_MS, MatrixPanel, MountingSign, MountingSignError, RenderError,
+    render_matrix_boot,
 };
