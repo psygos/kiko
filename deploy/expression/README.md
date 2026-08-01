@@ -20,7 +20,8 @@ using the bus evidence recorded in `docs/head-compliant-hold-2026-08-01.md`.
 
 The live owner also runs the same conservative encoder-domain compliant-hold
 policy qualified by the typed Rust controller: one second of settled motion
-arms touch detection, three direction-consistent samples admit contact, the
+captures a bounded four-axis gravity/tracking bias and arms touch detection,
+three direction-consistent residual samples admit contact, the
 head follows 35% of bounded displacement, waits 600 ms after release, and
 returns with a 2.4 s minimum-jerk trajectory. The pure planner is isolated in
 `compliant_head.py`, strictly parses its complete policy once, binds the policy

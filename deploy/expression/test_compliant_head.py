@@ -84,6 +84,20 @@ class CompliantHeadControllerTests(unittest.TestCase):
         # 35% of 24 ticks rounds to 8, but one physical command may move only 3.
         self.assertEqual(third.target_ticks, (103, 100, 100, 100))
 
+    def test_settled_gravity_bias_is_not_misclassified_as_touch(self):
+        controller = make_controller()
+        biased = (117, 115, 100, 100)
+        for step in range(11):
+            result = service(controller, step / 10.0, biased)
+        self.assertEqual(result.event, "pet_ready")
+        self.assertEqual(controller.baseline_error, (17, 15, 0, 0))
+        # The same equilibrium remains inside the release band after arming.
+        result = service(controller, 1.1, biased)
+        self.assertEqual(result.state, FOLLOWING)
+        # Contact is displacement beyond the learned bias, not raw goal error.
+        result = service(controller, 1.2, (136, 115, 100, 100), moving=True)
+        self.assertEqual(result.state, CONFIRMING)
+
     def test_direction_reversal_rejects_false_contact(self):
         controller = make_controller()
         self.arm(controller)

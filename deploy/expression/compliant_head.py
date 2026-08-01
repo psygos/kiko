@@ -165,6 +165,7 @@ class CompliantHeadController:
         self.previous_observation = None
         self.quiescent_since = None
         self.contact_armed = False
+        self.baseline_error = (0, 0, 0, 0)
         self.candidate_directions = None
         self.candidate_samples = 0
         self.return_target = None
@@ -210,16 +211,17 @@ class CompliantHeadController:
                         f"joint {joint} observation discontinuity {difference} ticks")
 
     def _inside_release(self, positions):
-        return all(abs(actual - command) <= release
-                   for actual, command, release in zip(
-                       positions, self.target,
+        return all(abs(actual - command - baseline) <= release
+                   for actual, command, baseline, release in zip(
+                       positions, self.target, self.baseline_error,
                        self.policy.contact_release_error_ticks))
 
     def _directions(self, positions):
         result = []
-        for actual, command, threshold in zip(
-                positions, self.target, self.policy.contact_entry_error_ticks):
-            error = actual - command
+        for actual, command, baseline, threshold in zip(
+                positions, self.target, self.baseline_error,
+                self.policy.contact_entry_error_ticks):
+            error = actual - command - baseline
             result.append(0 if abs(error) < threshold else (1 if error > 0 else -1))
         return tuple(result)
 
@@ -245,7 +247,7 @@ class CompliantHeadController:
         desired = []
         for joint, actual in enumerate(positions):
             origin = self.return_target[joint]
-            displacement = actual - origin
+            displacement = actual - origin - self.baseline_error[joint]
             offset = self._round_nearest(displacement * self.policy.follow_fraction)
             maximum = self.policy.maximum_yield_ticks[joint]
             offset = max(-maximum, min(maximum, offset))
@@ -293,12 +295,26 @@ class CompliantHeadController:
             if not expression_quiet:
                 self.quiescent_since = None
                 self.contact_armed = False
+                self.baseline_error = (0, 0, 0, 0)
             elif not self.contact_armed:
-                settled = self._inside_release(positions) and not any(moving)
+                candidate_baseline = tuple(
+                    actual - command
+                    for actual, command in zip(positions, self.target))
+                # A learned holding bias is admissible only strictly inside
+                # the contact-entry band. Larger error is not quietly
+                # reclassified as gravity; it prevents arming.
+                settled = (not any(moving) and all(
+                    abs(error) < entry for error, entry in zip(
+                        candidate_baseline,
+                        self.policy.contact_entry_error_ticks)))
                 self.quiescent_since = (self.quiescent_since if settled
                                         else None)
                 if settled and self.quiescent_since is None:
                     self.quiescent_since = now
+                if settled:
+                    self.baseline_error = candidate_baseline
+                else:
+                    self.baseline_error = (0, 0, 0, 0)
                 if (self.quiescent_since is not None and
                         now - self.quiescent_since >= self.policy.contact_arm_dwell_s):
                     self.contact_armed = True
@@ -322,6 +338,7 @@ class CompliantHeadController:
                 self.target = expression_target
                 self.quiescent_since = None
                 self.contact_armed = False
+                self.baseline_error = (0, 0, 0, 0)
                 self.candidate_directions = None
                 self.candidate_samples = 0
             else:
@@ -331,6 +348,7 @@ class CompliantHeadController:
                     self.target = expression_target
                     self.quiescent_since = None
                     self.contact_armed = False
+                    self.baseline_error = (0, 0, 0, 0)
                 else:
                     self.candidate_samples += 1
                     if self.candidate_samples >= self.policy.contact_acquisition_samples:
@@ -380,6 +398,7 @@ class CompliantHeadController:
                     self.state = FOLLOWING
                     self.quiescent_since = None
                     self.contact_armed = False
+                    self.baseline_error = (0, 0, 0, 0)
                     event = "pet_returned"
 
         self.previous_expression_target = expression_target
