@@ -320,3 +320,9 @@ confirmations can remain inside one response-corruption burst on this bus. It
 does not prove a universal maximum burst length. The deployed confirmation
 interval is therefore 100 ms, beyond the observed 85 ms recovery, and retains
 two confirmation samples over 200 ms before a genuine three-high fail-stop.
+After rebuilding, the deliberately restarted guardian and both of its exact
+children remained unchanged for a 274-second observation ending at
+`2026-08-01T12:06:32+05:30`. The typed head owner therefore passed the earlier
+171.79-second failure point under the extended policy. Process survival does
+not reveal how many transient classifications occurred because the autonomous
+commissioning loop does not emit each non-fault receipt.
