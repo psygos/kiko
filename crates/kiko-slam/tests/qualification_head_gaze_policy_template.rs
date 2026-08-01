@@ -15,25 +15,10 @@ const TEMPLATE: &str = include_str!(concat!(
     "/../../configs/nano-wheels-off-qualification-template/head-gaze-policy-v1.json.template"
 ));
 
-const UNRESOLVED_SENTINELS: [&str; 35] = [
+const UNRESOLVED_SENTINELS: [&str; 20] = [
     "${HEAD_ASSEMBLY_DECLARATION_ID}",
     "${HEAD_GAZE_UNVALIDATED_PROPOSAL_EVIDENCE_ID}",
     "${HEAD_GAZE_UNVALIDATED_PROPOSAL_EVIDENCE_CONTENT_SHA256}",
-    "${HEAD_GAZE_UNVALIDATED_BOW_MINIMUM_TICKS}",
-    "${HEAD_GAZE_UNVALIDATED_BOW_MAXIMUM_TICKS}",
-    "${HEAD_GAZE_UNVALIDATED_CURL_MINIMUM_TICKS}",
-    "${HEAD_GAZE_UNVALIDATED_CURL_MAXIMUM_TICKS}",
-    "${HEAD_GAZE_UNVALIDATED_YAW_MINIMUM_TICKS}",
-    "${HEAD_GAZE_UNVALIDATED_YAW_MAXIMUM_TICKS}",
-    "${HEAD_GAZE_UNVALIDATED_ROLL_MINIMUM_TICKS}",
-    "${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_TICKS}",
-    "${HEAD_GAZE_UNVALIDATED_PITCH_DOWN_BOW_TICKS_PER_RADIAN}",
-    "${HEAD_GAZE_UNVALIDATED_PITCH_DOWN_CURL_TICKS_PER_RADIAN}",
-    "${HEAD_GAZE_UNVALIDATED_YAW_RIGHT_YAW_TICKS_PER_RADIAN}",
-    "${HEAD_CHARACTER_UNVALIDATED_BOW_POSITIVE_FULL_SCALE_TICKS}",
-    "${HEAD_CHARACTER_UNVALIDATED_CURL_POSITIVE_FULL_SCALE_TICKS}",
-    "${HEAD_CHARACTER_UNVALIDATED_YAW_POSITIVE_FULL_SCALE_TICKS}",
-    "${HEAD_CHARACTER_UNVALIDATED_ROLL_POSITIVE_FULL_SCALE_TICKS}",
     "${HEAD_GAZE_UNVALIDATED_CONTROL_PERIOD_NS}",
     "${HEAD_GAZE_UNVALIDATED_MAXIMUM_TICK_LATENESS_NS}",
     "${HEAD_GAZE_UNVALIDATED_PROPOSAL_TTL_NS}",
@@ -66,42 +51,6 @@ fn render_parser_fixture() -> String {
         (
             "${HEAD_GAZE_UNVALIDATED_PROPOSAL_EVIDENCE_CONTENT_SHA256}",
             "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff",
-        ),
-        ("${HEAD_GAZE_UNVALIDATED_BOW_MINIMUM_TICKS}", "1974"),
-        ("${HEAD_GAZE_UNVALIDATED_BOW_MAXIMUM_TICKS}", "2374"),
-        ("${HEAD_GAZE_UNVALIDATED_CURL_MINIMUM_TICKS}", "2370"),
-        ("${HEAD_GAZE_UNVALIDATED_CURL_MAXIMUM_TICKS}", "2770"),
-        ("${HEAD_GAZE_UNVALIDATED_YAW_MINIMUM_TICKS}", "1437"),
-        ("${HEAD_GAZE_UNVALIDATED_YAW_MAXIMUM_TICKS}", "1837"),
-        ("${HEAD_GAZE_UNVALIDATED_ROLL_MINIMUM_TICKS}", "2847"),
-        ("${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_TICKS}", "3247"),
-        (
-            "${HEAD_GAZE_UNVALIDATED_PITCH_DOWN_BOW_TICKS_PER_RADIAN}",
-            "-300.0",
-        ),
-        (
-            "${HEAD_GAZE_UNVALIDATED_PITCH_DOWN_CURL_TICKS_PER_RADIAN}",
-            "300.0",
-        ),
-        (
-            "${HEAD_GAZE_UNVALIDATED_YAW_RIGHT_YAW_TICKS_PER_RADIAN}",
-            "300.0",
-        ),
-        (
-            "${HEAD_CHARACTER_UNVALIDATED_BOW_POSITIVE_FULL_SCALE_TICKS}",
-            "100",
-        ),
-        (
-            "${HEAD_CHARACTER_UNVALIDATED_CURL_POSITIVE_FULL_SCALE_TICKS}",
-            "-100",
-        ),
-        (
-            "${HEAD_CHARACTER_UNVALIDATED_YAW_POSITIVE_FULL_SCALE_TICKS}",
-            "150",
-        ),
-        (
-            "${HEAD_CHARACTER_UNVALIDATED_ROLL_POSITIVE_FULL_SCALE_TICKS}",
-            "100",
         ),
         ("${HEAD_GAZE_UNVALIDATED_CONTROL_PERIOD_NS}", "20000000"),
         (
@@ -177,9 +126,12 @@ fn render_parser_fixture() -> String {
 }
 
 #[test]
-fn checked_in_template_keeps_every_unknown_value_explicitly_unvalidated() {
+fn checked_in_template_keeps_every_remaining_unknown_explicitly_unvalidated() {
     assert!(TEMPLATE.contains("\"kind\": \"proposal_only\""));
-    assert!(TEMPLATE.contains("\"calibration_provenance_id\": \"unvalidated-"));
+    assert!(
+        TEMPLATE
+            .contains("\"calibration_provenance_id\": \"kiko-follow-config-0d98af8c-2026-07-31\"")
+    );
     assert!(!TEMPLATE.contains("operator_claimed_physical_review"));
     for sentinel in UNRESOLVED_SENTINELS {
         assert!(
@@ -223,6 +175,30 @@ fn rendered_contract_is_typed_proposal_only_with_exact_known_geometry() {
             .map(|position| position.get()),
         [2174, 2570, 1637, 3047]
     );
+    assert_eq!(
+        kiko_head_protocol::HeadJoint::ALL.map(|joint| {
+            let envelope = mapping.hard_envelope(joint);
+            [envelope.minimum().get(), envelope.maximum().get()]
+        }),
+        [[2064, 2284], [2390, 2750], [1157, 2117], [2887, 3207]]
+    );
+    assert_eq!(
+        [
+            mapping.tick_offset_per_radian(
+                kiko_expression_runtime::HeadGazeCoordinate::PitchDown,
+                kiko_head_protocol::HeadJoint::Bow,
+            ),
+            mapping.tick_offset_per_radian(
+                kiko_expression_runtime::HeadGazeCoordinate::PitchDown,
+                kiko_head_protocol::HeadJoint::Curl,
+            ),
+            mapping.tick_offset_per_radian(
+                kiko_expression_runtime::HeadGazeCoordinate::YawRight,
+                kiko_head_protocol::HeadJoint::Yaw,
+            ),
+        ],
+        [-93.0, 465.0, -1050.0]
+    );
     let character = policy
         .character_mapping()
         .expect("template retains an explicit proposal-only four-joint mapping");
@@ -233,7 +209,7 @@ fn rendered_contract_is_typed_proposal_only_with_exact_known_geometry() {
             character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Yaw),
             character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Roll),
         ],
-        [100, -100, 150, 100]
+        [110, -180, 480, 160]
     );
 
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]

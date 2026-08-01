@@ -63,9 +63,15 @@ absent or a combined target is unsafe, the returned disposition says exactly
 why the expressive overlay was withheld. Face gaze can still use its safe base
 proposal.
 
-The checked-in qualification template contains unresolved placeholders for
-all four full-scale offsets. That is intentional: source behavior is ready,
-but copied Python signs are not treated as physical calibration evidence.
+The four-axis calibration was already present and active on the Nano. Read-only
+inspection bound it to configuration SHA-256
+`0d98af8c9fde9f34686375ff49a963c9f290386e3bdb7d623390cc3fbe82085f`
+and source SHA-256
+`a41f6d4717dd1b301da04e89906587aa6d4f1b9238e041ab9e9480e8bc1938ad`.
+The qualification template now retains its exact natural pose, per-axis
+software envelopes, gaze signs/scales, and character-positive offsets. Its
+remaining placeholders concern controller timing/limits and review-artifact
+binding, not servo recalibration.
 
 ## Rerun seam
 
@@ -121,5 +127,5 @@ arithmetic. The embedded target is compile-checked separately.
 These checks prove software behavior only. No eye firmware was flashed and no
 servo was moved by this change. A physical rollout still requires an explicit
 guardian handoff, a fresh non-reused firmware build identity, exact KEP2
-identity admission, reviewed four-axis calibration, and observed motion with
-the wheels safely removed.
+identity admission, binding the existing four-axis calibration into the
+reviewed physical policy, and observed motion with the wheels safely removed.

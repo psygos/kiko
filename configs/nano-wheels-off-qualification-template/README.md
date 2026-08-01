@@ -78,16 +78,27 @@ fixes only these currently declared facts:
 - a two-dimensional face ray uses an assumed `1.5 m` camera-forward focus
   plane, not observed range;
 - the natural encoder declaration is bow/curl/yaw/roll
-  `[2174, 2570, 1637, 3047]`; and
+  `[2174, 2570, 1637, 3047]`;
+- the active four-axis configuration SHA-256
+  `0d98af8c9fde9f34686375ff49a963c9f290386e3bdb7d623390cc3fbe82085f`
+  supplies software offset limits `[110,180,480,160]`, which produce the
+  inclusive envelopes
+  `[2064..2284,2390..2750,1157..2117,2887..3207]`;
+- the same configuration plus source SHA-256
+  `a41f6d4717dd1b301da04e89906587aa6d4f1b9238e041ab9e9480e8bc1938ad`
+  supplies the exact coordinate conversion: pitch-down maps to bow/curl
+  `[-93,+465]` ticks/radian, yaw-right maps to yaw `-1050` ticks/radian,
+  and character-positive full scale maps to `[+110,-180,+480,+160]` ticks;
+  and
 - the lifecycle is `proposal_only`.
 
 The assembly identifier, retained proposal-evidence identifier and digest,
-hard encoder envelopes, encoder signs/scales, controller timing, hysteresis,
-and per-joint motion limits remain visibly named `UNVALIDATED` sentinels.
-Replacing a sentinel proves neither its physical value nor its safety. The
-rendered policy must continue to use `proposal_only`; it must not be converted
-to `operator_claimed_physical_review` without a separate, retained, physically
-witnessed review transaction.
+controller timing, hysteresis, and per-joint controller motion limits remain
+visibly named `UNVALIDATED` sentinels. The four-axis calibration is not one of
+the missing facts. Replacing a remaining sentinel proves neither its physical
+value nor its safety. The rendered policy must continue to use
+`proposal_only`; it must not be converted to `operator_claimed_physical_review`
+without a separate, retained, physically witnessed review transaction.
 
 The controller declaration remains non-command metadata even after it parses.
 Gate A leaves `assets.head_gaze_policy_source_path` absent, so the renderer

@@ -8,7 +8,7 @@
   },
   "mapping_declaration": {
     "assembly_id": "${HEAD_ASSEMBLY_DECLARATION_ID}",
-    "calibration_provenance_id": "unvalidated-head-gaze-mapping-proposal-v1",
+    "calibration_provenance_id": "kiko-follow-config-0d98af8c-2026-07-31",
     "gaze_only_focus_plane": {
       "camera_forward_depth_m": 1.5
     },
@@ -33,41 +33,41 @@
     },
     "hard_encoder_envelopes_ticks": {
       "bow": {
-        "minimum_ticks": ${HEAD_GAZE_UNVALIDATED_BOW_MINIMUM_TICKS},
-        "maximum_ticks": ${HEAD_GAZE_UNVALIDATED_BOW_MAXIMUM_TICKS}
+        "minimum_ticks": 2064,
+        "maximum_ticks": 2284
       },
       "curl": {
-        "minimum_ticks": ${HEAD_GAZE_UNVALIDATED_CURL_MINIMUM_TICKS},
-        "maximum_ticks": ${HEAD_GAZE_UNVALIDATED_CURL_MAXIMUM_TICKS}
+        "minimum_ticks": 2390,
+        "maximum_ticks": 2750
       },
       "yaw": {
-        "minimum_ticks": ${HEAD_GAZE_UNVALIDATED_YAW_MINIMUM_TICKS},
-        "maximum_ticks": ${HEAD_GAZE_UNVALIDATED_YAW_MAXIMUM_TICKS}
+        "minimum_ticks": 1157,
+        "maximum_ticks": 2117
       },
       "roll": {
-        "minimum_ticks": ${HEAD_GAZE_UNVALIDATED_ROLL_MINIMUM_TICKS},
-        "maximum_ticks": ${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_TICKS}
+        "minimum_ticks": 2887,
+        "maximum_ticks": 3207
       }
     },
     "encoder_tick_offsets_per_radian": {
       "pitch_down_rad": {
-        "bow_ticks_per_radian": ${HEAD_GAZE_UNVALIDATED_PITCH_DOWN_BOW_TICKS_PER_RADIAN},
-        "curl_ticks_per_radian": ${HEAD_GAZE_UNVALIDATED_PITCH_DOWN_CURL_TICKS_PER_RADIAN},
+        "bow_ticks_per_radian": -93.0,
+        "curl_ticks_per_radian": 465.0,
         "yaw_ticks_per_radian": 0.0,
         "roll_ticks_per_radian": 0.0
       },
       "yaw_right_rad": {
         "bow_ticks_per_radian": 0.0,
         "curl_ticks_per_radian": 0.0,
-        "yaw_ticks_per_radian": ${HEAD_GAZE_UNVALIDATED_YAW_RIGHT_YAW_TICKS_PER_RADIAN},
+        "yaw_ticks_per_radian": -1050.0,
         "roll_ticks_per_radian": 0.0
       }
     },
     "character_positive_full_scale_encoder_offsets_ticks": {
-      "bow_ticks": ${HEAD_CHARACTER_UNVALIDATED_BOW_POSITIVE_FULL_SCALE_TICKS},
-      "curl_ticks": ${HEAD_CHARACTER_UNVALIDATED_CURL_POSITIVE_FULL_SCALE_TICKS},
-      "yaw_ticks": ${HEAD_CHARACTER_UNVALIDATED_YAW_POSITIVE_FULL_SCALE_TICKS},
-      "roll_ticks": ${HEAD_CHARACTER_UNVALIDATED_ROLL_POSITIVE_FULL_SCALE_TICKS}
+      "bow_ticks": 110,
+      "curl_ticks": -180,
+      "yaw_ticks": 480,
+      "roll_ticks": 160
     }
   },
   "controller_declaration": {
