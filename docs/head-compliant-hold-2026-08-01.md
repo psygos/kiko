@@ -191,6 +191,14 @@ motion as soft. Physical observations must either support those exact bytes or
 produce a new candidate; they must never be rewritten into evidence after the
 fact.
 
+The first Nano activation observed the already-energized bow joint settling
+from 2153 to 2132 ticks after the legacy owner released its serial endpoint.
+That was one tick below the historical startup-window minimum, so startup
+correctly refused every motion write. The attended configuration admits bow
+down to 2126 ticks, exactly `2174 - 48`: the existing reviewed target minus the
+existing maximum return travel. This is measured startup-admission evidence,
+not evidence for a wider return, compliant envelope, or touch behavior.
+
 For the attended Nano handoff, `deploy/kiko-accessory-commissioning-guardian.sh`
 keeps two deliberately separate device owners alive. The existing expression
 process runs with `--no-head` and therefore retains only OAK/eye behavior; the
