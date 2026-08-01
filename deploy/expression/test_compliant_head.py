@@ -249,6 +249,25 @@ class CompliantHeadControllerTests(unittest.TestCase):
             service(controller, 0.1, (150, 100, 100, 100))
         self.assertEqual(controller.state, FAULT_HELD)
 
+    def test_touch_observation_may_cross_command_edge_only_by_yield(self):
+        controller = make_controller()
+        # Commands stop at 150, but the reviewed 30-tick touch yield makes an
+        # actual encoder observation through 180 representable.
+        result = service(controller, 0.0, (180, 100, 100, 100))
+        self.assertEqual(result.state, FOLLOWING)
+        outside = make_controller()
+        with self.assertRaises(CompliantObservationError):
+            service(outside, 0.0, (181, 100, 100, 100))
+        self.assertEqual(outside.state, FAULT_HELD)
+
+    def test_expression_command_cannot_use_observation_excursion(self):
+        controller = make_controller()
+        with self.assertRaises(CompliantObservationError):
+            service(
+                controller, 0.0, (151, 100, 100, 100),
+                command=(151, 100, 100, 100))
+        self.assertEqual(controller.state, FAULT_HELD)
+
     def test_expression_motion_prevents_contact_arming(self):
         controller = make_controller()
         for step in range(20):

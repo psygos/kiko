@@ -227,7 +227,7 @@ class CompliantHeadController:
 
     def __init__(self, policy, initial_target_ticks, started_at):
         self.policy = policy
-        self._admit_pose(initial_target_ticks, "initial target")
+        self._admit_command_pose(initial_target_ticks, "initial target")
         self.state = FOLLOWING
         self.target = tuple(initial_target_ticks)
         self.previous_expression_target = tuple(initial_target_ticks)
@@ -256,7 +256,7 @@ class CompliantHeadController:
         return self.state in (
             CONFIRMING, YIELDING, RELEASE_DWELL, RESTING, RECOVERING)
 
-    def _admit_pose(self, pose, field):
+    def _admit_command_pose(self, pose, field):
         if not isinstance(pose, (list, tuple)) or len(pose) != JOINT_COUNT:
             raise CompliantObservationError(f"{field} must contain four ticks")
         for joint, value in enumerate(pose):
@@ -268,8 +268,27 @@ class CompliantHeadController:
                     f"[{self.policy.minimum_ticks[joint]}, "+
                     f"{self.policy.maximum_ticks[joint]}]")
 
+    def _admit_observation_pose(self, pose):
+        if not isinstance(pose, (list, tuple)) or len(pose) != JOINT_COUNT:
+            raise CompliantObservationError(
+                "observation must contain four ticks")
+        for joint, value in enumerate(pose):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise CompliantObservationError(
+                    f"observation[{joint}] is not an integer")
+            # minimum/maximum_ticks bound commands. At that boundary a person
+            # must still be able to move the joint by the already-reviewed
+            # maximum yield before the physical observation becomes a fault.
+            excursion = self.policy.maximum_yield_ticks[joint]
+            minimum = max(0, self.policy.minimum_ticks[joint] - excursion)
+            maximum = min(4095, self.policy.maximum_ticks[joint] + excursion)
+            if not minimum <= value <= maximum:
+                raise CompliantObservationError(
+                    f"observation[{joint}]={value} outside reviewed physical "+
+                    f"envelope [{minimum}, {maximum}]")
+
     def _admit_observation(self, positions, moving, observation_span_s):
-        self._admit_pose(positions, "observation")
+        self._admit_observation_pose(positions)
         if not isinstance(moving, (list, tuple)) or len(moving) != JOINT_COUNT:
             raise CompliantObservationError("moving must contain four booleans")
         if any(not isinstance(value, bool) for value in moving):
@@ -411,7 +430,8 @@ class CompliantHeadController:
         if now + 1e-9 < self.next_service_due:
             raise CompliantObservationError("compliant service called before scheduled tick")
         try:
-            self._admit_pose(expression_target_ticks, "expression target")
+            self._admit_command_pose(
+                expression_target_ticks, "expression target")
             self._admit_observation(positions, moving, observation_span_s)
         except CompliantObservationError as exc:
             self.fault = str(exc)
