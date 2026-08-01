@@ -32,6 +32,10 @@ from compliant_head import (
     RELEASE_DWELL, YIELDING,
 )
 from head_thermal import ThermalDerateController, ThermalDeratePolicy
+from organic_motion import (
+    EyeIntent, OrganicEyeDynamics, OrganicMotionAxis,
+    parse_head_motion_policies,
+)
 
 # ----------------------------------------------------------------------------
 # Configuration (operator-reviewed values; signs are flippable via config file)
@@ -49,12 +53,14 @@ DEFAULT_CONFIG = {
     "admission_window_ticks": 420,
     "torque_limit_permille": [650, 550, 400, 400],
     "return_speed_ticks_s": 50,
-    "track_speed_min": 30,
     "track_speed_max": 135,
     "return_step_ticks": 2,   # goal advance per 20 Hz cycle => 40 t/s
-    "track_step_ticks": 6,    # goal advance per 20 Hz cycle => <=120 t/s
     "goal_deadband_ticks": 3,
-    "offset_ease": 0.30,      # exponential ease toward desired offsets
+    "head_motion_response_hz": [0.62, 0.70, 0.82, 0.74],
+    "head_motion_max_velocity_ticks_s": [70, 115, 165, 110],
+    "head_motion_max_acceleration_ticks_s2": [180, 280, 420, 280],
+    "head_motion_max_jerk_ticks_s3": [900, 1400, 2100, 1400],
+    "head_motion_max_interval_ms": 150,
     "bow_limit_ticks": 45,
     "curl_limit_ticks": 90,
     "yaw_limit_ticks": 260,
@@ -479,10 +485,12 @@ class HeadController:
         self.cfg = cfg
         self.natural = list(cfg["natural_ticks"])
         self.goal = None                       # last commanded goals
-        self.expression_goal = None            # independently slewed character goal
         self.offsets = [0.0, 0.0, 0.0, 0.0]    # bow, curl, yaw, roll (ticks)
         self.limits = [cfg["bow_limit_ticks"], cfg["curl_limit_ticks"],
                        cfg["yaw_limit_ticks"], cfg["roll_limit_ticks"]]
+        self.motion_policies = parse_head_motion_policies(cfg, self.limits)
+        self.motion_axes = None
+        self.motion_gap_log_due = 0.0
         self.state = "INIT"
         self.fault = None
         self.thermal = ThermalDerateController(ThermalDeratePolicy.parse(cfg))
@@ -540,7 +548,6 @@ class HeadController:
                                 self.cfg["return_speed_ticks_s"])
             self.bus.write_torque_switch(servo_id, True)
         self.goal = list(poses)
-        self.expression_goal = list(poses)
         self.state = "RETURNING"
         print(f"engaged_at={poses}", flush=True)
 
@@ -558,43 +565,57 @@ class HeadController:
             self.goal[joint] = have + move
             self.bus.write_goal(servo_id, self.goal[joint], speed)
 
+    def _write_planned(self, desired):
+        deadband = self.cfg["goal_deadband_ticks"]
+        for joint, servo_id in enumerate(SERVO_IDS):
+            want = desired[joint]
+            if abs(want - self.goal[joint]) < deadband:
+                continue
+            self.goal[joint] = want
+            self.bus.write_goal(
+                servo_id, want, self.cfg["track_speed_max"])
+
     def step(self, desired_offsets, now=None):
         """One 20 Hz control step toward natural + bounded 4-DOF offsets."""
         now = time.monotonic() if now is None else now
-        desired = [max(-self.limits[j], min(self.limits[j], desired_offsets[j]))
-                   for j in range(4)]
+        if not isinstance(desired_offsets, (list, tuple)) or len(desired_offsets) != 4:
+            raise StsError("head expression must contain four offsets")
+        desired = []
+        for joint, value in enumerate(desired_offsets):
+            if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                    not math.isfinite(float(value))):
+                raise StsError(f"head expression joint {joint} is not finite")
+            desired.append(max(
+                -self.limits[joint], min(self.limits[joint], float(value))))
         if self.state == "RETURNING":
-            desired = [0.0, 0.0, 0.0, 0.0]
-        # Ease offsets toward desired (exponential, per-cycle step clamp), so
-        # motion starts and ends softly; the goal advance rate stays at or
-        # below the servo speed so the shaft keeps up with the goal.
-        step = (self.cfg["return_step_ticks"] if self.state == "RETURNING"
-                else self.cfg["track_step_ticks"])
-        ease = self.cfg["offset_ease"]
-        for i in range(4):
-            delta = (desired[i] - self.offsets[i]) * ease
-            self.offsets[i] += max(-step, min(step, delta))
-        target = self._target_ticks()
-        for joint in range(4):
-            have = self.expression_goal[joint]
-            move = max(-step, min(step, target[joint] - have))
-            self.expression_goal[joint] = have + move
-        speed_base = self.cfg["return_speed_ticks_s"]
-        # The incremental goal trajectory rate-limits real motion; the servo
-        # speed register only needs to keep the shaft up with the goal. During
-        # touch arbitration the compliant target is the only physical writer.
-        if self.compliance is None or self.compliance.state == FOLLOWING:
-            speed = (speed_base if self.state == "RETURNING"
-                     else self.cfg["track_speed_max"])
-            self._write_toward(self.expression_goal, step, speed)
-        if self.state == "RETURNING":
+            self._write_toward(
+                self.natural, self.cfg["return_step_ticks"],
+                self.cfg["return_speed_ticks_s"])
             err = max(abs(self.goal[j] - self.natural[j]) for j in range(4))
             if err <= 2:
                 self.state = "TRACKING"
-                self.expression_goal = list(self.natural)
+                self.offsets = [float(self.goal[j] - self.natural[j])
+                                for j in range(4)]
+                self.motion_axes = tuple(
+                    OrganicMotionAxis(policy, self.offsets[joint], now)
+                    for joint, policy in enumerate(self.motion_policies))
                 self.compliance = CompliantHeadController(
                     self.compliant_policy, tuple(self.goal), now)
                 print("head_at_natural tracking_enabled", flush=True)
+        elif self.state == "TRACKING":
+            if self.compliance is not None and self.compliance.state != FOLLOWING:
+                for axis in self.motion_axes:
+                    axis.hold(now)
+            else:
+                planned = tuple(
+                    axis.step(target, now)
+                    for axis, target in zip(self.motion_axes, desired))
+                self.offsets = [step.position for step in planned]
+                if (any(step.gap_reset for step in planned) and
+                        now >= self.motion_gap_log_due):
+                    print("head_motion_gap trajectory_frozen", flush=True)
+                    self.motion_gap_log_due = now + 1.0
+                self._write_planned(self._target_ticks())
 
         if (self.state == "TRACKING" and self.compliance is not None and
                 now + 1e-9 >= self.compliance.next_service_due):
@@ -1081,9 +1102,10 @@ class CharacterEngine:
     def __init__(self, cfg):
         self.cfg = cfg
         self.rng = random.SystemRandom()
+        self.created_at = time.monotonic()
         self.mode = "IDLE"
-        self.mode_since = time.monotonic()
-        self.last_person_at = time.monotonic()
+        self.mode_since = self.created_at
+        self.last_person_at = self.created_at
         self.greet_until = 0.0
         self.search_until = 0.0
         self.next_blink = time.monotonic() + 4.0
@@ -1093,43 +1115,50 @@ class CharacterEngine:
         self.last_run = {}
         self.history = []
         self.saccade = (0.0, 0.0)
-        self.saccade_until = 0.0
+        self.saccade_until = self.created_at + self.rng.uniform(0.8, 1.8)
+        self.search_rate_hz = 0.34
+        self.search_direction = 1
         self.hue_phase = self.rng.uniform(0.0, 6.28)
+        self.life_phases = tuple(self.rng.uniform(0.0, 2.0 * math.pi)
+                                 for _ in range(6))
         self.still_ref = 0.0
         self.still_since = time.monotonic()
         self.prev_proximity = 0.0
         self.greet_style = 0
 
     # -- mode machine ---------------------------------------------------------
-    def _enter(self, mode):
+    def _enter(self, mode, now):
         if mode != self.mode:
             print(f"eyes_mode {self.mode}->{mode}", flush=True)
             self.mode = mode
-            self.mode_since = time.monotonic()
+            self.mode_since = now
+            if mode == "SEARCH":
+                self.search_rate_hz = self.rng.uniform(0.26, 0.36)
+                self.search_direction = self.rng.choice((-1, 1))
 
     def _update_mode(self, person, now):
         if person:
             if self.mode in ("IDLE", "SLEEPY", "SEARCH", "LOST"):
                 if now - self.last_person_at > self.cfg["greet_cooldown_s"]:
-                    self._enter("GREET")
+                    self._enter("GREET", now)
                     self.greet_until = now + self.rng.uniform(0.9, 1.4)
                     self.greet_style = self.rng.randrange(3)
                 else:
-                    self._enter("TRACK")
+                    self._enter("TRACK", now)
             self.last_person_at = now
         else:
             if self.mode in ("TRACK", "GREET"):
-                self._enter("LOST")
+                self._enter("LOST", now)
             elif self.mode == "LOST" and now - self.mode_since > 0.7:
-                self._enter("SEARCH")
+                self._enter("SEARCH", now)
                 self.search_until = now + self.rng.uniform(2.2, 3.8)
             elif self.mode == "SEARCH" and now > self.search_until:
-                self._enter("IDLE")
+                self._enter("IDLE", now)
             elif self.mode == "IDLE" and (now - self.last_person_at
                                           > self.cfg["sleepy_after_idle_s"]):
-                self._enter("SLEEPY")
+                self._enter("SLEEPY", now)
         if self.mode == "GREET" and now >= self.greet_until:
-            self._enter("TRACK")
+            self._enter("TRACK", now)
 
     # -- act scheduling -------------------------------------------------------
     def _maybe_start_act(self, now, derate, proximity):
@@ -1202,10 +1231,11 @@ class CharacterEngine:
             blink = True
             self.next_blink = now + min(12.0, max(2.0, self.rng.expovariate(1 / 4.5)))
 
-        # Micro-saccades refresh at random intervals.
+        # Micro-saccades remain infrequent, small targets. The downstream eye
+        # dynamics turns each target change into one continuous trajectory.
         if now >= self.saccade_until:
-            self.saccade = (self.rng.gauss(0, 26), self.rng.gauss(0, 18))
-            self.saccade_until = now + self.rng.uniform(0.18, 0.55)
+            self.saccade = (self.rng.gauss(0, 14), self.rng.gauss(0, 9))
+            self.saccade_until = now + self.rng.uniform(0.9, 2.4)
 
         # Slowly drifting base color, warmed by proximity.
         hue = 0.52 + 0.10 * math.sin(now * 0.045 + self.hue_phase)
@@ -1232,10 +1262,11 @@ class CharacterEngine:
                          brightness=760, pupil=800, blink=blink),
                 ]
                 style = styles[self.greet_style]
-                intent = dict(gaze_x=gx, gaze_y=gy, lid=40 + lid_add,
-                              pupil=style["pupil"], brightness=style["brightness"],
-                              expression=style["expression"], blink=style["blink"],
-                              color=style["color"])
+                intent = EyeIntent.bounded(
+                    gaze_x=gx, gaze_y=gy, lid=40 + lid_add,
+                    pupil=style["pupil"], brightness=style["brightness"],
+                    expression=style["expression"], blink=style["blink"],
+                    color=style["color"])
             else:
                 expression = "curious" if (act and act.expression == "curious") else (
                     act.expression if act and act.expression else
@@ -1245,30 +1276,34 @@ class CharacterEngine:
                     color = act.color
                 if "hue" in act_values:
                     color = _hsv_to_rgb(act_values["hue"], 0.9, 1.0)
-                intent = dict(
+                intent = EyeIntent.bounded(
                     gaze_x=gx, gaze_y=gy, lid=60 + lid_add,
                     pupil=int(430 + proximity * 400 + pupil_add),
                     brightness=int(720 * bright_mul), expression=expression,
                     blink=blink, color=color)
         elif self.mode == "LOST":
-            intent = dict(gaze_x=self.saccade[0] * 3, gaze_y=gy_act, lid=140,
-                          pupil=520, brightness=600, expression="concerned",
-                          blink=False, color=(200, 120, 180))
+            intent = EyeIntent.bounded(
+                gaze_x=self.saccade[0] * 3, gaze_y=gy_act, lid=140,
+                pupil=520, brightness=600, expression="concerned",
+                blink=False, color=(200, 120, 180))
         elif self.mode == "SEARCH":
-            phase = (now - self.mode_since) * 2 * math.pi * self.rng.choice((0.3, 0.35, 0.42))
-            intent = dict(gaze_x=650 * math.sin(phase), gaze_y=-80 + gy_act,
-                          lid=100, pupil=560, brightness=650,
-                          expression="curious", blink=blink,
-                          color=(150, 150, 210))
+            phase = ((now - self.mode_since) * 2.0 * math.pi
+                     * self.search_rate_hz * self.search_direction)
+            intent = EyeIntent.bounded(
+                gaze_x=650 * math.sin(phase), gaze_y=-80 + gy_act,
+                lid=100, pupil=560, brightness=650,
+                expression="curious", blink=blink,
+                color=(150, 150, 210))
         elif self.mode == "SLEEPY":
             breathe = 0.5 + 0.5 * math.sin((now - self.mode_since) * 0.5)
-            intent = dict(gaze_x=0, gaze_y=-250, lid=620, pupil=400,
-                          brightness=int(150 + 60 * breathe),
-                          expression="sleepy", blink=False, color=(25, 60, 130))
+            intent = EyeIntent.bounded(
+                gaze_x=0, gaze_y=-250, lid=620, pupil=400,
+                brightness=int(150 + 60 * breathe),
+                expression="sleepy", blink=False, color=(25, 60, 130))
         else:  # IDLE
             t = now - self.mode_since
             breathe = 0.5 + 0.5 * math.sin(t * 2 * math.pi * 0.1)
-            intent = dict(
+            intent = EyeIntent.bounded(
                 gaze_x=200 * math.sin(t * 0.31) + gx_act + self.saccade[0] * 0.6,
                 gaze_y=120 * math.sin(t * 0.21 + 1.3) + gy_act,
                 lid=90 + lid_add, pupil=int(550 + pupil_add),
@@ -1280,7 +1315,19 @@ class CharacterEngine:
                        else (act.color if act and act.color else base_color)))
 
         # Head: tracking aim + act overlay, all as bounded offsets.
-        breathing = 6.0 * math.sin(now * 2 * math.pi * 0.22)
+        living_t = now - self.created_at
+        p = self.life_phases
+        living_scale = 0.35 if self.mode == "SLEEPY" else 1.0
+        living_pitch = living_scale * (
+            7.0 * math.sin(living_t * 0.43 + p[0])
+            + 3.0 * math.sin(living_t * 0.91 + p[1]))
+        living_yaw = living_scale * (
+            12.0 * math.sin(living_t * 0.31 + p[2])
+            + 5.0 * math.sin(living_t * 0.67 + p[3]))
+        living_roll = living_scale * (
+            8.0 * math.sin(living_t * 0.27 + p[4])
+            + 4.0 * math.sin(living_t * 0.73 + p[5]))
+        breathing = 7.0 * math.sin(living_t * 2 * math.pi * 0.18 + p[4])
         if person:
             yaw_aim = cfg["yaw_sign"] * cfg["yaw_ticks_per_rad"] * bearings[0]
             pitch_aim = cfg["pitch_ticks_per_rad"] * bearings[1]
@@ -1294,17 +1341,21 @@ class CharacterEngine:
             mode_roll = side * 95.0 * pulse
             mode_pitch = 34.0 * pulse
         elif self.mode == "SEARCH":
-            sweep_phase = (now - self.mode_since) * 2 * math.pi * 0.3
-            mode_yaw = 140.0 * math.sin(sweep_phase)
-            mode_roll = 30.0 * math.sin(sweep_phase * 0.5)
-        pitch_total = pitch_aim + act_values.get("pitch", 0.0) + mode_pitch
+            sweep_phase = ((now - self.mode_since) * 2.0 * math.pi
+                           * self.search_rate_hz * self.search_direction)
+            mode_yaw = 165.0 * math.sin(sweep_phase)
+            mode_roll = 38.0 * math.sin(sweep_phase * 0.5)
+        pitch_total = (pitch_aim + act_values.get("pitch", 0.0)
+                       + mode_pitch + living_pitch)
         if derate:
             pitch_total = 0.0
         curl_t = cfg["curl_sign"] * cfg["curl_pitch_share"] * pitch_total
         bow_t = -cfg["curl_sign"] * cfg["bow_pitch_share"] * pitch_total
-        yaw_t = yaw_aim + act_values.get("yaw", 0.0) + mode_yaw
+        yaw_t = yaw_aim + act_values.get("yaw", 0.0) + mode_yaw + living_yaw
+        turn_cant = max(-24.0, min(24.0, -0.055 * yaw_aim))
         roll_t = cfg["roll_sign"] * (act_values.get("roll", 0.0) + mode_roll
-                                     + 34.0 * proximity) + breathing
+                                     + 34.0 * proximity + living_roll
+                                     + turn_cant) + breathing
         desired4 = [bow_t, curl_t, yaw_t, roll_t]
         return intent, desired4
 
@@ -1394,6 +1445,7 @@ def main():
                 time.sleep(0.1)
 
     engine = CharacterEngine(cfg)
+    eye_dynamics = OrganicEyeDynamics()
     yaw_rad_est = 0.0
     pitch_rad_est = 0.0
     smoothing = {"x": None, "y": None, "w": None}
@@ -1482,7 +1534,8 @@ def main():
                 elif (loop_t0 - last_seen) >= cfg["person_lost_grace_s"]:
                     smoothing = {"x": None, "y": None, "w": None}
 
-            # Head at 10 Hz (every 2nd tick), eyes every tick (20 Hz).
+            # Head and eyes plan at 20 Hz; compliant telemetry is scheduled by
+            # its own 10 Hz monotonic deadline.
             derate = head.thermal_derate if head is not None else False
             intent, desired4 = engine.compute(
                 loop_t0, person, bearings if person else (0.0, 0.0),
@@ -1506,18 +1559,19 @@ def main():
                         # Held contact gets a sustained, unmistakable warm
                         # squint. Head compliance still owns all movement;
                         # this is only its eye-level acknowledgement.
-                        intent.update(
+                        intent = intent.with_overrides(
                             lid=330, pupil=720, brightness=900,
                             expression="greet", blink=False,
                             color=(255, 125, 175),
                         )
                     elif pet_state == RECOVERING:
-                        intent.update(
+                        intent = intent.with_overrides(
                             lid=180, pupil=650, brightness=820,
                             expression="greet", color=(255, 175, 105),
                         )
                 try:
-                    eyes.apply(**intent)
+                    intent = eye_dynamics.step(loop_t0, intent)
+                    eyes.apply(**intent.wire_values())
                     eye_failures = 0
                 except Kep2Error as exc:
                     eye_failures += 1
