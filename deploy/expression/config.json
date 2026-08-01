@@ -17,6 +17,7 @@
   "offset_ease": 0.34,
   "admission_window_ticks": 128,
   "temp_abort_raw": 65,
+  "preengage_temp_limit_raw": 55,
   "compliant_hold": {
     "minimum_ticks": [2064, 2390, 1157, 2887],
     "maximum_ticks": [2284, 2750, 2117, 3207],

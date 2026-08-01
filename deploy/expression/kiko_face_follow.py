@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
     "eye_x_sign": 1,              # flip if eyes mirror instead of follow
     "eye_y_sign": 1,
     "temp_abort_raw": 58,
+    "preengage_temp_limit_raw": 55,
     "volt_min_raw": 90,
     "volt_max_raw": 135,
     "head_offset_up_m": 0.18,    # head center above camera origin (operator)
@@ -483,24 +484,45 @@ class HeadController:
             cfg["compliant_hold"], cfg["torque_limit_permille"])
         self.compliance = None
 
+    def _confirm_temperature(self, joint, servo_id, telemetry, limit, stage):
+        if telemetry["temperature_raw"] <= limit:
+            return telemetry
+        temperatures = [telemetry["temperature_raw"]]
+        for _ in range(2):
+            time.sleep(0.100)
+            telemetry = self.bus.read_telemetry(servo_id)
+            temperatures.append(telemetry["temperature_raw"])
+            if telemetry["temperature_raw"] <= limit:
+                print(
+                    f"telemetry_temperature_transient stage={stage} "
+                    f"joint={JOINT_NAMES[joint]} "
+                    f"samples={'->'.join(map(str, temperatures))}",
+                    flush=True,
+                )
+                return telemetry
+        raise StsError(
+            f"{JOINT_NAMES[joint]} confirmed {stage} overtemp "
+            f"{'->'.join(map(str, temperatures))}")
+
     def admit_and_engage(self):
         poses = []
         for joint, servo_id in enumerate(SERVO_IDS):
             t = self.bus.read_position_redundant(servo_id)
-            poses.append(t["position"])
+            verified_position = t["position"]
+            t = self._confirm_temperature(
+                joint, servo_id, t,
+                self.cfg["preengage_temp_limit_raw"], "preengage")
+            poses.append(verified_position)
             window = self.cfg["admission_window_ticks"]
-            if abs(t["position"] - self.natural[joint]) > window:
+            if abs(verified_position - self.natural[joint]) > window:
                 raise StsError(
-                    f"{JOINT_NAMES[joint]} pose {t['position']} outside "
+                    f"{JOINT_NAMES[joint]} pose {verified_position} outside "
                     f"natural±{window}")
-            if t["temperature_raw"] > 55:
-                raise StsError(f"{JOINT_NAMES[joint]} too hot pre-engage: "
-                               f"{t['temperature_raw']}")
             if not (self.cfg["volt_min_raw"] <= t["voltage_raw"]
                     <= self.cfg["volt_max_raw"]):
                 raise StsError(f"{JOINT_NAMES[joint]} voltage out of range: "
                                f"{t['voltage_raw']}")
-            print(f"admit joint={JOINT_NAMES[joint]} pos={t['position']} "
+            print(f"admit joint={JOINT_NAMES[joint]} pos={verified_position} "
                   f"temp={t['temperature_raw']} volt={t['voltage_raw']}",
                   flush=True)
         # Engage: torque limit, goal = present pose (zero jump), torque on.
@@ -578,22 +600,13 @@ class HeadController:
         for joint, servo_id in enumerate(SERVO_IDS):
             t = self.bus.read_telemetry(servo_id)
             if t["temperature_raw"] >= self.cfg["temp_abort_raw"]:
-                temperatures = [t["temperature_raw"]]
-                for _ in range(2):
-                    time.sleep(0.100)
-                    t = self.bus.read_telemetry(servo_id)
-                    temperatures.append(t["temperature_raw"])
-                    if t["temperature_raw"] < self.cfg["temp_abort_raw"]:
-                        print(
-                            f"telemetry_temperature_transient "
-                            f"joint={JOINT_NAMES[joint]} "
-                            f"samples={'->'.join(map(str, temperatures))}",
-                            flush=True,
-                        )
-                        return None
-                raise StsError(
-                    f"{JOINT_NAMES[joint]} confirmed overtemp "
-                    f"{'->'.join(map(str, temperatures))}")
+                t = self._confirm_temperature(
+                    joint, servo_id, t,
+                    self.cfg["temp_abort_raw"] - 1, "energized")
+                # Confirmation occupied more than the admitted observation
+                # span. Freeze output and acquire a complete fresh set next
+                # control slot rather than mixing timestamps.
+                return None
             hottest = max(hottest, t["temperature_raw"])
             if not (self.cfg["volt_min_raw"] <= t["voltage_raw"]
                     <= self.cfg["volt_max_raw"]):
