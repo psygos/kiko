@@ -1,13 +1,18 @@
-//! Bounded autonomic eye behavior layered over fresh visual reactions.
+//! Bounded autonomic eye and four-joint character behavior.
 //!
 //! The visual mixer owns face/scene attention. This module owns only the
 //! character-like timing that makes an otherwise idle renderer feel alive:
 //! greeting, loss/search/sleep transitions, blinks, micro-saccades, and a
 //! finite act library derived from Kiko's retained expression-engine behavior.
+//! Eyes and head share one act clock so eye contact can lead a delayed,
+//! minimum-jerk head response instead of looking like unrelated animations.
+//!
 //! It performs no allocation, I/O, sleeping, wall-clock access, or head
-//! actuation. Physical head motion remains exclusively owned by the calibrated
-//! gaze path.
+//! actuation. Head output is a normalized semantic overlay, never encoder
+//! ticks or motion authority. Only the evidence-bound calibrated head path may
+//! convert it into a physical target.
 
+use core::fmt;
 use kiko_expression_core::MonotonicTimestamp;
 use kiko_eye_protocol::{
     Expression, EyeFlags, EyeIntent, NORMALIZED_SCALE, SignedUnit, UnitAmount,
@@ -37,7 +42,239 @@ const BLINK_MIN_NS: u64 = 2 * NS_PER_SECOND;
 const BLINK_MAX_NS: u64 = 12 * NS_PER_SECOND;
 const SACCADE_MIN_NS: u64 = 180 * NS_PER_MS;
 const SACCADE_MAX_NS: u64 = 550 * NS_PER_MS;
+const HEAD_EYE_LEAD_NS: u64 = 120 * NS_PER_MS;
 const NEVER_RUN: u64 = u64::MAX;
+
+/// Dimensionless signed character displacement scale.
+///
+/// `1_000` means the full *reviewed expressive excursion* for the named
+/// joint. Its sign is `character-positive`, whose encoder polarity must be an
+/// explicit physical mapping declaration; it never means a raw encoder
+/// position or the hardware hard limit.
+pub const CHARACTER_HEAD_SCALE: i16 = 1_000;
+
+/// A bounded normalized displacement for one named head joint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CharacterHeadAmount(i16);
+
+impl CharacterHeadAmount {
+    pub const ZERO: Self = Self(0);
+
+    pub const fn try_new(value: i16) -> Result<Self, CharacterHeadAmountError> {
+        if value < -CHARACTER_HEAD_SCALE || value > CHARACTER_HEAD_SCALE {
+            return Err(CharacterHeadAmountError { value });
+        }
+        Ok(Self(value))
+    }
+
+    const fn from_clamped(value: i32) -> Self {
+        let clamped = if value < -(CHARACTER_HEAD_SCALE as i32) {
+            -(CHARACTER_HEAD_SCALE as i32)
+        } else if value > CHARACTER_HEAD_SCALE as i32 {
+            CHARACTER_HEAD_SCALE as i32
+        } else {
+            value
+        };
+        Self(clamped as i16)
+    }
+
+    pub const fn get(self) -> i16 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CharacterHeadAmountError {
+    pub value: i16,
+}
+
+impl fmt::Display for CharacterHeadAmountError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "character-head amount {} is outside [{}, {}]",
+            self.value, -CHARACTER_HEAD_SCALE, CHARACTER_HEAD_SCALE
+        )
+    }
+}
+
+impl core::error::Error for CharacterHeadAmountError {}
+
+/// Named semantic axis at the transport-independent character boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterHeadAxis {
+    Bow,
+    Curl,
+    Yaw,
+    Roll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CharacterHeadOverlayParseError {
+    pub axis: CharacterHeadAxis,
+    pub source: CharacterHeadAmountError,
+}
+
+impl fmt::Display for CharacterHeadOverlayParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid {:?} character-head axis: {}",
+            self.axis, self.source
+        )
+    }
+}
+
+impl core::error::Error for CharacterHeadOverlayParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Semantic four-servo overlay relative to Kiko's reviewed natural pose.
+///
+/// Axes are named, but encoder polarity is deliberately absent. This prevents
+/// the character director from guessing mounting signs. The order of physical
+/// servo IDs is likewise absent from this domain type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CharacterHeadOverlay {
+    bow: CharacterHeadAmount,
+    curl: CharacterHeadAmount,
+    yaw: CharacterHeadAmount,
+    roll: CharacterHeadAmount,
+}
+
+impl CharacterHeadOverlay {
+    pub const NATURAL: Self = Self {
+        bow: CharacterHeadAmount::ZERO,
+        curl: CharacterHeadAmount::ZERO,
+        yaw: CharacterHeadAmount::ZERO,
+        roll: CharacterHeadAmount::ZERO,
+    };
+
+    pub fn try_new(
+        bow: i16,
+        curl: i16,
+        yaw: i16,
+        roll: i16,
+    ) -> Result<Self, CharacterHeadOverlayParseError> {
+        Ok(Self {
+            bow: CharacterHeadAmount::try_new(bow).map_err(|source| {
+                CharacterHeadOverlayParseError {
+                    axis: CharacterHeadAxis::Bow,
+                    source,
+                }
+            })?,
+            curl: CharacterHeadAmount::try_new(curl).map_err(|source| {
+                CharacterHeadOverlayParseError {
+                    axis: CharacterHeadAxis::Curl,
+                    source,
+                }
+            })?,
+            yaw: CharacterHeadAmount::try_new(yaw).map_err(|source| {
+                CharacterHeadOverlayParseError {
+                    axis: CharacterHeadAxis::Yaw,
+                    source,
+                }
+            })?,
+            roll: CharacterHeadAmount::try_new(roll).map_err(|source| {
+                CharacterHeadOverlayParseError {
+                    axis: CharacterHeadAxis::Roll,
+                    source,
+                }
+            })?,
+        })
+    }
+
+    const fn from_clamped(fields: HeadFields) -> Self {
+        Self {
+            bow: CharacterHeadAmount::from_clamped(fields.bow),
+            curl: CharacterHeadAmount::from_clamped(fields.curl),
+            yaw: CharacterHeadAmount::from_clamped(fields.yaw),
+            roll: CharacterHeadAmount::from_clamped(fields.roll),
+        }
+    }
+
+    pub const fn bow(self) -> CharacterHeadAmount {
+        self.bow
+    }
+
+    pub const fn curl(self) -> CharacterHeadAmount {
+        self.curl
+    }
+
+    pub const fn yaw(self) -> CharacterHeadAmount {
+        self.yaw
+    }
+
+    pub const fn roll(self) -> CharacterHeadAmount {
+        self.roll
+    }
+
+    pub const fn amounts(self) -> [CharacterHeadAmount; 4] {
+        [self.bow, self.curl, self.yaw, self.roll]
+    }
+
+    pub const fn is_natural(self) -> bool {
+        self.bow.get() == 0 && self.curl.get() == 0 && self.yaw.get() == 0 && self.roll.get() == 0
+    }
+}
+
+/// One time-coherent, transport-independent character decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedCharacterFrame {
+    eye: PreparedEyeIntent,
+    head: CharacterHeadOverlay,
+    mode: CharacterMode,
+    act: Option<CharacterAct>,
+}
+
+impl PreparedCharacterFrame {
+    pub const fn eyes_only(eye: PreparedEyeIntent) -> Self {
+        Self {
+            eye,
+            head: CharacterHeadOverlay::NATURAL,
+            mode: CharacterMode::Idle,
+            act: None,
+        }
+    }
+
+    const fn new(
+        eye: PreparedEyeIntent,
+        head: CharacterHeadOverlay,
+        mode: CharacterMode,
+        act: Option<CharacterAct>,
+    ) -> Self {
+        Self {
+            eye,
+            head,
+            mode,
+            act,
+        }
+    }
+
+    pub const fn eye(self) -> PreparedEyeIntent {
+        self.eye
+    }
+
+    /// Compatibility projection for diagnostics that previously received an
+    /// eye-only prepared value.
+    pub const fn intent(self) -> EyeIntent {
+        self.eye.intent()
+    }
+
+    pub const fn head(self) -> CharacterHeadOverlay {
+        self.head
+    }
+
+    pub const fn mode(self) -> CharacterMode {
+        self.mode
+    }
+
+    pub const fn act(self) -> Option<CharacterAct> {
+        self.act
+    }
+}
 
 /// High-level autonomic state. This is eye-rendering state, not navigation or
 /// physical authority.
@@ -241,6 +478,14 @@ struct EyeFields {
     color_rgb: [u8; 3],
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HeadFields {
+    bow: i32,
+    curl: i32,
+    yaw: i32,
+    roll: i32,
+}
+
 impl From<EyeIntent> for EyeFields {
     fn from(intent: EyeIntent) -> Self {
         Self {
@@ -338,12 +583,26 @@ impl AutonomicCharacterEngine {
     }
 
     /// Apply one autonomic sample without changing the reaction's freshness.
+    ///
+    /// This compatibility entrypoint discards the semantic head overlay. New
+    /// integrated callers should use [`Self::render_character`] so the eyes
+    /// and all four head joints retain their shared timing.
     pub fn render(
         &mut self,
         now: MonotonicTimestamp,
         face_present: bool,
         prepared: PreparedEyeIntent,
     ) -> PreparedEyeIntent {
+        self.render_character(now, face_present, prepared).eye()
+    }
+
+    /// Prepare one coherent eye plus four-joint character sample.
+    pub fn render_character(
+        &mut self,
+        now: MonotonicTimestamp,
+        face_present: bool,
+        prepared: PreparedEyeIntent,
+    ) -> PreparedCharacterFrame {
         let now_ns = now.nanos_since_epoch();
         self.initialize_if_needed(now_ns);
         self.update_mode(face_present, now_ns);
@@ -358,7 +617,15 @@ impl AutonomicCharacterEngine {
         self.apply_mode(&mut fields, now_ns);
         self.apply_act(&mut fields, now_ns);
         self.apply_blink(&mut fields, now_ns);
-        prepared.with_intent(fields.into_intent())
+        let mut head = HeadFields::default();
+        self.apply_head_mode(&mut head, now_ns);
+        self.apply_head_act(&mut head, now_ns);
+        PreparedCharacterFrame::new(
+            prepared.with_intent(fields.into_intent()),
+            CharacterHeadOverlay::from_clamped(head),
+            self.mode,
+            self.active_act(),
+        )
     }
 
     fn initialize_if_needed(&mut self, now_ns: u64) {
@@ -709,6 +976,203 @@ impl AutonomicCharacterEngine {
         }
     }
 
+    fn apply_head_mode(&self, fields: &mut HeadFields, now_ns: u64) {
+        let elapsed = now_ns.saturating_sub(self.mode_started_ns);
+        match self.mode {
+            CharacterMode::Greeting => {
+                let duration = self
+                    .greeting_until_ns
+                    .saturating_sub(self.mode_started_ns)
+                    .max(1);
+                let phase = normalized_phase(elapsed, duration);
+                let pulse = delayed_symmetric_pulse(elapsed, duration, HEAD_EYE_LEAD_NS);
+                let side = if self.greeting_style & 1 == 0 { -1 } else { 1 };
+                fields.bow += pulse * 85 / SCALE;
+                fields.curl -= pulse * 55 / SCALE;
+                fields.yaw += side * pulse * 45 / SCALE;
+                fields.roll += side * pulse * 80 / SCALE;
+                if phase > 820 {
+                    fields.roll += side * symmetric_pulse((phase - 820) * 5) * 18 / SCALE;
+                }
+            }
+            CharacterMode::Lost => {
+                let pulse = delayed_symmetric_pulse(elapsed, LOST_DURATION_NS, HEAD_EYE_LEAD_NS);
+                let side = if self.saccade_x < 0 { -1 } else { 1 };
+                fields.bow -= pulse * 35 / SCALE;
+                fields.curl += pulse * 45 / SCALE;
+                fields.yaw += side * pulse * 55 / SCALE;
+                fields.roll -= side * pulse * 45 / SCALE;
+            }
+            CharacterMode::Searching => {
+                let duration = self
+                    .searching_until_ns
+                    .saturating_sub(self.mode_started_ns)
+                    .max(1);
+                let envelope = delayed_symmetric_pulse(elapsed, duration, HEAD_EYE_LEAD_NS);
+                fields.bow += envelope * 28 / SCALE;
+                fields.curl += scale_wave(elapsed, 2_200 * NS_PER_MS, 36) * envelope / SCALE;
+                fields.yaw += scale_wave(elapsed, 3_000 * NS_PER_MS, 145) * envelope / SCALE;
+                fields.roll -= scale_wave(elapsed, 3_000 * NS_PER_MS, 42) * envelope / SCALE;
+            }
+            CharacterMode::Sleepy => {
+                let settled = minimum_jerk_ramp(normalized_phase(elapsed, 3 * NS_PER_SECOND));
+                let breathe = scale_wave(elapsed, 9 * NS_PER_SECOND, 12);
+                fields.bow += settled * 45 / SCALE + breathe;
+                fields.curl += settled * 70 / SCALE + breathe;
+                fields.yaw += scale_wave(elapsed, 17 * NS_PER_SECOND, 10);
+                fields.roll += scale_wave(elapsed, 13 * NS_PER_SECOND, 14);
+            }
+            CharacterMode::Idle | CharacterMode::Tracking => {}
+        }
+    }
+
+    fn apply_head_act(&self, fields: &mut HeadFields, now_ns: u64) {
+        let Some(running) = self.active_act else {
+            return;
+        };
+        let elapsed = now_ns.saturating_sub(running.started_ns);
+        let phase = normalized_phase(elapsed, running.duration_ns);
+        let pulse = delayed_symmetric_pulse(elapsed, running.duration_ns, HEAD_EYE_LEAD_NS);
+        let side = running.side;
+        let wave = |period_ms, amplitude| {
+            scale_wave(elapsed, period_ms * NS_PER_MS, amplitude) * pulse / SCALE
+        };
+
+        match running.act {
+            CharacterAct::CuriousTilt => {
+                fields.bow += pulse * 45 / SCALE;
+                fields.curl -= pulse * 38 / SCALE;
+                fields.yaw += side * pulse * 65 / SCALE;
+                fields.roll += side * pulse * 120 / SCALE;
+            }
+            CharacterAct::DoubleTake => {
+                let kick = if phase < 430 {
+                    minimum_jerk_ramp((phase * SCALE / 430).clamp(0, SCALE)) * 150 / SCALE
+                } else {
+                    -symmetric_pulse(((phase - 430) * SCALE / 570).clamp(0, SCALE)) * 45 / SCALE
+                };
+                fields.bow -= pulse * 28 / SCALE;
+                fields.curl -= pulse * 25 / SCALE;
+                fields.yaw += side * kick * pulse / SCALE;
+                fields.roll -= side * kick * 2 / 5 * pulse / SCALE;
+            }
+            CharacterAct::ExcitedWiggle => {
+                fields.bow += pulse * 75 / SCALE;
+                fields.curl += wave(520, 48);
+                fields.yaw += wave(420, 130);
+                fields.roll -= wave(420, 155);
+            }
+            CharacterAct::LeanIn => {
+                fields.bow += pulse * 165 / SCALE;
+                fields.curl -= pulse * 62 / SCALE;
+                fields.yaw += side * pulse * 24 / SCALE;
+                fields.roll += side * pulse * 32 / SCALE;
+            }
+            CharacterAct::Nod => {
+                fields.bow += wave(760, 58);
+                fields.curl += wave(700, 135);
+                fields.yaw += side * pulse * 12 / SCALE;
+                fields.roll += side * pulse * 14 / SCALE;
+            }
+            CharacterAct::SoftNod => {
+                fields.bow += wave(980, 42);
+                fields.curl += wave(850, 82);
+                fields.yaw += side * pulse * 14 / SCALE;
+                fields.roll += side * pulse * 24 / SCALE;
+            }
+            CharacterAct::HappySquint => {
+                fields.bow += pulse * 70 / SCALE;
+                fields.curl -= pulse * 42 / SCALE;
+                fields.yaw += side * pulse * 18 / SCALE;
+                fields.roll += side * pulse * 38 / SCALE;
+            }
+            CharacterAct::PuppyEyes => {
+                fields.bow += pulse * 92 / SCALE;
+                fields.curl -= pulse * 96 / SCALE;
+                fields.yaw += side * pulse * 42 / SCALE;
+                fields.roll += side * pulse * 112 / SCALE;
+            }
+            CharacterAct::ShyDip => {
+                fields.bow += pulse * 105 / SCALE;
+                fields.curl += pulse * 125 / SCALE;
+                fields.yaw += side * pulse * 92 / SCALE;
+                fields.roll -= side * pulse * 98 / SCALE;
+            }
+            CharacterAct::Sparkle => {
+                fields.bow += pulse * 35 / SCALE;
+                fields.curl -= pulse * 32 / SCALE;
+                fields.yaw += side * wave(360, 28);
+                fields.roll += side * wave(310, 38);
+            }
+            CharacterAct::BlinkFlourish => {
+                fields.bow += pulse * 30 / SCALE;
+                fields.curl -= pulse * 24 / SCALE;
+                fields.yaw += side * pulse * 34 / SCALE;
+                fields.roll += side * pulse * 74 / SCALE;
+            }
+            CharacterAct::LookAround => {
+                fields.bow += pulse * 24 / SCALE;
+                fields.curl += wave(2_100, 34);
+                fields.yaw += wave(1_300, 165);
+                fields.roll -= wave(1_300, 52);
+            }
+            CharacterAct::PerkUp => {
+                fields.bow -= pulse * 72 / SCALE;
+                fields.curl -= pulse * 92 / SCALE;
+                fields.yaw += side * pulse * 24 / SCALE;
+                fields.roll += side * pulse * 45 / SCALE;
+            }
+            CharacterAct::Daydream => {
+                fields.bow += pulse * 52 / SCALE;
+                fields.curl += wave(3_100, 48);
+                fields.yaw += wave(2_400, 95);
+                fields.roll -= wave(2_900, 78);
+            }
+            CharacterAct::Stretch => {
+                fields.bow -= pulse * 118 / SCALE;
+                fields.curl -= pulse * 145 / SCALE;
+                fields.yaw += side * pulse * 30 / SCALE;
+                fields.roll += side * pulse * 52 / SCALE;
+            }
+            CharacterAct::SweepScan => {
+                fields.bow += pulse * 28 / SCALE;
+                fields.curl += wave(3_200, 35);
+                fields.yaw += side * wave(2_000, 185);
+                fields.roll -= side * wave(2_000, 55);
+            }
+            CharacterAct::HeadBob => {
+                fields.bow += wave(600, 82);
+                fields.curl += wave(520, 142);
+                fields.yaw += side * wave(1_040, 22);
+                fields.roll += side * wave(1_040, 28);
+            }
+            CharacterAct::Sneeze => {
+                let anticipation = minimum_jerk_ramp((phase * SCALE / 620).clamp(0, SCALE));
+                let release = if phase < 620 {
+                    0
+                } else {
+                    symmetric_pulse(((phase - 620) * SCALE / 380).clamp(0, SCALE))
+                };
+                fields.bow -= anticipation * 55 / SCALE;
+                fields.bow += release * 150 / SCALE;
+                fields.curl -= anticipation * 80 / SCALE;
+                fields.curl += release * 205 / SCALE;
+                fields.yaw += side * release * 34 / SCALE;
+                fields.roll -= side * release * 65 / SCALE;
+                fields.bow = fields.bow * pulse / SCALE;
+                fields.curl = fields.curl * pulse / SCALE;
+                fields.yaw = fields.yaw * pulse / SCALE;
+                fields.roll = fields.roll * pulse / SCALE;
+            }
+            CharacterAct::Dance => {
+                fields.bow += pulse * 64 / SCALE + wave(860, 42);
+                fields.curl += wave(430, 78);
+                fields.yaw += wave(650, 175);
+                fields.roll -= wave(650, 190);
+            }
+        }
+    }
+
     fn apply_blink(&mut self, fields: &mut EyeFields, now_ns: u64) {
         if self.greeting_blink_pending {
             fields.blink = true;
@@ -777,6 +1241,43 @@ fn smooth_ramp(value: i32, maximum: i32) -> i32 {
     let x2 = x * x / i64::from(SCALE);
     let smooth = x2 * (3 * i64::from(SCALE) - 2 * x) / i64::from(SCALE);
     i32::try_from(smooth).expect("smooth ramp is normalized")
+}
+
+/// Quintic minimum-jerk position profile `10x^3 - 15x^4 + 6x^5`.
+///
+/// Integer arithmetic is bounded well below `i128::MAX` at the normalized
+/// scale. The exact endpoints are retained, including zero velocity and zero
+/// acceleration in the corresponding continuous polynomial.
+fn minimum_jerk_ramp(value: i32) -> i32 {
+    let x = i128::from(value.clamp(0, SCALE));
+    let scale = i128::from(SCALE);
+    let x2 = x * x;
+    let x3 = x2 * x;
+    let x4 = x3 * x;
+    let x5 = x4 * x;
+    let denominator = scale * scale * scale * scale;
+    let numerator = 10 * x3 * scale * scale - 15 * x4 * scale + 6 * x5;
+    let result = (numerator + denominator / 2) / denominator;
+    i32::try_from(result.clamp(0, scale)).expect("minimum-jerk ramp is normalized")
+}
+
+fn minimum_jerk_pulse(phase: i32) -> i32 {
+    let phase = phase.clamp(0, SCALE);
+    if phase <= SCALE / 2 {
+        minimum_jerk_ramp(phase * 2)
+    } else {
+        minimum_jerk_ramp((SCALE - phase) * 2)
+    }
+}
+
+fn delayed_symmetric_pulse(elapsed_ns: u64, duration_ns: u64, delay_ns: u64) -> i32 {
+    if elapsed_ns <= delay_ns || duration_ns <= delay_ns {
+        return 0;
+    }
+    minimum_jerk_pulse(normalized_phase(
+        elapsed_ns - delay_ns,
+        duration_ns - delay_ns,
+    ))
 }
 
 fn symmetric_pulse(phase: i32) -> i32 {
@@ -931,21 +1432,119 @@ mod tests {
                 side: if index % 2 == 0 { -1 } else { 1 },
                 style: (index % 3) as u8,
             });
+            let mut joint_moved = [false; 4];
             for step in 0..=100_u64 {
                 let now_ns = start + step * 50 * NS_PER_MS;
-                let output = engine.render(
+                let output = engine.render_character(
                     MonotonicTimestamp::from_nanos_since_epoch(now_ns),
                     engine.mode == CharacterMode::Tracking,
                     prepared(now_ns),
                 );
-                let intent = output.intent();
+                let intent = output.eye().intent();
                 assert!((-1000..=1000).contains(&intent.gaze_x().get()));
                 assert!((-1000..=1000).contains(&intent.gaze_y().get()));
                 assert!(intent.lid().get() <= 1000);
                 assert!(intent.pupil().get() <= 1000);
                 assert!(intent.brightness().get() <= 1000);
+                for (moved, amount) in joint_moved.iter_mut().zip(output.head().amounts()) {
+                    *moved |= amount.get() != 0;
+                    assert!((-CHARACTER_HEAD_SCALE..=CHARACTER_HEAD_SCALE).contains(&amount.get()));
+                }
             }
+            assert_eq!(
+                joint_moved,
+                [true; 4],
+                "{} must choreograph all four head joints",
+                act.as_str()
+            );
         }
+    }
+
+    #[test]
+    fn eyes_lead_each_head_act_and_the_head_returns_to_exact_natural() {
+        let start = 8 * NS_PER_SECOND;
+        let duration = 2 * NS_PER_SECOND;
+        let mut engine = AutonomicCharacterEngine::new(19);
+        engine.initialize_if_needed(start);
+        engine.mode = CharacterMode::Tracking;
+        engine.active_act = Some(RunningAct {
+            act: CharacterAct::CuriousTilt,
+            started_ns: start,
+            duration_ns: duration,
+            side: 1,
+            style: 0,
+        });
+
+        let at_start = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start),
+            true,
+            prepared(start),
+        );
+        let during_eye_lead = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start + HEAD_EYE_LEAD_NS),
+            true,
+            prepared(start + HEAD_EYE_LEAD_NS),
+        );
+        let moving = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start + 500 * NS_PER_MS),
+            true,
+            prepared(start + 500 * NS_PER_MS),
+        );
+        let complete = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start + duration),
+            true,
+            prepared(start + duration),
+        );
+
+        assert!(at_start.head().is_natural());
+        assert!(during_eye_lead.head().is_natural());
+        assert!(!moving.head().is_natural());
+        assert!(complete.head().is_natural());
+    }
+
+    #[test]
+    fn minimum_jerk_curve_has_exact_endpoints_and_is_monotonic() {
+        assert_eq!(minimum_jerk_ramp(0), 0);
+        assert_eq!(minimum_jerk_ramp(SCALE), SCALE);
+        let mut previous = 0;
+        for sample in 0..=SCALE {
+            let actual = minimum_jerk_ramp(sample);
+            assert!(actual >= previous);
+            assert!((0..=SCALE).contains(&actual));
+            previous = actual;
+        }
+    }
+
+    #[test]
+    fn external_head_overlay_parser_rejects_each_invalid_axis() {
+        assert_eq!(
+            CharacterHeadOverlay::try_new(1_001, 0, 0, 0),
+            Err(CharacterHeadOverlayParseError {
+                axis: CharacterHeadAxis::Bow,
+                source: CharacterHeadAmountError { value: 1_001 },
+            })
+        );
+        assert_eq!(
+            CharacterHeadOverlay::try_new(0, -1_001, 0, 0),
+            Err(CharacterHeadOverlayParseError {
+                axis: CharacterHeadAxis::Curl,
+                source: CharacterHeadAmountError { value: -1_001 },
+            })
+        );
+        assert_eq!(
+            CharacterHeadOverlay::try_new(0, 0, 1_001, 0),
+            Err(CharacterHeadOverlayParseError {
+                axis: CharacterHeadAxis::Yaw,
+                source: CharacterHeadAmountError { value: 1_001 },
+            })
+        );
+        assert_eq!(
+            CharacterHeadOverlay::try_new(0, 0, 0, -1_001),
+            Err(CharacterHeadOverlayParseError {
+                axis: CharacterHeadAxis::Roll,
+                source: CharacterHeadAmountError { value: -1_001 },
+            })
+        );
     }
 
     #[test]

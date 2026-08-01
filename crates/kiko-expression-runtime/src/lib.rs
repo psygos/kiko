@@ -30,7 +30,11 @@ pub use adapter::{
     AdaptError, EyeRenderStyle, PreparedEyeIntent, adapt_eye_intention, adapt_reaction_output,
     map_expression,
 };
-pub use autonomic::{AutonomicCharacterEngine, CharacterAct, CharacterMode};
+pub use autonomic::{
+    AutonomicCharacterEngine, CHARACTER_HEAD_SCALE, CharacterAct, CharacterHeadAmount,
+    CharacterHeadAmountError, CharacterHeadAxis, CharacterHeadOverlay,
+    CharacterHeadOverlayParseError, CharacterMode, PreparedCharacterFrame,
+};
 pub use face_tracking::{
     AcquiringFaceTarget, CloserFaceWidthRatio, CoastingFaceTarget, ConsecutiveFaceResults,
     DEFAULT_FACE_ACQUISITION_DISTANCE_PX, DEFAULT_FACE_ACQUISITION_RESULTS,
@@ -51,14 +55,17 @@ pub use gaze_geometry::{
     OakCameraTargetPoint, OakCameraTargetRay, QuaternionComponent, RayHeadGazeProjectionError,
 };
 pub use head_gaze_calibration::{
-    CameraRayHeadProposalError, DECLARED_HEAD_ORIGIN_IN_OAK_CAMERA_M,
-    DECLARED_NEUTRAL_HEAD_FROM_OAK_ROTATION_ROWS, HEAD_GAZE_FOCUS_PLANE_CAMERA_FORWARD_DEPTH_M,
-    HeadAssemblyId, HeadCalibrationProvenanceId, HeadGazeCoordinate, HeadGazeIdentifierError,
-    HeadGazeIdentifierField, HeadGazeMappingDeclaration, HeadGazeMappingDeclarationInput,
+    CameraRayHeadProposalError, CharacterHeadMappingDeclaration,
+    CharacterHeadMappingDeclarationParseError, CharacterHeadOverlayMappingError,
+    DECLARED_HEAD_ORIGIN_IN_OAK_CAMERA_M, DECLARED_NEUTRAL_HEAD_FROM_OAK_ROTATION_ROWS,
+    HEAD_GAZE_FOCUS_PLANE_CAMERA_FORWARD_DEPTH_M, HeadAssemblyId, HeadCalibrationProvenanceId,
+    HeadGazeCoordinate, HeadGazeIdentifierError, HeadGazeIdentifierField,
+    HeadGazeMappingDeclaration, HeadGazeMappingDeclarationInput,
     HeadGazeMappingDeclarationParseError, HeadGazeProposalMappingError, HeadGazeTargetProposal,
     HeadGazeTickOffsetsPerRadianInput, HeadNaturalPoseDeclaration, HeadTickEnvelope,
     HeadTickEnvelopeBound, HeadTickEnvelopeInput, MAX_HEAD_GAZE_IDENTIFIER_BYTES,
-    NamedHeadTickEnvelopesInput, NamedHeadTickOffsetsPerRadianInput, NamedNaturalHeadTicksInput,
+    NamedCharacterHeadFullScaleTickOffsetsInput, NamedHeadTickEnvelopesInput,
+    NamedHeadTickOffsetsPerRadianInput, NamedNaturalHeadTicksInput,
 };
 pub use scene_motion::{
     MAX_SCENE_SAMPLES, MonotonicLatestAdmission, MonotonicLatestGap, MonotonicLatestSceneAnalysis,

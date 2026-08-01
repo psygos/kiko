@@ -31,9 +31,10 @@ use kiko_head_protocol::{
 };
 
 use crate::{
-    CameraForwardDepthMeters, CameraGazeTargetError, CameraToHeadGazeExtrinsics,
-    CameraToHeadGazeExtrinsicsInput, GazeExtrinsicsParseError, HeadRelativeGaze,
-    OakCameraTargetRay, RayHeadGazeProjectionError,
+    CHARACTER_HEAD_SCALE, CameraForwardDepthMeters, CameraGazeTargetError,
+    CameraToHeadGazeExtrinsics, CameraToHeadGazeExtrinsicsInput, CharacterHeadAmount,
+    CharacterHeadOverlay, GazeExtrinsicsParseError, HeadRelativeGaze, OakCameraTargetRay,
+    RayHeadGazeProjectionError,
 };
 
 /// Declared Kiko head-centre origin in OAK coordinates, in metres.
@@ -134,6 +135,214 @@ impl HeadGazeTargetProposal {
         self.positions
     }
 }
+
+/// Signed encoder deltas for `+1000` character displacement on every named
+/// joint. A negative value is a calibrated mounting polarity, not a negative
+/// travel limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NamedCharacterHeadFullScaleTickOffsetsInput {
+    pub bow_ticks: i16,
+    pub curl_ticks: i16,
+    pub yaw_ticks: i16,
+    pub roll_ticks: i16,
+}
+
+impl NamedCharacterHeadFullScaleTickOffsetsInput {
+    const fn for_joint(self, joint: HeadJoint) -> i16 {
+        match joint {
+            HeadJoint::Bow => self.bow_ticks,
+            HeadJoint::Curl => self.curl_ticks,
+            HeadJoint::Yaw => self.yaw_ticks,
+            HeadJoint::Roll => self.roll_ticks,
+        }
+    }
+}
+
+/// Proposal-only mapping from character-positive axes to encoder deltas.
+///
+/// It is constructed from an already parsed gaze mapping so natural position
+/// and hard envelopes have exactly one owner. It cannot construct a head
+/// command or grant motion authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CharacterHeadMappingDeclaration {
+    natural: HeadNaturalPoseDeclaration,
+    hard_envelopes: [HeadTickEnvelope; 4],
+    full_scale_tick_offsets: [i16; 4],
+}
+
+impl CharacterHeadMappingDeclaration {
+    pub fn parse_for_gaze_mapping(
+        gaze: &HeadGazeMappingDeclaration,
+        input: NamedCharacterHeadFullScaleTickOffsetsInput,
+    ) -> Result<Self, CharacterHeadMappingDeclarationParseError> {
+        let natural = gaze.natural_declaration();
+        let mut offsets = [0_i16; 4];
+        for joint in HeadJoint::ALL {
+            let offset = input.for_joint(joint);
+            if offset == 0 {
+                return Err(
+                    CharacterHeadMappingDeclarationParseError::ZeroFullScaleOffset { joint },
+                );
+            }
+            let envelope = gaze.hard_envelope(joint);
+            let natural_ticks = i32::from(natural.position(joint).get());
+            for amount in [-CHARACTER_HEAD_SCALE, CHARACTER_HEAD_SCALE] {
+                let proposed = natural_ticks + scaled_character_tick_delta(amount, offset);
+                if proposed < i32::from(envelope.minimum().get())
+                    || proposed > i32::from(envelope.maximum().get())
+                {
+                    return Err(
+                        CharacterHeadMappingDeclarationParseError::FullScaleOutsideHardEnvelope {
+                            joint,
+                            natural: natural.position(joint),
+                            full_scale_offset_ticks: offset,
+                            amount,
+                            proposed_ticks: proposed,
+                            minimum: envelope.minimum(),
+                            maximum: envelope.maximum(),
+                        },
+                    );
+                }
+            }
+            offsets[joint_index(joint)] = offset;
+        }
+        Ok(Self {
+            natural,
+            hard_envelopes: gaze.hard_envelopes,
+            full_scale_tick_offsets: offsets,
+        })
+    }
+
+    pub const fn natural_declaration(self) -> HeadNaturalPoseDeclaration {
+        self.natural
+    }
+
+    pub const fn full_scale_tick_offset(self, joint: HeadJoint) -> i16 {
+        self.full_scale_tick_offsets[joint_index(joint)]
+    }
+
+    pub fn proposal_for_natural_overlay(
+        self,
+        overlay: CharacterHeadOverlay,
+    ) -> Result<HeadGazeTargetProposal, CharacterHeadOverlayMappingError> {
+        self.proposal_for_base_overlay(
+            HeadGazeTargetProposal::from_positions(
+                self.natural.position(HeadJoint::Bow),
+                self.natural.position(HeadJoint::Curl),
+                self.natural.position(HeadJoint::Yaw),
+                self.natural.position(HeadJoint::Roll),
+            ),
+            overlay,
+        )
+    }
+
+    pub fn proposal_for_base_overlay(
+        self,
+        base: HeadGazeTargetProposal,
+        overlay: CharacterHeadOverlay,
+    ) -> Result<HeadGazeTargetProposal, CharacterHeadOverlayMappingError> {
+        let mut positions = base.positions();
+        for joint in HeadJoint::ALL {
+            let amount = character_amount(overlay, joint);
+            let offset = self.full_scale_tick_offset(joint);
+            let base_position = base.position(joint);
+            let proposed =
+                i32::from(base_position.get()) + scaled_character_tick_delta(amount.get(), offset);
+            let envelope = self.hard_envelopes[joint_index(joint)];
+            if proposed < i32::from(envelope.minimum().get())
+                || proposed > i32::from(envelope.maximum().get())
+            {
+                return Err(CharacterHeadOverlayMappingError::OutsideHardEnvelope {
+                    joint,
+                    base: base_position,
+                    normalized_amount: amount,
+                    full_scale_offset_ticks: offset,
+                    proposed_ticks: proposed,
+                    minimum: envelope.minimum(),
+                    maximum: envelope.maximum(),
+                });
+            }
+            let proposed = u16::try_from(proposed)
+                .ok()
+                .and_then(|ticks| PositionTicks::try_new(ticks).ok())
+                .expect("hard-envelope membership proves a valid encoder position");
+            positions[joint_index(joint)] = proposed;
+        }
+        Ok(HeadGazeTargetProposal::from_positions(
+            positions[0],
+            positions[1],
+            positions[2],
+            positions[3],
+        ))
+    }
+}
+
+const fn character_amount(overlay: CharacterHeadOverlay, joint: HeadJoint) -> CharacterHeadAmount {
+    match joint {
+        HeadJoint::Bow => overlay.bow(),
+        HeadJoint::Curl => overlay.curl(),
+        HeadJoint::Yaw => overlay.yaw(),
+        HeadJoint::Roll => overlay.roll(),
+    }
+}
+
+const fn scaled_character_tick_delta(amount: i16, full_scale_offset: i16) -> i32 {
+    let product = amount as i32 * full_scale_offset as i32;
+    let divisor = CHARACTER_HEAD_SCALE as i32;
+    if product >= 0 {
+        (product + divisor / 2) / divisor
+    } else {
+        (product - divisor / 2) / divisor
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterHeadMappingDeclarationParseError {
+    ZeroFullScaleOffset {
+        joint: HeadJoint,
+    },
+    FullScaleOutsideHardEnvelope {
+        joint: HeadJoint,
+        natural: PositionTicks,
+        full_scale_offset_ticks: i16,
+        amount: i16,
+        proposed_ticks: i32,
+        minimum: PositionTicks,
+        maximum: PositionTicks,
+    },
+}
+
+impl fmt::Display for CharacterHeadMappingDeclarationParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid four-joint character-head mapping declaration: {self:?}"
+        )
+    }
+}
+
+impl core::error::Error for CharacterHeadMappingDeclarationParseError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterHeadOverlayMappingError {
+    OutsideHardEnvelope {
+        joint: HeadJoint,
+        base: PositionTicks,
+        normalized_amount: CharacterHeadAmount,
+        full_scale_offset_ticks: i16,
+        proposed_ticks: i32,
+        minimum: PositionTicks,
+        maximum: PositionTicks,
+    },
+}
+
+impl fmt::Display for CharacterHeadOverlayMappingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "cannot map character-head overlay: {self:?}")
+    }
+}
+
+impl core::error::Error for CharacterHeadOverlayMappingError {}
 
 /// Inclusive absolute encoder envelope for one named joint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -974,6 +1183,106 @@ mod tests {
 
     fn expected_tick(natural: u16, coefficient: f64, angle: f64) -> u16 {
         (f64::from(natural) + coefficient * angle + 0.5) as u16
+    }
+
+    fn character_mapping() -> CharacterHeadMappingDeclaration {
+        let mut input = valid_input();
+        input.hard_envelopes.roll = HeadTickEnvelopeInput {
+            minimum_ticks: 2_997,
+            maximum_ticks: 3_097,
+        };
+        let gaze = HeadGazeMappingDeclaration::parse(input).unwrap();
+        CharacterHeadMappingDeclaration::parse_for_gaze_mapping(
+            &gaze,
+            NamedCharacterHeadFullScaleTickOffsetsInput {
+                bow_ticks: 45,
+                curl_ticks: -90,
+                yaw_ticks: 260,
+                roll_ticks: 50,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn character_overlay_maps_every_named_axis_with_signed_nearest_rounding() {
+        let mapping = character_mapping();
+        let overlay = CharacterHeadOverlay::try_new(1_000, -1_000, 501, -510).unwrap();
+        let proposal = mapping.proposal_for_natural_overlay(overlay).unwrap();
+        assert_eq!(
+            proposal.positions().map(PositionTicks::get),
+            [2_219, 2_660, 1_767, 3_021]
+        );
+        assert_eq!(mapping.full_scale_tick_offset(HeadJoint::Bow), 45);
+        assert_eq!(mapping.full_scale_tick_offset(HeadJoint::Curl), -90);
+        assert_eq!(mapping.full_scale_tick_offset(HeadJoint::Yaw), 260);
+        assert_eq!(mapping.full_scale_tick_offset(HeadJoint::Roll), 50);
+    }
+
+    #[test]
+    fn character_mapping_requires_all_four_nonzero_and_full_scale_safe() {
+        let mut input = valid_input();
+        input.hard_envelopes.roll = HeadTickEnvelopeInput {
+            minimum_ticks: 2_997,
+            maximum_ticks: 3_097,
+        };
+        let gaze = HeadGazeMappingDeclaration::parse(input).unwrap();
+        let zero_roll = CharacterHeadMappingDeclaration::parse_for_gaze_mapping(
+            &gaze,
+            NamedCharacterHeadFullScaleTickOffsetsInput {
+                bow_ticks: 45,
+                curl_ticks: -90,
+                yaw_ticks: 260,
+                roll_ticks: 0,
+            },
+        );
+        assert_eq!(
+            zero_roll,
+            Err(
+                CharacterHeadMappingDeclarationParseError::ZeroFullScaleOffset {
+                    joint: HeadJoint::Roll
+                }
+            )
+        );
+
+        let excessive_bow = CharacterHeadMappingDeclaration::parse_for_gaze_mapping(
+            &gaze,
+            NamedCharacterHeadFullScaleTickOffsetsInput {
+                bow_ticks: 46,
+                curl_ticks: -90,
+                yaw_ticks: 260,
+                roll_ticks: 50,
+            },
+        );
+        assert!(matches!(
+            excessive_bow,
+            Err(
+                CharacterHeadMappingDeclarationParseError::FullScaleOutsideHardEnvelope {
+                    joint: HeadJoint::Bow,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn character_overlay_composition_rejects_a_gaze_edge_without_clamping() {
+        let mapping = character_mapping();
+        let base = HeadGazeTargetProposal::from_positions(
+            PositionTicks::try_new(2_219).unwrap(),
+            PositionTicks::try_new(2_570).unwrap(),
+            PositionTicks::try_new(1_637).unwrap(),
+            PositionTicks::try_new(3_047).unwrap(),
+        );
+        let overlay = CharacterHeadOverlay::try_new(12, 0, 0, 0).unwrap();
+        assert!(matches!(
+            mapping.proposal_for_base_overlay(base, overlay),
+            Err(CharacterHeadOverlayMappingError::OutsideHardEnvelope {
+                joint: HeadJoint::Bow,
+                proposed_ticks: 2_220,
+                ..
+            })
+        ));
     }
 
     #[test]

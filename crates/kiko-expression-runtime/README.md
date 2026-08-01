@@ -87,11 +87,11 @@ calibrated polarity from silently crossing builds.
 
 ## Autonomic character layer
 
-`AutonomicCharacterEngine` decorates each fresh, already typed eye reaction
-without extending or replacing its host freshness. It is a fixed-size state
-machine with no allocation, I/O, wall clock, or background task. One stream
-epoch seeds its local xorshift sequence, so the same seed, monotonic samples,
-face-presence sequence, and base intentions produce identical output.
+`AutonomicCharacterEngine` decorates each fresh, already typed reaction without
+extending or replacing its host freshness. It is a fixed-size state machine
+with no allocation, I/O, wall clock, or background task. One stream epoch seeds
+its local xorshift sequence, so the same seed, monotonic samples, face-presence
+sequence, and base intentions produce identical output.
 
 The retained modes are idle, greeting, tracking, lost, searching, and sleepy.
 The finite act vocabulary preserves all 19 named behaviors from the prior
@@ -103,11 +103,28 @@ state, not sleeps. All output is reconstructed through KEP2's signed/unit
 domain constructors after explicit saturation to `[-1000,1000]` or
 `[0,1000]`; the frame path retains no untyped eye values.
 
-This layer animates the eyes only. Act names describe their character intent;
-they do not authorize matching servo choreography. Physical head following
-continues through the separately calibrated camera-to-head gaze mapping and
-single head actor. This deliberately avoids treating offsets copied from an
-older Python process as reviewed servo calibration.
+`render_character` returns one `PreparedCharacterFrame`: the KEP2 eye intent,
+mode, optional named act, and a semantic overlay for bow, curl, yaw, and roll.
+The eyes begin the reaction first; the four head axes remain exactly natural
+for 120 ms, follow a quintic minimum-jerk pulse, and return exactly to natural.
+Every retained act exercises every joint, but small secondary-axis motion is
+deliberate so a nod still reads as a nod rather than four unrelated gestures.
+The named values use a dimensionless `character-positive` scale of
+`[-1000,1000]`, not encoder ticks. This coherent frame is also the stable seam
+for Rerun or other diagnostics: telemetry can record mode, act, eye values,
+and four normalized axes without parsing transport bytes or claiming physical
+motion.
+
+Physical conversion remains separate and fail-closed. An optional declaration
+in the reviewed head-gaze policy binds the positive full-scale offset for each
+named joint. That declaration is parsed once against the same natural pose and
+hard envelopes as gaze. Composition uses signed nearest-tick rounding and
+rejects an out-of-envelope result; it never clamps. Without the exact mapping,
+the overlay is explicitly withheld. With physical head gaze enabled, the
+single existing head actor evaluates face gaze and character overlay together,
+requires the sole base owner's exact-zero lease, and owns the only bus write.
+This avoids a second servo owner and avoids treating signs copied from the
+older Python process as calibration evidence.
 
 Semantic expressions project exhaustively:
 
@@ -120,9 +137,10 @@ Semantic expressions project exhaustively:
 
 The caller supplies the active semantic label because a mixed
 `ReactionOutput` intentionally has no single dominant `ExpressionKind` field.
-Neutral fallback is always forced to KEP2 `Neutral`. A reaction containing a
-head offset is rejected: this crate owns no head actor. The production default
-remains `ReactionMixer::default()` → `HeadIntention::NaturalHold`.
+Neutral fallback is always forced to KEP2 `Neutral`. A core reaction containing
+a head offset is still rejected: this crate owns no head actor. The production
+default remains `ReactionMixer::default()` → `HeadIntention::NaturalHold`;
+the separate typed character overlay cannot grant actuation authority.
 
 ## Eye ownership session
 
