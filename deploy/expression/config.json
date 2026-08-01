@@ -16,5 +16,23 @@
   "track_speed_max": 175,
   "offset_ease": 0.34,
   "admission_window_ticks": 128,
-  "temp_abort_raw": 65
+  "temp_abort_raw": 65,
+  "compliant_hold": {
+    "minimum_ticks": [2064, 2390, 1157, 2887],
+    "maximum_ticks": [2284, 2750, 2117, 3207],
+    "contact_entry_error_ticks": [18, 24, 32, 18],
+    "contact_release_error_ticks": [8, 10, 14, 8],
+    "maximum_yield_ticks": [24, 36, 80, 24],
+    "maximum_command_step_ticks": [3, 4, 8, 3],
+    "maximum_observed_step_ticks": [64, 80, 160, 64],
+    "quiet_command_step_ticks": [1, 2, 2, 1],
+    "holding_torque_limit_permille": [650, 550, 400, 400],
+    "control_period_ms": 100,
+    "maximum_observation_span_ms": 60,
+    "contact_arm_dwell_ms": 1000,
+    "contact_acquisition_samples": 3,
+    "release_dwell_ms": 600,
+    "recovery_duration_ms": 2400,
+    "follow_permille": 350
+  }
 }
