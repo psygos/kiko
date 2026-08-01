@@ -12,7 +12,8 @@ mod probe;
 mod transport;
 
 pub use actor::{
-    ActorExit, ActorTermination, ArmingFreshnessCheck, CancellationCause, FrameWriteError,
+    ActorExit, ActorTermination, ArmingFreshnessCheck,
+    AttendedCompliantCommissioningTakeoverConsent, CancellationCause, FrameWriteError,
     HeadActorHandle, HeadActorSpawnError, HeadActorStartError, HeadActorTask, HeadCommandError,
     HeadGazeActuationConfig, HeadGazeActuationConfigError, HeadGazeHardwareApplication,
     HeadGazeProposalCommandError, HeadGazeServiceError, HeadGazeServiceOutcome,
@@ -33,6 +34,7 @@ pub use actor::{
     WriteEvidence, WritePurpose, spawn_head_actor, spawn_head_return_actor,
     spawn_tension_preserving_head_gaze_actor, spawn_tension_preserving_head_return_actor,
     start_serial_head_actor, start_serial_head_return_actor,
+    start_serial_tension_preserving_head_compliant_commission_actor,
     start_serial_tension_preserving_head_gaze_actor,
     start_serial_tension_preserving_head_return_actor,
 };

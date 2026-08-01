@@ -163,3 +163,39 @@ Before enabling this mode on the robot:
 
 No physical touch, minimum-torque, latency, or thermal result is claimed by the
 software tests in this change.
+
+## Attended activation surface
+
+`kiko-head-commission --compliant-hold` is the bounded head-only lane used to
+collect that missing evidence without weakening production admission. It:
+
+- parses one strict configuration and derives all domain types before opening
+  the serial endpoint;
+- performs a tension-preserving takeover, returns to the reviewed natural
+  pose, then services compliance continuously inside the same actor;
+- has no camera, eye, STM32, base-motion, gaze, deployment, or production
+  authority;
+- retains the exact typed compliant failure in actor-exit evidence; and
+- on SIGINT, SIGTERM, or lease expiry, releases serial ownership without a
+  torque-switch write, preserving the last verified hold.
+
+The checked-in
+`configs/nano-head-compliant-commissioning-v1.json` is a conservative first
+commissioning candidate. Its natural pose, four-axis envelopes, adapter
+identity, and existing `[600,400,400,400]` torque values come from the retained
+Kiko configuration. Its 100 ms service period, touch hysteresis, bounded yield,
+35% follow gain, dwell values, and 2.4 s minimum-jerk recovery are hypotheses
+selected for an attended wheels-off trial. They are not a promoted physical
+review, minimum-torque evidence, or a claim that a person will perceive the
+motion as soft. Physical observations must either support those exact bytes or
+produce a new candidate; they must never be rewritten into evidence after the
+fact.
+
+For the attended Nano handoff, `deploy/kiko-accessory-commissioning-guardian.sh`
+keeps two deliberately separate device owners alive. The existing expression
+process runs with `--no-head` and therefore retains only OAK/eye behavior; the
+typed Rust commissioning process is the sole head-serial owner. Independent
+restart loops keep a camera failure from interrupting head tension and keep a
+head-control fault from taking down the eyes. The script never opens or starts
+the STM32, base, navigation, or SLAM and must not be represented as the final
+production owner.

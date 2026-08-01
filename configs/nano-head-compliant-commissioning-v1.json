@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "probe": {
+    "device_path": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B14031114-if00",
+    "response_timeout_ms": 100,
+    "request_timeout_ms": 100,
+    "noise_budget_bytes": 32
+  },
+  "hold_observed": null,
+  "return_to_target": {
+    "write_timeout_ms": 100,
+    "arming_freshness_ms": 250,
+    "write_attempts": 2,
+    "redundant_read_tolerance_ticks": 10,
+    "readback_tolerance_ticks": 20,
+    "final_target_tolerance_ticks": 20,
+    "path_corridor_tolerance_ticks": 20,
+    "direction_regression_tolerance_ticks": 20,
+    "goal_speed_ticks_per_second": 50,
+    "torque_limit_permille": [600, 400, 400, 400],
+    "minimum_start_ticks": [2133, 2550, 1617, 3023],
+    "maximum_start_ticks": [2194, 2660, 1852, 3067],
+    "target_ticks": [2174, 2570, 1637, 3047],
+    "maximum_travel_ticks": [48, 96, 224, 32],
+    "maximum_hold_ms": 86400000,
+    "physical_motion_consent": "return_to_reviewed_target"
+  },
+  "compliant_hold": {
+    "minimum_ticks": [2064, 2390, 1157, 2887],
+    "maximum_ticks": [2284, 2750, 2117, 3207],
+    "contact_entry_error_ticks": [18, 24, 32, 18],
+    "contact_release_error_ticks": [8, 10, 14, 8],
+    "maximum_yield_ticks": [24, 36, 80, 24],
+    "maximum_command_step_ticks": [3, 4, 8, 3],
+    "maximum_observed_step_ticks": [64, 80, 160, 64],
+    "control_period_ms": 100,
+    "observation_transaction_timeout_ms": 80,
+    "maximum_observation_span_ms": 60,
+    "observation_ttl_ms": 150,
+    "contact_arm_dwell_ms": 1000,
+    "contact_acquisition_samples": 3,
+    "release_dwell_ms": 600,
+    "recovery_duration_ms": 2400,
+    "follow_permille": 350
+  }
+}

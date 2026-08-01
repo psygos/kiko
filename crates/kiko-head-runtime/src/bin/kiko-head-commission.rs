@@ -8,19 +8,25 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use kiko_head_protocol::HeadJoint;
+use kiko_head_protocol::{FrameBuildError, HeadJoint, PositionTicks};
+use kiko_head_runtime::compliant_hold::{
+    CompliantJointPolicy, CompliantJointPolicyError, HeadCompliantHoldConfig,
+    HeadCompliantHoldConfigError,
+};
 use kiko_head_runtime::{
-    ActorExit, HeadProbeConfig, HeadProbeConfigInput, HeadProbeReport, ObservedHoldConfig,
-    ObservedHoldConfigInput, PhysicalHeadMotionConsent, PhysicalTorqueEnableConsent,
-    ReturnToTargetConfig, ReturnToTargetConfigInput, SerialConfigurationEvidence,
+    ActorExit, AttendedCompliantCommissioningTakeoverConsent, HeadProbeConfig,
+    HeadProbeConfigInput, HeadProbeReport, ObservedHoldConfig, ObservedHoldConfigInput,
+    PhysicalHeadMotionConsent, PhysicalTorqueEnableConsent, ReturnToTargetConfig,
+    ReturnToTargetConfigInput, SerialConfigurationEvidence, TensionPreservingHeadActorExit,
     TorqueDisableReport, VerifiedHeadReturnEvidence, VerifiedNaturalHoldEvidence,
     probe_serial_head, start_serial_head_actor, start_serial_head_return_actor,
+    start_serial_tension_preserving_head_compliant_commission_actor,
 };
 use serde::Deserialize;
 
 const CONFIG_SCHEMA_VERSION: u8 = 1;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
-const MAX_COMMISSIONING_HOLD_DURATION_MS: u64 = 900_000;
+const MAX_COMMISSIONING_HOLD_DURATION_MS: u64 = 86_400_000;
 #[cfg(target_os = "linux")]
 const O_NOFOLLOW: i32 = 0o400000;
 #[cfg(target_os = "macos")]
@@ -31,6 +37,7 @@ enum Mode {
     Probe,
     HoldObserved,
     ReturnToTarget,
+    CompliantHold,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -47,12 +54,15 @@ enum CliError {
     DuplicateConfig,
     DuplicateHoldObserved,
     DuplicateReturnToTarget,
+    DuplicateCompliantHold,
     DuplicatePhysicalConsent,
     DuplicatePhysicalMotionConsent,
     ConflictingMotionModes,
     HoldRequiresPhysicalConsent,
     ReturnRequiresPhysicalConsent,
     ReturnRequiresPhysicalMotionConsent,
+    CompliantRequiresPhysicalConsent,
+    CompliantRequiresPhysicalMotionConsent,
     TorqueConsentRequiresMotionMode,
     MotionConsentRequiresReturn,
     UnknownArgument(OsString),
@@ -71,6 +81,9 @@ impl fmt::Display for CliError {
             Self::DuplicateReturnToTarget => {
                 formatter.write_str("--return-to-target was provided more than once")
             }
+            Self::DuplicateCompliantHold => {
+                formatter.write_str("--compliant-hold was provided more than once")
+            }
             Self::DuplicatePhysicalConsent => {
                 formatter.write_str("--physical-torque-consent was provided more than once")
             }
@@ -78,7 +91,9 @@ impl fmt::Display for CliError {
                 formatter.write_str("--physical-motion-consent was provided more than once")
             }
             Self::ConflictingMotionModes => {
-                formatter.write_str("--hold-observed and --return-to-target are mutually exclusive")
+                formatter.write_str(
+                    "--hold-observed, --return-to-target, and --compliant-hold are mutually exclusive",
+                )
             }
             Self::HoldRequiresPhysicalConsent => formatter
                 .write_str("--hold-observed requires the separate --physical-torque-consent flag"),
@@ -88,11 +103,19 @@ impl fmt::Display for CliError {
             Self::ReturnRequiresPhysicalMotionConsent => formatter.write_str(
                 "--return-to-target requires the separate --physical-motion-consent flag",
             ),
+            Self::CompliantRequiresPhysicalConsent => formatter.write_str(
+                "--compliant-hold requires the separate --physical-torque-consent flag",
+            ),
+            Self::CompliantRequiresPhysicalMotionConsent => formatter.write_str(
+                "--compliant-hold requires the separate --physical-motion-consent flag",
+            ),
             Self::TorqueConsentRequiresMotionMode => formatter.write_str(
-                "--physical-torque-consent requires --hold-observed or --return-to-target",
+                "--physical-torque-consent requires --hold-observed, --return-to-target, or --compliant-hold",
             ),
             Self::MotionConsentRequiresReturn => {
-                formatter.write_str("--physical-motion-consent requires --return-to-target")
+                formatter.write_str(
+                    "--physical-motion-consent requires --return-to-target or --compliant-hold",
+                )
             }
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument {argument:?}"),
         }
@@ -135,10 +158,13 @@ enum ConfigFileError {
     Probe(kiko_head_runtime::ConfigParseError),
     Hold(kiko_head_runtime::ObservedHoldConfigParseError),
     Return(kiko_head_runtime::ReturnToTargetConfigParseError),
+    Compliant(CompliantInputParseError),
     ReturnHoldDuration(CommissioningHoldDurationError),
     ConflictingConfigurations,
+    CompliantWithoutReturn,
     HoldModeMissingConfiguration,
     ReturnModeMissingConfiguration,
+    CompliantModeMissingConfiguration,
 }
 
 impl fmt::Display for ConfigFileError {
@@ -197,17 +223,22 @@ impl fmt::Display for ConfigFileError {
             Self::Probe(_) => formatter.write_str("probe configuration is invalid"),
             Self::Hold(_) => formatter.write_str("observed-hold configuration is invalid"),
             Self::Return(_) => formatter.write_str("return-to-target configuration is invalid"),
+            Self::Compliant(_) => formatter.write_str("compliant-hold configuration is invalid"),
             Self::ReturnHoldDuration(_) => {
                 formatter.write_str("return commissioning hold duration is invalid")
             }
             Self::ConflictingConfigurations => {
                 formatter.write_str("hold_observed and return_to_target cannot both be configured")
             }
+            Self::CompliantWithoutReturn => formatter
+                .write_str("compliant_hold requires the reviewed return_to_target configuration"),
             Self::HoldModeMissingConfiguration => {
                 formatter.write_str("--hold-observed requires a hold_observed configuration object")
             }
             Self::ReturnModeMissingConfiguration => formatter
                 .write_str("--return-to-target requires a return_to_target configuration object"),
+            Self::CompliantModeMissingConfiguration => formatter
+                .write_str("--compliant-hold requires a compliant_hold configuration object"),
         }
     }
 }
@@ -220,6 +251,7 @@ impl Error for ConfigFileError {
             Self::Probe(source) => Some(source),
             Self::Hold(source) => Some(source),
             Self::Return(source) => Some(source),
+            Self::Compliant(source) => Some(source),
             Self::ReturnHoldDuration(source) => Some(source),
             Self::PathMustBeAbsolute { .. }
             | Self::PathContainsTraversal { .. }
@@ -228,8 +260,10 @@ impl Error for ConfigFileError {
             | Self::TooLarge { .. }
             | Self::UnsupportedSchema { .. }
             | Self::ConflictingConfigurations
+            | Self::CompliantWithoutReturn
             | Self::HoldModeMissingConfiguration
-            | Self::ReturnModeMissingConfiguration => None,
+            | Self::ReturnModeMissingConfiguration
+            | Self::CompliantModeMissingConfiguration => None,
         }
     }
 }
@@ -274,6 +308,42 @@ impl fmt::Display for CommissioningHoldDurationError {
 
 impl Error for CommissioningHoldDurationError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompliantPositionBound {
+    Minimum,
+    Maximum,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompliantInputParseError {
+    Position {
+        joint: HeadJoint,
+        bound: CompliantPositionBound,
+        source: FrameBuildError,
+    },
+    Joint {
+        joint: HeadJoint,
+        source: CompliantJointPolicyError,
+    },
+    Config(HeadCompliantHoldConfigError),
+}
+
+impl fmt::Display for CompliantInputParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid compliant-hold boundary: {self:?}")
+    }
+}
+
+impl Error for CompliantInputParseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Position { source, .. } => Some(source),
+            Self::Joint { source, .. } => Some(source),
+            Self::Config(source) => Some(source),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFileInput {
@@ -281,6 +351,7 @@ struct ConfigFileInput {
     probe: ProbeInput,
     hold_observed: Option<HoldInput>,
     return_to_target: Option<ReturnInput>,
+    compliant_hold: Option<CompliantInput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -328,6 +399,27 @@ struct ReturnInput {
     physical_motion_consent: PhysicalMotionConsentInput,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompliantInput {
+    minimum_ticks: [u16; 4],
+    maximum_ticks: [u16; 4],
+    contact_entry_error_ticks: [u16; 4],
+    contact_release_error_ticks: [u16; 4],
+    maximum_yield_ticks: [u16; 4],
+    maximum_command_step_ticks: [u16; 4],
+    maximum_observed_step_ticks: [u16; 4],
+    control_period_ms: u64,
+    observation_transaction_timeout_ms: u64,
+    maximum_observation_span_ms: u64,
+    observation_ttl_ms: u64,
+    contact_arm_dwell_ms: u64,
+    contact_acquisition_samples: u8,
+    release_dwell_ms: u64,
+    recovery_duration_ms: u64,
+    follow_permille: u16,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum PhysicalMotionConsentInput {
@@ -338,6 +430,7 @@ struct CommissionConfig {
     probe: HeadProbeConfig,
     hold: Option<ObservedHoldConfig>,
     head_return: Option<CommissioningReturnConfig>,
+    compliant_hold: Option<HeadCompliantHoldConfig>,
 }
 
 struct CommissioningReturnConfig {
@@ -396,6 +489,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             .head_return
             .ok_or(ConfigFileError::ReturnModeMissingConfiguration)?;
         run_return_to_target(head_return).await?;
+    } else if cli.mode == Mode::CompliantHold {
+        let head_return = config
+            .head_return
+            .ok_or(ConfigFileError::ReturnModeMissingConfiguration)?;
+        let compliant_hold = config
+            .compliant_hold
+            .ok_or(ConfigFileError::CompliantModeMissingConfiguration)?;
+        run_compliant_hold(head_return, compliant_hold).await?;
     }
     Ok(())
 }
@@ -405,6 +506,7 @@ fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<Cli, CliEr
     let mut config_path = None;
     let mut hold_observed = false;
     let mut return_to_target = false;
+    let mut compliant_hold = false;
     let mut physical_consent = false;
     let mut physical_motion_consent = false;
     while let Some(argument) = arguments.next() {
@@ -428,6 +530,12 @@ fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<Cli, CliEr
                 }
                 return_to_target = true;
             }
+            Some("--compliant-hold") => {
+                if compliant_hold {
+                    return Err(CliError::DuplicateCompliantHold);
+                }
+                compliant_hold = true;
+            }
             Some("--physical-torque-consent") => {
                 if physical_consent {
                     return Err(CliError::DuplicatePhysicalConsent);
@@ -443,24 +551,43 @@ fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<Cli, CliEr
             _ => return Err(CliError::UnknownArgument(argument)),
         }
     }
-    let mode = match (
-        hold_observed,
-        return_to_target,
-        physical_consent,
-        physical_motion_consent,
-    ) {
-        (false, false, false, false) => Mode::Probe,
-        (true, false, true, false) => Mode::HoldObserved,
-        (false, true, true, true) => Mode::ReturnToTarget,
-        (true, true, _, _) => return Err(CliError::ConflictingMotionModes),
-        (true, false, false, _) => return Err(CliError::HoldRequiresPhysicalConsent),
-        (true, false, true, true) => return Err(CliError::MotionConsentRequiresReturn),
-        (false, true, false, _) => return Err(CliError::ReturnRequiresPhysicalConsent),
-        (false, true, true, false) => {
+    let selected_modes =
+        usize::from(hold_observed) + usize::from(return_to_target) + usize::from(compliant_hold);
+    if selected_modes > 1 {
+        return Err(CliError::ConflictingMotionModes);
+    }
+    let mode = if hold_observed {
+        if !physical_consent {
+            return Err(CliError::HoldRequiresPhysicalConsent);
+        }
+        if physical_motion_consent {
+            return Err(CliError::MotionConsentRequiresReturn);
+        }
+        Mode::HoldObserved
+    } else if return_to_target {
+        if !physical_consent {
+            return Err(CliError::ReturnRequiresPhysicalConsent);
+        }
+        if !physical_motion_consent {
             return Err(CliError::ReturnRequiresPhysicalMotionConsent);
         }
-        (false, false, true, _) => return Err(CliError::TorqueConsentRequiresMotionMode),
-        (false, false, false, true) => return Err(CliError::MotionConsentRequiresReturn),
+        Mode::ReturnToTarget
+    } else if compliant_hold {
+        if !physical_consent {
+            return Err(CliError::CompliantRequiresPhysicalConsent);
+        }
+        if !physical_motion_consent {
+            return Err(CliError::CompliantRequiresPhysicalMotionConsent);
+        }
+        Mode::CompliantHold
+    } else {
+        if physical_consent {
+            return Err(CliError::TorqueConsentRequiresMotionMode);
+        }
+        if physical_motion_consent {
+            return Err(CliError::MotionConsentRequiresReturn);
+        }
+        Mode::Probe
     };
     Ok(Cli {
         config_path: config_path.ok_or(CliError::MissingConfig)?,
@@ -600,11 +727,75 @@ fn load_config(path: &Path) -> Result<CommissionConfig, ConfigFileError> {
     if hold.is_some() && head_return.is_some() {
         return Err(ConfigFileError::ConflictingConfigurations);
     }
+    let compliant_hold = match input.compliant_hold {
+        Some(compliant) => {
+            let head_return = head_return
+                .as_ref()
+                .ok_or(ConfigFileError::CompliantWithoutReturn)?;
+            Some(
+                parse_compliant_input(compliant, head_return.transaction.runtime().torque_limits())
+                    .map_err(ConfigFileError::Compliant)?,
+            )
+        }
+        None => None,
+    };
     Ok(CommissionConfig {
         probe,
         hold,
         head_return,
+        compliant_hold,
     })
+}
+
+fn parse_compliant_input(
+    input: CompliantInput,
+    holding_torque_limits: kiko_head_protocol::HeadTorqueLimits,
+) -> Result<HeadCompliantHoldConfig, CompliantInputParseError> {
+    let joints = HeadJoint::ALL.map(|joint| {
+        let index = joint as usize;
+        let minimum = PositionTicks::try_new(input.minimum_ticks[index]).map_err(|source| {
+            CompliantInputParseError::Position {
+                joint,
+                bound: CompliantPositionBound::Minimum,
+                source,
+            }
+        })?;
+        let maximum = PositionTicks::try_new(input.maximum_ticks[index]).map_err(|source| {
+            CompliantInputParseError::Position {
+                joint,
+                bound: CompliantPositionBound::Maximum,
+                source,
+            }
+        })?;
+        CompliantJointPolicy::try_new(
+            minimum,
+            maximum,
+            input.contact_entry_error_ticks[index],
+            input.contact_release_error_ticks[index],
+            input.maximum_yield_ticks[index],
+            input.maximum_command_step_ticks[index],
+            input.maximum_observed_step_ticks[index],
+        )
+        .map_err(|source| CompliantInputParseError::Joint { joint, source })
+    });
+    let [bow, curl, yaw, roll] = joints;
+    HeadCompliantHoldConfig::try_new(
+        bow?,
+        curl?,
+        yaw?,
+        roll?,
+        holding_torque_limits,
+        Duration::from_millis(input.control_period_ms),
+        Duration::from_millis(input.observation_transaction_timeout_ms),
+        Duration::from_millis(input.maximum_observation_span_ms),
+        Duration::from_millis(input.observation_ttl_ms),
+        Duration::from_millis(input.contact_arm_dwell_ms),
+        input.contact_acquisition_samples,
+        Duration::from_millis(input.release_dwell_ms),
+        Duration::from_millis(input.recovery_duration_ms),
+        input.follow_permille,
+    )
+    .map_err(CompliantInputParseError::Config)
 }
 
 fn path_contains_dot_segment(path: &Path) -> bool {
@@ -811,6 +1002,130 @@ async fn run_return_to_target(config: CommissioningReturnConfig) -> Result<(), B
     Ok(())
 }
 
+async fn run_compliant_hold(
+    config: CommissioningReturnConfig,
+    compliant_hold: HeadCompliantHoldConfig,
+) -> Result<(), Box<dyn Error>> {
+    let maximum_duration = config.hold_duration.get();
+    let mut stop_signals = StopSignals::install()?;
+    let (serial, handle, startup, task) =
+        start_serial_tension_preserving_head_compliant_commission_actor(
+            config.transaction,
+            compliant_hold,
+            PhysicalTorqueEnableConsent::explicitly_granted(),
+            PhysicalHeadMotionConsent::explicitly_granted(),
+            AttendedCompliantCommissioningTakeoverConsent::explicitly_granted(),
+        )?;
+    print_serial("compliant_serial", &serial);
+    let task_wait = task.join();
+    tokio::pin!(task_wait);
+
+    let startup_outcome = {
+        let startup_wait = startup.wait();
+        tokio::pin!(startup_wait);
+        tokio::select! {
+            result = &mut startup_wait => WaitOutcome::Completed(result),
+            stop = stop_signals.wait_signal() => WaitOutcome::Stopped(stop),
+        }
+    };
+    let startup_result = match startup_outcome {
+        WaitOutcome::Completed(Ok(result)) => result,
+        WaitOutcome::Stopped(stop) => {
+            let release = handle.release_ownership_preserving_hold().await;
+            let exit = (&mut task_wait).await?;
+            print_tension_actor_exit(&exit);
+            println!("compliant_stop reason={:?}", stop?);
+            release?;
+            return Ok(());
+        }
+        WaitOutcome::Completed(Err(source)) => {
+            drop(handle);
+            let exit = (&mut task_wait).await?;
+            print_tension_actor_exit(&exit);
+            return Err(Box::new(source));
+        }
+    };
+    let hold = match startup_result {
+        Ok(evidence) => evidence,
+        Err(source) => {
+            drop(handle);
+            let exit = (&mut task_wait).await?;
+            print_tension_actor_exit(&exit);
+            return Err(Box::new(source));
+        }
+    };
+    print_hold_started(&hold, maximum_duration);
+
+    let return_outcome = {
+        let return_wait = handle.return_to_target();
+        tokio::pin!(return_wait);
+        tokio::select! {
+            result = &mut return_wait => WaitOutcome::Completed(result),
+            stop = stop_signals.wait_signal() => WaitOutcome::Stopped(stop),
+        }
+    };
+    let return_result = match return_outcome {
+        WaitOutcome::Completed(Ok(result)) => result,
+        WaitOutcome::Stopped(stop) => {
+            let release = handle.release_ownership_preserving_hold().await;
+            let exit = (&mut task_wait).await?;
+            print_tension_actor_exit(&exit);
+            println!("compliant_stop reason={:?}", stop?);
+            release?;
+            return Ok(());
+        }
+        WaitOutcome::Completed(Err(source)) => {
+            drop(handle);
+            let exit = (&mut task_wait).await?;
+            print_tension_actor_exit(&exit);
+            return Err(Box::new(source));
+        }
+    };
+    let returned = match return_result {
+        Ok(evidence) => evidence,
+        Err(source) => {
+            eprintln!(
+                "compliant_return_failed owner_retained={} error={source}",
+                source.retains_owner_after_fault()
+            );
+            let release = handle.release_ownership_preserving_hold().await;
+            let exit = (&mut task_wait).await?;
+            print_tension_actor_exit(&exit);
+            release?;
+            return Err(Box::new(source));
+        }
+    };
+    print_return_completed(&returned, maximum_duration);
+    println!(
+        "compliant_active control_period_ms={} contact_arm_dwell_ms={} release_dwell_ms={} recovery_duration_ms={} maximum_hold_ms={}",
+        compliant_hold.control_period().as_millis(),
+        compliant_hold.contact_arm_dwell().as_millis(),
+        compliant_hold.release_dwell().as_millis(),
+        compliant_hold.recovery_duration().as_millis(),
+        maximum_duration.as_millis(),
+    );
+
+    tokio::select! {
+        stop = stop_signals.wait(maximum_duration) => {
+            let release = handle.release_ownership_preserving_hold().await;
+            let exit = (&mut task_wait).await?;
+            print_tension_actor_exit(&exit);
+            println!("compliant_stop reason={:?}", stop?);
+            release?;
+            Ok(())
+        }
+        exit = &mut task_wait => {
+            drop(handle);
+            let exit = exit?;
+            print_tension_actor_exit(&exit);
+            if let Some(source) = exit.compliant_fault() {
+                return Err(Box::new(source.clone()));
+            }
+            Err(Box::new(UnexpectedCompliantActorExit(exit.termination().clone())))
+        }
+    }
+}
+
 struct StopSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
@@ -853,6 +1168,21 @@ impl fmt::Display for CleanupIncomplete {
 }
 
 impl Error for CleanupIncomplete {}
+
+#[derive(Debug)]
+struct UnexpectedCompliantActorExit(kiko_head_runtime::ActorTermination);
+
+impl fmt::Display for UnexpectedCompliantActorExit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "compliant head actor exited before the commissioning lease ended: {:?}",
+            self.0
+        )
+    }
+}
+
+impl Error for UnexpectedCompliantActorExit {}
 
 fn print_probe(report: &HeadProbeReport) {
     print_serial("probe_serial", report.serial());
@@ -953,6 +1283,32 @@ fn print_actor_exit(exit: &ActorExit) {
     print_cleanup(exit.torque_disable());
 }
 
+fn print_tension_actor_exit(exit: &TensionPreservingHeadActorExit) {
+    println!(
+        "compliant_exit termination={:?} ownership_release_recorded_at_ns={}",
+        exit.termination(),
+        exit.hold_preserving_release()
+            .recorded_at()
+            .duration_since_origin()
+            .as_nanos(),
+    );
+    if let Err(source) = exit.startup() {
+        eprintln!("compliant_exit startup_error={source}");
+    }
+    if let Some(result) = exit.head_return() {
+        match result {
+            Ok(evidence) => println!(
+                "compliant_return_exit completed=true waypoint_batches={}",
+                evidence.waypoint_writes().len()
+            ),
+            Err(source) => eprintln!("compliant_return_exit completed=false error={source}"),
+        }
+    }
+    if let Some(source) = exit.compliant_fault() {
+        eprintln!("compliant_exit service_error={source}");
+    }
+}
+
 fn print_cleanup(report: &TorqueDisableReport) {
     println!(
         "torque_disable_complete all_writes_completed={}",
@@ -983,7 +1339,7 @@ const fn joint_name(joint: HeadJoint) -> &'static str {
 
 fn print_usage() {
     eprintln!(
-        "usage: kiko-head-commission --config /absolute/path.json [--hold-observed --physical-torque-consent | --return-to-target --physical-torque-consent --physical-motion-consent]"
+        "usage: kiko-head-commission --config /absolute/path.json [--hold-observed --physical-torque-consent | --return-to-target --physical-torque-consent --physical-motion-consent | --compliant-hold --physical-torque-consent --physical-motion-consent]"
     );
 }
 
@@ -1070,6 +1426,66 @@ mod tests {
             ])),
             Err(CliError::ReturnRequiresPhysicalMotionConsent)
         ));
+    }
+
+    #[test]
+    fn compliant_hold_requires_both_physical_consents() {
+        let cli = parse_cli(os(&[
+            "--config",
+            "/tmp/head.json",
+            "--compliant-hold",
+            "--physical-torque-consent",
+            "--physical-motion-consent",
+        ]))
+        .expect("explicitly consented compliant CLI");
+        assert_eq!(cli.mode, Mode::CompliantHold);
+        assert!(matches!(
+            parse_cli(os(&[
+                "--config",
+                "/tmp/head.json",
+                "--compliant-hold",
+                "--physical-torque-consent",
+            ])),
+            Err(CliError::CompliantRequiresPhysicalMotionConsent)
+        ));
+        assert!(matches!(
+            parse_cli(os(&[
+                "--config",
+                "/tmp/head.json",
+                "--compliant-hold",
+                "--return-to-target",
+                "--physical-torque-consent",
+                "--physical-motion-consent",
+            ])),
+            Err(CliError::ConflictingMotionModes)
+        ));
+    }
+
+    #[test]
+    fn checked_in_compliant_commissioning_config_parses_once_into_domain_types() {
+        let path = fs::canonicalize(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../configs/nano-head-compliant-commissioning-v1.json"
+        )))
+        .expect("canonical checked-in config path");
+        let config = load_config(&path).expect("checked-in compliant configuration");
+        let head_return = config.head_return.expect("reviewed return");
+        let compliant = config.compliant_hold.expect("compliant policy");
+
+        assert_eq!(
+            head_return
+                .transaction
+                .target()
+                .positions()
+                .map(PositionTicks::get),
+            [2174, 2570, 1637, 3047]
+        );
+        assert_eq!(compliant.control_period(), Duration::from_millis(100));
+        assert_eq!(compliant.contact_acquisition_samples(), 3);
+        assert_eq!(compliant.recovery_duration(), Duration::from_millis(2400));
+        compliant
+            .admit_runtime_torque_limits(head_return.transaction.runtime().torque_limits())
+            .expect("exact torque binding");
     }
 
     #[test]

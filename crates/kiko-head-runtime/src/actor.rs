@@ -269,6 +269,18 @@ impl ProductionTensionPreservingTakeoverConsent {
     }
 }
 
+/// Deliberate opt-in for an attended, head-only compliant commissioning
+/// takeover. It grants no camera, gaze, base, deployment, or production
+/// authority and is accepted only by the dedicated commissioning constructor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AttendedCompliantCommissioningTakeoverConsent(());
+
+impl AttendedCompliantCommissioningTakeoverConsent {
+    pub const fn explicitly_granted() -> Self {
+        Self(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RuntimeStage {
     ObserveFirst,
@@ -1694,6 +1706,9 @@ pub enum ActorTermination {
     StartupFault,
     StartupFaultWithShutdownRequested,
     HeadReturnFault,
+    /// The continuously serviced, head-only compliant commissioning loop
+    /// failed. The exact typed cause is retained separately in the actor exit.
+    CompliantCommissioningFault,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1701,6 +1716,7 @@ pub struct ActorExit {
     startup: Result<VerifiedNaturalHoldEvidence, HeadRuntimeError>,
     head_return: Option<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
     termination: ActorTermination,
+    compliant_fault: Option<HeadGazeServiceError>,
     torque_disable: TorqueDisableReport,
 }
 
@@ -1717,6 +1733,10 @@ impl ActorExit {
 
     pub const fn termination(&self) -> &ActorTermination {
         &self.termination
+    }
+
+    pub const fn compliant_fault(&self) -> Option<&HeadGazeServiceError> {
+        self.compliant_fault.as_ref()
     }
 
     pub const fn torque_disable(&self) -> &TorqueDisableReport {
@@ -1753,6 +1773,7 @@ pub struct TensionPreservingHeadActorExit {
     startup: Result<VerifiedNaturalHoldEvidence, HeadRuntimeError>,
     head_return: Option<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
     termination: ActorTermination,
+    compliant_fault: Option<HeadGazeServiceError>,
     hold_preserving_release: HoldPreservingOwnershipReleaseEvidence,
 }
 
@@ -1769,6 +1790,10 @@ impl TensionPreservingHeadActorExit {
 
     pub const fn termination(&self) -> &ActorTermination {
         &self.termination
+    }
+
+    pub const fn compliant_fault(&self) -> Option<&HeadGazeServiceError> {
+        self.compliant_fault.as_ref()
     }
 
     pub const fn hold_preserving_release(&self) -> &HoldPreservingOwnershipReleaseEvidence {
@@ -1794,9 +1819,10 @@ pub struct VerifiedHeadGazeControlStep {
     hardware: HeadGazeHardwareApplication,
 }
 
-/// One compliant-hold step committed by the same exclusive serial owner used
-/// for gaze. The raw diagnostic registers remain available through the
-/// controller receipt's observation without being interpreted as force.
+/// One compliant-hold step committed by the exclusive serial owner used for
+/// either gaze actuation or attended head-only compliant commissioning. The
+/// raw diagnostic registers remain available through the controller receipt's
+/// observation without being interpreted as force.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedHeadCompliantHoldStep {
     controller: CompliantHoldCommitReceipt,
@@ -1913,7 +1939,7 @@ pub enum HeadGazeServiceError {
 
 impl fmt::Display for HeadGazeServiceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "head-gaze service failed: {self:?}")
+        write!(formatter, "head control service failed: {self:?}")
     }
 }
 
@@ -2303,6 +2329,7 @@ impl std::error::Error for HeadActorSpawnError {
 pub enum HeadActorStartError {
     NoTokioRuntime { source: TryCurrentError },
     CompliantTorqueBinding(HeadCompliantTorqueBindingError),
+    CompliantControllerInitialization(CompliantHoldPrepareError),
     Serial { source: SerialOpenError },
 }
 
@@ -2317,6 +2344,7 @@ impl std::error::Error for HeadActorStartError {
         match self {
             Self::NoTokioRuntime { source } => Some(source),
             Self::CompliantTorqueBinding(source) => Some(source),
+            Self::CompliantControllerInitialization(source) => Some(source),
             Self::Serial { source } => Some(source),
         }
     }
@@ -2343,7 +2371,7 @@ where
         config,
         configured_pose_bounds,
         None,
-        None,
+        HeadControlMode::NaturalHold,
     );
     Ok((HeadActorHandle { commands }, startup, task))
 }
@@ -2370,7 +2398,7 @@ where
         runtime_config,
         start_bounds,
         Some(plan),
-        None,
+        HeadControlMode::NaturalHold,
     );
     Ok((HeadReturnActorHandle { commands }, startup, task))
 }
@@ -2410,7 +2438,7 @@ where
         runtime_config,
         start_bounds,
         Some(plan),
-        None,
+        HeadControlMode::NaturalHold,
     );
     Ok((
         TensionPreservingHeadReturnActorHandle { commands },
@@ -2458,7 +2486,7 @@ where
         runtime_config,
         start_bounds,
         Some(plan),
-        Some(gaze_config),
+        HeadControlMode::Gaze(gaze_config),
     );
     Ok((
         TensionPreservingHeadGazeActorHandle { commands },
@@ -2474,7 +2502,7 @@ fn spawn_head_actor_on<T, C>(
     config: HeadRuntimeConfig,
     configured_pose_bounds: ConfiguredHeadPoseBounds,
     return_plan: Option<HeadReturnPlan>,
-    gaze_config: Option<HeadGazeActuationConfig>,
+    control_mode: HeadControlMode,
 ) -> (mpsc::Sender<HeadCommand>, StartupReceipt, HeadActorTask)
 where
     T: AsyncByteTransport,
@@ -2489,7 +2517,7 @@ where
         configured_pose_bounds,
         startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
         return_plan,
-        gaze_config,
+        control_mode,
     };
     let task = runtime.spawn(async move {
         actor
@@ -2513,7 +2541,7 @@ fn spawn_tension_preserving_head_actor_on<T, C>(
     config: HeadRuntimeConfig,
     configured_pose_bounds: ConfiguredHeadPoseBounds,
     return_plan: Option<HeadReturnPlan>,
-    gaze_config: Option<HeadGazeActuationConfig>,
+    control_mode: HeadControlMode,
 ) -> (
     mpsc::Sender<HeadCommand>,
     StartupReceipt,
@@ -2532,7 +2560,7 @@ where
         configured_pose_bounds,
         startup_torque_policy: StartupTorquePolicy::TensionPreservingTakeover,
         return_plan,
-        gaze_config,
+        control_mode,
     };
     let task = runtime.spawn(async move {
         actor
@@ -2578,7 +2606,7 @@ pub fn start_serial_head_actor(
         config,
         configured_pose_bounds,
         None,
-        None,
+        HeadControlMode::NaturalHold,
     );
     Ok((
         serial_evidence,
@@ -2616,7 +2644,7 @@ pub fn start_serial_head_return_actor(
         runtime_config,
         start_bounds,
         Some(plan),
-        None,
+        HeadControlMode::NaturalHold,
     );
     Ok((
         serial_evidence,
@@ -2659,7 +2687,60 @@ pub fn start_serial_tension_preserving_head_return_actor(
         runtime_config,
         start_bounds,
         Some(plan),
-        None,
+        HeadControlMode::NaturalHold,
+    );
+    Ok((
+        serial_evidence,
+        TensionPreservingHeadReturnActorHandle { commands },
+        startup,
+        task,
+    ))
+}
+
+/// Open one attended, head-only compliant commissioning owner.
+///
+/// This surface continuously services the compliant controller after the
+/// reviewed natural return succeeds. It does not create gaze authority, open
+/// the camera or base controller, or bypass the production base-zero lease.
+/// It exists so encoder-domain touch/yield/recovery dynamics can be observed
+/// and retained before a policy is promoted into the production owner.
+pub fn start_serial_tension_preserving_head_compliant_commission_actor(
+    config: ReturnToTargetConfig,
+    compliant_hold: HeadCompliantHoldConfig,
+    _torque_consent: PhysicalTorqueEnableConsent,
+    _motion_consent: PhysicalHeadMotionConsent,
+    _takeover_consent: AttendedCompliantCommissioningTakeoverConsent,
+) -> Result<
+    (
+        SerialConfigurationEvidence,
+        TensionPreservingHeadReturnActorHandle,
+        StartupReceipt,
+        TensionPreservingHeadActorTask,
+    ),
+    HeadActorStartError,
+> {
+    let runtime =
+        Handle::try_current().map_err(|source| HeadActorStartError::NoTokioRuntime { source })?;
+    compliant_hold
+        .admit_runtime_torque_limits(config.runtime().torque_limits())
+        .map_err(HeadActorStartError::CompliantTorqueBinding)?;
+    // Prove the reviewed return target is inside the compliant envelope before
+    // opening or changing the serial endpoint. The throwaway pure controller
+    // performs no I/O and cannot grant physical authority.
+    HeadCompliantHoldController::try_new(compliant_hold, config.target(), MonotonicTime::ZERO)
+        .map_err(HeadActorStartError::CompliantControllerInitialization)?;
+    let (runtime_config, start_bounds, plan) = config.into_actor_parts();
+    let transport = SerialTransport::open(runtime_config.device())
+        .map_err(|source| HeadActorStartError::Serial { source })?;
+    let serial_evidence = transport.evidence().clone();
+    let (commands, startup, task) = spawn_tension_preserving_head_actor_on(
+        &runtime,
+        transport,
+        TokioClock::new(),
+        runtime_config,
+        start_bounds,
+        Some(plan),
+        HeadControlMode::CompliantCommissioning(compliant_hold),
     );
     Ok((
         serial_evidence,
@@ -2711,7 +2792,7 @@ where
         runtime_config,
         start_bounds,
         Some(plan),
-        Some(gaze_config),
+        HeadControlMode::Gaze(gaze_config),
     );
     Ok((
         serial_evidence,
@@ -2727,6 +2808,30 @@ enum StartupTorquePolicy {
     TensionPreservingTakeover,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeadControlMode {
+    NaturalHold,
+    Gaze(HeadGazeActuationConfig),
+    /// Attended head-only commissioning; never production gaze authority.
+    CompliantCommissioning(HeadCompliantHoldConfig),
+}
+
+impl HeadControlMode {
+    const fn gaze(self) -> Option<HeadGazeActuationConfig> {
+        match self {
+            Self::Gaze(config) => Some(config),
+            Self::NaturalHold | Self::CompliantCommissioning(_) => None,
+        }
+    }
+
+    const fn compliant_commissioning(self) -> Option<HeadCompliantHoldConfig> {
+        match self {
+            Self::CompliantCommissioning(config) => Some(config),
+            Self::NaturalHold | Self::Gaze(_) => None,
+        }
+    }
+}
+
 struct HeadActor<T, C> {
     transport: T,
     clock: C,
@@ -2734,7 +2839,7 @@ struct HeadActor<T, C> {
     configured_pose_bounds: ConfiguredHeadPoseBounds,
     startup_torque_policy: StartupTorquePolicy,
     return_plan: Option<HeadReturnPlan>,
-    gaze_config: Option<HeadGazeActuationConfig>,
+    control_mode: HeadControlMode,
 }
 
 struct ControlState {
@@ -2765,6 +2870,7 @@ struct HeadActorRunExit {
     startup: Result<VerifiedNaturalHoldEvidence, HeadRuntimeError>,
     head_return: Option<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
     termination: ActorTermination,
+    compliant_fault: Option<HeadGazeServiceError>,
     cleanup: HeadActorCleanup,
 }
 
@@ -2777,6 +2883,7 @@ impl HeadActorRunExit {
             startup: self.startup,
             head_return: self.head_return,
             termination: self.termination,
+            compliant_fault: self.compliant_fault,
             torque_disable: *torque_disable,
         }
     }
@@ -2789,6 +2896,7 @@ impl HeadActorRunExit {
             startup: self.startup,
             head_return: self.head_return,
             termination: self.termination,
+            compliant_fault: self.compliant_fault,
             hold_preserving_release,
         }
     }
@@ -3076,6 +3184,7 @@ where
         let mut control = ControlState::new();
         let startup = self.startup(&mut commands, &mut control).await;
         let mut head_return = None;
+        let mut compliant_fault = None;
         // Startup observation is optional to the actor's safety. If the caller
         // dropped its receipt, the complete result still remains in ActorExit.
         let _startup_receiver_present = startup_sender.send(startup.clone()).is_ok();
@@ -3137,6 +3246,7 @@ where
                         &mut control,
                         evidence.observed_pose(),
                         &mut head_return,
+                        &mut compliant_fault,
                     )
                     .await
                 }
@@ -3176,6 +3286,7 @@ where
             startup,
             head_return,
             termination,
+            compliant_fault,
             cleanup,
         }
     }
@@ -3186,6 +3297,7 @@ where
         control: &mut ControlState,
         start_pose: HeadPose,
         head_return: &mut Option<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
+        compliant_fault: &mut Option<HeadGazeServiceError>,
     ) -> ActorTermination {
         let mut hold_target = HeadHoldTarget::StartupObserved(start_pose);
         let mut telemetry_safety_fault: Option<Box<HeadHealthObservationError>> = None;
@@ -3195,7 +3307,68 @@ where
             Result<HeadCompliantHoldController, CompliantHoldPrepareError>,
         > = None;
         loop {
-            match commands.recv().await {
+            let command = if self.control_mode.compliant_commissioning().is_some() {
+                match compliant_controller.as_mut() {
+                    Some(Err(source)) => {
+                        *compliant_fault = Some(
+                            HeadGazeServiceError::CompliantControllerInitialization(*source),
+                        );
+                        return ActorTermination::CompliantCommissioningFault;
+                    }
+                    Some(Ok(compliant)) => {
+                        let now = self.clock.now();
+                        if now < compliant.next_service_due() {
+                            let delay = compliant
+                                .next_service_due()
+                                .checked_duration_since(now)
+                                .expect("ordered monotonic timestamps have a duration");
+                            tokio::select! {
+                                command = commands.recv() => command,
+                                () = tokio::time::sleep(delay) => continue,
+                            }
+                        } else {
+                            let expression_target = self
+                                .return_plan
+                                .expect("compliant commissioning requires reviewed return")
+                                .target();
+                            let transaction_timeout = self.config.write_timeout();
+                            match self
+                                .execute_compliant_hold_step(
+                                    expression_target,
+                                    true,
+                                    transaction_timeout,
+                                    compliant,
+                                    commands,
+                                    control,
+                                )
+                                .await
+                            {
+                                Ok(Some(evidence)) => {
+                                    hold_target = HeadHoldTarget::ReviewedCompliant(
+                                        evidence.controller().committed_target(),
+                                    );
+                                }
+                                Ok(None) => {}
+                                Err(source) => {
+                                    if let Some(termination) = control.termination.clone() {
+                                        return termination;
+                                    }
+                                    *compliant_fault = Some(source);
+                                    return ActorTermination::CompliantCommissioningFault;
+                                }
+                            }
+                            if let Some(termination) = control.termination.clone() {
+                                return termination;
+                            }
+                            continue;
+                        }
+                    }
+                    None => commands.recv().await,
+                }
+            } else {
+                commands.recv().await
+            };
+            match command {
                 Some(HeadCommand::Shutdown { response }) => {
                     control.shutdown_response = Some(HeadShutdownResponse::Disable(response));
                     return ActorTermination::RequestedShutdown;
@@ -3268,19 +3441,27 @@ where
                         Err(_) => hold_target,
                     };
                     let _requester_present = response.send(result.clone()).is_ok();
-                    if let (Some(gaze_config), Ok(evidence)) = (self.gaze_config, &result) {
-                        gaze_controller = Some(HeadGazeController::try_new(
-                            gaze_config.controller(),
-                            evidence.target(),
-                            self.clock.now(),
-                        ));
-                        compliant_controller = gaze_config.compliant_hold().map(|config| {
-                            HeadCompliantHoldController::try_new(
+                    if let Ok(evidence) = &result {
+                        if let Some(gaze_config) = self.control_mode.gaze() {
+                            gaze_controller = Some(HeadGazeController::try_new(
+                                gaze_config.controller(),
+                                evidence.target(),
+                                self.clock.now(),
+                            ));
+                            compliant_controller = gaze_config.compliant_hold().map(|config| {
+                                HeadCompliantHoldController::try_new(
+                                    config,
+                                    evidence.target(),
+                                    self.clock.now(),
+                                )
+                            });
+                        } else if let Some(config) = self.control_mode.compliant_commissioning() {
+                            compliant_controller = Some(HeadCompliantHoldController::try_new(
                                 config,
                                 evidence.target(),
                                 self.clock.now(),
-                            )
-                        });
+                            ));
+                        }
                     }
                     *head_return = Some(result.clone());
                     if result.is_err() && !owner_retained_after_fault {
@@ -3291,7 +3472,7 @@ where
                     }
                 }
                 Some(HeadCommand::AdmitGazeProposal { proposal, response }) => {
-                    let result = if self.gaze_config.is_none() {
+                    let result = if self.control_mode.gaze().is_none() {
                         Err(HeadGazeProposalCommandError::NotConfigured)
                     } else {
                         match gaze_controller.as_mut() {
@@ -3310,7 +3491,7 @@ where
                     _base_zero_lease,
                     response,
                 }) => {
-                    let result = if self.gaze_config.is_none() {
+                    let result = if self.control_mode.gaze().is_none() {
                         Err(HeadGazeServiceError::NotConfigured)
                     } else {
                         match gaze_controller.as_mut() {
@@ -3378,7 +3559,19 @@ where
                     });
                 }
             } else if let Some(evidence) = self
-                .execute_compliant_hold_step(controller, compliant, commands, control)
+                .execute_compliant_hold_step(
+                    controller.committed_target(),
+                    HeadJoint::ALL
+                        .into_iter()
+                        .all(|joint| controller.velocity().velocity(joint).get() == 0),
+                    self.control_mode
+                        .gaze()
+                        .expect("compliance is configured only as part of gaze actuation")
+                        .goal_register_transaction_timeout(),
+                    compliant,
+                    commands,
+                    control,
+                )
                 .await?
             {
                 return Ok(HeadGazeServiceOutcome::Compliant(Box::new(evidence)));
@@ -3403,7 +3596,8 @@ where
             HeadGazeHardwareApplication::RetainedPreviouslyVerifiedTarget { target }
         } else {
             let gaze_config = self
-                .gaze_config
+                .control_mode
+                .gaze()
                 .expect("gaze service is called only for a configured actor");
             match self
                 .write_goals_with_register_readback(
@@ -3452,7 +3646,9 @@ where
 
     async fn execute_compliant_hold_step(
         &mut self,
-        gaze: &HeadGazeController,
+        expression_target: ExactHeadTargetPose,
+        expression_quiet: bool,
+        goal_register_transaction_timeout: OperationTimeout,
         compliant: &mut HeadCompliantHoldController,
         commands: &mut mpsc::Receiver<HeadCommand>,
         control: &mut ControlState,
@@ -3490,11 +3686,8 @@ where
             compliant_config.observation_ttl(),
         )
         .map_err(HeadGazeServiceError::CompliantObservation)?;
-        let expression_quiet = HeadJoint::ALL
-            .into_iter()
-            .all(|joint| gaze.velocity().velocity(joint).get() == 0);
         let prepared = compliant
-            .prepare(now, gaze.committed_target(), expression_quiet, observation)
+            .prepare(now, expression_target, expression_quiet, observation)
             .map_err(HeadGazeServiceError::CompliantPlanner)?;
         let disposition = prepared.disposition();
         let target = prepared.target();
@@ -3502,7 +3695,7 @@ where
             disposition,
             crate::compliant_hold::CompliantHoldDisposition::FollowingExpression
         ) {
-            debug_assert_eq!(target, gaze.committed_target());
+            debug_assert_eq!(target, expression_target);
             compliant.commit(prepared).map_err(|source| {
                 HeadGazeServiceError::CompliantCommitAfterVerifiedApplication { source, target }
             })?;
@@ -3514,14 +3707,11 @@ where
         let hardware = if target == compliant.committed_target() {
             HeadGazeHardwareApplication::RetainedPreviouslyVerifiedTarget { target }
         } else {
-            let gaze_config = self
-                .gaze_config
-                .expect("compliance is configured only as part of gaze actuation");
             match self
                 .write_goals_with_register_readback(
                     target,
                     self.config.goal_speed(),
-                    gaze_config.goal_register_transaction_timeout(),
+                    goal_register_transaction_timeout,
                     commands,
                     control,
                 )
@@ -6370,7 +6560,7 @@ mod tests {
                 configured_pose_bounds: valid_pose_bounds(),
                 startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
                 return_plan: None,
-                gaze_config: None,
+                control_mode: HeadControlMode::NaturalHold,
             },
             shared,
         )
@@ -6564,7 +6754,7 @@ mod tests {
             })
             .collect();
         let (mut actor, shared) = goal_register_actor(reads);
-        actor.gaze_config = Some(gaze_actuation_config(natural));
+        actor.control_mode = HeadControlMode::Gaze(gaze_actuation_config(natural));
         let mut controller =
             HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
                 .expect("controller");
@@ -6605,7 +6795,7 @@ mod tests {
     async fn partial_gaze_write_aborts_candidate_and_latches_controller_fault() {
         let natural = goal_register_target();
         let (mut actor, shared) = goal_register_actor(Vec::new());
-        actor.gaze_config = Some(gaze_actuation_config(natural));
+        actor.control_mode = HeadControlMode::Gaze(gaze_actuation_config(natural));
         shared
             .lock()
             .expect("fake state")
@@ -6674,7 +6864,7 @@ mod tests {
             ReadAction::Bytes(goal_position_response(joint, yielded.position(joint).get()))
         }));
         let (mut actor, shared) = goal_register_actor(reads);
-        actor.gaze_config = Some(gaze_with_compliance(natural));
+        actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
         let mut gaze =
             HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
                 .unwrap();
@@ -6746,7 +6936,7 @@ mod tests {
         let (mut actor, shared) = goal_register_actor(reads);
         let compliant_config =
             compliant_hold_config_with_observation_timeout(natural, Duration::from_millis(20));
-        actor.gaze_config = Some(
+        actor.control_mode = HeadControlMode::Gaze(
             gaze_actuation_config(natural)
                 .try_with_compliant_hold(compliant_config)
                 .expect("deadline fits inside gaze lateness"),
@@ -6794,7 +6984,7 @@ mod tests {
         }];
         let (mut actor, shared) = goal_register_actor(reads);
         actor.clock.set_milliseconds(10);
-        actor.gaze_config = Some(gaze_with_compliance(natural));
+        actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
         let mut gaze = HeadGazeController::try_new(
             gaze_control_config(natural),
             natural,
@@ -6849,7 +7039,7 @@ mod tests {
             natural.position(HeadJoint::Roll).get(),
         ]));
         let (mut actor, shared) = goal_register_actor(reads);
-        actor.gaze_config = Some(gaze_with_compliance(natural));
+        actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
         // Twelve observation requests precede the two attempted goal writes.
         shared.lock().unwrap().write_failures.insert(
             13,
@@ -9131,7 +9321,7 @@ mod tests {
             configured_pose_bounds: valid_pose_bounds(),
             startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: Some(plan()),
-            gaze_config: None,
+            control_mode: HeadControlMode::NaturalHold,
         };
         let (commands, mut receiver) = mpsc::channel(1);
         let mut control = ControlState::new();
@@ -9177,7 +9367,7 @@ mod tests {
             configured_pose_bounds: valid_pose_bounds(),
             startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: Some(plan()),
-            gaze_config: None,
+            control_mode: HeadControlMode::NaturalHold,
         };
         let (commands, mut receiver) = mpsc::channel(1);
         let mut control = ControlState::new();
@@ -9228,7 +9418,7 @@ mod tests {
             configured_pose_bounds: valid_pose_bounds(),
             startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: None,
-            gaze_config: None,
+            control_mode: HeadControlMode::NaturalHold,
         };
         let positions =
             kiko_head_protocol::ExactHeadTargetPose::try_from_ticks([2_127, 2_558, 2_925, 2_930])
