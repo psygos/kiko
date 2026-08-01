@@ -1,25 +1,20 @@
 #!/usr/bin/env bash
-# Transitional Nano owner for attended expression/head commissioning.
+# Attended Nano owner for the proven full expression/head runtime.
 #
-# This deliberately does not start the STM32, base, navigation, or SLAM. The
-# legacy expression process is retained only for OAK-derived eyes and is
-# required to release the head with --no-head. The typed Rust commissioning
-# binary is the sole head-bus owner.
+# This deliberately does not start the STM32, base, navigation, or SLAM. One
+# process owns OAK RGB, KEP2 eyes, and the STS head bus so its face tracking and
+# four-axis character decision cannot be split across competing owners.
 
 set -u
 
 readonly KIKO_ROOT=/home/makerspace/kiko
-readonly FOLLOW_ROOT=/home/makerspace/kiko-follow
-readonly HEAD_BINARY="${KIKO_ROOT}/target/release/kiko-head-commission"
-readonly HEAD_CONFIG="${KIKO_ROOT}/configs/nano-head-compliant-commissioning-v1.json"
+readonly EXPRESSION_ROOT="${KIKO_ROOT}/deploy/expression"
 readonly LOCK_FILE=/tmp/kiko-accessory-commissioning-guardian.lock
 readonly GUARDIAN_LOG=/tmp/kiko-accessory-commissioning-guardian.log
-readonly FOLLOW_LOG=/tmp/kiko-follow-track.log
-readonly HEAD_LOG=/tmp/kiko-head-compliant.log
+readonly EXPRESSION_LOG=/tmp/kiko-follow-track.log
 
-follow_pid=
-head_pid=
-head_fault_latched=0
+accessory_pid=
+accessory_fault_latched=0
 stop_requested=0
 
 log() {
@@ -49,41 +44,21 @@ request_stop() {
 
 cleanup() {
   trap - EXIT INT TERM HUP
-  stop_child head "${head_pid}"
-  stop_child expression "${follow_pid}"
+  stop_child accessory "${accessory_pid}"
   log "guardian stopped pid=$$"
 }
 
-start_expression() {
-  if [[ ! -f "${FOLLOW_ROOT}/kiko_face_follow.py" ]]; then
-    log "expression start refused: ${FOLLOW_ROOT}/kiko_face_follow.py is missing"
+start_accessory() {
+  if [[ ! -f "${EXPRESSION_ROOT}/kiko_face_follow.py" ]]; then
+    log "accessory start refused: ${EXPRESSION_ROOT}/kiko_face_follow.py is missing"
     return 1
   fi
   (
-    cd "${FOLLOW_ROOT}" || exit 1
-    exec python3 kiko_face_follow.py --duration-s 864000 --no-head
-  ) >>"${FOLLOW_LOG}" 2>&1 < /dev/null &
-  follow_pid=$!
-  log "expression started pid=${follow_pid} head_authority=disabled"
-}
-
-start_head() {
-  if [[ ! -x "${HEAD_BINARY}" ]]; then
-    log "head start refused: ${HEAD_BINARY} is not executable"
-    return 1
-  fi
-  if [[ ! -r "${HEAD_CONFIG}" ]]; then
-    log "head start refused: ${HEAD_CONFIG} is not readable"
-    return 1
-  fi
-  "${HEAD_BINARY}" \
-    --config "${HEAD_CONFIG}" \
-    --compliant-hold \
-    --physical-torque-consent \
-    --physical-motion-consent \
-    >>"${HEAD_LOG}" 2>&1 < /dev/null &
-  head_pid=$!
-  log "head compliant owner started pid=${head_pid}"
+    cd "${EXPRESSION_ROOT}" || exit 1
+    exec python3 kiko_face_follow.py --duration-s 864000
+  ) >>"${EXPRESSION_LOG}" 2>&1 < /dev/null &
+  accessory_pid=$!
+  log "accessory started pid=${accessory_pid} authority=oak,eyes,head"
 }
 
 exec 9>"${LOCK_FILE}"
@@ -96,27 +71,18 @@ trap cleanup EXIT
 log "guardian started pid=$$"
 
 while (( stop_requested == 0 )); do
-  if ! child_is_live "${follow_pid}"; then
-    if [[ -n "${follow_pid}" ]]; then
-      wait "${follow_pid}" 2>/dev/null
-      log "expression exited status=$? pid=${follow_pid}"
+  if (( accessory_fault_latched == 0 )) && ! child_is_live "${accessory_pid}"; then
+    if [[ -n "${accessory_pid}" ]]; then
+      accessory_status=0
+      wait "${accessory_pid}" 2>/dev/null || accessory_status=$?
+      log "accessory exited status=${accessory_status} pid=${accessory_pid}"
+      accessory_fault_latched=1
+      log "accessory fault latched; deliberate guardian restart required"
     fi
-    follow_pid=
-    start_expression || true
-  fi
-
-  if (( head_fault_latched == 0 )) && ! child_is_live "${head_pid}"; then
-    if [[ -n "${head_pid}" ]]; then
-      head_status=0
-      wait "${head_pid}" 2>/dev/null || head_status=$?
-      log "head compliant owner exited status=${head_status} pid=${head_pid}"
-      head_fault_latched=1
-      log "head compliant fault latched; deliberate guardian restart required"
-    fi
-    head_pid=
-    if (( head_fault_latched == 0 )) && ! start_head; then
-      head_fault_latched=1
-      log "head compliant start fault latched; deliberate guardian restart required"
+    accessory_pid=
+    if (( accessory_fault_latched == 0 )) && ! start_accessory; then
+      accessory_fault_latched=1
+      log "accessory start fault latched; deliberate guardian restart required"
     fi
   fi
 
