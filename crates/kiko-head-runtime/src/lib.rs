@@ -3,6 +3,7 @@
 
 mod actor;
 mod base_motion_interlock;
+pub mod compliant_hold;
 mod config;
 mod framing;
 pub mod gaze_control;
@@ -27,11 +28,12 @@ pub use actor::{
     TensionPreservingHeadActorExit, TensionPreservingHeadActorTask,
     TensionPreservingHeadGazeActorHandle, TensionPreservingHeadReturnActorHandle,
     TorqueDisableJointOutcome, TorqueDisableReport, VerificationSample,
-    VerifiedHeadGazeControlStep, VerifiedHeadGoalRegisterEvidence, VerifiedHeadHealthEvidence,
-    VerifiedHeadReturnEvidence, VerifiedNaturalHoldEvidence, WriteEvidence, WritePurpose,
-    spawn_head_actor, spawn_head_return_actor, spawn_tension_preserving_head_gaze_actor,
-    spawn_tension_preserving_head_return_actor, start_serial_head_actor,
-    start_serial_head_return_actor, start_serial_tension_preserving_head_gaze_actor,
+    VerifiedHeadCompliantHoldStep, VerifiedHeadGazeControlStep, VerifiedHeadGoalRegisterEvidence,
+    VerifiedHeadHealthEvidence, VerifiedHeadReturnEvidence, VerifiedNaturalHoldEvidence,
+    WriteEvidence, WritePurpose, spawn_head_actor, spawn_head_return_actor,
+    spawn_tension_preserving_head_gaze_actor, spawn_tension_preserving_head_return_actor,
+    start_serial_head_actor, start_serial_head_return_actor,
+    start_serial_tension_preserving_head_gaze_actor,
     start_serial_tension_preserving_head_return_actor,
 };
 pub use base_motion_interlock::{

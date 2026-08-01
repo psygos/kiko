@@ -12,6 +12,11 @@ use tokio::runtime::{Handle, TryCurrentError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 
+use crate::compliant_hold::{
+    CompliantHeadObservation, CompliantHeadObservationError, CompliantHoldCommitError,
+    CompliantHoldCommitReceipt, CompliantHoldPrepareError, HeadCompliantHoldConfig,
+    HeadCompliantHoldController, HeadCompliantTorqueBindingError,
+};
 use crate::config::{
     ConfigParseError, ConfiguredHeadPoseBounds, HeadPoseBoundsAdmissionError,
     HeadPoseWithinConfiguredBounds, HeadReturnPlan, HeadRuntimeConfig,
@@ -68,6 +73,7 @@ use crate::base_motion_interlock::HeadGazeBaseZeroExclusiveLease;
 pub struct HeadGazeActuationConfig {
     controller: HeadGazeControlConfig,
     goal_register_transaction_timeout: OperationTimeout,
+    compliant_hold: Option<HeadCompliantHoldConfig>,
 }
 
 impl HeadGazeActuationConfig {
@@ -119,6 +125,7 @@ impl HeadGazeActuationConfig {
         Ok(Self {
             controller,
             goal_register_transaction_timeout,
+            compliant_hold: None,
         })
     }
 
@@ -128,6 +135,64 @@ impl HeadGazeActuationConfig {
 
     pub const fn goal_register_transaction_timeout(self) -> OperationTimeout {
         self.goal_register_transaction_timeout
+    }
+
+    /// Add compliant touch arbitration inside the same exclusive head owner.
+    ///
+    /// Every compliant envelope must stay inside the already reviewed gaze
+    /// envelope. Runtime torque limits are independently cross-bound before a
+    /// serial device is opened.
+    pub fn try_with_compliant_hold(
+        mut self,
+        compliant_hold: HeadCompliantHoldConfig,
+    ) -> Result<Self, HeadGazeActuationConfigError> {
+        let gaze_period = self.controller.timing().control_period().get();
+        if compliant_hold.control_period() != gaze_period {
+            return Err(
+                HeadGazeActuationConfigError::CompliantControlPeriodMismatch {
+                    gaze: gaze_period,
+                    compliant: compliant_hold.control_period(),
+                },
+            );
+        }
+        let gaze_lateness = self.controller.timing().maximum_tick_lateness().get();
+        if compliant_hold.observation_transaction_timeout() > gaze_lateness {
+            return Err(
+                HeadGazeActuationConfigError::CompliantObservationExceedsGazeLateness {
+                    observation_transaction_timeout: compliant_hold
+                        .observation_transaction_timeout(),
+                    gaze_maximum_lateness: gaze_lateness,
+                },
+            );
+        }
+        for joint in HeadJoint::ALL {
+            let compliant = compliant_hold.joint(joint);
+            let gaze = self.controller.motion_limits().joint(joint);
+            if compliant.minimum() < gaze.minimum() || compliant.maximum() > gaze.maximum() {
+                return Err(
+                    HeadGazeActuationConfigError::CompliantEnvelopeOutsideGazeEnvelope {
+                        joint,
+                        compliant_minimum: compliant.minimum(),
+                        compliant_maximum: compliant.maximum(),
+                        gaze_minimum: gaze.minimum(),
+                        gaze_maximum: gaze.maximum(),
+                    },
+                );
+            }
+            if compliant.maximum_command_step_ticks() > gaze.maximum_position_step().get() {
+                return Err(HeadGazeActuationConfigError::CompliantStepExceedsGazeStep {
+                    joint,
+                    compliant_ticks: compliant.maximum_command_step_ticks(),
+                    gaze_ticks: gaze.maximum_position_step().get(),
+                });
+            }
+        }
+        self.compliant_hold = Some(compliant_hold);
+        Ok(self)
+    }
+
+    pub const fn compliant_hold(self) -> Option<HeadCompliantHoldConfig> {
+        self.compliant_hold
     }
 }
 
@@ -141,6 +206,26 @@ pub enum HeadGazeActuationConfigError {
     TransactionTimeoutExceedsControlPeriod {
         transaction_timeout: Duration,
         control_period: Duration,
+    },
+    CompliantEnvelopeOutsideGazeEnvelope {
+        joint: HeadJoint,
+        compliant_minimum: PositionTicks,
+        compliant_maximum: PositionTicks,
+        gaze_minimum: PositionTicks,
+        gaze_maximum: PositionTicks,
+    },
+    CompliantControlPeriodMismatch {
+        gaze: Duration,
+        compliant: Duration,
+    },
+    CompliantStepExceedsGazeStep {
+        joint: HeadJoint,
+        compliant_ticks: u16,
+        gaze_ticks: u16,
+    },
+    CompliantObservationExceedsGazeLateness {
+        observation_transaction_timeout: Duration,
+        gaze_maximum_lateness: Duration,
     },
 }
 
@@ -158,7 +243,11 @@ impl std::error::Error for HeadGazeActuationConfigError {
         match self {
             Self::TransactionTimeout(source) => Some(source),
             Self::NaturalPoseDoesNotMatchReviewedReturn { .. }
-            | Self::TransactionTimeoutExceedsControlPeriod { .. } => None,
+            | Self::TransactionTimeoutExceedsControlPeriod { .. }
+            | Self::CompliantEnvelopeOutsideGazeEnvelope { .. }
+            | Self::CompliantControlPeriodMismatch { .. }
+            | Self::CompliantStepExceedsGazeStep { .. }
+            | Self::CompliantObservationExceedsGazeLateness { .. } => None,
         }
     }
 }
@@ -816,6 +905,9 @@ pub enum HeadHoldTarget {
     ///
     /// This does not claim the mechanism has reached the target.
     ReviewedGaze(ExactHeadTargetPose),
+    /// Latest actor-local compliant target whose complete goal-register set
+    /// was verified. This does not claim the mechanism has reached the target.
+    ReviewedCompliant(ExactHeadTargetPose),
     RecoverableReturnCommand([PositionTicks; 4]),
 }
 
@@ -823,7 +915,9 @@ impl HeadHoldTarget {
     pub const fn position(self, joint: HeadJoint) -> PositionTicks {
         match self {
             Self::StartupObserved(pose) => pose.position(joint),
-            Self::ReviewedReturn(target) | Self::ReviewedGaze(target) => target.position(joint),
+            Self::ReviewedReturn(target)
+            | Self::ReviewedGaze(target)
+            | Self::ReviewedCompliant(target) => target.position(joint),
             Self::RecoverableReturnCommand(positions) => positions[joint as usize],
         }
     }
@@ -831,7 +925,9 @@ impl HeadHoldTarget {
     pub const fn positions(self) -> [PositionTicks; 4] {
         match self {
             Self::StartupObserved(pose) => pose.positions(),
-            Self::ReviewedReturn(target) | Self::ReviewedGaze(target) => target.positions(),
+            Self::ReviewedReturn(target)
+            | Self::ReviewedGaze(target)
+            | Self::ReviewedCompliant(target) => target.positions(),
             Self::RecoverableReturnCommand(positions) => positions,
         }
     }
@@ -1698,6 +1794,25 @@ pub struct VerifiedHeadGazeControlStep {
     hardware: HeadGazeHardwareApplication,
 }
 
+/// One compliant-hold step committed by the same exclusive serial owner used
+/// for gaze. The raw diagnostic registers remain available through the
+/// controller receipt's observation without being interpreted as force.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedHeadCompliantHoldStep {
+    controller: CompliantHoldCommitReceipt,
+    hardware: HeadGazeHardwareApplication,
+}
+
+impl VerifiedHeadCompliantHoldStep {
+    pub const fn controller(&self) -> CompliantHoldCommitReceipt {
+        self.controller
+    }
+
+    pub const fn hardware(&self) -> &HeadGazeHardwareApplication {
+        &self.hardware
+    }
+}
+
 impl VerifiedHeadGazeControlStep {
     pub const fn controller(&self) -> HeadGazeCommitReceipt {
         self.controller
@@ -1741,6 +1856,7 @@ pub enum HeadGazeServiceOutcome {
         scheduled_for: MonotonicTime,
         observed_at: MonotonicTime,
     },
+    Compliant(Box<VerifiedHeadCompliantHoldStep>),
     Applied(Box<VerifiedHeadGazeControlStep>),
 }
 
@@ -1750,6 +1866,40 @@ pub enum HeadGazeServiceError {
     CommandAlreadyInProgress,
     NotConfigured,
     ControllerInitialization(HeadGazeControllerInitError),
+    CompliantControllerInitialization(CompliantHoldPrepareError),
+    CompliantControl(Box<HeadHealthFailure>),
+    CompliantTelemetryRead {
+        joint: HeadJoint,
+        request_write: Option<WriteEvidence>,
+        source: RequestError,
+    },
+    CompliantObservationDeadline {
+        joint: HeadJoint,
+        started_at: MonotonicTime,
+        observed_at: MonotonicTime,
+        maximum: Duration,
+        request_write: Option<WriteEvidence>,
+        completed_response: Option<Box<ResponseEvidence<FullTelemetry>>>,
+        source: Option<RequestError>,
+    },
+    CompliantObservationClockRegression {
+        joint: HeadJoint,
+        started_at: MonotonicTime,
+        observed_at: MonotonicTime,
+        request_write: Option<WriteEvidence>,
+        completed_response: Option<Box<ResponseEvidence<FullTelemetry>>>,
+        source: Option<RequestError>,
+    },
+    CompliantObservation(CompliantHeadObservationError),
+    CompliantPlanner(CompliantHoldPrepareError),
+    CompliantGoalRegisters {
+        source: Box<HeadGoalRegisterError>,
+        abort: Result<(), CompliantHoldCommitError>,
+    },
+    CompliantCommitAfterVerifiedApplication {
+        source: CompliantHoldCommitError,
+        target: ExactHeadTargetPose,
+    },
     Controller(HeadGazeTickError),
     GoalRegisters {
         source: Box<HeadGoalRegisterError>,
@@ -1771,6 +1921,19 @@ impl std::error::Error for HeadGazeServiceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ControllerInitialization(source) => Some(source),
+            Self::CompliantControllerInitialization(source) => Some(source),
+            Self::CompliantTelemetryRead { source, .. } => Some(source),
+            Self::CompliantObservationDeadline { source, .. } => source
+                .as_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+            Self::CompliantObservationClockRegression { source, .. } => source
+                .as_ref()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
+            Self::CompliantControl(source) => Some(source.as_ref()),
+            Self::CompliantObservation(source) => Some(source),
+            Self::CompliantPlanner(source) => Some(source),
+            Self::CompliantGoalRegisters { source, .. } => Some(source.as_ref()),
+            Self::CompliantCommitAfterVerifiedApplication { source, .. } => Some(source),
             Self::Controller(source) => Some(source),
             Self::GoalRegisters { source, .. } => Some(source.as_ref()),
             Self::CommitAfterVerifiedApplication { source, .. } => Some(source),
@@ -2118,6 +2281,7 @@ impl TensionPreservingHeadActorTask {
 #[derive(Debug)]
 pub enum HeadActorSpawnError {
     NoTokioRuntime { source: TryCurrentError },
+    CompliantTorqueBinding(HeadCompliantTorqueBindingError),
 }
 
 impl fmt::Display for HeadActorSpawnError {
@@ -2130,6 +2294,7 @@ impl std::error::Error for HeadActorSpawnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NoTokioRuntime { source } => Some(source),
+            Self::CompliantTorqueBinding(source) => Some(source),
         }
     }
 }
@@ -2137,6 +2302,7 @@ impl std::error::Error for HeadActorSpawnError {
 #[derive(Debug)]
 pub enum HeadActorStartError {
     NoTokioRuntime { source: TryCurrentError },
+    CompliantTorqueBinding(HeadCompliantTorqueBindingError),
     Serial { source: SerialOpenError },
 }
 
@@ -2150,6 +2316,7 @@ impl std::error::Error for HeadActorStartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NoTokioRuntime { source } => Some(source),
+            Self::CompliantTorqueBinding(source) => Some(source),
             Self::Serial { source } => Some(source),
         }
     }
@@ -2279,6 +2446,11 @@ where
     let runtime =
         Handle::try_current().map_err(|source| HeadActorSpawnError::NoTokioRuntime { source })?;
     let (runtime_config, start_bounds, plan) = config.into_actor_parts();
+    if let Some(compliant) = gaze_config.compliant_hold() {
+        compliant
+            .admit_runtime_torque_limits(runtime_config.torque_limits())
+            .map_err(HeadActorSpawnError::CompliantTorqueBinding)?;
+    }
     let (commands, startup, task) = spawn_tension_preserving_head_actor_on(
         &runtime,
         transport,
@@ -2524,6 +2696,11 @@ where
     let runtime =
         Handle::try_current().map_err(|source| HeadActorStartError::NoTokioRuntime { source })?;
     let (runtime_config, start_bounds, plan) = config.into_actor_parts();
+    if let Some(compliant) = gaze_config.compliant_hold() {
+        compliant
+            .admit_runtime_torque_limits(runtime_config.torque_limits())
+            .map_err(HeadActorStartError::CompliantTorqueBinding)?;
+    }
     let transport = SerialTransport::open(runtime_config.device())
         .map_err(|source| HeadActorStartError::Serial { source })?;
     let serial_evidence = transport.evidence().clone();
@@ -2665,6 +2842,88 @@ struct HeadGoalRegisterBudget {
     started_at: MonotonicTime,
     last_observed_at: MonotonicTime,
     maximum: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct HeadCompliantObservationBudget {
+    started_at: MonotonicTime,
+    maximum: Duration,
+}
+
+impl HeadCompliantObservationBudget {
+    const fn new(started_at: MonotonicTime, maximum: Duration) -> Self {
+        Self {
+            started_at,
+            maximum,
+        }
+    }
+
+    fn remaining(self, now: MonotonicTime) -> Result<Duration, CompliantBudgetFailure> {
+        let elapsed = now.checked_duration_since(self.started_at).ok_or(
+            CompliantBudgetFailure::ClockRegression {
+                started_at: self.started_at,
+                observed_at: now,
+            },
+        )?;
+        if elapsed >= self.maximum {
+            return Err(CompliantBudgetFailure::Deadline {
+                started_at: self.started_at,
+                observed_at: now,
+                maximum: self.maximum,
+            });
+        }
+        Ok(self
+            .maximum
+            .checked_sub(elapsed)
+            .expect("elapsed is strictly inside the compliance budget"))
+    }
+}
+
+enum CompliantBudgetFailure {
+    ClockRegression {
+        started_at: MonotonicTime,
+        observed_at: MonotonicTime,
+    },
+    Deadline {
+        started_at: MonotonicTime,
+        observed_at: MonotonicTime,
+        maximum: Duration,
+    },
+}
+
+fn compliant_observation_budget_error(
+    joint: HeadJoint,
+    failure: CompliantBudgetFailure,
+    request_write: Option<WriteEvidence>,
+    completed_response: Option<Box<ResponseEvidence<FullTelemetry>>>,
+    source: Option<RequestError>,
+) -> HeadGazeServiceError {
+    match failure {
+        CompliantBudgetFailure::ClockRegression {
+            started_at,
+            observed_at,
+        } => HeadGazeServiceError::CompliantObservationClockRegression {
+            joint,
+            started_at,
+            observed_at,
+            request_write,
+            completed_response,
+            source,
+        },
+        CompliantBudgetFailure::Deadline {
+            started_at,
+            observed_at,
+            maximum,
+        } => HeadGazeServiceError::CompliantObservationDeadline {
+            joint,
+            started_at,
+            observed_at,
+            maximum,
+            request_write,
+            completed_response,
+            source,
+        },
+    }
 }
 
 impl HeadGoalRegisterBudget {
@@ -2932,6 +3191,9 @@ where
         let mut telemetry_safety_fault: Option<Box<HeadHealthObservationError>> = None;
         let mut gaze_controller: Option<Result<HeadGazeController, HeadGazeControllerInitError>> =
             None;
+        let mut compliant_controller: Option<
+            Result<HeadCompliantHoldController, CompliantHoldPrepareError>,
+        > = None;
         loop {
             match commands.recv().await {
                 Some(HeadCommand::Shutdown { response }) => {
@@ -3012,6 +3274,13 @@ where
                             evidence.target(),
                             self.clock.now(),
                         ));
+                        compliant_controller = gaze_config.compliant_hold().map(|config| {
+                            HeadCompliantHoldController::try_new(
+                                config,
+                                evidence.target(),
+                                self.clock.now(),
+                            )
+                        });
                     }
                     *head_return = Some(result.clone());
                     if result.is_err() && !owner_retained_after_fault {
@@ -3045,10 +3314,28 @@ where
                         Err(HeadGazeServiceError::NotConfigured)
                     } else {
                         match gaze_controller.as_mut() {
-                            Some(Ok(controller)) => {
-                                self.execute_gaze_control_step(controller, commands, control)
+                            Some(Ok(controller)) => match compliant_controller.as_mut() {
+                                Some(Ok(compliant)) => {
+                                    self.execute_gaze_control_step(
+                                        controller,
+                                        Some(compliant),
+                                        commands,
+                                        control,
+                                    )
                                     .await
-                            }
+                                }
+                                Some(Err(source)) => {
+                                    Err(HeadGazeServiceError::CompliantControllerInitialization(
+                                        *source,
+                                    ))
+                                }
+                                None => {
+                                    self.execute_gaze_control_step(
+                                        controller, None, commands, control,
+                                    )
+                                    .await
+                                }
+                            },
                             Some(Err(source)) => {
                                 Err(HeadGazeServiceError::ControllerInitialization(*source))
                             }
@@ -3058,6 +3345,11 @@ where
                     if let Ok(HeadGazeServiceOutcome::Applied(evidence)) = &result {
                         hold_target =
                             HeadHoldTarget::ReviewedGaze(evidence.controller().committed_target());
+                    }
+                    if let Ok(HeadGazeServiceOutcome::Compliant(evidence)) = &result {
+                        hold_target = HeadHoldTarget::ReviewedCompliant(
+                            evidence.controller().committed_target(),
+                        );
                     }
                     let _requester_present = response.send(result).is_ok();
                     if let Some(termination) = control.termination.clone() {
@@ -3072,9 +3364,26 @@ where
     async fn execute_gaze_control_step(
         &mut self,
         controller: &mut HeadGazeController,
+        compliant: Option<&mut HeadCompliantHoldController>,
         commands: &mut mpsc::Receiver<HeadCommand>,
         control: &mut ControlState,
     ) -> Result<HeadGazeServiceOutcome, HeadGazeServiceError> {
+        if let Some(compliant) = compliant {
+            let now = self.clock.now();
+            if now < compliant.next_service_due() {
+                if compliant.state().suppresses_expression_motion() {
+                    return Ok(HeadGazeServiceOutcome::BeforeScheduledTick {
+                        scheduled_for: compliant.next_service_due(),
+                        observed_at: now,
+                    });
+                }
+            } else if let Some(evidence) = self
+                .execute_compliant_hold_step(controller, compliant, commands, control)
+                .await?
+            {
+                return Ok(HeadGazeServiceOutcome::Compliant(Box::new(evidence)));
+            }
+        }
         let now = self.clock.now();
         let prepared = match controller.prepare_tick(now) {
             Ok(prepared) => prepared,
@@ -3139,6 +3448,244 @@ where
                 Err(HeadGazeServiceError::CommitAfterVerifiedApplication { source, target })
             }
         }
+    }
+
+    async fn execute_compliant_hold_step(
+        &mut self,
+        gaze: &HeadGazeController,
+        compliant: &mut HeadCompliantHoldController,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<Option<VerifiedHeadCompliantHoldStep>, HeadGazeServiceError> {
+        let compliant_config = compliant.config();
+        let observation_budget = HeadCompliantObservationBudget::new(
+            self.clock.now(),
+            compliant_config.observation_transaction_timeout(),
+        );
+        let mut responses: [Option<ResponseEvidence<FullTelemetry>>; 4] =
+            std::array::from_fn(|_| None);
+        for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+            self.check_health_control(commands, control, joint)
+                .map_err(|source| HeadGazeServiceError::CompliantControl(Box::new(source)))?;
+            let request = build_full_telemetry_read(joint.servo_id());
+            let response = self
+                .read_compliant_telemetry(joint, &request, observation_budget)
+                .await?;
+            responses[index] = Some(response);
+        }
+        self.check_health_control(commands, control, HeadJoint::Roll)
+            .map_err(|source| HeadGazeServiceError::CompliantControl(Box::new(source)))?;
+        let responses = responses.map(|response| {
+            response.expect("canonical compliant observation fills every joint exactly once")
+        });
+        let samples = responses.each_ref().map(|response| *response.value());
+        let received_at = responses.each_ref().map(|response| response.received_at());
+        let now = self.clock.now();
+        let observation = CompliantHeadObservation::try_from_timed_telemetry(
+            samples,
+            received_at,
+            now,
+            self.config.telemetry_safety_limits(),
+            compliant_config.maximum_observation_span(),
+            compliant_config.observation_ttl(),
+        )
+        .map_err(HeadGazeServiceError::CompliantObservation)?;
+        let expression_quiet = HeadJoint::ALL
+            .into_iter()
+            .all(|joint| gaze.velocity().velocity(joint).get() == 0);
+        let prepared = compliant
+            .prepare(now, gaze.committed_target(), expression_quiet, observation)
+            .map_err(HeadGazeServiceError::CompliantPlanner)?;
+        let disposition = prepared.disposition();
+        let target = prepared.target();
+        if matches!(
+            disposition,
+            crate::compliant_hold::CompliantHoldDisposition::FollowingExpression
+        ) {
+            debug_assert_eq!(target, gaze.committed_target());
+            compliant.commit(prepared).map_err(|source| {
+                HeadGazeServiceError::CompliantCommitAfterVerifiedApplication { source, target }
+            })?;
+            // The gaze controller's target already carries complete actor-local
+            // goal-register evidence. Synchronising the passive compliance
+            // planner must not duplicate those four writes and readbacks.
+            return Ok(None);
+        }
+        let hardware = if target == compliant.committed_target() {
+            HeadGazeHardwareApplication::RetainedPreviouslyVerifiedTarget { target }
+        } else {
+            let gaze_config = self
+                .gaze_config
+                .expect("compliance is configured only as part of gaze actuation");
+            match self
+                .write_goals_with_register_readback(
+                    target,
+                    self.config.goal_speed(),
+                    gaze_config.goal_register_transaction_timeout(),
+                    commands,
+                    control,
+                )
+                .await
+            {
+                Ok(evidence) => {
+                    HeadGazeHardwareApplication::GoalRegistersVerified(Box::new(evidence))
+                }
+                Err(source) => {
+                    let abort = compliant.abort_with_application_uncertain(prepared);
+                    return Err(HeadGazeServiceError::CompliantGoalRegisters {
+                        source: Box::new(source),
+                        abort,
+                    });
+                }
+            }
+        };
+        let controller = compliant.commit(prepared).map_err(|source| {
+            HeadGazeServiceError::CompliantCommitAfterVerifiedApplication { source, target }
+        })?;
+        Ok(Some(VerifiedHeadCompliantHoldStep {
+            controller,
+            hardware,
+        }))
+    }
+
+    async fn read_compliant_telemetry(
+        &mut self,
+        joint: HeadJoint,
+        request: &kiko_head_protocol::CommandFrame,
+        budget: HeadCompliantObservationBudget,
+    ) -> Result<ResponseEvidence<FullTelemetry>, HeadGazeServiceError> {
+        let mut recovered_failures = Vec::new();
+        let maximum_attempts = self.config.write_attempts().get();
+        let mut attempt = 1_u8;
+        let request_write = loop {
+            let remaining = budget.remaining(self.clock.now()).map_err(|source| {
+                compliant_observation_budget_error(joint, source, None, None, None)
+            })?;
+            let timeout = self.config.write_timeout().get().min(remaining);
+            match self.transport.write_all(request.as_bytes(), timeout).await {
+                Ok(()) => {
+                    let evidence = WriteEvidence {
+                        attempts_used: attempt,
+                        recovered_failures,
+                        completed_at: self.clock.now(),
+                    };
+                    budget
+                        .remaining(evidence.completed_at())
+                        .map_err(|source| {
+                            compliant_observation_budget_error(
+                                joint,
+                                source,
+                                Some(evidence.clone()),
+                                None,
+                                None,
+                            )
+                        })?;
+                    break evidence;
+                }
+                Err(source) => {
+                    let frame_error = FrameWriteError {
+                        joint,
+                        purpose: WritePurpose::TelemetryReadRequest,
+                        attempts_used: attempt,
+                        recovered_failures: recovered_failures.clone(),
+                        source: source.clone(),
+                    };
+                    if let Err(timing) = budget.remaining(self.clock.now()) {
+                        return Err(compliant_observation_budget_error(
+                            joint,
+                            timing,
+                            None,
+                            None,
+                            Some(RequestError::RequestWrite(frame_error)),
+                        ));
+                    }
+                    if attempt < maximum_attempts && source.is_retryable_without_progress() {
+                        recovered_failures.push(source);
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(HeadGazeServiceError::CompliantTelemetryRead {
+                        joint,
+                        request_write: None,
+                        source: RequestError::RequestWrite(frame_error),
+                    });
+                }
+            }
+        };
+
+        let remaining = budget.remaining(self.clock.now()).map_err(|source| {
+            compliant_observation_budget_error(
+                joint,
+                source,
+                Some(request_write.clone()),
+                None,
+                None,
+            )
+        })?;
+        let frame = match read_response_frame(
+            &mut self.transport,
+            &self.clock,
+            self.config.response_timeout().capped_by(remaining),
+            self.config.noise_budget_bytes(),
+        )
+        .await
+        {
+            Ok(frame) => frame,
+            Err(source) => {
+                let request_error = RequestError::ResponseFrame(source);
+                return Err(match budget.remaining(self.clock.now()) {
+                    Err(timing) => compliant_observation_budget_error(
+                        joint,
+                        timing,
+                        Some(request_write),
+                        None,
+                        Some(request_error),
+                    ),
+                    Ok(_) => HeadGazeServiceError::CompliantTelemetryRead {
+                        joint,
+                        request_write: Some(request_write),
+                        source: request_error,
+                    },
+                });
+            }
+        };
+        let received_at = self.clock.now();
+        let value = match FullTelemetry::parse(frame.as_bytes(), joint.servo_id()) {
+            Ok(value) => value,
+            Err(source) => {
+                let request_error = RequestError::Telemetry(source);
+                return Err(match budget.remaining(received_at) {
+                    Err(timing) => compliant_observation_budget_error(
+                        joint,
+                        timing,
+                        Some(request_write),
+                        None,
+                        Some(request_error),
+                    ),
+                    Ok(_) => HeadGazeServiceError::CompliantTelemetryRead {
+                        joint,
+                        request_write: Some(request_write),
+                        source: request_error,
+                    },
+                });
+            }
+        };
+        let response = ResponseEvidence {
+            value,
+            request_write,
+            discarded_noise_bytes: frame.discarded_noise_bytes(),
+            received_at,
+        };
+        budget.remaining(received_at).map_err(|source| {
+            compliant_observation_budget_error(
+                joint,
+                source,
+                None,
+                Some(Box::new(response.clone())),
+                None,
+            )
+        })?;
+        Ok(response)
     }
 
     async fn startup(
@@ -5323,9 +5870,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use kiko_head_protocol::{PositionStepLimit, ResponseParseError, ServoId, TelemetryParseError};
+    use kiko_head_protocol::{
+        HeadTorqueLimits, PositionStepLimit, ResponseParseError, ServoId, TelemetryParseError,
+        TorqueLimitPermille,
+    };
 
     use super::*;
+    use crate::compliant_hold::{
+        CompliantHoldDisposition, CompliantHoldFault, CompliantHoldState, CompliantJointPolicy,
+    };
     use crate::config::{
         HeadProbeConfig, HeadProbeConfigInput, HeadRuntimeConfigInput, ReturnToTargetConfigInput,
     };
@@ -5842,7 +6395,7 @@ mod tests {
         HeadGazeControlConfig::try_new(
             HeadGazeTiming::new(
                 HeadControlPeriod::try_new(Duration::from_millis(200)).expect("period"),
-                HeadTickLateness::new(Duration::from_millis(20)),
+                HeadTickLateness::new(Duration::from_millis(21)),
                 HeadProposalTtl::try_new(Duration::from_millis(300)).expect("TTL"),
                 HeadAcquisitionProposalCount::try_new(1).expect("acquisition"),
             ),
@@ -5865,6 +6418,79 @@ mod tests {
     fn gaze_actuation_config(natural: ExactHeadTargetPose) -> HeadGazeActuationConfig {
         HeadGazeActuationConfig::try_new(gaze_control_config(natural), natural, 100)
             .expect("test gaze actuation")
+    }
+
+    fn compliant_hold_config(natural: ExactHeadTargetPose) -> HeadCompliantHoldConfig {
+        compliant_hold_config_with_observation_timeout(natural, Duration::from_millis(21))
+    }
+
+    fn compliant_hold_config_with_observation_timeout(
+        natural: ExactHeadTargetPose,
+        observation_transaction_timeout: Duration,
+    ) -> HeadCompliantHoldConfig {
+        let joint = |joint| {
+            let center = natural.position(joint).get();
+            CompliantJointPolicy::try_new(
+                PositionTicks::try_new(center - 100).unwrap(),
+                PositionTicks::try_new(center + 100).unwrap(),
+                10,
+                3,
+                40,
+                4,
+                50,
+            )
+            .expect("test compliant joint")
+        };
+        HeadCompliantHoldConfig::try_new(
+            joint(HeadJoint::Bow),
+            joint(HeadJoint::Curl),
+            joint(HeadJoint::Yaw),
+            joint(HeadJoint::Roll),
+            HeadTorqueLimits::new(
+                TorqueLimitPermille::try_new(600).unwrap(),
+                TorqueLimitPermille::try_new(400).unwrap(),
+                TorqueLimitPermille::try_new(400).unwrap(),
+                TorqueLimitPermille::try_new(400).unwrap(),
+            ),
+            Duration::from_millis(200),
+            observation_transaction_timeout,
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+            1,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            800,
+        )
+        .expect("test compliant config")
+    }
+
+    fn gaze_with_compliance(natural: ExactHeadTargetPose) -> HeadGazeActuationConfig {
+        gaze_actuation_config(natural)
+            .try_with_compliant_hold(compliant_hold_config(natural))
+            .expect("test gaze-compliance binding")
+    }
+
+    async fn arm_compliance_actor(
+        actor: &mut HeadActor<FakeTransport, TestClock>,
+        gaze: &mut HeadGazeController,
+        compliant: &mut HeadCompliantHoldController,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) {
+        let first = actor
+            .execute_gaze_control_step(gaze, Some(compliant), commands, control)
+            .await
+            .expect("first stationary arming observation");
+        assert!(matches!(first, HeadGazeServiceOutcome::Applied(_)));
+        actor.clock.set_milliseconds(220);
+        let second = actor
+            .execute_gaze_control_step(gaze, Some(compliant), commands, control)
+            .await
+            .expect("complete stationary arming dwell");
+        assert!(matches!(second, HeadGazeServiceOutcome::Applied(_)));
+        assert_eq!(compliant.state(), CompliantHoldState::FollowingExpression);
+        actor.clock.set_milliseconds(440);
     }
 
     fn health_observation_error(error: HeadHealthRequestError) -> Box<HeadHealthObservationError> {
@@ -5905,6 +6531,22 @@ mod tests {
             }) if transaction_timeout == Duration::from_millis(201)
                 && control_period == Duration::from_millis(200)
         ));
+
+        let actuation = HeadGazeActuationConfig::try_new(config, natural, 100)
+            .expect("base actuation configuration");
+        assert!(matches!(
+            actuation.try_with_compliant_hold(
+                compliant_hold_config_with_observation_timeout(
+                    natural,
+                    Duration::from_millis(22),
+                )
+            ),
+            Err(HeadGazeActuationConfigError::CompliantObservationExceedsGazeLateness {
+                observation_transaction_timeout,
+                gaze_maximum_lateness,
+            }) if observation_transaction_timeout == Duration::from_millis(22)
+                && gaze_maximum_lateness == Duration::from_millis(21)
+        ));
     }
 
     #[tokio::test]
@@ -5941,7 +6583,7 @@ mod tests {
         let mut control = ControlState::new();
 
         let outcome = actor
-            .execute_gaze_control_step(&mut controller, &mut receiver, &mut control)
+            .execute_gaze_control_step(&mut controller, None, &mut receiver, &mut control)
             .await
             .expect("verified gaze step");
         drop(commands);
@@ -5987,7 +6629,7 @@ mod tests {
         let mut control = ControlState::new();
 
         let error = actor
-            .execute_gaze_control_step(&mut controller, &mut receiver, &mut control)
+            .execute_gaze_control_step(&mut controller, None, &mut receiver, &mut control)
             .await
             .expect_err("partial write is terminal for this controller instance");
         drop(commands);
@@ -6007,6 +6649,253 @@ mod tests {
                 HeadGazeExternalFault::ActuatorApplicationUncertain
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn compliant_contact_preempts_gaze_and_commits_through_the_same_verified_owner() {
+        let natural = goal_register_target();
+        let yielded = ExactHeadTargetPose::try_from_ticks([
+            natural.position(HeadJoint::Bow).get() + 4,
+            natural.position(HeadJoint::Curl).get(),
+            natural.position(HeadJoint::Yaw).get(),
+            natural.position(HeadJoint::Roll).get(),
+        ])
+        .unwrap();
+        let natural_positions = natural.positions().map(PositionTicks::get);
+        let mut reads = health_reads(natural_positions);
+        reads.extend(health_reads(natural_positions));
+        reads.extend(health_reads([
+            natural.position(HeadJoint::Bow).get() + 20,
+            natural.position(HeadJoint::Curl).get(),
+            natural.position(HeadJoint::Yaw).get(),
+            natural.position(HeadJoint::Roll).get(),
+        ]));
+        reads.extend(HeadJoint::ALL.into_iter().map(|joint| {
+            ReadAction::Bytes(goal_position_response(joint, yielded.position(joint).get()))
+        }));
+        let (mut actor, shared) = goal_register_actor(reads);
+        actor.gaze_config = Some(gaze_with_compliance(natural));
+        let mut gaze =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .unwrap();
+        let mut compliant = HeadCompliantHoldController::try_new(
+            compliant_hold_config(natural),
+            natural,
+            MonotonicTime::ZERO,
+        )
+        .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        arm_compliance_actor(
+            &mut actor,
+            &mut gaze,
+            &mut compliant,
+            &mut receiver,
+            &mut control,
+        )
+        .await;
+
+        let outcome = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect("compliant step");
+
+        let HeadGazeServiceOutcome::Compliant(evidence) = outcome else {
+            panic!("touch must suppress gaze for this service transaction");
+        };
+        assert_eq!(evidence.controller().committed_target(), yielded);
+        assert_eq!(
+            evidence.controller().disposition(),
+            CompliantHoldDisposition::Yielding {
+                envelope_limited: [false; 4],
+                command_step_limited: [true, false, false, false],
+            }
+        );
+        assert_eq!(gaze.committed_target(), natural);
+        assert_eq!(compliant.committed_target(), yielded);
+        assert!(matches!(
+            evidence.hardware(),
+            HeadGazeHardwareApplication::GoalRegistersVerified(_)
+        ));
+        // Eight stationary arming reads, four contact reads, four goal writes,
+        // and four exact goal-register reads pass through this one actor.
+        assert_eq!(shared.lock().unwrap().writes.len(), 20);
+
+        let between_ticks = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect("active compliance retains arbitration before its next tick");
+        assert!(matches!(
+            between_ticks,
+            HeadGazeServiceOutcome::BeforeScheduledTick { .. }
+        ));
+        assert_eq!(shared.lock().unwrap().writes.len(), 20);
+        drop(commands);
+    }
+
+    #[tokio::test]
+    async fn compliant_observation_rejects_a_complete_set_at_the_exact_transaction_deadline() {
+        let natural = goal_register_target();
+        let reads = health_reads([
+            natural.position(HeadJoint::Bow).get() + 20,
+            natural.position(HeadJoint::Curl).get(),
+            natural.position(HeadJoint::Yaw).get(),
+            natural.position(HeadJoint::Roll).get(),
+        ]);
+        let (mut actor, shared) = goal_register_actor(reads);
+        let compliant_config =
+            compliant_hold_config_with_observation_timeout(natural, Duration::from_millis(20));
+        actor.gaze_config = Some(
+            gaze_actuation_config(natural)
+                .try_with_compliant_hold(compliant_config)
+                .expect("deadline fits inside gaze lateness"),
+        );
+        let mut gaze =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .unwrap();
+        let mut compliant =
+            HeadCompliantHoldController::try_new(compliant_config, natural, MonotonicTime::ZERO)
+                .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect_err("the aggregate deadline is exclusive");
+        drop(commands);
+
+        assert!(matches!(
+            error,
+            HeadGazeServiceError::CompliantObservationDeadline {
+                joint: HeadJoint::Roll,
+                started_at: MonotonicTime::ZERO,
+                observed_at,
+                maximum,
+                request_write: None,
+                completed_response: Some(response),
+                source: None,
+            } if observed_at == MonotonicTime::from_duration_since_origin(Duration::from_millis(20))
+                && maximum == Duration::from_millis(20)
+                && response.value().position() == natural.position(HeadJoint::Roll)
+        ));
+        assert_eq!(gaze.committed_target(), natural);
+        assert_eq!(compliant.committed_target(), natural);
+        assert_eq!(shared.lock().unwrap().writes.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn compliant_observation_clock_regression_retains_joint_and_interrupted_request() {
+        let natural = goal_register_target();
+        let reads = vec![ReadAction::SetClockAndBytes {
+            milliseconds: 5,
+            bytes: telemetry_response(HeadJoint::Bow, natural.position(HeadJoint::Bow).get()),
+        }];
+        let (mut actor, shared) = goal_register_actor(reads);
+        actor.clock.set_milliseconds(10);
+        actor.gaze_config = Some(gaze_with_compliance(natural));
+        let mut gaze = HeadGazeController::try_new(
+            gaze_control_config(natural),
+            natural,
+            MonotonicTime::from_duration_since_origin(Duration::from_millis(10)),
+        )
+        .unwrap();
+        let mut compliant = HeadCompliantHoldController::try_new(
+            compliant_hold_config(natural),
+            natural,
+            MonotonicTime::from_duration_since_origin(Duration::from_millis(10)),
+        )
+        .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect_err("regressed receive clock cannot admit telemetry");
+        drop(commands);
+
+        assert!(matches!(
+            error,
+            HeadGazeServiceError::CompliantObservationClockRegression {
+                joint: HeadJoint::Bow,
+                started_at,
+                observed_at,
+                request_write: Some(request_write),
+                completed_response: None,
+                source: Some(RequestError::ResponseFrame(
+                    FrameReadError::NonMonotonicClock { .. }
+                )),
+            } if started_at == MonotonicTime::from_duration_since_origin(Duration::from_millis(10))
+                && observed_at < started_at
+                && request_write.attempts_used() == 1
+        ));
+        assert_eq!(gaze.committed_target(), natural);
+        assert_eq!(compliant.committed_target(), natural);
+        assert_eq!(shared.lock().unwrap().writes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_compliant_write_faults_only_the_transactional_override() {
+        let natural = goal_register_target();
+        let natural_positions = natural.positions().map(PositionTicks::get);
+        let mut reads = health_reads(natural_positions);
+        reads.extend(health_reads(natural_positions));
+        reads.extend(health_reads([
+            natural.position(HeadJoint::Bow).get() + 20,
+            natural.position(HeadJoint::Curl).get(),
+            natural.position(HeadJoint::Yaw).get(),
+            natural.position(HeadJoint::Roll).get(),
+        ]));
+        let (mut actor, shared) = goal_register_actor(reads);
+        actor.gaze_config = Some(gaze_with_compliance(natural));
+        // Twelve observation requests precede the two attempted goal writes.
+        shared.lock().unwrap().write_failures.insert(
+            13,
+            TransportFailure::timed_out(TransportOperation::Write, 3),
+        );
+        let mut gaze =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .unwrap();
+        let mut compliant = HeadCompliantHoldController::try_new(
+            compliant_hold_config(natural),
+            natural,
+            MonotonicTime::ZERO,
+        )
+        .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        arm_compliance_actor(
+            &mut actor,
+            &mut gaze,
+            &mut compliant,
+            &mut receiver,
+            &mut control,
+        )
+        .await;
+
+        let error = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect_err("partial compliant goal application is uncertain");
+        drop(commands);
+
+        assert!(matches!(
+            error,
+            HeadGazeServiceError::CompliantGoalRegisters {
+                source,
+                abort: Ok(()),
+            } if source.completed_writes()[0].is_some()
+                && source.completed_writes()[1..].iter().all(Option::is_none)
+        ));
+        assert_eq!(compliant.committed_target(), natural);
+        assert_eq!(
+            compliant.fault(),
+            Some(CompliantHoldFault::ApplicationUncertain)
+        );
+        assert_eq!(gaze.committed_target(), natural);
     }
 
     #[tokio::test]

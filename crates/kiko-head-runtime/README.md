@@ -311,6 +311,33 @@ An open, exclusivity, or serial-configuration error occurs before an actor or a
 qualified bus exists. That path sends no protocol byte and reports
 `SerialOpenError`; it cannot truthfully claim that torque-disable was attempted.
 
+## Optional compliant hold
+
+The tension-preserving gaze actor can additionally own one strict
+`HeadCompliantHoldConfig`. It detects repeatable external encoder displacement
+against the actor's verified goal after a stationary in-band arming dwell,
+yields through per-joint envelope/yield/step bounds, dwells after release, and
+returns to the expression pose captured at contact through a fixed-point
+quintic minimum-jerk curve. Continued resistance during return reacquires
+contact and yields again. Gaze and character motion remain subordinate for the
+complete contact/recovery transaction.
+
+The compliance control period must equal gaze, and active compliance retains
+arbitration between ticks without another telemetry read. Every observation is
+a bounded-span, fresh, identity-ordered, status-zero, electrically/thermally
+admitted four-servo set. All four requests share one aggregate, exclusive
+transaction deadline whose remaining budget caps every write and response;
+the deadline must fit inside gaze tick lateness. Raw load/current values are
+diagnostic only: the runtime does not assign them force units or use them for
+contact decisions.
+
+Compliance torque values must exactly match the runtime's startup torque
+limits before a serial device opens. This cross-binding is not evidence that
+the values are “just enough”; minimum stable torque still requires attended
+physical characterization with gravity-loaded joints supported. See
+`docs/head-compliant-hold-2026-08-01.md` for state, math, evidence, and the
+physical verification gate.
+
 ## Recorded physical evidence and present state
 
 The detailed run record is in `docs/nano-bench-evidence-2026-07-21.md`. The
