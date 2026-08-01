@@ -18,7 +18,16 @@ only to use its adjacent canonical config, state the retained-torque shutdown
 semantics accurately, and separate high temperature confirmations by 100 ms
 using the bus evidence recorded in `docs/head-compliant-hold-2026-08-01.md`.
 
-This attended runtime provides the visible expression behavior now. It does
-not implement the typed Rust compliant-petting controller, MPC, SLAM, base
-motion, or STM32 ownership. Those capabilities must enter through the single
-production Nano agent; they must not be started beside this owner.
+The live owner also runs the same conservative encoder-domain compliant-hold
+policy qualified by the typed Rust controller: one second of settled motion
+arms touch detection, three direction-consistent samples admit contact, the
+head follows 35% of bounded displacement, waits 600 ms after release, and
+returns with a 2.4 s minimum-jerk trajectory. The pure planner is isolated in
+`compliant_head.py`, strictly parses its complete policy once, binds the policy
+to the installed torque limits, ignores unqualified load/current units, and is
+covered by deterministic transition and fault tests. Serial I/O remains in the
+single full-expression process.
+
+This attended runtime does not own MPC, SLAM, base motion, or STM32. Those
+capabilities must enter through the single production Nano agent; they must
+not be started beside this owner.

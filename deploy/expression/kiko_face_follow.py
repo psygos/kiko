@@ -27,6 +27,8 @@ import cv2
 import numpy as np
 import serial
 
+from compliant_head import CompliantHeadController, CompliantHeadPolicy, FOLLOWING
+
 # ----------------------------------------------------------------------------
 # Configuration (operator-reviewed values; signs are flippable via config file)
 # ----------------------------------------------------------------------------
@@ -470,12 +472,16 @@ class HeadController:
         self.cfg = cfg
         self.natural = list(cfg["natural_ticks"])
         self.goal = None                       # last commanded goals
+        self.expression_goal = None            # independently slewed character goal
         self.offsets = [0.0, 0.0, 0.0, 0.0]    # bow, curl, yaw, roll (ticks)
         self.limits = [cfg["bow_limit_ticks"], cfg["curl_limit_ticks"],
                        cfg["yaw_limit_ticks"], cfg["roll_limit_ticks"]]
         self.state = "INIT"
         self.fault = None
         self.thermal_derate = False
+        self.compliant_policy = CompliantHeadPolicy.parse(
+            cfg["compliant_hold"], cfg["torque_limit_permille"])
+        self.compliance = None
 
     def admit_and_engage(self):
         poses = []
@@ -505,14 +511,27 @@ class HeadController:
                                 self.cfg["return_speed_ticks_s"])
             self.bus.write_torque_switch(servo_id, True)
         self.goal = list(poses)
+        self.expression_goal = list(poses)
         self.state = "RETURNING"
         print(f"engaged_at={poses}", flush=True)
 
     def _target_ticks(self):
         return [self.natural[j] + int(round(self.offsets[j])) for j in range(4)]
 
-    def step(self, desired_offsets):
+    def _write_toward(self, desired, step, speed):
+        deadband = self.cfg["goal_deadband_ticks"]
+        for joint, servo_id in enumerate(SERVO_IDS):
+            want = desired[joint]
+            have = self.goal[joint]
+            if abs(want - have) < deadband:
+                continue
+            move = max(-step, min(step, want - have))
+            self.goal[joint] = have + move
+            self.bus.write_goal(servo_id, self.goal[joint], speed)
+
+    def step(self, desired_offsets, now=None):
         """One 20 Hz control step toward natural + bounded 4-DOF offsets."""
+        now = time.monotonic() if now is None else now
         desired = [max(-self.limits[j], min(self.limits[j], desired_offsets[j]))
                    for j in range(4)]
         if self.state == "RETURNING":
@@ -527,44 +546,43 @@ class HeadController:
             delta = (desired[i] - self.offsets[i]) * ease
             self.offsets[i] += max(-step, min(step, delta))
         target = self._target_ticks()
+        for joint in range(4):
+            have = self.expression_goal[joint]
+            move = max(-step, min(step, target[joint] - have))
+            self.expression_goal[joint] = have + move
         speed_base = self.cfg["return_speed_ticks_s"]
-        deadband = self.cfg["goal_deadband_ticks"]
-        for joint, servo_id in enumerate(SERVO_IDS):
-            want = target[joint]
-            have = self.goal[joint]
-            if abs(want - have) < deadband:
-                continue
-            move = max(-step, min(step, want - have))
-            self.goal[joint] = have + move
-            # The incremental goal trajectory rate-limits real motion; the servo
-            # speed register only needs to keep the shaft up with the goal.
+        # The incremental goal trajectory rate-limits real motion; the servo
+        # speed register only needs to keep the shaft up with the goal. During
+        # touch arbitration the compliant target is the only physical writer.
+        if self.compliance is None or self.compliance.state == FOLLOWING:
             speed = (speed_base if self.state == "RETURNING"
                      else self.cfg["track_speed_max"])
-            self.bus.write_goal(servo_id, self.goal[joint], speed)
+            self._write_toward(self.expression_goal, step, speed)
         if self.state == "RETURNING":
             err = max(abs(self.goal[j] - self.natural[j]) for j in range(4))
             if err <= 2:
                 self.state = "TRACKING"
+                self.expression_goal = list(self.natural)
+                self.compliance = CompliantHeadController(
+                    self.compliant_policy, tuple(self.goal), now)
                 print("head_at_natural tracking_enabled", flush=True)
 
-    def telemetry_check(self):
+        if (self.state == "TRACKING" and self.compliance is not None and
+                now + 1e-9 >= self.compliance.next_service_due):
+            self._service_compliance(now)
+
+    def _read_safe_observation(self):
+        started = time.monotonic()
+        telemetry = []
         hottest = 0
         for joint, servo_id in enumerate(SERVO_IDS):
             t = self.bus.read_telemetry(servo_id)
             if t["temperature_raw"] >= self.cfg["temp_abort_raw"]:
-                # The installed STS bus has produced isolated, checksum-valid
-                # temperature bytes such as 122 and 150 between normal
-                # readings in the 30s/40s, including two identical corrupt
-                # reads in one burst. A real overtemperature remains above
-                # the threshold across the 200 ms required for two fresh,
-                # deliberately separated transactions; a short corrupt burst
-                # must not tear down OAK, eyes, and head ownership.
                 temperatures = [t["temperature_raw"]]
                 for _ in range(2):
                     time.sleep(0.100)
-                    confirmed = self.bus.read_telemetry(servo_id)
-                    temperatures.append(confirmed["temperature_raw"])
-                    t = confirmed
+                    t = self.bus.read_telemetry(servo_id)
+                    temperatures.append(t["temperature_raw"])
                     if t["temperature_raw"] < self.cfg["temp_abort_raw"]:
                         print(
                             f"telemetry_temperature_transient "
@@ -572,11 +590,10 @@ class HeadController:
                             f"samples={'->'.join(map(str, temperatures))}",
                             flush=True,
                         )
-                        break
-                else:
-                    raise StsError(
-                        f"{JOINT_NAMES[joint]} confirmed overtemp "
-                        f"{'->'.join(map(str, temperatures))}")
+                        return None
+                raise StsError(
+                    f"{JOINT_NAMES[joint]} confirmed overtemp "
+                    f"{'->'.join(map(str, temperatures))}")
             hottest = max(hottest, t["temperature_raw"])
             if not (self.cfg["volt_min_raw"] <= t["voltage_raw"]
                     <= self.cfg["volt_max_raw"]):
@@ -588,6 +605,12 @@ class HeadController:
                     raise StsError(
                         f"{JOINT_NAMES[joint]} diverged {divergence} ticks "
                         f"(pos={t['position']} goal={self.goal[joint]})")
+            telemetry.append(t)
+        span = time.monotonic() - started
+        self._update_thermal_derate(hottest)
+        return telemetry, span
+
+    def _update_thermal_derate(self, hottest):
         if not self.thermal_derate and hottest >= self.cfg["derate_temp_raw"]:
             self.thermal_derate = True
             print(f"thermal_derate_on hottest={hottest} "
@@ -596,10 +619,39 @@ class HeadController:
             self.thermal_derate = False
             print(f"thermal_derate_off hottest={hottest}", flush=True)
 
+    def _service_compliance(self, now):
+        observed = self._read_safe_observation()
+        if observed is None:
+            # Preserve the last verified target while fresh temperature
+            # confirmation consumed this control slot.
+            self.compliance.next_service_due = time.monotonic()
+            return
+        telemetry, span = observed
+        step = self.compliance.service(
+            now,
+            tuple(self.goal),
+            tuple(item["position"] for item in telemetry),
+            tuple(bool(item["moving"]) for item in telemetry),
+            span,
+        )
+        desired = list(step.target_ticks)
+        for joint, servo_id in enumerate(SERVO_IDS):
+            if desired[joint] != self.goal[joint]:
+                self.goal[joint] = desired[joint]
+                self.bus.write_goal(
+                    servo_id, desired[joint], self.cfg["track_speed_max"])
+        if step.event is not None:
+            print(f"compliant event={step.event} state={step.state} "
+                  f"target={list(step.target_ticks)}", flush=True)
+
+    def telemetry_check(self):
+        self._read_safe_observation()
+
     def park_and_release(self):
-        """Return to natural at bounded speed, then torque off. Fail-closed."""
+        """Return to natural at bounded speed and release I/O, retaining torque."""
         try:
             print("park_begin", flush=True)
+            self.compliance = None
             deadline = time.monotonic() + 15.0
             while time.monotonic() < deadline:
                 pending = False
@@ -1394,14 +1446,14 @@ def main():
                 residual, proximity, derate)
 
             if head is not None and head.state != "INIT":
-                head.step(desired4)
+                head.step(desired4, loop_t0)
                 yaw_rad_est = (head.offsets[YAW]
                                / (cfg["yaw_sign"] * cfg["yaw_ticks_per_rad"]))
                 pitch_rad_est = (head.offsets[CURL]
                                  / (cfg["curl_sign"]
                                     * cfg["pitch_ticks_per_rad"]
                                     * cfg["curl_pitch_share"]))
-                if tick % 20 == 0:
+                if tick % 20 == 0 and head.compliance is None:
                     head.telemetry_check()
 
             if eyes is not None:
@@ -1434,7 +1486,10 @@ def main():
 
             if tick % 100 == 0:
                 state = head.state if head else "no-head"
+                compliant = (head.compliance.state if head and head.compliance
+                             else "inactive")
                 print(f"status t={loop_t0 - started:6.1f}s head={state} "
+                      f"compliant={compliant} "
                       f"eyes={engine.mode} person={person} "
                       f"prox={proximity:.2f}", flush=True)
             tick += 1
