@@ -31,6 +31,7 @@ from compliant_head import (
     CompliantHeadController, CompliantHeadPolicy, FOLLOWING, RECOVERING,
     RELEASE_DWELL, YIELDING,
 )
+from head_thermal import ThermalDerateController, ThermalDeratePolicy
 
 # ----------------------------------------------------------------------------
 # Configuration (operator-reviewed values; signs are flippable via config file)
@@ -61,9 +62,11 @@ DEFAULT_CONFIG = {
     "yaw_ticks_per_rad": 750.0,   # slightly theatrical aim
     "pitch_ticks_per_rad": 330.0,
     "curl_pitch_share": 0.75,
-    "bow_pitch_share": 0.15,   # bow fights gravity; keep its duty low (overtemp)
+    "bow_pitch_share": 0.25,   # modest gravity-axis share; thermally supervised
     "derate_temp_raw": 48,     # pitch joints rest at natural above this
-    "derate_clear_temp_raw": 42,
+    "derate_clear_temp_raw": 45,
+    "derate_confirm_samples": 3,
+    "derate_clear_samples": 10,
     "yaw_sign": 1,                # flip to -1 if head turns away from person
     "curl_sign": 1,               # flip to -1 if head pitches away vertically
     "roll_sign": 1,               # aesthetic tilt direction
@@ -482,7 +485,7 @@ class HeadController:
                        cfg["yaw_limit_ticks"], cfg["roll_limit_ticks"]]
         self.state = "INIT"
         self.fault = None
-        self.thermal_derate = False
+        self.thermal = ThermalDerateController(ThermalDeratePolicy.parse(cfg))
         self.compliant_policy = CompliantHeadPolicy.parse(
             cfg["compliant_hold"], cfg["torque_limit_permille"])
         self.compliance = None
@@ -600,7 +603,6 @@ class HeadController:
     def _read_safe_observation(self):
         started = time.monotonic()
         telemetry = []
-        hottest = 0
         for joint, servo_id in enumerate(SERVO_IDS):
             t = self.bus.read_telemetry(servo_id)
             if t["temperature_raw"] >= self.cfg["temp_abort_raw"]:
@@ -611,7 +613,6 @@ class HeadController:
                 # span. Freeze output and acquire a complete fresh set next
                 # control slot rather than mixing timestamps.
                 return None
-            hottest = max(hottest, t["temperature_raw"])
             if not (self.cfg["volt_min_raw"] <= t["voltage_raw"]
                     <= self.cfg["volt_max_raw"]):
                 raise StsError(f"{JOINT_NAMES[joint]} voltage "
@@ -624,17 +625,20 @@ class HeadController:
                         f"(pos={t['position']} goal={self.goal[joint]})")
             telemetry.append(t)
         span = time.monotonic() - started
-        self._update_thermal_derate(hottest)
+        thermal = self.thermal.update(tuple(
+            item["temperature_raw"] for item in telemetry))
+        if thermal.event is not None:
+            required_samples = (self.thermal.policy.engage_samples
+                                if thermal.active
+                                else self.thermal.policy.clear_samples)
+            print(f"{thermal.event} pitch_hottest={thermal.pitch_hottest_raw} "
+                  f"samples={required_samples}",
+                  flush=True)
         return telemetry, span
 
-    def _update_thermal_derate(self, hottest):
-        if not self.thermal_derate and hottest >= self.cfg["derate_temp_raw"]:
-            self.thermal_derate = True
-            print(f"thermal_derate_on hottest={hottest} "
-                  f"(pitch joints resting)", flush=True)
-        elif self.thermal_derate and hottest <= self.cfg["derate_clear_temp_raw"]:
-            self.thermal_derate = False
-            print(f"thermal_derate_off hottest={hottest}", flush=True)
+    @property
+    def thermal_derate(self):
+        return self.thermal.active
 
     def _service_compliance(self, now):
         observed = self._read_safe_observation()
@@ -1543,8 +1547,10 @@ def main():
                 state = head.state if head else "no-head"
                 compliant = (head.compliance.state if head and head.compliance
                              else "inactive")
+                head_goal = list(head.goal) if head and head.goal else None
                 print(f"status t={loop_t0 - started:6.1f}s head={state} "
                       f"compliant={compliant} "
+                      f"derate={derate} goal={head_goal} "
                       f"eyes={engine.mode} person={person} "
                       f"prox={proximity:.2f}", flush=True)
             tick += 1
