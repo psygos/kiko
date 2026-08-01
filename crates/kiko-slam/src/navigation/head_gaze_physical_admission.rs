@@ -179,6 +179,7 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
 
         let declaration = *policy.controller();
         let character_mapping = policy.character_mapping();
+        let compliant_hold = policy.compliant_hold();
         let controller = HeadGazeControlConfig::try_new(
             declaration.timing(),
             reviewed_natural,
@@ -186,12 +187,20 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
             declaration.error_band(),
         )
         .map_err(EvidenceBoundPhysicalHeadGazePolicyError::Controller)?;
-        let actuation = HeadGazeActuationConfig::try_new_with_transaction_timeout(
+        let mut actuation = HeadGazeActuationConfig::try_new_with_transaction_timeout(
             controller,
             reviewed_natural,
             reviewed_return.runtime().write_timeout(),
         )
         .map_err(EvidenceBoundPhysicalHeadGazePolicyError::Actuation)?;
+        if let Some(compliant_hold) = compliant_hold {
+            compliant_hold
+                .admit_runtime_torque_limits(reviewed_return.runtime().torque_limits())
+                .map_err(EvidenceBoundPhysicalHeadGazePolicyError::CompliantTorqueBinding)?;
+            actuation = actuation
+                .try_with_compliant_hold(compliant_hold)
+                .map_err(EvidenceBoundPhysicalHeadGazePolicyError::Actuation)?;
+        }
         let adapter = HeadGazeFaceProposalAdapter::try_new(policy)
             .map_err(EvidenceBoundPhysicalHeadGazePolicyError::Adapter)?;
 
@@ -345,6 +354,7 @@ pub enum EvidenceBoundPhysicalHeadGazePolicyError {
     },
     Controller(HeadGazeControlConfigError),
     Actuation(HeadGazeActuationConfigError),
+    CompliantTorqueBinding(kiko_head_runtime::compliant_hold::HeadCompliantTorqueBindingError),
     Adapter(HeadGazeFaceProposalAdapterError),
 }
 
@@ -362,6 +372,7 @@ impl std::error::Error for EvidenceBoundPhysicalHeadGazePolicyError {
         match self {
             Self::Controller(source) => Some(source),
             Self::Actuation(source) => Some(source),
+            Self::CompliantTorqueBinding(source) => Some(source),
             Self::Adapter(source) => Some(source),
             Self::NotPhysicallyReviewed
             | Self::ReviewEvidenceDigestMismatch { .. }
@@ -374,7 +385,7 @@ impl std::error::Error for EvidenceBoundPhysicalHeadGazePolicyError {
 mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use kiko_device_inventory::{
         ArtifactRelativePath, DeploymentAssetByteLimit, load_deployment_asset,
@@ -576,6 +587,55 @@ mod tests {
             .expect("parse policy")
     }
 
+    fn with_compliance(mut value: Value, control_period_ns: u64) -> Value {
+        value["controller_declaration"]["timing"]["maximum_tick_lateness_ns"] = json!(20_000_000);
+        value["compliant_hold_declaration"] = json!({
+            "holding_torque_limit_permille": {
+                "bow": 600, "curl": 400, "yaw": 400, "roll": 400
+            },
+            "control_period_ns": control_period_ns,
+            "observation_transaction_timeout_ns": 20_000_000,
+            "maximum_observation_span_ns": 20_000_000,
+            "observation_ttl_ns": 50_000_000,
+            "contact_arm_dwell_ns": 100_000_000,
+            "contact_acquisition_samples": 2,
+            "release_dwell_ns": 200_000_000,
+            "recovery_duration_ns": 1_500_000_000,
+            "follow_permille": 800,
+            "joints": {
+                "bow": {
+                    "contact_entry_error_ticks": 20,
+                    "contact_release_error_ticks": 6,
+                    "maximum_yield_ticks": 80,
+                    "maximum_command_step_ticks": 8,
+                    "maximum_observed_step_ticks": 100
+                },
+                "curl": {
+                    "contact_entry_error_ticks": 20,
+                    "contact_release_error_ticks": 6,
+                    "maximum_yield_ticks": 100,
+                    "maximum_command_step_ticks": 8,
+                    "maximum_observed_step_ticks": 100
+                },
+                "yaw": {
+                    "contact_entry_error_ticks": 20,
+                    "contact_release_error_ticks": 6,
+                    "maximum_yield_ticks": 180,
+                    "maximum_command_step_ticks": 8,
+                    "maximum_observed_step_ticks": 100
+                },
+                "roll": {
+                    "contact_entry_error_ticks": 20,
+                    "contact_release_error_ticks": 6,
+                    "maximum_yield_ticks": 90,
+                    "maximum_command_step_ticks": 4,
+                    "maximum_observed_step_ticks": 100
+                }
+            }
+        });
+        value
+    }
+
     fn no_target_update(observed_at_ns: u64) -> FaceTrackingUpdate {
         let layout = ImageLayout::try_new(640, 400, 1_920, ChannelOrder::Bgr).unwrap();
         let observed_at = MonotonicTimestamp::from_nanos_since_epoch(observed_at_ns);
@@ -652,6 +712,38 @@ mod tests {
             character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Roll),
             160
         );
+    }
+
+    #[test]
+    fn compliant_dynamics_cross_bind_torque_period_envelopes_and_steps_before_open() {
+        let (_root, evidence) = load_evidence(b"retained physical review evidence");
+        let digest = lowercase_hex(evidence.content_sha256().as_bytes());
+        let policy = parse_policy(&with_compliance(
+            policy_value(&digest, 100_000_000),
+            100_000_000,
+        ));
+        let reviewed_return = reviewed_return();
+        let admitted =
+            EvidenceBoundPhysicalHeadGazePolicy::admit(policy, &evidence, &reviewed_return)
+                .expect("fully cross-bound compliance");
+        let compliant = admitted
+            .actuation_config()
+            .compliant_hold()
+            .expect("compliance retained by sole actor config");
+        assert_eq!(compliant.control_period(), Duration::from_millis(100));
+        assert_eq!(compliant.follow_permille(), 800);
+
+        let mut wrong_torque = with_compliance(policy_value(&digest, 100_000_000), 100_000_000);
+        wrong_torque["compliant_hold_declaration"]["holding_torque_limit_permille"]["curl"] =
+            json!(399);
+        assert!(matches!(
+            EvidenceBoundPhysicalHeadGazePolicy::admit(
+                parse_policy(&wrong_torque),
+                &evidence,
+                &reviewed_return,
+            ),
+            Err(EvidenceBoundPhysicalHeadGazePolicyError::CompliantTorqueBinding(_))
+        ));
     }
 
     #[test]

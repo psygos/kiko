@@ -241,14 +241,15 @@ pub use head_gaze_physical_admission::{
 };
 #[cfg(feature = "agent-runtime")]
 pub use head_gaze_policy::{
-    HEAD_GAZE_POLICY_V1, HeadGazeControllerDeclaration, HeadGazeControllerDeclarationParseError,
-    HeadGazeErrorBandField, HeadGazeEvidenceContentSha256, HeadGazeEvidenceContentSha256Error,
-    HeadGazeLifecycleClaimParseError, HeadGazeLifecycleIdentifierError,
-    HeadGazeLifecycleIdentifierField, HeadGazeMotionField, HeadGazeMotionValueError,
-    HeadGazeOperatorId, HeadGazePolicyLifecycleClaim, HeadGazePolicyParseError, HeadGazePolicyV1,
-    HeadGazeProposalClaimId, HeadGazeProposalOnlyClaim, HeadGazeReviewClaimId,
-    HeadGazeReviewEvidenceId, HeadGazeTimingField, MAX_HEAD_GAZE_POLICY_JSON_BYTES,
-    OperatorClaimedHeadGazePhysicalReview, REQUIRED_HEAD_GAZE_ACQUISITION_PROPOSALS,
+    HEAD_GAZE_POLICY_V1, HeadCompliantHoldDeclarationParseError, HeadGazeControllerDeclaration,
+    HeadGazeControllerDeclarationParseError, HeadGazeErrorBandField, HeadGazeEvidenceContentSha256,
+    HeadGazeEvidenceContentSha256Error, HeadGazeLifecycleClaimParseError,
+    HeadGazeLifecycleIdentifierError, HeadGazeLifecycleIdentifierField, HeadGazeMotionField,
+    HeadGazeMotionValueError, HeadGazeOperatorId, HeadGazePolicyLifecycleClaim,
+    HeadGazePolicyParseError, HeadGazePolicyV1, HeadGazeProposalClaimId, HeadGazeProposalOnlyClaim,
+    HeadGazeReviewClaimId, HeadGazeReviewEvidenceId, HeadGazeTimingField,
+    MAX_HEAD_GAZE_POLICY_JSON_BYTES, OperatorClaimedHeadGazePhysicalReview,
+    REQUIRED_HEAD_GAZE_ACQUISITION_PROPOSALS,
 };
 #[cfg(feature = "agent-runtime")]
 pub use head_gaze_proposal_adapter::{

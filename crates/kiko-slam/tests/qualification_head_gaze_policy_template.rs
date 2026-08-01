@@ -15,7 +15,7 @@ const TEMPLATE: &str = include_str!(concat!(
     "/../../configs/nano-wheels-off-qualification-template/head-gaze-policy-v1.json.template"
 ));
 
-const UNRESOLVED_SENTINELS: [&str; 20] = [
+const UNRESOLVED_SENTINELS: [&str; 44] = [
     "${HEAD_ASSEMBLY_DECLARATION_ID}",
     "${HEAD_GAZE_UNVALIDATED_PROPOSAL_EVIDENCE_ID}",
     "${HEAD_GAZE_UNVALIDATED_PROPOSAL_EVIDENCE_CONTENT_SHA256}",
@@ -36,6 +36,30 @@ const UNRESOLVED_SENTINELS: [&str; 20] = [
     "${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_VELOCITY_TICKS_PER_CONTROL_TICK}",
     "${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_ACCELERATION_TICKS_PER_CONTROL_TICK_SQUARED}",
     "${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_POSITION_STEP_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_OBSERVATION_TRANSACTION_TIMEOUT_NS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_MAXIMUM_OBSERVATION_SPAN_NS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_OBSERVATION_TTL_NS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_CONTACT_ARM_DWELL_NS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_CONTACT_ACQUISITION_SAMPLES}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_RELEASE_DWELL_NS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_RECOVERY_DURATION_NS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_FOLLOW_PERMILLE}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_BOW_CONTACT_ENTRY_ERROR_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_BOW_CONTACT_RELEASE_ERROR_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_BOW_MAXIMUM_YIELD_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_BOW_MAXIMUM_OBSERVED_STEP_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_CURL_CONTACT_ENTRY_ERROR_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_CURL_CONTACT_RELEASE_ERROR_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_CURL_MAXIMUM_YIELD_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_CURL_MAXIMUM_OBSERVED_STEP_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_YAW_CONTACT_ENTRY_ERROR_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_YAW_CONTACT_RELEASE_ERROR_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_YAW_MAXIMUM_YIELD_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_YAW_MAXIMUM_OBSERVED_STEP_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_ROLL_CONTACT_ENTRY_ERROR_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_ROLL_CONTACT_RELEASE_ERROR_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_ROLL_MAXIMUM_YIELD_TICKS}",
+    "${HEAD_COMPLIANCE_UNVALIDATED_ROLL_MAXIMUM_OBSERVED_STEP_TICKS}",
 ];
 
 fn render_parser_fixture() -> String {
@@ -107,6 +131,99 @@ fn render_parser_fixture() -> String {
         (
             "${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_POSITION_STEP_TICKS}",
             "4",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_OBSERVATION_TRANSACTION_TIMEOUT_NS}",
+            "5000000",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_MAXIMUM_OBSERVATION_SPAN_NS}",
+            "4000000",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_OBSERVATION_TTL_NS}",
+            "30000000",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_CONTACT_ARM_DWELL_NS}",
+            "40000000",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_CONTACT_ACQUISITION_SAMPLES}",
+            "2",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_RELEASE_DWELL_NS}",
+            "100000000",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_RECOVERY_DURATION_NS}",
+            "1000000000",
+        ),
+        ("${HEAD_COMPLIANCE_UNVALIDATED_FOLLOW_PERMILLE}", "800"),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_BOW_CONTACT_ENTRY_ERROR_TICKS}",
+            "20",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_BOW_CONTACT_RELEASE_ERROR_TICKS}",
+            "6",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_BOW_MAXIMUM_YIELD_TICKS}",
+            "80",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_BOW_MAXIMUM_OBSERVED_STEP_TICKS}",
+            "100",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_CURL_CONTACT_ENTRY_ERROR_TICKS}",
+            "20",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_CURL_CONTACT_RELEASE_ERROR_TICKS}",
+            "6",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_CURL_MAXIMUM_YIELD_TICKS}",
+            "100",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_CURL_MAXIMUM_OBSERVED_STEP_TICKS}",
+            "100",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_YAW_CONTACT_ENTRY_ERROR_TICKS}",
+            "20",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_YAW_CONTACT_RELEASE_ERROR_TICKS}",
+            "6",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_YAW_MAXIMUM_YIELD_TICKS}",
+            "180",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_YAW_MAXIMUM_OBSERVED_STEP_TICKS}",
+            "100",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_ROLL_CONTACT_ENTRY_ERROR_TICKS}",
+            "20",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_ROLL_CONTACT_RELEASE_ERROR_TICKS}",
+            "6",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_ROLL_MAXIMUM_YIELD_TICKS}",
+            "90",
+        ),
+        (
+            "${HEAD_COMPLIANCE_UNVALIDATED_ROLL_MAXIMUM_OBSERVED_STEP_TICKS}",
+            "100",
         ),
     ];
 
@@ -210,6 +327,44 @@ fn rendered_contract_is_typed_proposal_only_with_exact_known_geometry() {
             character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Roll),
         ],
         [110, -180, 480, 160]
+    );
+    let compliant = policy
+        .compliant_hold()
+        .expect("rendered fixture carries typed but explicitly unvalidated compliance dynamics");
+    assert_eq!(
+        compliant.control_period(),
+        std::time::Duration::from_millis(20)
+    );
+    assert_eq!(
+        compliant.observation_transaction_timeout(),
+        std::time::Duration::from_millis(5)
+    );
+    assert_eq!(
+        compliant.maximum_observation_span(),
+        std::time::Duration::from_millis(4)
+    );
+    assert_eq!(
+        compliant.observation_ttl(),
+        std::time::Duration::from_millis(30)
+    );
+    assert_eq!(
+        compliant.contact_arm_dwell(),
+        std::time::Duration::from_millis(40)
+    );
+    assert_eq!(compliant.contact_acquisition_samples(), 2);
+    assert_eq!(
+        compliant.release_dwell(),
+        std::time::Duration::from_millis(100)
+    );
+    assert_eq!(
+        compliant.recovery_duration(),
+        std::time::Duration::from_secs(1)
+    );
+    assert_eq!(compliant.follow_permille(), 800);
+    assert_eq!(
+        kiko_head_protocol::HeadJoint::ALL
+            .map(|joint| { compliant.holding_torque_limits().for_joint(joint).get() }),
+        [600, 400, 400, 400]
     );
 
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]

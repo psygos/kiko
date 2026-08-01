@@ -22,7 +22,14 @@ use kiko_expression_runtime::{
     NamedCharacterHeadFullScaleTickOffsetsInput, NamedHeadTickEnvelopesInput,
     NamedHeadTickOffsetsPerRadianInput, NamedNaturalHeadTicksInput,
 };
-use kiko_head_protocol::{HeadJoint, JointCalibrationError, PositionStepLimit};
+use kiko_head_protocol::{
+    FrameBuildError, HeadJoint, HeadTorqueLimits, JointCalibrationError, PositionStepLimit,
+    TorqueLimitPermille,
+};
+use kiko_head_runtime::compliant_hold::{
+    CompliantJointPolicy, CompliantJointPolicyError, HeadCompliantHoldConfig,
+    HeadCompliantHoldConfigError,
+};
 use kiko_head_runtime::gaze_control::{
     HeadAcquisitionProposalCount, HeadAcquisitionProposalCountError, HeadControlPeriod,
     HeadDeadbandTicks, HeadErrorBandValueError, HeadGazeErrorBand, HeadGazeErrorBandError,
@@ -56,6 +63,7 @@ pub struct HeadGazePolicyV1 {
     mapping: HeadGazeMappingDeclaration,
     character_mapping: Option<CharacterHeadMappingDeclaration>,
     controller: HeadGazeControllerDeclaration,
+    compliant_hold: Option<HeadCompliantHoldConfig>,
     lifecycle: HeadGazePolicyLifecycleClaim,
 }
 
@@ -89,6 +97,11 @@ impl HeadGazePolicyV1 {
         let (mapping, character_mapping) = parse_mapping(dto.mapping_declaration)?;
         let controller = HeadGazeControllerDeclaration::parse(dto.controller_declaration, &mapping)
             .map_err(HeadGazePolicyParseError::Controller)?;
+        let compliant_hold = dto
+            .compliant_hold_declaration
+            .map(|declaration| parse_compliant_hold(declaration, &mapping))
+            .transpose()
+            .map_err(HeadGazePolicyParseError::CompliantHold)?;
         let lifecycle =
             parse_lifecycle(dto.lifecycle).map_err(HeadGazePolicyParseError::Lifecycle)?;
 
@@ -96,6 +109,7 @@ impl HeadGazePolicyV1 {
             mapping,
             character_mapping,
             controller,
+            compliant_hold,
             lifecycle,
         })
     }
@@ -119,6 +133,13 @@ impl HeadGazePolicyV1 {
     /// `HeadGazeControlConfig`.
     pub const fn controller(&self) -> &HeadGazeControllerDeclaration {
         &self.controller
+    }
+
+    /// Optional fully typed compliant-hold dynamics. This is still only a
+    /// declaration: physical admission must bind its torque limits to the
+    /// reviewed return runtime before any serial device is opened.
+    pub const fn compliant_hold(&self) -> Option<HeadCompliantHoldConfig> {
+        self.compliant_hold
     }
 
     /// Caller-supplied lifecycle/review claim retained for later evidence
@@ -661,6 +682,88 @@ fn parse_joint_motion(
     .map_err(|source| HeadGazeControllerDeclarationParseError::JointMotionLimits { joint, source })
 }
 
+fn parse_compliant_hold(
+    dto: HeadCompliantHoldDeclarationDto,
+    mapping: &HeadGazeMappingDeclaration,
+) -> Result<HeadCompliantHoldConfig, HeadCompliantHoldDeclarationParseError> {
+    let joint = |joint, values: CompliantJointPolicyDto| {
+        let envelope = mapping.hard_envelope(joint);
+        CompliantJointPolicy::try_new(
+            envelope.minimum(),
+            envelope.maximum(),
+            values.contact_entry_error_ticks,
+            values.contact_release_error_ticks,
+            values.maximum_yield_ticks,
+            values.maximum_command_step_ticks,
+            values.maximum_observed_step_ticks,
+        )
+        .map_err(|source| HeadCompliantHoldDeclarationParseError::Joint { joint, source })
+    };
+    let bow = joint(HeadJoint::Bow, dto.joints.bow)?;
+    let curl = joint(HeadJoint::Curl, dto.joints.curl)?;
+    let yaw = joint(HeadJoint::Yaw, dto.joints.yaw)?;
+    let roll = joint(HeadJoint::Roll, dto.joints.roll)?;
+    let torque = |joint, value| {
+        TorqueLimitPermille::try_new(value)
+            .map_err(|source| HeadCompliantHoldDeclarationParseError::Torque { joint, source })
+    };
+    let torque_limits = HeadTorqueLimits::new(
+        torque(HeadJoint::Bow, dto.holding_torque_limit_permille.bow)?,
+        torque(HeadJoint::Curl, dto.holding_torque_limit_permille.curl)?,
+        torque(HeadJoint::Yaw, dto.holding_torque_limit_permille.yaw)?,
+        torque(HeadJoint::Roll, dto.holding_torque_limit_permille.roll)?,
+    );
+    HeadCompliantHoldConfig::try_new(
+        bow,
+        curl,
+        yaw,
+        roll,
+        torque_limits,
+        Duration::from_nanos(dto.control_period_ns),
+        Duration::from_nanos(dto.observation_transaction_timeout_ns),
+        Duration::from_nanos(dto.maximum_observation_span_ns),
+        Duration::from_nanos(dto.observation_ttl_ns),
+        Duration::from_nanos(dto.contact_arm_dwell_ns),
+        dto.contact_acquisition_samples,
+        Duration::from_nanos(dto.release_dwell_ns),
+        Duration::from_nanos(dto.recovery_duration_ns),
+        dto.follow_permille,
+    )
+    .map_err(HeadCompliantHoldDeclarationParseError::Config)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadCompliantHoldDeclarationParseError {
+    Joint {
+        joint: HeadJoint,
+        source: CompliantJointPolicyError,
+    },
+    Torque {
+        joint: HeadJoint,
+        source: FrameBuildError,
+    },
+    Config(HeadCompliantHoldConfigError),
+}
+
+impl fmt::Display for HeadCompliantHoldDeclarationParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid head compliant-hold declaration: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for HeadCompliantHoldDeclarationParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Joint { source, .. } => Some(source),
+            Self::Torque { source, .. } => Some(source),
+            Self::Config(source) => Some(source),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum HeadGazePolicyParseError {
     InputTooLarge {
@@ -676,6 +779,7 @@ pub enum HeadGazePolicyParseError {
     Mapping(HeadGazeMappingDeclarationParseError),
     CharacterMapping(CharacterHeadMappingDeclarationParseError),
     Controller(HeadGazeControllerDeclarationParseError),
+    CompliantHold(HeadCompliantHoldDeclarationParseError),
     Lifecycle(HeadGazeLifecycleClaimParseError),
 }
 
@@ -692,6 +796,7 @@ impl std::error::Error for HeadGazePolicyParseError {
             Self::Mapping(source) => Some(source),
             Self::CharacterMapping(source) => Some(source),
             Self::Controller(source) => Some(source),
+            Self::CompliantHold(source) => Some(source),
             Self::Lifecycle(source) => Some(source),
             Self::InputTooLarge { .. } | Self::UnsupportedSchemaVersion { .. } => None,
         }
@@ -899,6 +1004,7 @@ struct HeadGazePolicyV1Dto {
     lifecycle: HeadGazePolicyLifecycleDto,
     mapping_declaration: HeadGazeMappingDeclarationDto,
     controller_declaration: HeadGazeControllerDeclarationDto,
+    compliant_hold_declaration: Option<HeadCompliantHoldDeclarationDto>,
 }
 
 #[derive(Deserialize)]
@@ -1072,6 +1178,50 @@ struct HeadGazeJointMotionLimitsDto {
     maximum_position_step_ticks: u16,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeadCompliantHoldDeclarationDto {
+    holding_torque_limit_permille: NamedHeadTorqueLimitsDto,
+    control_period_ns: u64,
+    observation_transaction_timeout_ns: u64,
+    maximum_observation_span_ns: u64,
+    observation_ttl_ns: u64,
+    contact_arm_dwell_ns: u64,
+    contact_acquisition_samples: u8,
+    release_dwell_ns: u64,
+    recovery_duration_ns: u64,
+    follow_permille: u16,
+    joints: NamedCompliantJointPoliciesDto,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamedHeadTorqueLimitsDto {
+    bow: u16,
+    curl: u16,
+    yaw: u16,
+    roll: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamedCompliantJointPoliciesDto {
+    bow: CompliantJointPolicyDto,
+    curl: CompliantJointPolicyDto,
+    yaw: CompliantJointPolicyDto,
+    roll: CompliantJointPolicyDto,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompliantJointPolicyDto {
+    contact_entry_error_ticks: u16,
+    contact_release_error_ticks: u16,
+    maximum_yield_ticks: u16,
+    maximum_command_step_ticks: u16,
+    maximum_observed_step_ticks: u16,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1175,6 +1325,53 @@ mod tests {
 
     fn parse(value: &Value) -> Result<HeadGazePolicyV1, HeadGazePolicyParseError> {
         HeadGazePolicyV1::parse_json(&serde_json::to_vec(value).expect("fixture JSON"))
+    }
+
+    fn compliant_declaration() -> Value {
+        json!({
+            "holding_torque_limit_permille": {
+                "bow": 600, "curl": 400, "yaw": 400, "roll": 400
+            },
+            "control_period_ns": 20_000_000,
+            "observation_transaction_timeout_ns": 10_000_000,
+            "maximum_observation_span_ns": 10_000_000,
+            "observation_ttl_ns": 30_000_000,
+            "contact_arm_dwell_ns": 20_000_000,
+            "contact_acquisition_samples": 2,
+            "release_dwell_ns": 100_000_000,
+            "recovery_duration_ns": 1_000_000_000,
+            "follow_permille": 800,
+            "joints": {
+                "bow": {
+                    "contact_entry_error_ticks": 20,
+                    "contact_release_error_ticks": 6,
+                    "maximum_yield_ticks": 80,
+                    "maximum_command_step_ticks": 8,
+                    "maximum_observed_step_ticks": 100
+                },
+                "curl": {
+                    "contact_entry_error_ticks": 20,
+                    "contact_release_error_ticks": 6,
+                    "maximum_yield_ticks": 100,
+                    "maximum_command_step_ticks": 8,
+                    "maximum_observed_step_ticks": 100
+                },
+                "yaw": {
+                    "contact_entry_error_ticks": 20,
+                    "contact_release_error_ticks": 6,
+                    "maximum_yield_ticks": 180,
+                    "maximum_command_step_ticks": 8,
+                    "maximum_observed_step_ticks": 100
+                },
+                "roll": {
+                    "contact_entry_error_ticks": 20,
+                    "contact_release_error_ticks": 6,
+                    "maximum_yield_ticks": 90,
+                    "maximum_command_step_ticks": 4,
+                    "maximum_observed_step_ticks": 100
+                }
+            }
+        })
     }
 
     #[test]
@@ -1471,6 +1668,66 @@ mod tests {
             parse(&no_hysteresis),
             Err(HeadGazePolicyParseError::Controller(
                 HeadGazeControllerDeclarationParseError::ErrorBand { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn optional_compliance_is_parsed_once_and_rejects_ambiguous_touch_dynamics() {
+        let mut document = valid_value();
+        document["compliant_hold_declaration"] = compliant_declaration();
+        let policy = parse(&document).expect("typed compliant declaration");
+        let compliant = policy.compliant_hold().expect("compliance present");
+        assert_eq!(compliant.contact_arm_dwell(), Duration::from_millis(20));
+        assert_eq!(compliant.contact_acquisition_samples(), 2);
+        assert_eq!(compliant.follow_permille(), 800);
+        assert_eq!(compliant.recovery_duration(), Duration::from_secs(1));
+
+        let mut no_hysteresis = document.clone();
+        no_hysteresis["compliant_hold_declaration"]["joints"]["bow"]["contact_release_error_ticks"] =
+            json!(20);
+        assert!(matches!(
+            parse(&no_hysteresis),
+            Err(HeadGazePolicyParseError::CompliantHold(
+                HeadCompliantHoldDeclarationParseError::Joint {
+                    joint: HeadJoint::Bow,
+                    source: CompliantJointPolicyError::ReleaseNotInsideEntry { .. }
+                }
+            ))
+        ));
+
+        let mut mismatched_time = document.clone();
+        mismatched_time["compliant_hold_declaration"]["observation_ttl_ns"] = json!(10_000_000);
+        assert!(matches!(
+            parse(&mismatched_time),
+            Err(HeadGazePolicyParseError::CompliantHold(
+                HeadCompliantHoldDeclarationParseError::Config(
+                    HeadCompliantHoldConfigError::ObservationSpanNotInsideTtl { .. }
+                )
+            ))
+        ));
+
+        let mut no_arm_dwell = document.clone();
+        no_arm_dwell["compliant_hold_declaration"]["contact_arm_dwell_ns"] = json!(0);
+        assert!(matches!(
+            parse(&no_arm_dwell),
+            Err(HeadGazePolicyParseError::CompliantHold(
+                HeadCompliantHoldDeclarationParseError::Config(
+                    HeadCompliantHoldConfigError::ZeroContactArmDwell
+                )
+            ))
+        ));
+
+        let mut invalid_torque = document;
+        invalid_torque["compliant_hold_declaration"]["holding_torque_limit_permille"]["yaw"] =
+            json!(1_001);
+        assert!(matches!(
+            parse(&invalid_torque),
+            Err(HeadGazePolicyParseError::CompliantHold(
+                HeadCompliantHoldDeclarationParseError::Torque {
+                    joint: HeadJoint::Yaw,
+                    ..
+                }
             ))
         ));
     }

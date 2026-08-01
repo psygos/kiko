@@ -1878,7 +1878,7 @@ pub enum NanoPhysicalHeadGazeRuntimeError {
     ProposalRejected(HeadGazeProposalCommandError),
     BaseInterlock(HeadGazeBaseInterlockError),
     ServiceCommand(HeadCommandError),
-    Service(HeadGazeServiceError),
+    Service(Box<HeadGazeServiceError>),
 }
 
 #[cfg(feature = "nano-agent")]
@@ -1899,7 +1899,7 @@ impl std::error::Error for NanoPhysicalHeadGazeRuntimeError {
             Self::ProposalRejected(source) => Some(source),
             Self::BaseInterlock(source) => Some(source),
             Self::ServiceCommand(source) => Some(source),
-            Self::Service(source) => Some(source),
+            Self::Service(source) => Some(source.as_ref()),
             Self::ProjectionGridMismatch { .. } | Self::ProposalSequenceExhausted { .. } => None,
         }
     }
@@ -4078,7 +4078,8 @@ impl SerialReviewedNaturalHeadPort {
             return Ok(evidence);
         }
         #[cfg(feature = "nano-agent")]
-        if let HeadHoldTarget::ReviewedGaze(target) = observed
+        if let HeadHoldTarget::ReviewedGaze(target) | HeadHoldTarget::ReviewedCompliant(target) =
+            observed
             && let Some(physical) = self
                 .active
                 .as_ref()
@@ -4173,7 +4174,7 @@ impl SerialReviewedNaturalHeadPort {
             .service_gaze(lease)
             .await
             .map_err(NanoPhysicalHeadGazeRuntimeError::ServiceCommand)?
-            .map_err(NanoPhysicalHeadGazeRuntimeError::Service)?;
+            .map_err(|source| NanoPhysicalHeadGazeRuntimeError::Service(Box::new(source)))?;
         Ok(())
     }
 }

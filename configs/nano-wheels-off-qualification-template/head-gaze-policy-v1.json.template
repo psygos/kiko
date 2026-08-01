@@ -103,5 +103,52 @@
         "maximum_position_step_ticks": ${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_POSITION_STEP_TICKS}
       }
     }
+  },
+  "compliant_hold_declaration": {
+    "holding_torque_limit_permille": {
+      "bow": 600,
+      "curl": 400,
+      "yaw": 400,
+      "roll": 400
+    },
+    "control_period_ns": ${HEAD_GAZE_UNVALIDATED_CONTROL_PERIOD_NS},
+    "observation_transaction_timeout_ns": ${HEAD_COMPLIANCE_UNVALIDATED_OBSERVATION_TRANSACTION_TIMEOUT_NS},
+    "maximum_observation_span_ns": ${HEAD_COMPLIANCE_UNVALIDATED_MAXIMUM_OBSERVATION_SPAN_NS},
+    "observation_ttl_ns": ${HEAD_COMPLIANCE_UNVALIDATED_OBSERVATION_TTL_NS},
+    "contact_arm_dwell_ns": ${HEAD_COMPLIANCE_UNVALIDATED_CONTACT_ARM_DWELL_NS},
+    "contact_acquisition_samples": ${HEAD_COMPLIANCE_UNVALIDATED_CONTACT_ACQUISITION_SAMPLES},
+    "release_dwell_ns": ${HEAD_COMPLIANCE_UNVALIDATED_RELEASE_DWELL_NS},
+    "recovery_duration_ns": ${HEAD_COMPLIANCE_UNVALIDATED_RECOVERY_DURATION_NS},
+    "follow_permille": ${HEAD_COMPLIANCE_UNVALIDATED_FOLLOW_PERMILLE},
+    "joints": {
+      "bow": {
+        "contact_entry_error_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_BOW_CONTACT_ENTRY_ERROR_TICKS},
+        "contact_release_error_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_BOW_CONTACT_RELEASE_ERROR_TICKS},
+        "maximum_yield_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_BOW_MAXIMUM_YIELD_TICKS},
+        "maximum_command_step_ticks": ${HEAD_GAZE_UNVALIDATED_BOW_MAXIMUM_POSITION_STEP_TICKS},
+        "maximum_observed_step_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_BOW_MAXIMUM_OBSERVED_STEP_TICKS}
+      },
+      "curl": {
+        "contact_entry_error_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_CURL_CONTACT_ENTRY_ERROR_TICKS},
+        "contact_release_error_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_CURL_CONTACT_RELEASE_ERROR_TICKS},
+        "maximum_yield_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_CURL_MAXIMUM_YIELD_TICKS},
+        "maximum_command_step_ticks": ${HEAD_GAZE_UNVALIDATED_CURL_MAXIMUM_POSITION_STEP_TICKS},
+        "maximum_observed_step_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_CURL_MAXIMUM_OBSERVED_STEP_TICKS}
+      },
+      "yaw": {
+        "contact_entry_error_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_YAW_CONTACT_ENTRY_ERROR_TICKS},
+        "contact_release_error_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_YAW_CONTACT_RELEASE_ERROR_TICKS},
+        "maximum_yield_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_YAW_MAXIMUM_YIELD_TICKS},
+        "maximum_command_step_ticks": ${HEAD_GAZE_UNVALIDATED_YAW_MAXIMUM_POSITION_STEP_TICKS},
+        "maximum_observed_step_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_YAW_MAXIMUM_OBSERVED_STEP_TICKS}
+      },
+      "roll": {
+        "contact_entry_error_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_ROLL_CONTACT_ENTRY_ERROR_TICKS},
+        "contact_release_error_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_ROLL_CONTACT_RELEASE_ERROR_TICKS},
+        "maximum_yield_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_ROLL_MAXIMUM_YIELD_TICKS},
+        "maximum_command_step_ticks": ${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_POSITION_STEP_TICKS},
+        "maximum_observed_step_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_ROLL_MAXIMUM_OBSERVED_STEP_TICKS}
+      }
+    }
   }
 }

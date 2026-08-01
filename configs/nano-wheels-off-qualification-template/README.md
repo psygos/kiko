@@ -89,14 +89,23 @@ fixes only these currently declared facts:
   supplies the exact coordinate conversion: pitch-down maps to bow/curl
   `[-93,+465]` ticks/radian, yaw-right maps to yaw `-1050` ticks/radian,
   and character-positive full scale maps to `[+110,-180,+480,+160]` ticks;
-  and
+- the compliant-hold declaration is cross-bound to the currently configured
+  startup torque limits `[600,400,400,400]` permille. This records what the
+  runtime would install; it does **not** claim those limits are the minimum
+  safe holding torque or that contact dynamics have been commissioned; and
 - the lifecycle is `proposal_only`.
 
 The assembly identifier, retained proposal-evidence identifier and digest,
-controller timing, hysteresis, and per-joint controller motion limits remain
-visibly named `UNVALIDATED` sentinels. The four-axis calibration is not one of
-the missing facts. Replacing a remaining sentinel proves neither its physical
-value nor its safety. The rendered policy must continue to use
+controller timing, hysteresis, per-joint controller motion limits, compliant
+aggregate observation transaction deadline, observation span/freshness,
+stationary contact-arming dwell, contact hysteresis, yield bounds, follow gain,
+release dwell, and recovery duration remain visibly named `UNVALIDATED`
+sentinels. The four-axis pose calibration is not one of the missing facts.
+Replacing a remaining sentinel proves neither its physical value nor its
+safety. In particular, the compliance values must come from an attended
+wheels-off touch/hold/release characterization, with smaller gravity-axis
+travel accepted unless physical evidence supports more. The rendered policy
+must continue to use
 `proposal_only`; it must not be converted to `operator_claimed_physical_review`
 without a separate, retained, physically witnessed review transaction.
 
