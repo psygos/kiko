@@ -35,6 +35,8 @@
     "contact_entry_error_ticks": [14, 18, 10, 10],
     "contact_release_error_ticks": [5, 7, 4, 4],
     "maximum_yield_ticks": [24, 36, 80, 24],
+    "contact_rest_pose_offset_ticks": [-8, 18, 0, 0],
+    "contact_directional_rest_offset_ticks": [0, 0, 12, 10],
     "maximum_command_step_ticks": [3, 4, 8, 3],
     "maximum_observed_step_ticks": [64, 80, 160, 64],
     "quiet_command_step_ticks": [1, 2, 2, 1],
@@ -44,7 +46,11 @@
     "contact_arm_dwell_ms": 1000,
     "contact_acquisition_samples": 2,
     "release_dwell_ms": 600,
+    "rest_dwell_ms": 900,
+    "rest_per_additional_joint_ms": 350,
+    "maximum_rest_dwell_ms": 1950,
     "recovery_duration_ms": 2400,
+    "recovery_per_additional_joint_permille": 150,
     "follow_permille": 500
   }
 }

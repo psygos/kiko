@@ -15,6 +15,7 @@ FOLLOWING = "FOLLOWING_EXPRESSION"
 CONFIRMING = "CONFIRMING_CONTACT"
 YIELDING = "YIELDING"
 RELEASE_DWELL = "RELEASE_DWELL"
+RESTING = "RESTING"
 RECOVERING = "RECOVERING"
 FAULT_HELD = "FAULT_HELD"
 
@@ -44,6 +45,17 @@ def _int4(value, field, minimum, maximum):
     return parsed
 
 
+def _signed_int4(value, field, magnitude):
+    if not isinstance(value, list) or len(value) != JOINT_COUNT:
+        raise CompliantConfigError(f"{field} must contain exactly four integers")
+    parsed = tuple(_plain_int(item, f"{field}[{index}]")
+                   for index, item in enumerate(value))
+    if any(abs(item) > magnitude for item in parsed):
+        raise CompliantConfigError(
+            f"{field} magnitudes must not exceed {magnitude}")
+    return parsed
+
+
 @dataclass(frozen=True)
 class CompliantHeadPolicy:
     minimum_ticks: tuple
@@ -52,6 +64,8 @@ class CompliantHeadPolicy:
     contact_entry_error_ticks: tuple
     contact_release_error_ticks: tuple
     maximum_yield_ticks: tuple
+    contact_rest_pose_offset_ticks: tuple
+    contact_directional_rest_offset_ticks: tuple
     maximum_command_step_ticks: tuple
     maximum_observed_step_ticks: tuple
     quiet_command_step_ticks: tuple
@@ -61,7 +75,11 @@ class CompliantHeadPolicy:
     contact_arm_dwell_s: float
     contact_acquisition_samples: int
     release_dwell_s: float
+    rest_dwell_s: float
+    rest_per_additional_joint_s: float
+    maximum_rest_dwell_s: float
     recovery_duration_s: float
+    recovery_per_additional_joint_fraction: float
     follow_fraction: float
 
     @classmethod
@@ -72,11 +90,16 @@ class CompliantHeadPolicy:
             "minimum_ticks", "maximum_ticks", "maximum_baseline_error_ticks",
             "contact_entry_error_ticks",
             "contact_release_error_ticks", "maximum_yield_ticks",
+            "contact_rest_pose_offset_ticks",
+            "contact_directional_rest_offset_ticks",
             "maximum_command_step_ticks", "maximum_observed_step_ticks",
             "quiet_command_step_ticks", "holding_torque_limit_permille",
             "control_period_ms", "maximum_observation_span_ms",
             "contact_arm_dwell_ms", "contact_acquisition_samples",
-            "release_dwell_ms", "recovery_duration_ms", "follow_permille",
+            "release_dwell_ms", "rest_dwell_ms",
+            "rest_per_additional_joint_ms", "maximum_rest_dwell_ms",
+            "recovery_duration_ms",
+            "recovery_per_additional_joint_permille", "follow_permille",
         }
         unknown = sorted(set(raw) - expected)
         missing = sorted(expected - set(raw))
@@ -95,6 +118,12 @@ class CompliantHeadPolicy:
                         "contact_release_error_ticks", 0, 4095)
         maximum_yield = _int4(raw["maximum_yield_ticks"],
                               "maximum_yield_ticks", 1, 4095)
+        rest_pose = _signed_int4(
+            raw["contact_rest_pose_offset_ticks"],
+            "contact_rest_pose_offset_ticks", 4095)
+        directional_rest = _int4(
+            raw["contact_directional_rest_offset_ticks"],
+            "contact_directional_rest_offset_ticks", 0, 4095)
         command_step = _int4(raw["maximum_command_step_ticks"],
                              "maximum_command_step_ticks", 1, 4095)
         observed_step = _int4(raw["maximum_observed_step_ticks"],
@@ -120,6 +149,12 @@ class CompliantHeadPolicy:
             if maximum_yield[joint] > maximum[joint] - minimum[joint]:
                 raise CompliantConfigError(
                     f"joint {joint} maximum yield exceeds its envelope")
+            if abs(rest_pose[joint]) > maximum_yield[joint]:
+                raise CompliantConfigError(
+                    f"joint {joint} rest pose exceeds maximum yield")
+            if abs(rest_pose[joint]) + directional_rest[joint] > maximum_yield[joint]:
+                raise CompliantConfigError(
+                    f"joint {joint} directional rest pose exceeds maximum yield")
             if observed_step[joint] < max(command_step[joint], entry[joint]):
                 raise CompliantConfigError(
                     f"joint {joint} observed-step limit is internally inconsistent")
@@ -131,12 +166,27 @@ class CompliantHeadPolicy:
         acquisition = _plain_int(
             raw["contact_acquisition_samples"], "contact_acquisition_samples")
         release_ms = _plain_int(raw["release_dwell_ms"], "release_dwell_ms")
+        rest_ms = _plain_int(raw["rest_dwell_ms"], "rest_dwell_ms")
+        rest_additional_ms = _plain_int(
+            raw["rest_per_additional_joint_ms"],
+            "rest_per_additional_joint_ms")
+        maximum_rest_ms = _plain_int(
+            raw["maximum_rest_dwell_ms"], "maximum_rest_dwell_ms")
         recovery_ms = _plain_int(raw["recovery_duration_ms"], "recovery_duration_ms")
+        recovery_additional_permille = _plain_int(
+            raw["recovery_per_additional_joint_permille"],
+            "recovery_per_additional_joint_permille")
         follow_permille = _plain_int(raw["follow_permille"], "follow_permille")
         if control_ms <= 0 or observation_ms <= 0 or observation_ms > control_ms:
             raise CompliantConfigError("observation span must fit inside control period")
-        if arm_ms <= 0 or release_ms <= 0 or recovery_ms <= 0:
+        if (arm_ms <= 0 or release_ms <= 0 or rest_ms <= 0 or
+                recovery_ms <= 0):
             raise CompliantConfigError("compliant dwell/recovery durations must be positive")
+        if rest_additional_ms < 0 or maximum_rest_ms < rest_ms:
+            raise CompliantConfigError("compliant rest timing is inconsistent")
+        if not 0 <= recovery_additional_permille <= 1000:
+            raise CompliantConfigError(
+                "recovery_per_additional_joint_permille must be in [0, 1000]")
         if acquisition <= 0 or acquisition > 255:
             raise CompliantConfigError("contact_acquisition_samples must be in [1, 255]")
         if follow_permille <= 0 or follow_permille > 1000:
@@ -152,10 +202,14 @@ class CompliantHeadPolicy:
 
         return cls(
             minimum, maximum, maximum_baseline, entry, release, maximum_yield,
+            rest_pose, directional_rest,
             command_step, observed_step, quiet_step, holding_torque,
             control_ms / 1000.0,
             observation_ms / 1000.0, arm_ms / 1000.0, acquisition,
-            release_ms / 1000.0, recovery_ms / 1000.0,
+            release_ms / 1000.0, rest_ms / 1000.0,
+            rest_additional_ms / 1000.0, maximum_rest_ms / 1000.0,
+            recovery_ms / 1000.0,
+            recovery_additional_permille / 1000.0,
             follow_permille / 1000.0,
         )
 
@@ -187,14 +241,20 @@ class CompliantHeadController:
         self.quiet_since = None
         self.recovery_start = None
         self.recovery_started_at = None
+        self.rest_started_at = None
         self.reacquire_directions = None
         self.reacquire_samples = 0
+        self.contact_directions = (0, 0, 0, 0)
+        self.contact_rest_pose = self.policy.contact_rest_pose_offset_ticks
+        self.active_rest_duration_s = self.policy.rest_dwell_s
+        self.active_recovery_duration_s = self.policy.recovery_duration_s
         self.next_service_due = started_at
         self.fault = None
 
     @property
     def active(self):
-        return self.state in (CONFIRMING, YIELDING, RELEASE_DWELL, RECOVERING)
+        return self.state in (
+            CONFIRMING, YIELDING, RELEASE_DWELL, RESTING, RECOVERING)
 
     def _admit_pose(self, pose, field):
         if not isinstance(pose, (list, tuple)) or len(pose) != JOINT_COUNT:
@@ -266,8 +326,11 @@ class CompliantHeadController:
         desired = []
         for joint, actual in enumerate(positions):
             origin = self.return_target[joint]
-            displacement = actual - origin - self.baseline_error[joint]
-            offset = self._round_nearest(displacement * self.policy.follow_fraction)
+            rest = self.contact_rest_pose[joint]
+            displacement_from_rest = (
+                actual - origin - self.baseline_error[joint] - rest)
+            offset = rest + self._round_nearest(
+                displacement_from_rest * self.policy.follow_fraction)
             maximum = self.policy.maximum_yield_ticks[joint]
             offset = max(-maximum, min(maximum, offset))
             desired.append(max(self.policy.minimum_ticks[joint],
@@ -281,12 +344,65 @@ class CompliantHeadController:
         u = max(0.0, elapsed / duration)
         return u * u * u * (10.0 + u * (-15.0 + 6.0 * u))
 
-    def _enter_yield(self, positions):
+    def recovery_progress(self, now):
+        """Return the admitted [0, 1] progress of the active recovery."""
+        if self.state != RECOVERING or self.recovery_started_at is None:
+            return 0.0
+        if (isinstance(now, bool) or not isinstance(now, (int, float)) or
+                not math.isfinite(float(now)) or now < self.recovery_started_at):
+            raise CompliantObservationError("invalid recovery progress time")
+        return self._minimum_jerk(
+            float(now) - self.recovery_started_at,
+            self.active_recovery_duration_s)
+
+    def _enter_yield(self, positions, directions, event="pet_contact"):
+        active_joints = max(1, sum(direction != 0 for direction in directions))
+        additional_joints = active_joints - 1
+        self.contact_directions = tuple(directions)
+        self.contact_rest_pose = tuple(
+            base + direction * directional
+            for base, direction, directional in zip(
+                self.policy.contact_rest_pose_offset_ticks,
+                directions,
+                self.policy.contact_directional_rest_offset_ticks))
+        self.active_rest_duration_s = min(
+            self.policy.maximum_rest_dwell_s,
+            self.policy.rest_dwell_s
+            + additional_joints * self.policy.rest_per_additional_joint_s)
+        self.active_recovery_duration_s = self.policy.recovery_duration_s * (
+            1.0 + additional_joints
+            * self.policy.recovery_per_additional_joint_fraction)
         self.state = YIELDING
         self.quiet_since = None
+        self.rest_started_at = None
+        self.reacquire_directions = None
+        self.reacquire_samples = 0
         residual = self._residual_errors(positions)
         self.target = self._yield_target(positions)
-        return CompliantStep(self.state, self.target, residual, "pet_contact")
+        return CompliantStep(self.state, self.target, residual, event)
+
+    def _recontact_confirmed(self, positions):
+        directions = self._directions(positions)
+        if directions == (0, 0, 0, 0):
+            self.reacquire_directions = None
+            self.reacquire_samples = 0
+        elif (self.reacquire_directions is not None and
+              self._directions_continue(self.reacquire_directions, directions)):
+            self.reacquire_directions = tuple(
+                old if old != 0 else new for old, new in zip(
+                    self.reacquire_directions, directions))
+            self.reacquire_samples += 1
+        else:
+            self.reacquire_directions = directions
+            self.reacquire_samples = 1
+        return self.reacquire_samples >= self.policy.contact_acquisition_samples
+
+    def _rest_target(self):
+        return tuple(max(self.policy.minimum_ticks[joint],
+                         min(self.policy.maximum_ticks[joint],
+                             self.return_target[joint]
+                             + self.contact_rest_pose[joint]))
+                     for joint in range(JOINT_COUNT))
 
     def service(self, now, expression_target_ticks, positions, moving,
                 observation_span_s):
@@ -352,7 +468,7 @@ class CompliantHeadController:
                     self.candidate_directions = directions
                     self.candidate_samples = 1
                     if self.policy.contact_acquisition_samples == 1:
-                        result = self._enter_yield(positions)
+                        result = self._enter_yield(positions, directions)
                         event = result.event
                     else:
                         self.state = CONFIRMING
@@ -376,9 +492,13 @@ class CompliantHeadController:
                     self.contact_armed = False
                     self.baseline_error = (0, 0, 0, 0)
                 else:
+                    self.candidate_directions = tuple(
+                        old if old != 0 else new for old, new in zip(
+                            self.candidate_directions, directions))
                     self.candidate_samples += 1
                     if self.candidate_samples >= self.policy.contact_acquisition_samples:
-                        result = self._enter_yield(positions)
+                        result = self._enter_yield(
+                            positions, self.candidate_directions)
                         event = result.event
 
         elif self.state in (YIELDING, RELEASE_DWELL):
@@ -388,39 +508,46 @@ class CompliantHeadController:
                     self.quiet_since = now
                 self.state = RELEASE_DWELL
                 if now - self.quiet_since >= self.policy.release_dwell_s:
+                    self.state = RESTING
+                    self.rest_started_at = now
+                    self.reacquire_directions = None
+                    self.reacquire_samples = 0
+                    event = "pet_resting"
+            else:
+                self.quiet_since = None
+                self.state = YIELDING
+                self.target = self._yield_target(positions)
+
+        elif self.state == RESTING:
+            if self._recontact_confirmed(positions):
+                result = self._enter_yield(
+                    positions, self.reacquire_directions, "pet_recontact")
+                event = result.event
+            else:
+                self.target = self._command_step(self._rest_target())
+                if now - self.rest_started_at >= self.active_rest_duration_s:
                     self.state = RECOVERING
                     self.recovery_start = self.target
                     self.recovery_started_at = now
                     self.reacquire_directions = None
                     self.reacquire_samples = 0
                     event = "pet_recovering"
-            else:
-                self.quiet_since = None
-                self.state = YIELDING
-                self.target = self._yield_target(positions)
 
         elif self.state == RECOVERING:
-            directions = self._directions(positions)
-            if directions == (0, 0, 0, 0):
-                self.reacquire_directions = None
-                self.reacquire_samples = 0
-            elif (self.reacquire_directions is not None and
-                  self._directions_continue(self.reacquire_directions, directions)):
-                self.reacquire_samples += 1
-            else:
-                self.reacquire_directions = directions
-                self.reacquire_samples = 1
-            if self.reacquire_samples >= self.policy.contact_acquisition_samples:
-                result = self._enter_yield(positions)
-                event = "pet_recontact"
+            if self._recontact_confirmed(positions):
+                result = self._enter_yield(
+                    positions, self.reacquire_directions, "pet_recontact")
+                event = result.event
             else:
                 elapsed = now - self.recovery_started_at
-                progress = self._minimum_jerk(elapsed, self.policy.recovery_duration_s)
+                progress = self._minimum_jerk(
+                    elapsed, self.active_recovery_duration_s)
                 desired = tuple(self._round_nearest(start + (finish - start) * progress)
                                 for start, finish in zip(
                                     self.recovery_start, self.return_target))
                 self.target = self._command_step(desired)
-                if elapsed >= self.policy.recovery_duration_s and self.target == self.return_target:
+                if (elapsed >= self.active_recovery_duration_s and
+                        self.target == self.return_target):
                     self.state = FOLLOWING
                     self.quiescent_since = None
                     self.contact_armed = False

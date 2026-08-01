@@ -8,7 +8,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from organic_motion import (
     EyeIntent, MotionAxisPolicy, MotionConfigError, MotionInputError,
-    OrganicEyeDynamics, OrganicMotionAxis, parse_head_motion_policies,
+    OrganicEyeDynamics, OrganicMotionAxis, PetEyeChoreographer,
+    parse_head_motion_policies,
 )
 
 
@@ -133,6 +134,66 @@ class OrganicEyeDynamicsTests(unittest.TestCase):
             previous = actual
         self.assertLessEqual(maximum_output_step, 75)
         self.assertGreater(len(set(outputs)), 2)
+
+
+class PetEyeChoreographerTests(unittest.TestCase):
+    def test_touch_direction_selects_distinct_continuous_visual_fields(self):
+        base = EyeIntent.bounded(gaze_x=10, gaze_y=20, color=(20, 30, 40))
+        yaw = PetEyeChoreographer().apply(
+            1.0, base, "YIELDING", (0, 0, 1, 0))
+        roll = PetEyeChoreographer().apply(
+            1.0, base, "YIELDING", (0, 0, 0, -1))
+        multi = PetEyeChoreographer().apply(
+            1.0, base, "YIELDING", (1, 1, 1, 0))
+        self.assertGreater(yaw.gaze_x, 0)
+        self.assertLess(roll.gaze_x, 0)
+        self.assertNotEqual(yaw.color, roll.color)
+        self.assertGreater(multi.lid, yaw.lid)
+        self.assertLess(multi.gaze_y, yaw.gaze_y)
+
+    def test_rest_looks_down_blinks_once_and_softens(self):
+        choreography = PetEyeChoreographer()
+        base = EyeIntent.bounded(gaze_y=100, lid=60, brightness=900)
+        first = choreography.apply(
+            1.0, base, "RESTING", (1, 0, 0, 0))
+        second = choreography.apply(
+            1.1, base, "RESTING", (1, 0, 0, 0))
+        self.assertLess(first.gaze_y, -350)
+        self.assertGreater(first.lid, 500)
+        self.assertLess(first.brightness, base.brightness)
+        self.assertEqual(first.expression, "sleepy")
+        self.assertTrue(first.blink)
+        self.assertFalse(second.blink)
+
+    def test_recovery_arc_blends_exactly_back_to_living_intent(self):
+        choreography = PetEyeChoreographer()
+        base = EyeIntent.bounded(
+            gaze_x=-120, gaze_y=80, lid=90, pupil=540,
+            brightness=760, expression="curious", color=(30, 170, 210))
+        start = choreography.apply(
+            1.0, base, "RECOVERING", (0, 0, 1, 1), 0.0)
+        before_mid = choreography.apply(
+            1.3, base, "RECOVERING", (0, 0, 1, 1), 0.4)
+        middle = choreography.apply(
+            1.4, base, "RECOVERING", (0, 0, 1, 1), 0.55)
+        after_mid = choreography.apply(
+            1.5, base, "RECOVERING", (0, 0, 1, 1), 0.6)
+        finish = choreography.apply(
+            2.0, base, "RECOVERING", (0, 0, 1, 1), 1.0)
+        self.assertTrue(start.blink)
+        self.assertFalse(before_mid.blink)
+        self.assertTrue(middle.blink)
+        self.assertFalse(after_mid.blink)
+        self.assertEqual(finish, base)
+
+    def test_invalid_direction_is_rejected_once_at_boundary(self):
+        with self.assertRaises(MotionInputError):
+            PetEyeChoreographer().apply(
+                0.0, EyeIntent.bounded(), "RESTING", (0, 0, 2, 0))
+        with self.assertRaises(MotionInputError):
+            PetEyeChoreographer().apply(
+                0.0, EyeIntent.bounded(), "RECOVERING", (0, 0, 1, 0),
+                math.nan)
 
 
 if __name__ == "__main__":
