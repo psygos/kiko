@@ -206,6 +206,14 @@ No axis is admitted beyond either the structural startup bound or the prior
 engine's calibrated range. This is takeover compatibility evidence, not
 evidence for touch quality or perceived softness.
 
+The same live handoff also showed a repeatable raw-moving transient after the
+actor wrote the observed goal and repeated the already-enabled torque state:
+the preceding probe was stationary, but the immediate first stopped readback
+reported `moving`. Startup now waits exactly one existing 100 ms head-return
+control period before collecting its two required stopped readbacks. The wait
+does not convert motion into success; both samples still fail closed on raw
+moving, mismatch, unstable position, device status, or telemetry limits.
+
 For the attended Nano handoff, `deploy/kiko-accessory-commissioning-guardian.sh`
 keeps two deliberately separate device owners alive. The existing expression
 process runs with `--no-head` and therefore retains only OAK/eye behavior; the

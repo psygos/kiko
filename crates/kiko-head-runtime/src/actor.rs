@@ -18,9 +18,9 @@ use crate::compliant_hold::{
     HeadCompliantHoldController, HeadCompliantTorqueBindingError,
 };
 use crate::config::{
-    ConfigParseError, ConfiguredHeadPoseBounds, HeadPoseBoundsAdmissionError,
-    HeadPoseWithinConfiguredBounds, HeadReturnPlan, HeadRuntimeConfig,
-    HeadTelemetrySafetyViolation, OperationTimeout, ReturnToTargetConfig,
+    ConfigParseError, ConfiguredHeadPoseBounds, HEAD_RETURN_CONTROL_PERIOD,
+    HeadPoseBoundsAdmissionError, HeadPoseWithinConfiguredBounds, HeadReturnPlan,
+    HeadRuntimeConfig, HeadTelemetrySafetyViolation, OperationTimeout, ReturnToTargetConfig,
 };
 use crate::framing::{FrameReadError, read_response_frame};
 use crate::gaze_control::{
@@ -4025,6 +4025,14 @@ where
                 control,
             )
             .await?;
+
+        // A goal write equal to the observed position or a repeated torque-on
+        // write can transiently assert the servo's raw moving bit even when
+        // the pre-write observation was stationary. Wait one existing servo
+        // control period before the two mandatory stopped readbacks. This is
+        // not a fallback: either readback still fails closed on moving,
+        // mismatch, unstable position, device status, or telemetry limits.
+        tokio::time::sleep(HEAD_RETURN_CONTROL_PERIOD).await;
 
         let readbacks = [
             self.verify_joint(
