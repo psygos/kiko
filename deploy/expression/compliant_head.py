@@ -141,6 +141,14 @@ class CompliantHeadPolicy:
             raise CompliantConfigError("contact_acquisition_samples must be in [1, 255]")
         if follow_permille <= 0 or follow_permille > 1000:
             raise CompliantConfigError("follow_permille must be in [1, 1000]")
+        for joint in range(JOINT_COUNT):
+            yielded_at_entry = (
+                entry[joint] * follow_permille + 500) // 1000
+            retained_error = entry[joint] - yielded_at_entry
+            if retained_error <= release[joint]:
+                raise CompliantConfigError(
+                    f"joint {joint} follow gain collapses contact/release "
+                    "hysteresis at the entry boundary")
 
         return cls(
             minimum, maximum, maximum_baseline, entry, release, maximum_yield,
