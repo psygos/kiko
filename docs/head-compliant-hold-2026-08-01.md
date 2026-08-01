@@ -222,9 +222,12 @@ holding the assembled mechanism: `[650,550,400,400]` permille, not the earlier
 `[600,400,400,400]` commissioning hypothesis. At its natural goal, repeated
 stationary telemetry showed gravity-axis tracking offsets of 22 and 23 ticks.
 The attended config therefore uses the proven torque values and a 24-tick
-startup readback tolerance. This does not claim minimum sufficient torque; it
-only prevents a takeover from weakening the known working hold or rejecting
-its measured stationary tracking error.
+startup readback tolerance. The distinct final-target, path-corridor, and
+direction-regression tolerances are likewise 24 ticks, so the return controller
+uses the same measured tracking-error envelope without conflating their typed
+roles. This does not claim minimum sufficient torque; it only prevents a
+takeover from weakening the known working hold or rejecting its measured
+stationary tracking error.
 
 Most importantly, attended takeover no longer writes the observed shaft pose
 back as a new goal. Under gravity that erased the prior goal error which was
