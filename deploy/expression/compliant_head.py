@@ -156,6 +156,7 @@ class CompliantHeadPolicy:
 class CompliantStep:
     state: str
     target_ticks: tuple
+    residual_error_ticks: tuple
     event: str = None
 
 
@@ -217,17 +218,21 @@ class CompliantHeadController:
                         f"joint {joint} observation discontinuity {difference} ticks")
 
     def _inside_release(self, positions):
-        return all(abs(actual - command - baseline) <= release
-                   for actual, command, baseline, release in zip(
-                       positions, self.target, self.baseline_error,
-                       self.policy.contact_release_error_ticks))
+        return all(abs(error) <= release for error, release in zip(
+            self._residual_errors(positions),
+            self.policy.contact_release_error_ticks))
+
+    def _residual_errors(self, positions, target=None):
+        command_ticks = self.target if target is None else target
+        return tuple(actual - command - baseline
+                     for actual, command, baseline in zip(
+                         positions, command_ticks, self.baseline_error))
 
     def _directions(self, positions):
         result = []
-        for actual, command, baseline, threshold in zip(
-                positions, self.target, self.baseline_error,
+        for error, threshold in zip(
+                self._residual_errors(positions),
                 self.policy.contact_entry_error_ticks):
-            error = actual - command - baseline
             result.append(0 if abs(error) < threshold else (1 if error > 0 else -1))
         return tuple(result)
 
@@ -271,8 +276,9 @@ class CompliantHeadController:
     def _enter_yield(self, positions):
         self.state = YIELDING
         self.quiet_since = None
+        residual = self._residual_errors(positions)
         self.target = self._yield_target(positions)
-        return CompliantStep(self.state, self.target, "pet_contact")
+        return CompliantStep(self.state, self.target, residual, "pet_contact")
 
     def service(self, now, expression_target_ticks, positions, moving,
                 observation_span_s):
@@ -289,6 +295,10 @@ class CompliantHeadController:
             raise
 
         expression_target = tuple(expression_target_ticks)
+        # The serial owner has already issued expression_target as the
+        # physical command. Compute diagnostics against that exact generation,
+        # not the planner's preceding target.
+        observed_residual = self._residual_errors(positions, expression_target)
         expression_quiet = all(
             abs(actual - previous) <= maximum
             for actual, previous, maximum in zip(
@@ -412,4 +422,4 @@ class CompliantHeadController:
         self.previous_expression_target = expression_target
         self.previous_observation = tuple(positions)
         self.next_service_due = now + self.policy.control_period_s
-        return CompliantStep(self.state, self.target, event)
+        return CompliantStep(self.state, self.target, observed_residual, event)

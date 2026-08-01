@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -46,6 +47,16 @@ def service(controller, at, position=(100, 100, 100, 100),
 
 
 class CompliantHeadPolicyTests(unittest.TestCase):
+    def test_deployed_pet_profile_is_parsed_as_reviewed(self):
+        with open(os.path.join(os.path.dirname(__file__), "config.json")) as source:
+            raw = json.load(source)
+        policy = CompliantHeadPolicy.parse(
+            raw["compliant_hold"], [650, 550, 400, 400])
+        self.assertEqual(policy.contact_entry_error_ticks, (10, 12, 10, 10))
+        self.assertEqual(policy.contact_release_error_ticks, (4, 5, 4, 4))
+        self.assertEqual(policy.contact_acquisition_samples, 2)
+        self.assertEqual(policy.follow_fraction, 0.8)
+
     def test_boundary_rejects_unknown_and_missing_fields(self):
         raw = policy_json()
         raw["mystery"] = 1
@@ -82,6 +93,7 @@ class CompliantHeadControllerTests(unittest.TestCase):
         third = service(controller, 1.3, (124, 100, 100, 100), moving=True)
         self.assertEqual(third.state, YIELDING)
         self.assertEqual(third.event, "pet_contact")
+        self.assertEqual(third.residual_error_ticks, (24, 0, 0, 0))
         # 35% of 24 ticks rounds to 8, but one physical command may move only 3.
         self.assertEqual(third.target_ticks, (103, 100, 100, 100))
 
