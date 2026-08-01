@@ -22,8 +22,8 @@
     "minimum_ticks": [2064, 2390, 1157, 2887],
     "maximum_ticks": [2284, 2750, 2117, 3207],
     "maximum_baseline_error_ticks": [32, 40, 24, 24],
-    "contact_entry_error_ticks": [12, 16, 18, 12],
-    "contact_release_error_ticks": [5, 7, 8, 5],
+    "contact_entry_error_ticks": [10, 12, 10, 10],
+    "contact_release_error_ticks": [4, 5, 4, 4],
     "maximum_yield_ticks": [24, 36, 80, 24],
     "maximum_command_step_ticks": [3, 4, 8, 3],
     "maximum_observed_step_ticks": [64, 80, 160, 64],
@@ -32,9 +32,9 @@
     "control_period_ms": 100,
     "maximum_observation_span_ms": 60,
     "contact_arm_dwell_ms": 1000,
-    "contact_acquisition_samples": 3,
+    "contact_acquisition_samples": 2,
     "release_dwell_ms": 600,
     "recovery_duration_ms": 2400,
-    "follow_permille": 500
+    "follow_permille": 800
   }
 }

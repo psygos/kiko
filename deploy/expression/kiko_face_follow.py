@@ -27,7 +27,10 @@ import cv2
 import numpy as np
 import serial
 
-from compliant_head import CompliantHeadController, CompliantHeadPolicy, FOLLOWING
+from compliant_head import (
+    CompliantHeadController, CompliantHeadPolicy, FOLLOWING, RECOVERING,
+    RELEASE_DWELL, YIELDING,
+)
 
 # ----------------------------------------------------------------------------
 # Configuration (operator-reviewed values; signs are flippable via config file)
@@ -483,6 +486,7 @@ class HeadController:
         self.compliant_policy = CompliantHeadPolicy.parse(
             cfg["compliant_hold"], cfg["torque_limit_permille"])
         self.compliance = None
+        self.compliance_probe_due = 0.0
 
     def _confirm_temperature(self, joint, servo_id, telemetry, limit, stage):
         if telemetry["temperature_raw"] <= limit:
@@ -640,9 +644,10 @@ class HeadController:
             self.compliance.next_service_due = time.monotonic()
             return
         telemetry, span = observed
+        observed_command = tuple(self.goal)
         step = self.compliance.service(
             now,
-            tuple(self.goal),
+            observed_command,
             tuple(item["position"] for item in telemetry),
             tuple(bool(item["moving"]) for item in telemetry),
             span,
@@ -655,7 +660,27 @@ class HeadController:
                     servo_id, desired[joint], self.cfg["track_speed_max"])
         if step.event is not None:
             print(f"compliant event={step.event} state={step.state} "
-                  f"target={list(step.target_ticks)}", flush=True)
+                  f"target={list(step.target_ticks)} "
+                  f"residual={list(step.residual_error_ticks)}", flush=True)
+        # A bounded, rate-limited near-threshold trace makes attended tuning
+        # observable without turning ordinary encoder noise into a touch or
+        # flooding the long-running owner log.
+        near_contact = any(
+            abs(error) * 2 >= threshold
+            for error, threshold in zip(
+                step.residual_error_ticks,
+                self.compliant_policy.contact_entry_error_ticks))
+        if (self.compliance.contact_armed and near_contact and
+                now >= self.compliance_probe_due):
+            print(
+                f"compliant probe residual={list(step.residual_error_ticks)} "
+                f"positions={[item['position'] for item in telemetry]} "
+                f"goal={list(observed_command)} "
+                f"baseline={list(self.compliance.baseline_error)} "
+                f"moving={[bool(item['moving']) for item in telemetry]}",
+                flush=True,
+            )
+            self.compliance_probe_due = now + 0.5
 
     def telemetry_check(self):
         self._read_safe_observation()
@@ -1470,6 +1495,22 @@ def main():
                     head.telemetry_check()
 
             if eyes is not None:
+                if head is not None and head.compliance is not None:
+                    pet_state = head.compliance.state
+                    if pet_state in (YIELDING, RELEASE_DWELL):
+                        # Held contact gets a sustained, unmistakable warm
+                        # squint. Head compliance still owns all movement;
+                        # this is only its eye-level acknowledgement.
+                        intent.update(
+                            lid=330, pupil=720, brightness=900,
+                            expression="greet", blink=False,
+                            color=(255, 125, 175),
+                        )
+                    elif pet_state == RECOVERING:
+                        intent.update(
+                            lid=180, pupil=650, brightness=820,
+                            expression="greet", color=(255, 175, 105),
+                        )
                 try:
                     eyes.apply(**intent)
                     eye_failures = 0
