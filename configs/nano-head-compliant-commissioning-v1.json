@@ -18,10 +18,10 @@
     "direction_regression_tolerance_ticks": 20,
     "goal_speed_ticks_per_second": 50,
     "torque_limit_permille": [600, 400, 400, 400],
-    "minimum_start_ticks": [2064, 2442, 1509, 2919],
-    "maximum_start_ticks": [2284, 2698, 1765, 3175],
+    "minimum_start_ticks": [2046, 2442, 1509, 2919],
+    "maximum_start_ticks": [2302, 2698, 1765, 3175],
     "target_ticks": [2174, 2570, 1637, 3047],
-    "maximum_travel_ticks": [110, 128, 128, 128],
+    "maximum_travel_ticks": [128, 128, 128, 128],
     "maximum_hold_ms": 86400000,
     "physical_motion_consent": "return_to_reviewed_target"
   },

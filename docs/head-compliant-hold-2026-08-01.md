@@ -200,11 +200,14 @@ around the same `[2174,2570,1637,3047]` natural pose. The typed takeover domain
 also limits every per-axis startup window to 256 ticks, so this attended
 configuration retains the complete 220-tick calibrated bow span and a
 natural-centered 256-tick subset for curl, yaw, and roll. Maximum return travel
-is cross-bound to the resulting `[110,128,128,128]` maximum offsets. The
-observed handoff pose `[2123,2621,1633,3041]` lies inside those exact windows.
-No axis is admitted beyond either the structural startup bound or the prior
-engine's calibrated range. This is takeover compatibility evidence, not
-evidence for touch quality or perceived softness.
+is cross-bound to 128 ticks on every axis. During the handoff the bow settled
+at 2062 ticks around the legacy minimum command of 2064, a 2-tick tracking
+offset inside the existing 20-tick readback tolerance. The natural-centered
+bow window is therefore also 256 ticks (`2046..=2302`): it remains inside the
+structural span and inside the calibrated command range plus readback
+tolerance. The final observed handoff pose `[2062,2673,1632,3041]` lies inside
+the exact windows. This is takeover compatibility evidence, not evidence for
+touch quality or perceived softness.
 
 The same live handoff also showed a repeatable raw-moving transient after the
 actor wrote the observed goal and repeated the already-enabled torque state:
