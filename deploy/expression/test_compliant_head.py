@@ -51,7 +51,9 @@ class CompliantHeadPolicyTests(unittest.TestCase):
         with open(os.path.join(os.path.dirname(__file__), "config.json")) as source:
             raw = json.load(source)
         policy = CompliantHeadPolicy.parse(
-            raw["compliant_hold"], [650, 550, 400, 400])
+            raw["compliant_hold"], raw["torque_limit_permille"])
+        self.assertEqual(
+            policy.holding_torque_limit_permille, (600, 500, 250, 300))
         self.assertEqual(policy.contact_entry_error_ticks, (10, 12, 10, 10))
         self.assertEqual(policy.contact_release_error_ticks, (4, 5, 4, 4))
         self.assertEqual(policy.contact_acquisition_samples, 2)

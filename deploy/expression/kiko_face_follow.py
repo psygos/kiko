@@ -661,7 +661,8 @@ class HeadController:
         if step.event is not None:
             print(f"compliant event={step.event} state={step.state} "
                   f"target={list(step.target_ticks)} "
-                  f"residual={list(step.residual_error_ticks)}", flush=True)
+                  f"residual={list(step.residual_error_ticks)} "
+                  f"baseline={list(self.compliance.baseline_error)}", flush=True)
         # A bounded, rate-limited near-threshold trace makes attended tuning
         # observable without turning ordinary encoder noise into a touch or
         # flooding the long-running owner log.
