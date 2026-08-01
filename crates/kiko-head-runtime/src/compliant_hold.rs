@@ -431,6 +431,7 @@ impl CompliantHeadObservation {
         let mut moving = [false; JOINT_COUNT];
         let mut load_raw = [0; JOINT_COUNT];
         let mut current_raw = [0; JOINT_COUNT];
+        let mut first_temperature_violation = None;
         for index in 1..JOINT_COUNT {
             if received_at[index] < received_at[index - 1] {
                 return Err(CompliantHeadObservationError::ClockRegression {
@@ -481,16 +482,29 @@ impl CompliantHeadObservation {
                     raw: sample.device_status_raw(),
                 });
             }
-            safety
-                .admit_energized(sample.voltage_raw(), sample.temperature_raw())
-                .map_err(|source| CompliantHeadObservationError::TelemetrySafety {
-                    joint,
-                    source,
-                })?;
+            match safety.admit_energized(sample.voltage_raw(), sample.temperature_raw()) {
+                Ok(()) => {}
+                Err(
+                    source @ HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
+                        ..
+                    },
+                ) => {
+                    first_temperature_violation.get_or_insert((joint, source));
+                }
+                Err(source) => {
+                    return Err(CompliantHeadObservationError::TelemetrySafety {
+                        joint,
+                        source,
+                    });
+                }
+            }
             positions[index] = sample.position();
             moving[index] = sample.is_moving();
             load_raw[index] = sample.load_raw();
             current_raw[index] = sample.current_raw();
+        }
+        if let Some((joint, source)) = first_temperature_violation {
+            return Err(CompliantHeadObservationError::TelemetrySafety { joint, source });
         }
         Ok(Self {
             observed_at: received_at[JOINT_COUNT - 1],
