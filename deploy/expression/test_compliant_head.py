@@ -15,6 +15,7 @@ def policy_json():
     return {
         "minimum_ticks": [50, 50, 50, 50],
         "maximum_ticks": [150, 150, 150, 150],
+        "maximum_baseline_error_ticks": [30, 30, 30, 30],
         "contact_entry_error_ticks": [18, 18, 18, 18],
         "contact_release_error_ticks": [8, 8, 8, 8],
         "maximum_yield_ticks": [30, 30, 30, 30],
@@ -97,6 +98,15 @@ class CompliantHeadControllerTests(unittest.TestCase):
         # Contact is displacement beyond the learned bias, not raw goal error.
         result = service(controller, 1.2, (136, 115, 100, 100), moving=True)
         self.assertEqual(result.state, CONFIRMING)
+
+    def test_baseline_outside_its_own_envelope_never_arms(self):
+        controller = make_controller()
+        outside = (131, 100, 100, 100)
+        for step in range(20):
+            result = service(controller, step / 10.0, outside)
+        self.assertEqual(result.state, FOLLOWING)
+        self.assertFalse(controller.contact_armed)
+        self.assertEqual(controller.baseline_error, (0, 0, 0, 0))
 
     def test_direction_reversal_rejects_false_contact(self):
         controller = make_controller()

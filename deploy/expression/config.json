@@ -20,8 +20,9 @@
   "compliant_hold": {
     "minimum_ticks": [2064, 2390, 1157, 2887],
     "maximum_ticks": [2284, 2750, 2117, 3207],
-    "contact_entry_error_ticks": [18, 24, 32, 18],
-    "contact_release_error_ticks": [8, 10, 14, 8],
+    "maximum_baseline_error_ticks": [32, 40, 24, 24],
+    "contact_entry_error_ticks": [12, 16, 18, 12],
+    "contact_release_error_ticks": [5, 7, 8, 5],
     "maximum_yield_ticks": [24, 36, 80, 24],
     "maximum_command_step_ticks": [3, 4, 8, 3],
     "maximum_observed_step_ticks": [64, 80, 160, 64],
@@ -33,6 +34,6 @@
     "contact_acquisition_samples": 3,
     "release_dwell_ms": 600,
     "recovery_duration_ms": 2400,
-    "follow_permille": 350
+    "follow_permille": 500
   }
 }
