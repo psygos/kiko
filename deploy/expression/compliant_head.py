@@ -48,6 +48,7 @@ def _int4(value, field, minimum, maximum):
 class CompliantHeadPolicy:
     minimum_ticks: tuple
     maximum_ticks: tuple
+    maximum_baseline_error_ticks: tuple
     contact_entry_error_ticks: tuple
     contact_release_error_ticks: tuple
     maximum_yield_ticks: tuple
@@ -68,7 +69,8 @@ class CompliantHeadPolicy:
         if not isinstance(raw, dict):
             raise CompliantConfigError("compliant_hold must be an object")
         expected = {
-            "minimum_ticks", "maximum_ticks", "contact_entry_error_ticks",
+            "minimum_ticks", "maximum_ticks", "maximum_baseline_error_ticks",
+            "contact_entry_error_ticks",
             "contact_release_error_ticks", "maximum_yield_ticks",
             "maximum_command_step_ticks", "maximum_observed_step_ticks",
             "quiet_command_step_ticks", "holding_torque_limit_permille",
@@ -84,6 +86,9 @@ class CompliantHeadPolicy:
 
         minimum = _int4(raw["minimum_ticks"], "minimum_ticks", 0, 4095)
         maximum = _int4(raw["maximum_ticks"], "maximum_ticks", 0, 4095)
+        maximum_baseline = _int4(
+            raw["maximum_baseline_error_ticks"],
+            "maximum_baseline_error_ticks", 1, 4095)
         entry = _int4(raw["contact_entry_error_ticks"],
                       "contact_entry_error_ticks", 1, 4095)
         release = _int4(raw["contact_release_error_ticks"],
@@ -138,8 +143,9 @@ class CompliantHeadPolicy:
             raise CompliantConfigError("follow_permille must be in [1, 1000]")
 
         return cls(
-            minimum, maximum, entry, release, maximum_yield, command_step,
-            observed_step, quiet_step, holding_torque, control_ms / 1000.0,
+            minimum, maximum, maximum_baseline, entry, release, maximum_yield,
+            command_step, observed_step, quiet_step, holding_torque,
+            control_ms / 1000.0,
             observation_ms / 1000.0, arm_ms / 1000.0, acquisition,
             release_ms / 1000.0, recovery_ms / 1000.0,
             follow_permille / 1000.0,
@@ -300,13 +306,15 @@ class CompliantHeadController:
                 candidate_baseline = tuple(
                     actual - command
                     for actual, command in zip(positions, self.target))
-                # A learned holding bias is admissible only strictly inside
-                # the contact-entry band. Larger error is not quietly
-                # reclassified as gravity; it prevents arming.
+                # Natural tracking bias and touch sensitivity are distinct
+                # physical quantities. A bounded stopped bias may be larger
+                # than the residual contact threshold, but an observation
+                # outside the separately reviewed bias envelope cannot be
+                # quietly reclassified as gravity.
                 settled = (not any(moving) and all(
-                    abs(error) < entry for error, entry in zip(
+                    abs(error) <= maximum for error, maximum in zip(
                         candidate_baseline,
-                        self.policy.contact_entry_error_ticks)))
+                        self.policy.maximum_baseline_error_ticks)))
                 self.quiescent_since = (self.quiescent_since if settled
                                         else None)
                 if settled and self.quiescent_since is None:

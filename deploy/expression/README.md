@@ -22,7 +22,7 @@ The live owner also runs the same conservative encoder-domain compliant-hold
 policy qualified by the typed Rust controller: one second of settled motion
 captures a bounded four-axis gravity/tracking bias and arms touch detection,
 three direction-consistent residual samples admit contact, the
-head follows 35% of bounded displacement, waits 600 ms after release, and
+head follows 50% of bounded displacement, waits 600 ms after release, and
 returns with a 2.4 s minimum-jerk trajectory. The pure planner is isolated in
 `compliant_head.py`, strictly parses its complete policy once, binds the policy
 to the installed torque limits, ignores unqualified load/current units, and is
