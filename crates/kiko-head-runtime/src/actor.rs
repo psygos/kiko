@@ -3,10 +3,11 @@ use std::time::Duration;
 
 use kiko_head_protocol::{
     ExactHeadTargetPose, FullTelemetry, GoalPositionObservation, GoalSpeedTicksPerSecond,
-    HeadJoint, HeadPose, HeadPoseError, PositionAgreementError, PositionAgreementTicks,
-    PositionTicks, TelemetryParseError, TorqueSwitch, ValidatedPresentPosition,
-    build_full_telemetry_read, build_goal_position_read, build_goal_with_speed_write,
-    build_natural_hold_frames, build_torque_switch_write,
+    HeadJoint, HeadPose, HeadPoseError, ObservedTorqueSwitch, PositionAgreementError,
+    PositionAgreementTicks, PositionTicks, ResponseParseError, TelemetryParseError, TorqueSwitch,
+    TorqueSwitchObservation, ValidatedPresentPosition, build_full_telemetry_read,
+    build_goal_position_read, build_goal_with_speed_write, build_natural_hold_frames,
+    build_torque_switch_read, build_torque_switch_write,
 };
 use tokio::runtime::{Handle, TryCurrentError};
 use tokio::sync::{mpsc, oneshot};
@@ -285,6 +286,7 @@ impl AttendedCompliantCommissioningTakeoverConsent {
 pub enum RuntimeStage {
     ObserveFirst,
     ObserveSecond,
+    ObserveRetainedTorqueSwitch,
     WriteObservedGoal,
     WriteTorqueLimit,
     RefreshBeforeEnable,
@@ -312,6 +314,7 @@ pub enum ArmingFreshnessCheck {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WritePurpose {
     TelemetryReadRequest,
+    TorqueSwitchReadRequest,
     GoalPositionReadRequest,
     ObservedGoal,
     GoalWithSpeed,
@@ -723,20 +726,105 @@ impl ReadbackEvidence {
 /// holding before the actor acquired exclusive serial ownership.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeadStartupTorqueEvidence {
-    CommissioningDisableFirst { report: Box<TorqueDisableReport> },
+    CommissioningDisableFirst {
+        report: Box<TorqueDisableReport>,
+    },
     TensionPreservingTakeover,
+    /// Attended takeover proved every torque switch enabled and retained the
+    /// pre-existing goals; it did not issue a torque-switch write.
+    AttendedEnabledHoldTakeover,
 }
 
 impl HeadStartupTorqueEvidence {
     pub fn commissioning_disable_report(&self) -> Option<&TorqueDisableReport> {
         match self {
             Self::CommissioningDisableFirst { report } => Some(report.as_ref()),
-            Self::TensionPreservingTakeover => None,
+            Self::TensionPreservingTakeover | Self::AttendedEnabledHoldTakeover => None,
         }
     }
 
     pub const fn is_tension_preserving_takeover(&self) -> bool {
-        matches!(self, Self::TensionPreservingTakeover)
+        matches!(
+            self,
+            Self::TensionPreservingTakeover | Self::AttendedEnabledHoldTakeover
+        )
+    }
+}
+
+/// Mutually exclusive evidence for how startup established or retained a
+/// stopped hold. Invalid mixtures of host-applied and retained-prior writes
+/// are unrepresentable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadStartupApplicationEvidence {
+    HostAppliedObservedHold(Box<HostAppliedObservedHoldEvidence>),
+    RetainedEnabledHold(Box<RetainedEnabledHoldEvidence>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostAppliedObservedHoldEvidence {
+    observed_goal_writes: [WriteEvidence; 4],
+    torque_limit_writes: [WriteEvidence; 4],
+    pre_enable_telemetry: [ResponseEvidence<FullTelemetry>; 4],
+    torque_enable_writes: [WriteEvidence; 4],
+    readbacks: [ReadbackEvidence; 4],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedEnabledHoldEvidence {
+    torque_switches: [ResponseEvidence<TorqueSwitchObservation>; 4],
+    torque_limit_writes: [WriteEvidence; 4],
+    readbacks: [ReadbackEvidence; 4],
+}
+
+impl HostAppliedObservedHoldEvidence {
+    pub const fn observed_goal_writes(&self) -> &[WriteEvidence; 4] {
+        &self.observed_goal_writes
+    }
+
+    pub const fn torque_limit_writes(&self) -> &[WriteEvidence; 4] {
+        &self.torque_limit_writes
+    }
+
+    pub const fn pre_enable_telemetry(&self) -> &[ResponseEvidence<FullTelemetry>; 4] {
+        &self.pre_enable_telemetry
+    }
+
+    pub const fn torque_enable_writes(&self) -> &[WriteEvidence; 4] {
+        &self.torque_enable_writes
+    }
+
+    pub const fn readbacks(&self) -> &[ReadbackEvidence; 4] {
+        &self.readbacks
+    }
+}
+
+impl RetainedEnabledHoldEvidence {
+    pub const fn torque_switches(&self) -> &[ResponseEvidence<TorqueSwitchObservation>; 4] {
+        &self.torque_switches
+    }
+
+    pub const fn torque_limit_writes(&self) -> &[WriteEvidence; 4] {
+        &self.torque_limit_writes
+    }
+
+    pub const fn readbacks(&self) -> &[ReadbackEvidence; 4] {
+        &self.readbacks
+    }
+}
+
+impl HeadStartupApplicationEvidence {
+    pub const fn torque_limit_writes(&self) -> &[WriteEvidence; 4] {
+        match self {
+            Self::HostAppliedObservedHold(evidence) => &evidence.torque_limit_writes,
+            Self::RetainedEnabledHold(evidence) => &evidence.torque_limit_writes,
+        }
+    }
+
+    pub const fn readbacks(&self) -> &[ReadbackEvidence; 4] {
+        match self {
+            Self::HostAppliedObservedHold(evidence) => &evidence.readbacks,
+            Self::RetainedEnabledHold(evidence) => &evidence.readbacks,
+        }
     }
 }
 
@@ -752,11 +840,7 @@ pub struct VerifiedNaturalHoldEvidence {
     observed_pose: HeadPose,
     configured_pose: HeadPoseWithinConfiguredBounds,
     observations: [PositionObservationEvidence; 4],
-    observed_goal_writes: [WriteEvidence; 4],
-    torque_limit_writes: [WriteEvidence; 4],
-    pre_enable_telemetry: [ResponseEvidence<FullTelemetry>; 4],
-    torque_enable_writes: [WriteEvidence; 4],
-    readbacks: [ReadbackEvidence; 4],
+    application: HeadStartupApplicationEvidence,
 }
 
 impl VerifiedNaturalHoldEvidence {
@@ -794,26 +878,18 @@ impl VerifiedNaturalHoldEvidence {
         &self.observations
     }
 
-    pub const fn observed_goal_writes(&self) -> &[WriteEvidence; 4] {
-        &self.observed_goal_writes
+    pub const fn application(&self) -> &HeadStartupApplicationEvidence {
+        &self.application
     }
 
     pub const fn torque_limit_writes(&self) -> &[WriteEvidence; 4] {
-        &self.torque_limit_writes
+        self.application.torque_limit_writes()
     }
 
     /// Fresh, complete, stopped raw telemetry observed after configuration
     /// writes and before the first torque-enable write.
-    pub const fn pre_enable_telemetry(&self) -> &[ResponseEvidence<FullTelemetry>; 4] {
-        &self.pre_enable_telemetry
-    }
-
-    pub const fn torque_enable_writes(&self) -> &[WriteEvidence; 4] {
-        &self.torque_enable_writes
-    }
-
     pub const fn readbacks(&self) -> &[ReadbackEvidence; 4] {
-        &self.readbacks
+        self.application.readbacks()
     }
 }
 
@@ -1451,6 +1527,7 @@ impl std::error::Error for FrameWriteError {
 pub enum RequestError {
     RequestWrite(FrameWriteError),
     ResponseFrame(FrameReadError),
+    TorqueSwitch(ResponseParseError),
     Telemetry(TelemetryParseError),
 }
 
@@ -1465,6 +1542,7 @@ impl std::error::Error for RequestError {
         match self {
             Self::RequestWrite(source) => Some(source),
             Self::ResponseFrame(source) => Some(source),
+            Self::TorqueSwitch(source) => Some(source),
             Self::Telemetry(source) => Some(source),
         }
     }
@@ -1495,6 +1573,15 @@ pub enum HeadRuntimeError {
     PositionAgreement {
         joint: HeadJoint,
         source: PositionAgreementError,
+    },
+    RetainedTorqueSwitchRead {
+        joint: HeadJoint,
+        source: RequestError,
+    },
+    RetainedTorqueNotEnabled {
+        joint: HeadJoint,
+        observed: ObservedTorqueSwitch,
+        response: Box<ResponseEvidence<TorqueSwitchObservation>>,
     },
     PreTorqueDeviceStatus {
         joint: HeadJoint,
@@ -1623,6 +1710,7 @@ impl std::error::Error for HeadRuntimeError {
                 .first_failure()
                 .map(|source| source as &(dyn std::error::Error + 'static)),
             Self::PositionObservation { source, .. }
+            | Self::RetainedTorqueSwitchRead { source, .. }
             | Self::PreEnableTelemetryRead { source, .. }
             | Self::VerificationRead { source, .. } => Some(source),
             Self::PositionAgreement { source, .. } => Some(source),
@@ -1633,6 +1721,7 @@ impl std::error::Error for HeadRuntimeError {
             Self::ConfiguredPoseAdmission { source } => Some(source),
             Self::Write { source, .. } => Some(source),
             Self::Cancelled { .. }
+            | Self::RetainedTorqueNotEnabled { .. }
             | Self::PreTorqueDeviceStatus { .. }
             | Self::PreTorqueMoving { .. }
             | Self::PreEnableDeviceStatus { .. }
@@ -2558,7 +2647,7 @@ where
         clock,
         config,
         configured_pose_bounds,
-        startup_torque_policy: StartupTorquePolicy::TensionPreservingTakeover,
+        startup_torque_policy: control_mode.startup_torque_policy(),
         return_plan,
         control_mode,
     };
@@ -2806,6 +2895,7 @@ where
 enum StartupTorquePolicy {
     CommissioningDisableFirst,
     TensionPreservingTakeover,
+    AttendedEnabledHoldTakeover,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2817,6 +2907,13 @@ enum HeadControlMode {
 }
 
 impl HeadControlMode {
+    const fn startup_torque_policy(self) -> StartupTorquePolicy {
+        match self {
+            Self::CompliantCommissioning(_) => StartupTorquePolicy::AttendedEnabledHoldTakeover,
+            Self::NaturalHold | Self::Gaze(_) => StartupTorquePolicy::TensionPreservingTakeover,
+        }
+    }
+
     const fn gaze(self) -> Option<HeadGazeActuationConfig> {
         match self {
             Self::Gaze(config) => Some(config),
@@ -3258,7 +3355,8 @@ where
             StartupTorquePolicy::CommissioningDisableFirst => {
                 HeadActorCleanup::TorqueDisable(Box::new(self.disable_all().await))
             }
-            StartupTorquePolicy::TensionPreservingTakeover => {
+            StartupTorquePolicy::TensionPreservingTakeover
+            | StartupTorquePolicy::AttendedEnabledHoldTakeover => {
                 HeadActorCleanup::HoldPreservingRelease(HoldPreservingOwnershipReleaseEvidence {
                     recorded_at: self.clock.now(),
                 })
@@ -3905,6 +4003,11 @@ where
                 // the position observation below.
                 HeadStartupTorqueEvidence::TensionPreservingTakeover
             }
+            StartupTorquePolicy::AttendedEnabledHoldTakeover => {
+                // This attended lane proves the retained torque switches in
+                // the same exclusive actor before any physical write.
+                HeadStartupTorqueEvidence::AttendedEnabledHoldTakeover
+            }
         };
         let bow = self
             .observe_joint(HeadJoint::Bow, commands, control)
@@ -3955,7 +4058,134 @@ where
             self.config.goal_speed(),
         );
 
-        // Clamp torque before writing any goal, including the observed pose.
+        let application = if matches!(
+            self.startup_torque_policy,
+            StartupTorquePolicy::AttendedEnabledHoldTakeover
+        ) {
+            self.retain_enabled_hold_startup(observed_pose, &frames, commands, control)
+                .await?
+        } else {
+            // Clamp torque before writing any goal, including the observed pose.
+            let torque_limit_writes = self
+                .write_stage(
+                    frames.torque_limit_writes(),
+                    RuntimeStage::WriteTorqueLimit,
+                    WritePurpose::TorqueLimit,
+                    commands,
+                    control,
+                )
+                .await?;
+            let observed_goal_writes = self
+                .write_stage(
+                    frames.goal_writes(),
+                    RuntimeStage::WriteObservedGoal,
+                    WritePurpose::ObservedGoal,
+                    commands,
+                    control,
+                )
+                .await?;
+            let pre_enable_telemetry = [
+                self.observe_pre_enable_joint(
+                    HeadJoint::Bow,
+                    observed_pose.position(HeadJoint::Bow),
+                    commands,
+                    control,
+                )
+                .await?,
+                self.observe_pre_enable_joint(
+                    HeadJoint::Curl,
+                    observed_pose.position(HeadJoint::Curl),
+                    commands,
+                    control,
+                )
+                .await?,
+                self.observe_pre_enable_joint(
+                    HeadJoint::Yaw,
+                    observed_pose.position(HeadJoint::Yaw),
+                    commands,
+                    control,
+                )
+                .await?,
+                self.observe_pre_enable_joint(
+                    HeadJoint::Roll,
+                    observed_pose.position(HeadJoint::Roll),
+                    commands,
+                    control,
+                )
+                .await?,
+            ];
+            let oldest_pre_enable_telemetry_at = pre_enable_telemetry
+                .iter()
+                .map(ResponseEvidence::received_at)
+                .min()
+                .expect("the exact pre-enable set always has four observations");
+            let pre_enable_maximum_age = self.config.pre_enable_telemetry_maximum_age();
+            self.ensure_observation_freshness_with_maximum(
+                oldest_pre_enable_telemetry_at,
+                HeadJoint::Bow,
+                ArmingFreshnessCheck::BeforeEnableWrite,
+                pre_enable_maximum_age,
+            )?;
+            let torque_enable_writes = self
+                .write_enable_stage(
+                    frames.torque_enable_writes(),
+                    oldest_pre_enable_telemetry_at,
+                    pre_enable_maximum_age,
+                    commands,
+                    control,
+                )
+                .await?;
+
+            // A goal write equal to the observed position or a repeated
+            // torque-on write can transiently assert the raw moving bit.
+            tokio::time::sleep(HEAD_RETURN_CONTROL_PERIOD).await;
+            let readbacks = self
+                .verify_pose(
+                    observed_pose,
+                    frames.verification_reads(),
+                    commands,
+                    control,
+                )
+                .await?;
+            HeadStartupApplicationEvidence::HostAppliedObservedHold(Box::new(
+                HostAppliedObservedHoldEvidence {
+                    observed_goal_writes,
+                    torque_limit_writes,
+                    pre_enable_telemetry,
+                    torque_enable_writes,
+                    readbacks,
+                },
+            ))
+        };
+
+        Ok(VerifiedNaturalHoldEvidence {
+            started_at,
+            completed_at: self.clock.now(),
+            startup_torque,
+            observed_pose,
+            configured_pose,
+            observations,
+            application,
+        })
+    }
+
+    async fn retain_enabled_hold_startup(
+        &mut self,
+        observed_pose: HeadPose,
+        frames: &kiko_head_protocol::NaturalHoldFrames,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<HeadStartupApplicationEvidence, HeadRuntimeError> {
+        let torque_switches = [
+            self.observe_retained_torque_switch(HeadJoint::Bow, commands, control)
+                .await?,
+            self.observe_retained_torque_switch(HeadJoint::Curl, commands, control)
+                .await?,
+            self.observe_retained_torque_switch(HeadJoint::Yaw, commands, control)
+                .await?,
+            self.observe_retained_torque_switch(HeadJoint::Roll, commands, control)
+                .await?,
+        ];
         let torque_limit_writes = self
             .write_stage(
                 frames.torque_limit_writes(),
@@ -3965,123 +4195,72 @@ where
                 control,
             )
             .await?;
-        let observed_goal_writes = self
-            .write_stage(
-                frames.goal_writes(),
-                RuntimeStage::WriteObservedGoal,
-                WritePurpose::ObservedGoal,
-                commands,
-                control,
-            )
-            .await?;
-        let pre_enable_telemetry = [
-            self.observe_pre_enable_joint(
-                HeadJoint::Bow,
-                observed_pose.position(HeadJoint::Bow),
-                commands,
-                control,
-            )
-            .await?,
-            self.observe_pre_enable_joint(
-                HeadJoint::Curl,
-                observed_pose.position(HeadJoint::Curl),
-                commands,
-                control,
-            )
-            .await?,
-            self.observe_pre_enable_joint(
-                HeadJoint::Yaw,
-                observed_pose.position(HeadJoint::Yaw),
-                commands,
-                control,
-            )
-            .await?,
-            self.observe_pre_enable_joint(
-                HeadJoint::Roll,
-                observed_pose.position(HeadJoint::Roll),
-                commands,
-                control,
-            )
-            .await?,
-        ];
-        let oldest_pre_enable_telemetry_at = pre_enable_telemetry
-            .iter()
-            .map(ResponseEvidence::received_at)
-            .min()
-            .expect("the exact pre-enable set always has four observations");
-        let pre_enable_maximum_age = self.config.pre_enable_telemetry_maximum_age();
-        self.ensure_observation_freshness_with_maximum(
-            oldest_pre_enable_telemetry_at,
-            HeadJoint::Bow,
-            ArmingFreshnessCheck::BeforeEnableWrite,
-            pre_enable_maximum_age,
-        )?;
-        let torque_enable_writes = self
-            .write_enable_stage(
-                frames.torque_enable_writes(),
-                oldest_pre_enable_telemetry_at,
-                pre_enable_maximum_age,
-                commands,
-                control,
-            )
-            .await?;
-
-        // A goal write equal to the observed position or a repeated torque-on
-        // write can transiently assert the servo's raw moving bit even when
-        // the pre-write observation was stationary. Wait one existing servo
-        // control period before the two mandatory stopped readbacks. This is
-        // not a fallback: either readback still fails closed on moving,
-        // mismatch, unstable position, device status, or telemetry limits.
+        // No goal or torque-switch write occurs in this lane. The pause lets a
+        // repeated torque-limit value settle before the two stopped readbacks
+        // prove that the retained hold did not move away from the observation.
         tokio::time::sleep(HEAD_RETURN_CONTROL_PERIOD).await;
+        let readbacks = self
+            .verify_pose(
+                observed_pose,
+                frames.verification_reads(),
+                commands,
+                control,
+            )
+            .await?;
+        Ok(HeadStartupApplicationEvidence::RetainedEnabledHold(
+            Box::new(RetainedEnabledHoldEvidence {
+                torque_switches,
+                torque_limit_writes,
+                readbacks,
+            }),
+        ))
+    }
 
-        let readbacks = [
-            self.verify_joint(
-                HeadJoint::Bow,
-                observed_pose,
-                &frames.verification_reads()[0],
-                commands,
-                control,
-            )
-            .await?,
-            self.verify_joint(
-                HeadJoint::Curl,
-                observed_pose,
-                &frames.verification_reads()[1],
-                commands,
-                control,
-            )
-            .await?,
-            self.verify_joint(
-                HeadJoint::Yaw,
-                observed_pose,
-                &frames.verification_reads()[2],
-                commands,
-                control,
-            )
-            .await?,
-            self.verify_joint(
-                HeadJoint::Roll,
-                observed_pose,
-                &frames.verification_reads()[3],
-                commands,
-                control,
-            )
-            .await?,
-        ];
+    async fn observe_retained_torque_switch(
+        &mut self,
+        joint: HeadJoint,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<ResponseEvidence<TorqueSwitchObservation>, HeadRuntimeError> {
+        self.check_control(
+            commands,
+            control,
+            RuntimeStage::ObserveRetainedTorqueSwitch,
+            joint,
+        )?;
+        let request = build_torque_switch_read(joint.servo_id());
+        let response = self
+            .read_torque_switch(joint, &request)
+            .await
+            .map_err(|source| HeadRuntimeError::RetainedTorqueSwitchRead { joint, source })?;
+        let observed = response.value().state();
+        if observed != ObservedTorqueSwitch::Enabled {
+            return Err(HeadRuntimeError::RetainedTorqueNotEnabled {
+                joint,
+                observed,
+                response: Box::new(response),
+            });
+        }
+        Ok(response)
+    }
 
-        Ok(VerifiedNaturalHoldEvidence {
-            started_at,
-            completed_at: self.clock.now(),
-            startup_torque,
-            observed_pose,
-            configured_pose,
-            observations,
-            observed_goal_writes,
-            torque_limit_writes,
-            pre_enable_telemetry,
-            torque_enable_writes,
-            readbacks,
-        })
+    async fn verify_pose(
+        &mut self,
+        pose: HeadPose,
+        requests: &[kiko_head_protocol::CommandFrame; 4],
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<[ReadbackEvidence; 4], HeadRuntimeError> {
+        Ok([
+            self.verify_joint(HeadJoint::Bow, pose, &requests[0], commands, control)
+                .await?,
+            self.verify_joint(HeadJoint::Curl, pose, &requests[1], commands, control)
+                .await?,
+            self.verify_joint(HeadJoint::Yaw, pose, &requests[2], commands, control)
+                .await?,
+            self.verify_joint(HeadJoint::Roll, pose, &requests[3], commands, control)
+                .await?,
+        ])
     }
 
     async fn execute_return_to_target(
@@ -5825,6 +6004,37 @@ where
         })
     }
 
+    async fn read_torque_switch(
+        &mut self,
+        joint: HeadJoint,
+        request: &kiko_head_protocol::CommandFrame,
+    ) -> Result<ResponseEvidence<TorqueSwitchObservation>, RequestError> {
+        let request_write = self
+            .write_frame(
+                joint,
+                WritePurpose::TorqueSwitchReadRequest,
+                request.as_bytes(),
+            )
+            .await
+            .map_err(RequestError::RequestWrite)?;
+        let frame = read_response_frame(
+            &mut self.transport,
+            &self.clock,
+            self.config.response_timeout(),
+            self.config.noise_budget_bytes(),
+        )
+        .await
+        .map_err(RequestError::ResponseFrame)?;
+        let value = TorqueSwitchObservation::parse(frame.as_bytes(), joint.servo_id())
+            .map_err(RequestError::TorqueSwitch)?;
+        Ok(ResponseEvidence {
+            value,
+            request_write,
+            discarded_noise_bytes: frame.discarded_noise_bytes(),
+            received_at: self.clock.now(),
+        })
+    }
+
     fn admit_stopped_readback(
         &self,
         joint: HeadJoint,
@@ -6299,6 +6509,10 @@ mod tests {
         status(joint.servo_id(), &position.to_le_bytes())
     }
 
+    fn torque_switch_response(joint: HeadJoint, state_raw: u8) -> Vec<u8> {
+        status(joint.servo_id(), &[state_raw])
+    }
+
     fn telemetry_response(joint: HeadJoint, position: u16) -> Vec<u8> {
         telemetry_response_with_moving(joint, position, false)
     }
@@ -6369,6 +6583,23 @@ mod tests {
         }
         for (joint, position) in HeadJoint::ALL.into_iter().zip(positions) {
             reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
+        }
+        for (joint, position) in HeadJoint::ALL.into_iter().zip(positions) {
+            reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
+            reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
+        }
+        reads
+    }
+
+    fn successful_retained_enabled_hold_reads() -> Vec<ReadAction> {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = Vec::with_capacity(20);
+        for (joint, position) in HeadJoint::ALL.into_iter().zip(positions) {
+            reads.push(ReadAction::Bytes(telemetry_response(joint, position - 2)));
+            reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
+        }
+        for joint in HeadJoint::ALL {
+            reads.push(ReadAction::Bytes(torque_switch_response(joint, 1)));
         }
         for (joint, position) in HeadJoint::ALL.into_iter().zip(positions) {
             reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
@@ -6483,6 +6714,37 @@ mod tests {
         )
         .expect("test runtime is active");
         (handle, startup, task, shared)
+    }
+
+    fn spawn_attended_retained_hold_fake(
+        reads: Vec<ReadAction>,
+        config: ReturnToTargetConfig,
+    ) -> (
+        TensionPreservingHeadReturnActorHandle,
+        StartupReceipt,
+        TensionPreservingHeadActorTask,
+        Arc<Mutex<FakeShared>>,
+    ) {
+        let runtime = Handle::try_current().expect("test runtime is active");
+        let clock = TestClock::default();
+        let (transport, shared) = FakeTransport::new(clock.clone(), reads);
+        let (runtime_config, start_bounds, plan) = config.into_actor_parts();
+        let compliant = compliant_hold_config(plan.target());
+        let (commands, startup, task) = spawn_tension_preserving_head_actor_on(
+            &runtime,
+            transport,
+            clock,
+            runtime_config,
+            start_bounds,
+            Some(plan),
+            HeadControlMode::CompliantCommissioning(compliant),
+        );
+        (
+            TensionPreservingHeadReturnActorHandle { commands },
+            startup,
+            task,
+            shared,
+        )
     }
 
     fn spawn_fake(
@@ -8098,9 +8360,14 @@ mod tests {
             evidence.observed_pose().positions().map(PositionTicks::get),
             positions
         );
+        let HeadStartupApplicationEvidence::HostAppliedObservedHold(application) =
+            evidence.application()
+        else {
+            panic!("production compatibility takeover still uses the applied-hold path")
+        };
         assert_eq!(
-            evidence
-                .pre_enable_telemetry()
+            application
+                .pre_enable_telemetry
                 .each_ref()
                 .map(|response| response.value().position().get()),
             positions
@@ -8165,6 +8432,102 @@ mod tests {
                 .iter()
                 .all(|write| write[4..=6] == [2, 56, 15])
         );
+    }
+
+    #[tokio::test]
+    async fn attended_takeover_retains_goals_and_proves_enabled_torque() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let (handle, receipt, task, shared) = spawn_attended_retained_hold_fake(
+            successful_retained_enabled_hold_reads(),
+            valid_return_config(positions, [1; 4]),
+        );
+        let evidence = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified attended retained hold");
+        assert!(matches!(
+            evidence.startup_torque(),
+            HeadStartupTorqueEvidence::AttendedEnabledHoldTakeover
+        ));
+        let HeadStartupApplicationEvidence::RetainedEnabledHold(application) =
+            evidence.application()
+        else {
+            panic!("attended takeover must retain the prior goal")
+        };
+        assert!(
+            application
+                .torque_switches
+                .iter()
+                .all(|response| response.value().state() == ObservedTorqueSwitch::Enabled)
+        );
+        assert_eq!(application.torque_limit_writes.len(), 4);
+        assert_eq!(application.readbacks.len(), 4);
+
+        let release = handle
+            .release_ownership_preserving_hold()
+            .await
+            .expect("hold-preserving release");
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.hold_preserving_release(), &release);
+
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.writes.len(), 24);
+        assert!(
+            shared.writes[..8]
+                .iter()
+                .all(|write| write[4..=6] == [2, 56, 15])
+        );
+        assert!(
+            shared.writes[8..12]
+                .iter()
+                .all(|write| write[4..=6] == [2, 40, 1])
+        );
+        assert!(shared.writes[12..16].iter().all(|write| write[5] == 48));
+        assert!(
+            shared.writes[16..]
+                .iter()
+                .all(|write| write[4..=6] == [2, 56, 15])
+        );
+        assert!(
+            shared
+                .writes
+                .iter()
+                .all(|write| !(write[4] == 3 && matches!(write[5], 40 | 42))),
+            "attended takeover must not rewrite torque switches or goals"
+        );
+    }
+
+    #[tokio::test]
+    async fn attended_takeover_rejects_disabled_torque_before_physical_writes() {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = Vec::new();
+        for (joint, position) in HeadJoint::ALL.into_iter().zip(positions) {
+            reads.push(ReadAction::Bytes(telemetry_response(joint, position - 2)));
+            reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
+        }
+        reads.push(ReadAction::Bytes(torque_switch_response(HeadJoint::Bow, 0)));
+        let (handle, receipt, task, shared) =
+            spawn_attended_retained_hold_fake(reads, valid_return_config(positions, [1; 4]));
+        let error = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect_err("disabled retained torque must fail");
+        assert!(matches!(
+            error,
+            HeadRuntimeError::RetainedTorqueNotEnabled {
+                joint: HeadJoint::Bow,
+                observed: ObservedTorqueSwitch::Disabled,
+                ..
+            }
+        ));
+        drop(handle);
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.termination(), &ActorTermination::StartupFault);
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.writes.len(), 9);
+        assert!(shared.writes.iter().all(|write| write[4] == 2));
     }
 
     #[tokio::test]

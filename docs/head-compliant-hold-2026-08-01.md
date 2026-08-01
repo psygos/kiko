@@ -104,7 +104,7 @@ admission requires them to equal the limits in the inseparable reviewed-return
 runtime. This prevents a policy reviewed for one holding stiffness from being
 silently paired with another.
 
-The currently recorded values are `[600,400,400,400]` permille in
+The attended Nano values are `[650,550,400,400]` permille in
 bow/curl/yaw/roll order. They are existing runtime values, not evidence that
 they are the lowest stable values. “Just enough torque” is assembly-, pose-,
 temperature-, and supply-dependent and cannot be derived from source code.
@@ -182,7 +182,7 @@ collect that missing evidence without weakening production admission. It:
 The checked-in
 `configs/nano-head-compliant-commissioning-v1.json` is a conservative first
 commissioning candidate. Its natural pose, four-axis envelopes, adapter
-identity, and existing `[600,400,400,400]` torque values come from the retained
+identity, and existing `[650,550,400,400]` torque values come from the retained
 Kiko configuration. Its 100 ms service period, touch hysteresis, bounded yield,
 35% follow gain, dwell values, and 2.4 s minimum-jerk recovery are hypotheses
 selected for an attended wheels-off trial. They are not a promoted physical
@@ -217,11 +217,37 @@ control period before collecting its two required stopped readbacks. The wait
 does not convert motion into success; both samples still fail closed on raw
 moving, mismatch, unstable position, device status, or telemetry limits.
 
+The retained live expression configuration was also the authority actually
+holding the assembled mechanism: `[650,550,400,400]` permille, not the earlier
+`[600,400,400,400]` commissioning hypothesis. At its natural goal, repeated
+stationary telemetry showed gravity-axis tracking offsets of 22 and 23 ticks.
+The attended config therefore uses the proven torque values and a 24-tick
+startup readback tolerance. This does not claim minimum sufficient torque; it
+only prevents a takeover from weakening the known working hold or rejecting
+its measured stationary tracking error.
+
+Most importantly, attended takeover no longer writes the observed shaft pose
+back as a new goal. Under gravity that erased the prior goal error which was
+producing holding torque, and repeated failed starts could ratchet the head
+downward. The actor now proves all four retained torque switches are enabled,
+writes only the reviewed torque limits, verifies two stopped readbacks around
+the pre-write observation, and leaves the prior goals untouched until the
+bounded return controller issues its first waypoint.
+
 For the attended Nano handoff, `deploy/kiko-accessory-commissioning-guardian.sh`
 keeps two deliberately separate device owners alive. The existing expression
 process runs with `--no-head` and therefore retains only OAK/eye behavior; the
 typed Rust commissioning process is the sole head-serial owner. Independent
-restart loops keep a camera failure from interrupting head tension and keep a
-head-control fault from taking down the eyes. The script never opens or starts
+lifecycle handling keeps a camera failure from interrupting head tension and
+keeps a head-control fault from taking down the eyes. The script never opens or
+starts
 the STM32, base, navigation, or SLAM and must not be represented as the final
 production owner.
+
+Head startup or runtime failure is latched for the lifetime of the guardian;
+only a deliberate guardian restart permits another physical takeover. This is
+asymmetric by design: the camera/eye process may restart independently because
+it does not rewrite the head's retained goal, while blindly restarting a
+tension-preserving head takeover can re-adopt a sagged pose after a partial
+startup. A typed head fault therefore leaves the last torque/goal state intact
+and the expression child alive instead of creating an actuation retry loop.

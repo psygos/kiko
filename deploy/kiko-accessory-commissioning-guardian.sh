@@ -19,6 +19,7 @@ readonly HEAD_LOG=/tmp/kiko-head-compliant.log
 
 follow_pid=
 head_pid=
+head_fault_latched=0
 stop_requested=0
 
 log() {
@@ -104,13 +105,19 @@ while (( stop_requested == 0 )); do
     start_expression || true
   fi
 
-  if ! child_is_live "${head_pid}"; then
+  if (( head_fault_latched == 0 )) && ! child_is_live "${head_pid}"; then
     if [[ -n "${head_pid}" ]]; then
-      wait "${head_pid}" 2>/dev/null
-      log "head compliant owner exited status=$? pid=${head_pid}"
+      head_status=0
+      wait "${head_pid}" 2>/dev/null || head_status=$?
+      log "head compliant owner exited status=${head_status} pid=${head_pid}"
+      head_fault_latched=1
+      log "head compliant fault latched; deliberate guardian restart required"
     fi
     head_pid=
-    start_head || true
+    if (( head_fault_latched == 0 )) && ! start_head; then
+      head_fault_latched=1
+      log "head compliant start fault latched; deliberate guardian restart required"
+    fi
   fi
 
   sleep 5 &
