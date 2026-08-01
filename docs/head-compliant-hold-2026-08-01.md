@@ -192,12 +192,19 @@ produce a new candidate; they must never be rewritten into evidence after the
 fact.
 
 The first Nano activation observed the already-energized bow joint settling
-from 2153 to 2132 ticks after the legacy owner released its serial endpoint.
-That was one tick below the historical startup-window minimum, so startup
-correctly refused every motion write. The attended configuration admits bow
-down to 2126 ticks, exactly `2174 - 48`: the existing reviewed target minus the
-existing maximum return travel. This is measured startup-admission evidence,
-not evidence for a wider return, compliant envelope, or touch behavior.
+from 2153 to 2123 ticks after the legacy owner released its serial endpoint.
+The original narrow startup window correctly refused every motion write, but
+inspection then proved it was inconsistent with the retained four-axis
+calibration. The legacy engine admits offsets of `[110,180,480,160]` ticks
+around the same `[2174,2570,1637,3047]` natural pose. The typed takeover domain
+also limits every per-axis startup window to 256 ticks, so this attended
+configuration retains the complete 220-tick calibrated bow span and a
+natural-centered 256-tick subset for curl, yaw, and roll. Maximum return travel
+is cross-bound to the resulting `[110,128,128,128]` maximum offsets. The
+observed handoff pose `[2123,2621,1633,3041]` lies inside those exact windows.
+No axis is admitted beyond either the structural startup bound or the prior
+engine's calibrated range. This is takeover compatibility evidence, not
+evidence for touch quality or perceived softness.
 
 For the attended Nano handoff, `deploy/kiko-accessory-commissioning-guardian.sh`
 keeps two deliberately separate device owners alive. The existing expression
