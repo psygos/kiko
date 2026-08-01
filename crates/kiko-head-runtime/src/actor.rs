@@ -39,6 +39,7 @@ use crate::transport::{
 };
 
 const ACTOR_MAILBOX_CAPACITY: usize = 1;
+const ENERGIZED_TEMPERATURE_CONFIRMATION_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Deliberate opt-in required before the actor can enable servo torque.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1918,6 +1919,59 @@ pub struct VerifiedHeadCompliantHoldStep {
     hardware: HeadGazeHardwareApplication,
 }
 
+/// Three fresh, checksum-valid responses proving that an initially high raw
+/// temperature byte was not repeated. The compliant owner freezes physical
+/// output for this transaction and does not advance planner state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedEnergizedTemperatureTransient {
+    joint: HeadJoint,
+    responses: Box<[ResponseEvidence<FullTelemetry>; 3]>,
+    maximum_raw_exclusive: u8,
+}
+
+impl VerifiedEnergizedTemperatureTransient {
+    pub const fn joint(&self) -> HeadJoint {
+        self.joint
+    }
+
+    pub const fn responses(&self) -> &[ResponseEvidence<FullTelemetry>; 3] {
+        &self.responses
+    }
+
+    pub const fn maximum_raw_exclusive(&self) -> u8 {
+        self.maximum_raw_exclusive
+    }
+}
+
+/// Three consecutive checksum-valid responses at or above the energized
+/// temperature limit. This is a fail-stop condition, not a filtered sample.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfirmedEnergizedTemperatureFault {
+    joint: HeadJoint,
+    responses: Box<[ResponseEvidence<FullTelemetry>; 3]>,
+    maximum_raw_exclusive: u8,
+}
+
+impl ConfirmedEnergizedTemperatureFault {
+    pub const fn joint(&self) -> HeadJoint {
+        self.joint
+    }
+
+    pub const fn responses(&self) -> &[ResponseEvidence<FullTelemetry>; 3] {
+        &self.responses
+    }
+
+    pub const fn maximum_raw_exclusive(&self) -> u8 {
+        self.maximum_raw_exclusive
+    }
+}
+
+enum HeadCompliantHoldExecution {
+    RetainedExpressionTarget,
+    TemperatureTransient(Box<VerifiedEnergizedTemperatureTransient>),
+    Applied(VerifiedHeadCompliantHoldStep),
+}
+
 impl VerifiedHeadCompliantHoldStep {
     pub const fn controller(&self) -> CompliantHoldCommitReceipt {
         self.controller
@@ -1972,6 +2026,7 @@ pub enum HeadGazeServiceOutcome {
         observed_at: MonotonicTime,
     },
     Compliant(Box<VerifiedHeadCompliantHoldStep>),
+    CompliantTemperatureTransient(Box<VerifiedEnergizedTemperatureTransient>),
     Applied(Box<VerifiedHeadGazeControlStep>),
 }
 
@@ -2006,6 +2061,16 @@ pub enum HeadGazeServiceError {
         source: Option<RequestError>,
     },
     CompliantObservation(CompliantHeadObservationError),
+    CompliantTemperatureConfirmationInterrupted {
+        joint: HeadJoint,
+        completed_responses: Vec<ResponseEvidence<FullTelemetry>>,
+        source: Box<HeadGazeServiceError>,
+    },
+    CompliantTemperatureConfirmationRejected {
+        responses: Box<[ResponseEvidence<FullTelemetry>; 3]>,
+        source: CompliantHeadObservationError,
+    },
+    ConfirmedEnergizedTemperature(Box<ConfirmedEnergizedTemperatureFault>),
     CompliantPlanner(CompliantHoldPrepareError),
     CompliantGoalRegisters {
         source: Box<HeadGoalRegisterError>,
@@ -2046,6 +2111,10 @@ impl std::error::Error for HeadGazeServiceError {
                 .map(|source| source as &(dyn std::error::Error + 'static)),
             Self::CompliantControl(source) => Some(source.as_ref()),
             Self::CompliantObservation(source) => Some(source),
+            Self::CompliantTemperatureConfirmationInterrupted { source, .. } => {
+                Some(source.as_ref())
+            }
+            Self::CompliantTemperatureConfirmationRejected { source, .. } => Some(source),
             Self::CompliantPlanner(source) => Some(source),
             Self::CompliantGoalRegisters { source, .. } => Some(source.as_ref()),
             Self::CompliantCommitAfterVerifiedApplication { source, .. } => Some(source),
@@ -2054,7 +2123,8 @@ impl std::error::Error for HeadGazeServiceError {
             Self::CommitAfterVerifiedApplication { source, .. } => Some(source),
             Self::CommandBeforeReviewedReturn
             | Self::CommandAlreadyInProgress
-            | Self::NotConfigured => None,
+            | Self::NotConfigured
+            | Self::ConfirmedEnergizedTemperature(_) => None,
         }
     }
 }
@@ -3441,12 +3511,15 @@ where
                                 )
                                 .await
                             {
-                                Ok(Some(evidence)) => {
+                                Ok(HeadCompliantHoldExecution::Applied(evidence)) => {
                                     hold_target = HeadHoldTarget::ReviewedCompliant(
                                         evidence.controller().committed_target(),
                                     );
                                 }
-                                Ok(None) => {}
+                                Ok(
+                                    HeadCompliantHoldExecution::RetainedExpressionTarget
+                                    | HeadCompliantHoldExecution::TemperatureTransient(_),
+                                ) => {}
                                 Err(source) => {
                                     if let Some(termination) = control.termination.clone() {
                                         return termination;
@@ -3656,23 +3729,33 @@ where
                         observed_at: now,
                     });
                 }
-            } else if let Some(evidence) = self
-                .execute_compliant_hold_step(
-                    controller.committed_target(),
-                    HeadJoint::ALL
-                        .into_iter()
-                        .all(|joint| controller.velocity().velocity(joint).get() == 0),
-                    self.control_mode
-                        .gaze()
-                        .expect("compliance is configured only as part of gaze actuation")
-                        .goal_register_transaction_timeout(),
-                    compliant,
-                    commands,
-                    control,
-                )
-                .await?
-            {
-                return Ok(HeadGazeServiceOutcome::Compliant(Box::new(evidence)));
+            } else {
+                match self
+                    .execute_compliant_hold_step(
+                        controller.committed_target(),
+                        HeadJoint::ALL
+                            .into_iter()
+                            .all(|joint| controller.velocity().velocity(joint).get() == 0),
+                        self.control_mode
+                            .gaze()
+                            .expect("compliance is configured only as part of gaze actuation")
+                            .goal_register_transaction_timeout(),
+                        compliant,
+                        commands,
+                        control,
+                    )
+                    .await?
+                {
+                    HeadCompliantHoldExecution::Applied(evidence) => {
+                        return Ok(HeadGazeServiceOutcome::Compliant(Box::new(evidence)));
+                    }
+                    HeadCompliantHoldExecution::TemperatureTransient(evidence) => {
+                        return Ok(HeadGazeServiceOutcome::CompliantTemperatureTransient(
+                            evidence,
+                        ));
+                    }
+                    HeadCompliantHoldExecution::RetainedExpressionTarget => {}
+                }
             }
         }
         let now = self.clock.now();
@@ -3750,7 +3833,7 @@ where
         compliant: &mut HeadCompliantHoldController,
         commands: &mut mpsc::Receiver<HeadCommand>,
         control: &mut ControlState,
-    ) -> Result<Option<VerifiedHeadCompliantHoldStep>, HeadGazeServiceError> {
+    ) -> Result<HeadCompliantHoldExecution, HeadGazeServiceError> {
         let compliant_config = compliant.config();
         let observation_budget = HeadCompliantObservationBudget::new(
             self.clock.now(),
@@ -3775,15 +3858,43 @@ where
         let samples = responses.each_ref().map(|response| *response.value());
         let received_at = responses.each_ref().map(|response| response.received_at());
         let now = self.clock.now();
-        let observation = CompliantHeadObservation::try_from_timed_telemetry(
+        let observation = match CompliantHeadObservation::try_from_timed_telemetry(
             samples,
             received_at,
             now,
             self.config.telemetry_safety_limits(),
             compliant_config.maximum_observation_span(),
             compliant_config.observation_ttl(),
-        )
-        .map_err(HeadGazeServiceError::CompliantObservation)?;
+        ) {
+            Ok(observation) => observation,
+            Err(CompliantHeadObservationError::TelemetrySafety {
+                joint,
+                source:
+                    HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
+                        maximum_raw_exclusive,
+                        ..
+                    },
+            }) => {
+                let index = HeadJoint::ALL
+                    .into_iter()
+                    .position(|candidate| candidate == joint)
+                    .expect("the canonical joint set contains every head joint");
+                let evidence = self
+                    .confirm_energized_temperature(
+                        joint,
+                        responses[index].clone(),
+                        maximum_raw_exclusive,
+                        compliant_config.observation_transaction_timeout(),
+                        commands,
+                        control,
+                    )
+                    .await?;
+                return Ok(HeadCompliantHoldExecution::TemperatureTransient(Box::new(
+                    evidence,
+                )));
+            }
+            Err(source) => return Err(HeadGazeServiceError::CompliantObservation(source)),
+        };
         let prepared = compliant
             .prepare(now, expression_target, expression_quiet, observation)
             .map_err(HeadGazeServiceError::CompliantPlanner)?;
@@ -3800,7 +3911,7 @@ where
             // The gaze controller's target already carries complete actor-local
             // goal-register evidence. Synchronising the passive compliance
             // planner must not duplicate those four writes and readbacks.
-            return Ok(None);
+            return Ok(HeadCompliantHoldExecution::RetainedExpressionTarget);
         }
         let hardware = if target == compliant.committed_target() {
             HeadGazeHardwareApplication::RetainedPreviouslyVerifiedTarget { target }
@@ -3830,10 +3941,115 @@ where
         let controller = compliant.commit(prepared).map_err(|source| {
             HeadGazeServiceError::CompliantCommitAfterVerifiedApplication { source, target }
         })?;
-        Ok(Some(VerifiedHeadCompliantHoldStep {
-            controller,
-            hardware,
-        }))
+        Ok(HeadCompliantHoldExecution::Applied(
+            VerifiedHeadCompliantHoldStep {
+                controller,
+                hardware,
+            },
+        ))
+    }
+
+    async fn confirm_energized_temperature(
+        &mut self,
+        joint: HeadJoint,
+        initial: ResponseEvidence<FullTelemetry>,
+        maximum_raw_exclusive: u8,
+        observation_transaction_timeout: Duration,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<VerifiedEnergizedTemperatureTransient, HeadGazeServiceError> {
+        let mut completed_responses = Vec::with_capacity(3);
+        completed_responses.push(initial);
+
+        tokio::time::sleep(ENERGIZED_TEMPERATURE_CONFIRMATION_INTERVAL).await;
+        self.check_health_control(commands, control, joint)
+            .map_err(|source| HeadGazeServiceError::CompliantControl(Box::new(source)))?;
+        let budget =
+            HeadCompliantObservationBudget::new(self.clock.now(), observation_transaction_timeout);
+        let request = build_full_telemetry_read(joint.servo_id());
+        for confirmation_index in 0..2 {
+            if confirmation_index != 0 {
+                tokio::time::sleep(ENERGIZED_TEMPERATURE_CONFIRMATION_INTERVAL).await;
+                if let Err(source) = self.check_health_control(commands, control, joint) {
+                    return Err(
+                        HeadGazeServiceError::CompliantTemperatureConfirmationInterrupted {
+                            joint,
+                            completed_responses,
+                            source: Box::new(HeadGazeServiceError::CompliantControl(Box::new(
+                                source,
+                            ))),
+                        },
+                    );
+                }
+            }
+            match self.read_compliant_telemetry(joint, &request, budget).await {
+                Ok(response) => completed_responses.push(response),
+                Err(source) => {
+                    return Err(
+                        HeadGazeServiceError::CompliantTemperatureConfirmationInterrupted {
+                            joint,
+                            completed_responses,
+                            source: Box::new(source),
+                        },
+                    );
+                }
+            }
+        }
+
+        let responses: [ResponseEvidence<FullTelemetry>; 3] = completed_responses
+            .try_into()
+            .expect("one initial and two confirmation responses are collected");
+        let safety = self.config.telemetry_safety_limits();
+        let mut observed_normal_temperature = false;
+        for response in &responses {
+            let sample = response.value();
+            let device_status_raw = sample.device_status_raw();
+            if device_status_raw != 0 {
+                return Err(
+                    HeadGazeServiceError::CompliantTemperatureConfirmationRejected {
+                        responses: Box::new(responses),
+                        source: CompliantHeadObservationError::DeviceStatus {
+                            joint,
+                            raw: device_status_raw,
+                        },
+                    },
+                );
+            }
+            match safety.admit_energized(sample.voltage_raw(), sample.temperature_raw()) {
+                Ok(()) => observed_normal_temperature = true,
+                Err(
+                    HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
+                        ..
+                    },
+                ) => {}
+                Err(source) => {
+                    return Err(
+                        HeadGazeServiceError::CompliantTemperatureConfirmationRejected {
+                            responses: Box::new(responses),
+                            source: CompliantHeadObservationError::TelemetrySafety {
+                                joint,
+                                source,
+                            },
+                        },
+                    );
+                }
+            }
+        }
+        if observed_normal_temperature {
+            Ok(VerifiedEnergizedTemperatureTransient {
+                joint,
+                responses: Box::new(responses),
+                maximum_raw_exclusive,
+            })
+        } else {
+            Err(HeadGazeServiceError::ConfirmedEnergizedTemperature(
+                Box::new(ConfirmedEnergizedTemperatureFault {
+                    joint,
+                    responses: Box::new(responses),
+                    maximum_raw_exclusive,
+                }),
+            ))
+        }
     }
 
     async fn read_compliant_telemetry(
@@ -7243,6 +7459,232 @@ mod tests {
         assert_eq!(gaze.committed_target(), natural);
         assert_eq!(compliant.committed_target(), natural);
         assert_eq!(shared.lock().unwrap().writes.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn compliant_temperature_transient_freezes_output_and_retains_all_three_samples() {
+        let natural = goal_register_target();
+        let natural_positions = natural.positions().map(PositionTicks::get);
+        let mut reads = health_reads(natural_positions);
+        reads.extend(health_reads(natural_positions));
+        reads.extend(HeadJoint::ALL.into_iter().map(|joint| {
+            ReadAction::Bytes(telemetry_response_with_voltage_temperature(
+                joint,
+                natural.position(joint).get(),
+                false,
+                0,
+                120,
+                if joint == HeadJoint::Bow { 72 } else { 30 },
+            ))
+        }));
+        for temperature_raw in [41, 42] {
+            reads.push(ReadAction::Bytes(
+                telemetry_response_with_voltage_temperature(
+                    HeadJoint::Bow,
+                    natural.position(HeadJoint::Bow).get(),
+                    false,
+                    0,
+                    120,
+                    temperature_raw,
+                ),
+            ));
+        }
+        let (mut actor, shared) = goal_register_actor(reads);
+        actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
+        let mut gaze =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .unwrap();
+        let mut compliant = HeadCompliantHoldController::try_new(
+            compliant_hold_config(natural),
+            natural,
+            MonotonicTime::ZERO,
+        )
+        .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        arm_compliance_actor(
+            &mut actor,
+            &mut gaze,
+            &mut compliant,
+            &mut receiver,
+            &mut control,
+        )
+        .await;
+        let next_service_due = compliant.next_service_due();
+        let outcome = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect("one normal confirmation classifies only the raw sample as transient");
+        drop(commands);
+
+        let HeadGazeServiceOutcome::CompliantTemperatureTransient(evidence) = outcome else {
+            panic!("the frozen transaction must expose transient evidence");
+        };
+        assert_eq!(evidence.joint(), HeadJoint::Bow);
+        assert_eq!(evidence.maximum_raw_exclusive(), 65);
+        assert_eq!(
+            evidence
+                .responses()
+                .each_ref()
+                .map(|response| response.value().temperature_raw()),
+            [72, 41, 42]
+        );
+        assert_eq!(gaze.committed_target(), natural);
+        assert_eq!(compliant.committed_target(), natural);
+        assert_eq!(compliant.next_service_due(), next_service_due);
+        assert_eq!(
+            shared.lock().unwrap().writes.len(),
+            14,
+            "eight arming reads plus four frozen-set reads and two confirmations only"
+        );
+    }
+
+    #[tokio::test]
+    async fn three_high_compliant_temperature_samples_fail_stop_with_exact_evidence() {
+        let natural = goal_register_target();
+        let natural_positions = natural.positions().map(PositionTicks::get);
+        let mut reads = health_reads(natural_positions);
+        reads.extend(health_reads(natural_positions));
+        reads.extend(HeadJoint::ALL.into_iter().map(|joint| {
+            ReadAction::Bytes(telemetry_response_with_voltage_temperature(
+                joint,
+                natural.position(joint).get(),
+                false,
+                0,
+                120,
+                if joint == HeadJoint::Bow { 72 } else { 30 },
+            ))
+        }));
+        for _ in 0..2 {
+            reads.push(ReadAction::Bytes(
+                telemetry_response_with_voltage_temperature(
+                    HeadJoint::Bow,
+                    natural.position(HeadJoint::Bow).get(),
+                    false,
+                    0,
+                    120,
+                    72,
+                ),
+            ));
+        }
+        let (mut actor, shared) = goal_register_actor(reads);
+        actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
+        let mut gaze =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .unwrap();
+        let mut compliant = HeadCompliantHoldController::try_new(
+            compliant_hold_config(natural),
+            natural,
+            MonotonicTime::ZERO,
+        )
+        .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        arm_compliance_actor(
+            &mut actor,
+            &mut gaze,
+            &mut compliant,
+            &mut receiver,
+            &mut control,
+        )
+        .await;
+        let error = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect_err("three high samples are a confirmed fail-stop");
+        drop(commands);
+
+        let HeadGazeServiceError::ConfirmedEnergizedTemperature(evidence) = error else {
+            panic!("confirmed temperatures need their own typed fault");
+        };
+        assert_eq!(evidence.joint(), HeadJoint::Bow);
+        assert_eq!(evidence.maximum_raw_exclusive(), 65);
+        assert_eq!(
+            evidence
+                .responses()
+                .each_ref()
+                .map(|response| response.value().temperature_raw()),
+            [72; 3]
+        );
+        assert_eq!(gaze.committed_target(), natural);
+        assert_eq!(compliant.committed_target(), natural);
+        assert_eq!(shared.lock().unwrap().writes.len(), 14);
+    }
+
+    #[tokio::test]
+    async fn compliant_temperature_confirmation_read_failure_is_not_relabeled_transient() {
+        let natural = goal_register_target();
+        let natural_positions = natural.positions().map(PositionTicks::get);
+        let mut reads = health_reads(natural_positions);
+        reads.extend(health_reads(natural_positions));
+        reads.extend(HeadJoint::ALL.into_iter().map(|joint| {
+            ReadAction::Bytes(telemetry_response_with_voltage_temperature(
+                joint,
+                natural.position(joint).get(),
+                false,
+                0,
+                120,
+                if joint == HeadJoint::Bow { 72 } else { 30 },
+            ))
+        }));
+        reads.push(ReadAction::Bytes(
+            telemetry_response_with_voltage_temperature(
+                HeadJoint::Bow,
+                natural.position(HeadJoint::Bow).get(),
+                false,
+                0,
+                120,
+                41,
+            ),
+        ));
+        reads.push(ReadAction::Failure(TransportFailure::timed_out(
+            TransportOperation::Read,
+            7,
+        )));
+        let (mut actor, shared) = goal_register_actor(reads);
+        actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
+        let mut gaze =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .unwrap();
+        let mut compliant = HeadCompliantHoldController::try_new(
+            compliant_hold_config(natural),
+            natural,
+            MonotonicTime::ZERO,
+        )
+        .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        arm_compliance_actor(
+            &mut actor,
+            &mut gaze,
+            &mut compliant,
+            &mut receiver,
+            &mut control,
+        )
+        .await;
+        let error = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect_err("an incomplete confirmation remains an exact read fault");
+        drop(commands);
+
+        assert!(matches!(
+            error,
+            HeadGazeServiceError::CompliantTemperatureConfirmationInterrupted {
+                joint: HeadJoint::Bow,
+                completed_responses,
+                source,
+            } if completed_responses.len() == 2
+                && completed_responses[0].value().temperature_raw() == 72
+                && completed_responses[1].value().temperature_raw() == 41
+                && matches!(*source, HeadGazeServiceError::CompliantTelemetryRead { .. })
+        ));
+        assert_eq!(gaze.committed_target(), natural);
+        assert_eq!(compliant.committed_target(), natural);
+        assert_eq!(shared.lock().unwrap().writes.len(), 14);
     }
 
     #[tokio::test]
