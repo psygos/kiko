@@ -1,0 +1,20 @@
+{
+  "natural_ticks": [2174, 2570, 1637, 3047],
+  "head_offset_up_m": 0.25,
+  "head_offset_back_m": 0.20,
+  "yaw_sign": -1,
+  "curl_sign": -1,
+  "eye_x_sign": -1,
+  "eye_y_sign": 1,
+  "yaw_limit_ticks": 480,
+  "yaw_ticks_per_rad": 1050.0,
+  "pitch_ticks_per_rad": 620.0,
+  "curl_limit_ticks": 180,
+  "bow_limit_ticks": 110,
+  "roll_limit_ticks": 160,
+  "track_step_ticks": 8,
+  "track_speed_max": 175,
+  "offset_ease": 0.34,
+  "admission_window_ticks": 128,
+  "temp_abort_raw": 65
+}
