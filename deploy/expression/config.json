@@ -18,6 +18,7 @@
   "admission_window_ticks": 128,
   "temp_abort_raw": 65,
   "preengage_temp_limit_raw": 55,
+  "torque_limit_permille": [600, 500, 250, 300],
   "compliant_hold": {
     "minimum_ticks": [2064, 2390, 1157, 2887],
     "maximum_ticks": [2284, 2750, 2117, 3207],
@@ -28,7 +29,7 @@
     "maximum_command_step_ticks": [3, 4, 8, 3],
     "maximum_observed_step_ticks": [64, 80, 160, 64],
     "quiet_command_step_ticks": [1, 2, 2, 1],
-    "holding_torque_limit_permille": [650, 550, 400, 400],
+    "holding_torque_limit_permille": [600, 500, 250, 300],
     "control_period_ms": 100,
     "maximum_observation_span_ms": 60,
     "contact_arm_dwell_ms": 1000,
