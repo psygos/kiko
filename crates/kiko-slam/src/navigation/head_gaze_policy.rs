@@ -15,10 +15,12 @@
 use std::{fmt, time::Duration};
 
 use kiko_expression_runtime::{
-    CameraToHeadGazeExtrinsicsInput, HeadGazeMappingDeclaration, HeadGazeMappingDeclarationInput,
-    HeadGazeMappingDeclarationParseError, HeadGazeTickOffsetsPerRadianInput, HeadTickEnvelope,
-    HeadTickEnvelopeInput, NamedHeadTickEnvelopesInput, NamedHeadTickOffsetsPerRadianInput,
-    NamedNaturalHeadTicksInput,
+    CameraToHeadGazeExtrinsicsInput, CharacterHeadMappingDeclaration,
+    CharacterHeadMappingDeclarationParseError, HeadGazeMappingDeclaration,
+    HeadGazeMappingDeclarationInput, HeadGazeMappingDeclarationParseError,
+    HeadGazeTickOffsetsPerRadianInput, HeadTickEnvelope, HeadTickEnvelopeInput,
+    NamedCharacterHeadFullScaleTickOffsetsInput, NamedHeadTickEnvelopesInput,
+    NamedHeadTickOffsetsPerRadianInput, NamedNaturalHeadTicksInput,
 };
 use kiko_head_protocol::{HeadJoint, JointCalibrationError, PositionStepLimit};
 use kiko_head_runtime::gaze_control::{
@@ -52,6 +54,7 @@ const MAX_PROPOSAL_TTL_NS: u64 = 5_000_000_000;
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeadGazePolicyV1 {
     mapping: HeadGazeMappingDeclaration,
+    character_mapping: Option<CharacterHeadMappingDeclaration>,
     controller: HeadGazeControllerDeclaration,
     lifecycle: HeadGazePolicyLifecycleClaim,
 }
@@ -83,8 +86,7 @@ impl HeadGazePolicyV1 {
             });
         }
 
-        let mapping =
-            parse_mapping(dto.mapping_declaration).map_err(HeadGazePolicyParseError::Mapping)?;
+        let (mapping, character_mapping) = parse_mapping(dto.mapping_declaration)?;
         let controller = HeadGazeControllerDeclaration::parse(dto.controller_declaration, &mapping)
             .map_err(HeadGazePolicyParseError::Controller)?;
         let lifecycle =
@@ -92,6 +94,7 @@ impl HeadGazePolicyV1 {
 
         Ok(Self {
             mapping,
+            character_mapping,
             controller,
             lifecycle,
         })
@@ -102,6 +105,12 @@ impl HeadGazePolicyV1 {
     /// Its output remains a non-command `HeadGazeTargetProposal`.
     pub const fn mapping(&self) -> &HeadGazeMappingDeclaration {
         &self.mapping
+    }
+
+    /// Optional four-joint character mapping from the exact same policy
+    /// document. Absence preserves the older gaze-only behavior.
+    pub const fn character_mapping(&self) -> Option<CharacterHeadMappingDeclaration> {
+        self.character_mapping
     }
 
     /// Typed timing, hysteresis, and motion-limit declaration.
@@ -411,7 +420,13 @@ fn parse_lifecycle(
 
 fn parse_mapping(
     dto: HeadGazeMappingDeclarationDto,
-) -> Result<HeadGazeMappingDeclaration, HeadGazeMappingDeclarationParseError> {
+) -> Result<
+    (
+        HeadGazeMappingDeclaration,
+        Option<CharacterHeadMappingDeclaration>,
+    ),
+    HeadGazePolicyParseError,
+> {
     let origin = dto.camera_to_neutral_head.head_origin_in_oak_camera_m;
     let rotation = dto
         .camera_to_neutral_head
@@ -419,7 +434,8 @@ fn parse_mapping(
     let envelopes = dto.hard_encoder_envelopes_ticks;
     let offsets = dto.encoder_tick_offsets_per_radian;
 
-    HeadGazeMappingDeclaration::parse(HeadGazeMappingDeclarationInput {
+    let character_offsets = dto.character_positive_full_scale_encoder_offsets_ticks;
+    let mapping = HeadGazeMappingDeclaration::parse(HeadGazeMappingDeclarationInput {
         assembly_id: &dto.assembly_id,
         calibration_provenance_id: &dto.calibration_provenance_id,
         focus_plane_camera_forward_depth_m: dto.gaze_only_focus_plane.camera_forward_depth_m,
@@ -446,6 +462,22 @@ fn parse_mapping(
             yaw_right: offsets.yaw_right_rad.into_domain(),
         },
     })
+    .map_err(HeadGazePolicyParseError::Mapping)?;
+    let character_mapping = character_offsets
+        .map(|offsets| {
+            CharacterHeadMappingDeclaration::parse_for_gaze_mapping(
+                &mapping,
+                NamedCharacterHeadFullScaleTickOffsetsInput {
+                    bow_ticks: offsets.bow_ticks,
+                    curl_ticks: offsets.curl_ticks,
+                    yaw_ticks: offsets.yaw_ticks,
+                    roll_ticks: offsets.roll_ticks,
+                },
+            )
+        })
+        .transpose()
+        .map_err(HeadGazePolicyParseError::CharacterMapping)?;
+    Ok((mapping, character_mapping))
 }
 
 fn parse_timing(
@@ -642,6 +674,7 @@ pub enum HeadGazePolicyParseError {
         supported: u32,
     },
     Mapping(HeadGazeMappingDeclarationParseError),
+    CharacterMapping(CharacterHeadMappingDeclarationParseError),
     Controller(HeadGazeControllerDeclarationParseError),
     Lifecycle(HeadGazeLifecycleClaimParseError),
 }
@@ -657,6 +690,7 @@ impl std::error::Error for HeadGazePolicyParseError {
         match self {
             Self::JsonDecode(source) | Self::JsonTrailingData(source) => Some(source),
             Self::Mapping(source) => Some(source),
+            Self::CharacterMapping(source) => Some(source),
             Self::Controller(source) => Some(source),
             Self::Lifecycle(source) => Some(source),
             Self::InputTooLarge { .. } | Self::UnsupportedSchemaVersion { .. } => None,
@@ -893,6 +927,17 @@ struct HeadGazeMappingDeclarationDto {
     natural_encoder_position_ticks: NamedNaturalHeadTicksDto,
     hard_encoder_envelopes_ticks: NamedHeadTickEnvelopesDto,
     encoder_tick_offsets_per_radian: HeadGazeTickOffsetsPerRadianDto,
+    character_positive_full_scale_encoder_offsets_ticks:
+        Option<NamedCharacterHeadFullScaleTickOffsetsDto>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamedCharacterHeadFullScaleTickOffsetsDto {
+    bow_ticks: i16,
+    curl_ticks: i16,
+    yaw_ticks: i16,
+    roll_ticks: i16,
 }
 
 #[derive(Deserialize)]
@@ -1162,6 +1207,37 @@ mod tests {
         assert_eq!(yaw.maximum_position_step().get(), 8);
         assert_eq!(policy.controller().error_band().deadband().get(), 2);
         assert_eq!(policy.controller().error_band().resume_threshold().get(), 5);
+        assert_eq!(policy.character_mapping(), None);
+    }
+
+    #[test]
+    fn optional_character_mapping_parses_all_four_signed_axes_once() {
+        let mut value = valid_value();
+        value["mapping_declaration"]["character_positive_full_scale_encoder_offsets_ticks"] = json!({
+            "bow_ticks": 110,
+            "curl_ticks": -180,
+            "yaw_ticks": 200,
+            "roll_ticks": 160
+        });
+        let policy = parse(&value).expect("four-joint character mapping");
+        let mapping = policy
+            .character_mapping()
+            .expect("optional declaration was present");
+        assert_eq!(mapping.full_scale_tick_offset(HeadJoint::Bow), 110);
+        assert_eq!(mapping.full_scale_tick_offset(HeadJoint::Curl), -180);
+        assert_eq!(mapping.full_scale_tick_offset(HeadJoint::Yaw), 200);
+        assert_eq!(mapping.full_scale_tick_offset(HeadJoint::Roll), 160);
+
+        value["mapping_declaration"]["character_positive_full_scale_encoder_offsets_ticks"]["roll_ticks"] =
+            json!(0);
+        assert!(matches!(
+            parse(&value),
+            Err(HeadGazePolicyParseError::CharacterMapping(
+                CharacterHeadMappingDeclarationParseError::ZeroFullScaleOffset {
+                    joint: HeadJoint::Roll
+                }
+            ))
+        ));
     }
 
     #[test]

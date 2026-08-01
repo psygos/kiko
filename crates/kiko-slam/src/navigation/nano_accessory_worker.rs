@@ -45,7 +45,7 @@ use kiko_device_inventory::{
 #[cfg(feature = "nano-agent")]
 use kiko_expression_core::{Deadline, NonZeroDuration};
 use kiko_expression_core::{MonotonicTimestamp, StreamEpochId};
-use kiko_expression_runtime::PreparedEyeIntent;
+use kiko_expression_runtime::{CharacterHeadOverlay, PreparedCharacterFrame, PreparedEyeIntent};
 #[cfg(feature = "nano-agent")]
 use kiko_expression_runtime::{FaceTrackingConfig, MAX_FACE_DETECTIONS};
 use kiko_eye_runtime::{
@@ -95,7 +95,7 @@ use super::{
     EvidenceBoundPhysicalHeadGazePolicy, EvidenceBoundPhysicalHeadGazePolicyError,
     HeadGazeFaceProposalAdapter, HeadGazeFaceProposalAdapterError, HeadGazeFaceProposalError,
     HeadGazeFaceProposalOutcome, HeadGazePolicyLifecycleClaim, HeadGazePolicyV1,
-    PhysicalHeadGazeFaceOutcome, RgbFacePinholeProjection,
+    PhysicalCharacterHeadOutcome, RgbFacePinholeProjection,
 };
 use super::{
     ManifestBoundNanoAgentPolicyConfigV3, NanoRgbExpressionConfig, RgbExpressionBridge,
@@ -3645,7 +3645,11 @@ trait ReviewedNaturalHeadPort<F> {
 
     async fn start(&mut self) -> Result<Self::Ready, Self::StartError>;
     async fn check_health(&mut self) -> Result<Self::Health, Self::HealthError>;
-    async fn process_gaze_frame(&mut self, _frame: &F) -> Result<(), Self::GazeError> {
+    async fn process_gaze_frame(
+        &mut self,
+        _frame: &F,
+        _character_head: CharacterHeadOverlay,
+    ) -> Result<(), Self::GazeError> {
         Ok(())
     }
     async fn shutdown(&mut self) -> Self::Shutdown;
@@ -3666,7 +3670,39 @@ trait RgbBridgePort<F> {
     type Intent;
     type Error: Clone;
 
-    fn process(&mut self, frame: F) -> Result<Self::Intent, Self::Error>;
+    fn process(&mut self, frame: &F) -> Result<Self::Intent, Self::Error>;
+}
+
+trait AccessoryCharacterIntent: Copy {
+    type EyeIntent;
+
+    fn head_overlay(self) -> CharacterHeadOverlay;
+    fn into_eye(self) -> Self::EyeIntent;
+}
+
+impl AccessoryCharacterIntent for PreparedCharacterFrame {
+    type EyeIntent = PreparedEyeIntent;
+
+    fn head_overlay(self) -> CharacterHeadOverlay {
+        self.head()
+    }
+
+    fn into_eye(self) -> Self::EyeIntent {
+        self.eye()
+    }
+}
+
+#[cfg(test)]
+impl AccessoryCharacterIntent for u64 {
+    type EyeIntent = u64;
+
+    fn head_overlay(self) -> CharacterHeadOverlay {
+        CharacterHeadOverlay::NATURAL
+    }
+
+    fn into_eye(self) -> Self::EyeIntent {
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3722,8 +3758,9 @@ async fn run_accessory_core<F, H, E, B, Ready, RecordHealth, PublishFault, Latch
 where
     F: NanoHeadGazeFrame + Send + 'static,
     H: ReviewedNaturalHeadPort<F>,
-    E: Kep2EyePort<B::Intent>,
+    E: Kep2EyePort<<B::Intent as AccessoryCharacterIntent>::EyeIntent>,
     B: RgbBridgePort<F>,
+    B::Intent: AccessoryCharacterIntent,
     Ready: FnOnce(H::Ready, E::Ready) -> bool,
     RecordHealth: FnMut(H::Health) -> bool,
     PublishFault: FnMut(CoreTerminalFault<H::HealthError, H::GazeError, B::Error, E::ApplyError>),
@@ -3800,28 +3837,25 @@ where
             event = channel.next_event() => {
                 match event {
                     LatestFrameEvent::Frame(frame) => {
-                        match head.process_gaze_frame(&frame).await {
-                            Err(source) => Some(CoreTerminalFault::HeadGaze(source)),
-                            Ok(()) => match bridge.process(frame) {
-                                Ok(intent) => match eye.apply(intent).await {
-                                    Ok(()) => {
-                                        match channel.counters.record_processed_successfully() {
-                                            Ok(()) => None,
-                                            Err(
-                                                NanoAccessoryHealthStatusError::Poisoned
-                                                | NanoAccessoryHealthStatusError::OwnerNotRunning {
-                                                    ..
-                                                }
-                                                | NanoAccessoryHealthStatusError::IngressDisconnected
-                                                | NanoAccessoryHealthStatusError::ChannelPoisoned,
-                                            ) => {
-                                                Some(CoreTerminalFault::RgbHealthStatusPoisoned)
-                                            }
-                                        }
-                                    }
+                        match bridge.process(&frame) {
+                            Err(source) => Some(CoreTerminalFault::Bridge(source)),
+                            Ok(intent) => match head
+                                .process_gaze_frame(&frame, intent.head_overlay())
+                                .await
+                            {
+                                Err(source) => Some(CoreTerminalFault::HeadGaze(source)),
+                                Ok(()) => match eye.apply(intent.into_eye()).await {
+                                    Ok(()) => match channel.counters.record_processed_successfully() {
+                                        Ok(()) => None,
+                                        Err(
+                                            NanoAccessoryHealthStatusError::Poisoned
+                                            | NanoAccessoryHealthStatusError::OwnerNotRunning { .. }
+                                            | NanoAccessoryHealthStatusError::IngressDisconnected
+                                            | NanoAccessoryHealthStatusError::ChannelPoisoned,
+                                        ) => Some(CoreTerminalFault::RgbHealthStatusPoisoned),
+                                    },
                                     Err(source) => Some(CoreTerminalFault::EyeApply(source)),
                                 },
-                                Err(source) => Some(CoreTerminalFault::Bridge(source)),
                             },
                         }
                     }
@@ -4075,6 +4109,7 @@ impl SerialReviewedNaturalHeadPort {
     async fn process_physical_gaze_frame(
         &self,
         frame: &NanoFaceTrackedRgbFrame,
+        character_head: CharacterHeadOverlay,
     ) -> Result<(), NanoPhysicalHeadGazeRuntimeError> {
         let active = self
             .active
@@ -4101,17 +4136,18 @@ impl SerialReviewedNaturalHeadPort {
         let projection = physical_head_gaze_projection(frame)?;
         let outcome = physical
             .policy
-            .evaluate(
+            .evaluate_character(
                 frame.output.tracking(),
                 frame.output.tracked_at(),
                 projection,
+                character_head,
             )
             .map_err(NanoPhysicalHeadGazeRuntimeError::Proposal)?;
         let handle = active
             .handle
             .gaze()
             .expect("physical gaze policy and gaze actor are constructed together");
-        if let PhysicalHeadGazeFaceOutcome::Proposed(proposal) = outcome {
+        if let PhysicalCharacterHeadOutcome::Proposed(proposal) = outcome {
             let detector_result_sequence = frame.output.tracking().detector_result_sequence().get();
             let proposal_id = detector_result_sequence.checked_add(1).ok_or(
                 NanoPhysicalHeadGazeRuntimeError::ProposalSequenceExhausted {
@@ -4308,19 +4344,23 @@ impl<F: NanoHeadGazeFrame> ReviewedNaturalHeadPort<F> for SerialReviewedNaturalH
             .and_then(|evidence| self.require_hold_target(evidence))
     }
 
-    async fn process_gaze_frame(&mut self, frame: &F) -> Result<(), Self::GazeError> {
+    async fn process_gaze_frame(
+        &mut self,
+        frame: &F,
+        character_head: CharacterHeadOverlay,
+    ) -> Result<(), Self::GazeError> {
         #[cfg(feature = "nano-agent")]
         {
             let Some(frame) = frame.tracked_face_frame() else {
                 return Ok(());
             };
-            self.process_physical_gaze_frame(frame)
+            self.process_physical_gaze_frame(frame, character_head)
                 .await
                 .map_err(NanoHeadGazePortError::Physical)
         }
         #[cfg(not(feature = "nano-agent"))]
         {
-            let _ = frame;
+            let _ = (frame, character_head);
             Ok(())
         }
     }
@@ -4344,36 +4384,36 @@ impl<F: NanoHeadGazeFrame> ReviewedNaturalHeadPort<F> for SerialReviewedNaturalH
 impl RgbBridgePort<IngressObservedRgbFrame<ImageFrame>>
     for RgbExpressionBridge<NanoAccessoryClock>
 {
-    type Intent = PreparedEyeIntent;
+    type Intent = PreparedCharacterFrame;
     type Error = RgbExpressionBridgeError;
 
     fn process(
         &mut self,
-        frame: IngressObservedRgbFrame<ImageFrame>,
+        frame: &IngressObservedRgbFrame<ImageFrame>,
     ) -> Result<Self::Intent, Self::Error> {
-        self.process_queued_oak_frame(frame)
-            .map(|outcome| outcome.into_prepared())
+        self.process_queued_oak_frame_borrowed(frame)
+            .map(|outcome| outcome.into_character())
     }
 }
 
 fn process_rgb_work<F, B>(
     bridge: &mut B,
-    work: Result<F, ClockError>,
+    work: &Result<F, ClockError>,
 ) -> Result<B::Intent, RgbExpressionBridgeError>
 where
     B: RgbBridgePort<F, Error = RgbExpressionBridgeError>,
 {
     match work {
         Ok(frame) => bridge.process(frame),
-        Err(source) => Err(RgbExpressionBridgeError::Clock(source)),
+        Err(source) => Err(RgbExpressionBridgeError::Clock(source.clone())),
     }
 }
 
 impl RgbBridgePort<NanoAccessoryRgbWork> for RgbExpressionBridge<NanoAccessoryClock> {
-    type Intent = PreparedEyeIntent;
+    type Intent = PreparedCharacterFrame;
     type Error = RgbExpressionBridgeError;
 
-    fn process(&mut self, work: NanoAccessoryRgbWork) -> Result<Self::Intent, Self::Error> {
+    fn process(&mut self, work: &NanoAccessoryRgbWork) -> Result<Self::Intent, Self::Error> {
         process_rgb_work(self, work)
     }
 }
@@ -4391,10 +4431,10 @@ struct ProductionSceneRgbBridge(RgbExpressionBridge<NanoAccessoryClock>);
     test
 ))]
 impl RgbBridgePort<NanoAccessoryRgbWork> for ProductionSceneRgbBridge {
-    type Intent = PreparedEyeIntent;
+    type Intent = PreparedCharacterFrame;
     type Error = NanoAccessoryRgbProcessingError;
 
-    fn process(&mut self, work: NanoAccessoryRgbWork) -> Result<Self::Intent, Self::Error> {
+    fn process(&mut self, work: &NanoAccessoryRgbWork) -> Result<Self::Intent, Self::Error> {
         self.0
             .process(work)
             .map_err(NanoAccessoryRgbProcessingError::Bridge)
@@ -4406,14 +4446,16 @@ struct ProductionFaceRgbBridge(RgbExpressionBridge<NanoAccessoryClock>);
 
 #[cfg(feature = "nano-agent")]
 impl RgbBridgePort<NanoFacePerceptionWork> for ProductionFaceRgbBridge {
-    type Intent = PreparedEyeIntent;
+    type Intent = PreparedCharacterFrame;
     type Error = NanoAccessoryRgbProcessingError;
 
-    fn process(&mut self, work: NanoFacePerceptionWork) -> Result<Self::Intent, Self::Error> {
-        let frame = work.map_err(NanoAccessoryRgbProcessingError::FacePerception)?;
+    fn process(&mut self, work: &NanoFacePerceptionWork) -> Result<Self::Intent, Self::Error> {
+        let frame = work
+            .as_ref()
+            .map_err(|source| NanoAccessoryRgbProcessingError::FacePerception(source.clone()))?;
         self.0
-            .process_queued_oak_frame_with_face(frame.frame, frame.output.tracking())
-            .map(|outcome| outcome.into_prepared())
+            .process_queued_oak_frame_with_face(&frame.frame, frame.output.tracking())
+            .map(|outcome| outcome.into_character())
             .map_err(NanoAccessoryRgbProcessingError::Bridge)
     }
 }
@@ -4503,7 +4545,7 @@ fn run_production_worker_core<F, B, LatchFault>(
 ) -> NanoAccessoryWorkerExit
 where
     F: NanoHeadGazeFrame + Send + 'static,
-    B: RgbBridgePort<F, Intent = PreparedEyeIntent, Error = NanoAccessoryRgbProcessingError>,
+    B: RgbBridgePort<F, Intent = PreparedCharacterFrame, Error = NanoAccessoryRgbProcessingError>,
     LatchFault: FnMut(),
 {
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -5690,7 +5732,11 @@ mod tests {
             }
         }
 
-        async fn process_gaze_frame(&mut self, _frame: &F) -> Result<(), Self::GazeError> {
+        async fn process_gaze_frame(
+            &mut self,
+            _frame: &F,
+            _character_head: CharacterHeadOverlay,
+        ) -> Result<(), Self::GazeError> {
             if self.fail_gaze {
                 self.log.lock().unwrap().push("head_gaze");
                 Err("head_gaze")
@@ -5750,9 +5796,9 @@ mod tests {
         type Intent = u64;
         type Error = &'static str;
 
-        fn process(&mut self, frame: u64) -> Result<Self::Intent, Self::Error> {
+        fn process(&mut self, frame: &u64) -> Result<Self::Intent, Self::Error> {
             self.log.lock().unwrap().push("bridge");
-            if self.fail { Err("bridge") } else { Ok(frame) }
+            if self.fail { Err("bridge") } else { Ok(*frame) }
         }
     }
 
@@ -5764,9 +5810,9 @@ mod tests {
         type Intent = u64;
         type Error = RgbExpressionBridgeError;
 
-        fn process(&mut self, frame: u64) -> Result<Self::Intent, Self::Error> {
+        fn process(&mut self, frame: &u64) -> Result<Self::Intent, Self::Error> {
             self.log.lock().unwrap().push("clock_bridge_frame");
-            Ok(frame)
+            Ok(*frame)
         }
     }
 
@@ -5774,7 +5820,7 @@ mod tests {
         type Intent = u64;
         type Error = RgbExpressionBridgeError;
 
-        fn process(&mut self, work: Result<u64, ClockError>) -> Result<Self::Intent, Self::Error> {
+        fn process(&mut self, work: &Result<u64, ClockError>) -> Result<Self::Intent, Self::Error> {
             process_rgb_work(self, work)
         }
     }
@@ -6379,8 +6425,8 @@ mod tests {
         assert_eq!(fault_rx.recv().await, Some(expected));
         if fail_head_gaze {
             let observed = log.lock().unwrap();
+            assert!(observed.contains(&"bridge"));
             assert!(observed.contains(&"head_gaze"));
-            assert!(!observed.contains(&"bridge"));
             assert!(!observed.contains(&"eye_apply"));
         }
         tokio::time::sleep(Duration::from_millis(12)).await;
@@ -6411,7 +6457,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn head_gaze_fault_precedes_eye_work_and_latches_without_releasing_hold() {
+    async fn character_bridge_prepares_before_head_and_head_fault_precedes_eye_apply() {
         assert_fault_does_not_shutdown_head(
             true,
             false,

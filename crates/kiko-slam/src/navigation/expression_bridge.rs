@@ -1,10 +1,12 @@
-//! Borrowed OAK RGB frames to bounded KEP2 eye intentions.
+//! Borrowed OAK RGB frames to bounded, time-coherent character intentions.
 //!
 //! This bridge deliberately owns no camera, protocol session, transport, eye
 //! actor, or head actor. One call borrows the tightly packed BGR888 bytes from
 //! an already parsed [`oak_sys::ImageFrame`], derives fixed-size scene-motion
-//! state, and returns only a [`PreparedEyeIntent`] for the eye actor's bounded
-//! mailbox. Source frame storage is neither copied nor retained.
+//! state, and returns one [`PreparedCharacterFrame`] whose eye projection is
+//! accepted by the eye actor and whose normalized four-joint head overlay is
+//! not physical motion authority. Source frame storage is neither copied nor
+//! retained.
 //!
 //! OAK device timestamps and host timestamps have unrelated epochs. The bridge
 //! therefore never guesses an offset between them: the device timestamp is
@@ -25,15 +27,19 @@ use kiko_expression_runtime::{
     AdaptError, AutonomicCharacterEngine, CameraForwardDepthMeters, CameraToHeadGazeExtrinsics,
     EyeRenderStyle, FaceTargetState, FaceTrackingUpdate, HeadGazeProjectionError, HeadRelativeGaze,
     MonotonicLatestAdmission, MonotonicLatestGap, OakCameraTargetPoint, OakCameraTargetRay,
-    PreparedEyeIntent, RayHeadGazeProjectionError, SceneAnalysis, SceneMotionConfig,
-    SceneMotionError, SceneMotionExtractor, adapt_reaction_output,
+    PreparedCharacterFrame, PreparedEyeIntent, RayHeadGazeProjectionError, SceneAnalysis,
+    SceneMotionConfig, SceneMotionError, SceneMotionExtractor, adapt_reaction_output,
 };
 use kiko_eye_runtime::{ClockError, MonotonicClock};
 use oak_sys::{ImageFrame, StreamId};
 
 use super::NanoRgbExpressionConfig;
 
-/// The RGB expression path can never request expressive head displacement.
+/// The base reaction mixer itself never requests expressive head displacement.
+///
+/// The autonomic character director may independently attach a normalized,
+/// proposal-only four-joint overlay after this mixer. That overlay still has
+/// no encoder polarity, calibration, transport, lease, or motion authority.
 pub const RGB_EXPRESSION_HEAD_POLICY: HeadMotionPolicy = HeadMotionPolicy::NaturalHold;
 
 /// Semantic attention strength selected by policy for one associated face.
@@ -75,16 +81,17 @@ impl std::error::Error for RgbHeadGazeProjectionError {
 
 /// A successful expression decision and its continuity semantics.
 ///
-/// Each variant contains exactly one small, transport-independent eye intent.
+/// Each variant contains exactly one small, transport-independent character
+/// frame.
 /// A forward gap remains a real comparison against the last accepted frame,
 /// while its exact skipped-sequence count remains available to diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RgbExpressionBridgeOutcome {
-    ColdStart(PreparedEyeIntent),
-    Consecutive(PreparedEyeIntent),
+    ColdStart(PreparedCharacterFrame),
+    Consecutive(PreparedCharacterFrame),
     ForwardGap {
         gap: MonotonicLatestGap,
-        prepared: PreparedEyeIntent,
+        prepared: PreparedCharacterFrame,
     },
 }
 
@@ -92,6 +99,12 @@ impl RgbExpressionBridgeOutcome {
     /// Discard bridge diagnostics and yield the only value accepted by the eye
     /// actor's bounded intent mailbox.
     pub const fn into_prepared(self) -> PreparedEyeIntent {
+        self.into_character().eye()
+    }
+
+    /// Preserve the coherent eye/head character decision for an integrated
+    /// single-owner runtime.
+    pub const fn into_character(self) -> PreparedCharacterFrame {
         match self {
             Self::ColdStart(prepared)
             | Self::Consecutive(prepared)
@@ -231,10 +244,6 @@ impl ParsedIngressRgbFrame {
     pub(super) const fn observation(&self) -> RgbObservation {
         self.observation
     }
-
-    fn into_parts(self) -> (ImageFrame, RgbObservation) {
-        (self.frame, self.observation)
-    }
 }
 
 /// Parse an ingress-stamped OAK frame into one provenance-bearing domain
@@ -364,14 +373,19 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         self.process_borrowed(frame.into())
     }
 
-    /// Process a moved frame whose host observation was captured before queue
-    /// admission by a clone of this bridge's exact clock origin.
-    pub(super) fn process_queued_oak_frame(
+    /// Borrow an ingress-owned frame so the integrated worker can use the
+    /// same allocation for head policy and eye/character processing.
+    pub(super) fn process_queued_oak_frame_borrowed(
         &mut self,
-        frame: IngressObservedRgbFrame<ImageFrame>,
+        frame: &IngressObservedRgbFrame<ImageFrame>,
     ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
-        let parsed = parse_ingress_observed_oak_frame(frame, self.stream_epoch, self.freshness)?;
-        self.process_parsed_queued_oak_frame(parsed, None)
+        let borrowed = BorrowedOakFrame::from(&frame.frame);
+        self.process_borrowed_at(
+            borrowed,
+            frame.observed_at,
+            self.clock.now().map_err(RgbExpressionBridgeError::Clock)?,
+            None,
+        )
     }
 
     /// Mix one face-association result produced from this exact queued frame.
@@ -382,7 +396,7 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
     #[cfg(feature = "nano-agent")]
     pub(super) fn process_queued_oak_frame_with_face(
         &mut self,
-        frame: ParsedIngressRgbFrame,
+        frame: &ParsedIngressRgbFrame,
         face: FaceTrackingUpdate,
     ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
         self.process_parsed_queued_oak_frame(frame, Some(face))
@@ -390,12 +404,11 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
 
     fn process_parsed_queued_oak_frame(
         &mut self,
-        frame: ParsedIngressRgbFrame,
+        frame: &ParsedIngressRgbFrame,
         face: Option<FaceTrackingUpdate>,
     ) -> Result<RgbExpressionBridgeOutcome, RgbExpressionBridgeError> {
         let now = self.clock.now().map_err(RgbExpressionBridgeError::Clock)?;
-        let (frame, observation) = frame.into_parts();
-        self.process_parsed_borrowed_at((&frame).into(), observation, now, face)
+        self.process_parsed_borrowed_at((&frame.frame).into(), frame.observation, now, face)
     }
 
     #[cfg(test)]
@@ -498,8 +511,8 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         let prepared = adapt_reaction_output(reaction, ExpressionKind::Curious, self.style, now)
             .map_err(RgbExpressionBridgeError::Adapt)?;
         let prepared = match self.character.as_mut() {
-            Some(character) => character.render(now, face_present, prepared),
-            None => prepared,
+            Some(character) => character.render_character(now, face_present, prepared),
+            None => PreparedCharacterFrame::eyes_only(prepared),
         };
 
         Ok(match admitted.admission() {
@@ -835,6 +848,28 @@ mod tests {
             [4, 5, 6],
             "the production character layer, not the transport adapter, owns idle styling"
         );
+    }
+
+    #[test]
+    fn production_bridge_preserves_all_four_character_axes_in_one_frame() {
+        let clock = TestClock::new(10);
+        let mut decorated = bridge(clock.clone());
+        decorated.character = Some(AutonomicCharacterEngine::new(stream_epoch().get()));
+        let mut moved = [false; 4];
+
+        for step in 0..500_u64 {
+            let now_ns = 10 + step * 50_000_000;
+            clock.set(now_ns);
+            let character = decorated
+                .process_borrowed(rgb(step + 1, (step + 1) as i64, &[0; 12]))
+                .expect("monotonic RGB character frame")
+                .into_character();
+            for (observed, amount) in moved.iter_mut().zip(character.head().amounts()) {
+                *observed |= amount.get() != 0;
+            }
+        }
+
+        assert_eq!(moved, [true; 4]);
     }
 
     #[test]

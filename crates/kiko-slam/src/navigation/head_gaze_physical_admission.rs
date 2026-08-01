@@ -14,7 +14,10 @@ use kiko_device_inventory::{
     ArtifactRelativePath, DeploymentAssetContentSha256, LoadedDeploymentAsset,
 };
 use kiko_expression_core::MonotonicTimestamp;
-use kiko_expression_runtime::FaceTrackingUpdate;
+use kiko_expression_runtime::{
+    CharacterHeadMappingDeclaration, CharacterHeadOverlay, CharacterHeadOverlayMappingError,
+    FaceTrackingUpdate,
+};
 use kiko_head_protocol::ExactHeadTargetPose;
 use kiko_head_runtime::{
     HeadGazeActuationConfig, HeadGazeActuationConfigError, ReturnToTargetConfig,
@@ -78,6 +81,52 @@ pub enum PhysicalHeadGazeFaceOutcome {
     Withheld(HeadGazeFaceProposalWithheld),
 }
 
+/// Truthful result of attempting to compose one character overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterHeadOverlayDisposition {
+    Natural,
+    Applied(CharacterHeadOverlay),
+    WithheldNoMapping(CharacterHeadOverlay),
+    WithheldOutsideHardEnvelope {
+        requested: CharacterHeadOverlay,
+        source: CharacterHeadOverlayMappingError,
+    },
+}
+
+/// One admitted physical target after optional face gaze and character
+/// overlay composition.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AdmittedPhysicalCharacterHeadProposal {
+    face: Option<HeadGazeFaceProposal>,
+    command_target: ExactHeadTargetPose,
+    overlay: CharacterHeadOverlayDisposition,
+}
+
+impl AdmittedPhysicalCharacterHeadProposal {
+    pub const fn face(self) -> Option<HeadGazeFaceProposal> {
+        self.face
+    }
+
+    pub const fn command_target(self) -> ExactHeadTargetPose {
+        self.command_target
+    }
+
+    pub const fn overlay(self) -> CharacterHeadOverlayDisposition {
+        self.overlay
+    }
+}
+
+/// Character evaluation can produce a target without a face (an autonomic
+/// act) or truthfully retain why no target was made.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PhysicalCharacterHeadOutcome {
+    Proposed(AdmittedPhysicalCharacterHeadProposal),
+    Withheld {
+        face: HeadGazeFaceProposalWithheld,
+        overlay: CharacterHeadOverlayDisposition,
+    },
+}
+
 /// Sole owner of a head-gaze policy that crossed every static activation
 /// boundary available before hardware is opened.
 ///
@@ -87,6 +136,7 @@ pub enum PhysicalHeadGazeFaceOutcome {
 #[derive(Debug)]
 pub struct EvidenceBoundPhysicalHeadGazePolicy {
     adapter: HeadGazeFaceProposalAdapter,
+    character_mapping: Option<CharacterHeadMappingDeclaration>,
     actuation: HeadGazeActuationConfig,
     review: OperatorClaimedHeadGazePhysicalReview,
     evidence: BoundHeadGazeReviewEvidence,
@@ -128,6 +178,7 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
         }
 
         let declaration = *policy.controller();
+        let character_mapping = policy.character_mapping();
         let controller = HeadGazeControlConfig::try_new(
             declaration.timing(),
             reviewed_natural,
@@ -146,6 +197,7 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
 
         Ok(Self {
             adapter,
+            character_mapping,
             actuation,
             review,
             evidence: BoundHeadGazeReviewEvidence {
@@ -166,6 +218,10 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
 
     pub const fn evidence(&self) -> &BoundHeadGazeReviewEvidence {
         &self.evidence
+    }
+
+    pub const fn character_mapping(&self) -> Option<CharacterHeadMappingDeclaration> {
+        self.character_mapping
     }
 
     /// Evaluate and activate one face update under this exact retained policy.
@@ -190,6 +246,87 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
             }
             HeadGazeFaceProposalOutcome::Withheld(reason) => {
                 Ok(PhysicalHeadGazeFaceOutcome::Withheld(reason))
+            }
+        }
+    }
+
+    /// Evaluate face gaze and the same-frame deterministic character overlay.
+    ///
+    /// Missing or out-of-envelope expressive calibration never silently
+    /// clamps. Face gaze may still proceed while the returned disposition
+    /// records that the overlay was withheld.
+    pub fn evaluate_character(
+        &self,
+        update: FaceTrackingUpdate,
+        evaluated_at: MonotonicTimestamp,
+        projection: RgbFacePinholeProjection,
+        overlay: CharacterHeadOverlay,
+    ) -> Result<PhysicalCharacterHeadOutcome, HeadGazeFaceProposalError> {
+        match self.adapter.evaluate(update, evaluated_at, projection)? {
+            HeadGazeFaceProposalOutcome::Proposed(face) => {
+                let base = face.target();
+                let (target, overlay_disposition) = if overlay.is_natural() {
+                    (base, CharacterHeadOverlayDisposition::Natural)
+                } else if let Some(mapping) = self.character_mapping {
+                    match mapping.proposal_for_base_overlay(base, overlay) {
+                        Ok(target) => (target, CharacterHeadOverlayDisposition::Applied(overlay)),
+                        Err(source) => (
+                            base,
+                            CharacterHeadOverlayDisposition::WithheldOutsideHardEnvelope {
+                                requested: overlay,
+                                source,
+                            },
+                        ),
+                    }
+                } else {
+                    (
+                        base,
+                        CharacterHeadOverlayDisposition::WithheldNoMapping(overlay),
+                    )
+                };
+                let [bow, curl, yaw, roll] = target.positions();
+                Ok(PhysicalCharacterHeadOutcome::Proposed(
+                    AdmittedPhysicalCharacterHeadProposal {
+                        face: Some(face),
+                        command_target: ExactHeadTargetPose::from_positions(bow, curl, yaw, roll),
+                        overlay: overlay_disposition,
+                    },
+                ))
+            }
+            HeadGazeFaceProposalOutcome::Withheld(face) => {
+                if overlay.is_natural() {
+                    return Ok(PhysicalCharacterHeadOutcome::Withheld {
+                        face,
+                        overlay: CharacterHeadOverlayDisposition::Natural,
+                    });
+                }
+                let Some(mapping) = self.character_mapping else {
+                    return Ok(PhysicalCharacterHeadOutcome::Withheld {
+                        face,
+                        overlay: CharacterHeadOverlayDisposition::WithheldNoMapping(overlay),
+                    });
+                };
+                match mapping.proposal_for_natural_overlay(overlay) {
+                    Ok(target) => {
+                        let [bow, curl, yaw, roll] = target.positions();
+                        Ok(PhysicalCharacterHeadOutcome::Proposed(
+                            AdmittedPhysicalCharacterHeadProposal {
+                                face: None,
+                                command_target: ExactHeadTargetPose::from_positions(
+                                    bow, curl, yaw, roll,
+                                ),
+                                overlay: CharacterHeadOverlayDisposition::Applied(overlay),
+                            },
+                        ))
+                    }
+                    Err(source) => Ok(PhysicalCharacterHeadOutcome::Withheld {
+                        face,
+                        overlay: CharacterHeadOverlayDisposition::WithheldOutsideHardEnvelope {
+                            requested: overlay,
+                            source,
+                        },
+                    }),
+                }
             }
         }
     }
@@ -241,6 +378,13 @@ mod tests {
 
     use kiko_device_inventory::{
         ArtifactRelativePath, DeploymentAssetByteLimit, load_deployment_asset,
+    };
+    use kiko_expression_core::{
+        ChannelOrder, FrameId, FreshnessWindow, ImageLayout, NonZeroDuration, RgbObservation,
+        StreamEpochId,
+    };
+    use kiko_expression_runtime::{
+        DetectorResultSequence, FaceDetectionBatch, FaceTracker, FaceTrackingConfig,
     };
     use kiko_head_runtime::{HeadProbeConfig, HeadProbeConfigInput, ReturnToTargetConfigInput};
     use serde_json::{Value, json};
@@ -382,6 +526,12 @@ mod tests {
                         "yaw_ticks_per_radian": 300.0,
                         "roll_ticks_per_radian": 0.0
                     }
+                },
+                "character_positive_full_scale_encoder_offsets_ticks": {
+                    "bow_ticks": 100,
+                    "curl_ticks": -180,
+                    "yaw_ticks": 180,
+                    "roll_ticks": 160
                 }
             },
             "controller_declaration": {
@@ -426,6 +576,34 @@ mod tests {
             .expect("parse policy")
     }
 
+    fn no_target_update(observed_at_ns: u64) -> FaceTrackingUpdate {
+        let layout = ImageLayout::try_new(640, 400, 1_920, ChannelOrder::Bgr).unwrap();
+        let observed_at = MonotonicTimestamp::from_nanos_since_epoch(observed_at_ns);
+        let observation = RgbObservation::new(
+            FrameId::new(StreamEpochId::try_new(1).unwrap(), 1),
+            layout,
+            FreshnessWindow::from_ttl(
+                observed_at,
+                NonZeroDuration::try_from_nanos(1_000_000_000).unwrap(),
+            )
+            .unwrap(),
+        );
+        let batch =
+            FaceDetectionBatch::try_new(observation, DetectorResultSequence::new(1), 0, &[])
+                .unwrap();
+        FaceTracker::new(FaceTrackingConfig::default())
+            .update(&batch, observed_at)
+            .unwrap()
+    }
+
+    fn projection() -> RgbFacePinholeProjection {
+        let layout = ImageLayout::try_new(640, 400, 1_920, ChannelOrder::Bgr).unwrap();
+        RgbFacePinholeProjection::new(
+            crate::PinholeIntrinsics::try_new(400.0, 400.0, 319.5, 199.5).unwrap(),
+            layout,
+        )
+    }
+
     #[test]
     fn exact_review_bytes_natural_pose_and_transport_budget_activate_once() {
         let (_root, evidence) = load_evidence(b"retained physical review evidence");
@@ -454,6 +632,89 @@ mod tests {
         assert_eq!(
             admitted.evidence().relative_path(),
             evidence.relative_path()
+        );
+        let character = admitted
+            .character_mapping()
+            .expect("reviewed document contained four-joint mapping");
+        assert_eq!(
+            character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Bow),
+            100
+        );
+        assert_eq!(
+            character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Curl),
+            -180
+        );
+        assert_eq!(
+            character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Yaw),
+            180
+        );
+        assert_eq!(
+            character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Roll),
+            160
+        );
+    }
+
+    #[test]
+    fn reviewed_character_overlay_can_drive_all_four_without_a_face() {
+        let (_root, evidence) = load_evidence(b"retained physical review evidence");
+        let digest = lowercase_hex(evidence.content_sha256().as_bytes());
+        let admitted = EvidenceBoundPhysicalHeadGazePolicy::admit(
+            parse_policy(&policy_value(&digest, 100_000_000)),
+            &evidence,
+            &reviewed_return(),
+        )
+        .unwrap();
+        let overlay = CharacterHeadOverlay::try_new(500, -500, 500, -500).unwrap();
+        let evaluated_at = MonotonicTimestamp::from_nanos_since_epoch(10);
+        let outcome = admitted
+            .evaluate_character(no_target_update(10), evaluated_at, projection(), overlay)
+            .unwrap();
+        let PhysicalCharacterHeadOutcome::Proposed(proposal) = outcome else {
+            panic!("reviewed non-natural overlay must propose");
+        };
+        assert_eq!(proposal.face(), None);
+        assert_eq!(
+            proposal
+                .command_target()
+                .positions()
+                .map(|ticks| ticks.get()),
+            [2_224, 2_660, 1_727, 2_967]
+        );
+        assert_eq!(
+            proposal.overlay(),
+            CharacterHeadOverlayDisposition::Applied(overlay)
+        );
+    }
+
+    #[test]
+    fn absent_character_mapping_is_reported_and_never_guessed() {
+        let (_root, evidence) = load_evidence(b"retained physical review evidence");
+        let digest = lowercase_hex(evidence.content_sha256().as_bytes());
+        let mut value = policy_value(&digest, 100_000_000);
+        value["mapping_declaration"]
+            .as_object_mut()
+            .unwrap()
+            .remove("character_positive_full_scale_encoder_offsets_ticks");
+        let admitted = EvidenceBoundPhysicalHeadGazePolicy::admit(
+            parse_policy(&value),
+            &evidence,
+            &reviewed_return(),
+        )
+        .unwrap();
+        let overlay = CharacterHeadOverlay::try_new(1, 2, 3, 4).unwrap();
+        assert_eq!(
+            admitted
+                .evaluate_character(
+                    no_target_update(10),
+                    MonotonicTimestamp::from_nanos_since_epoch(10),
+                    projection(),
+                    overlay,
+                )
+                .unwrap(),
+            PhysicalCharacterHeadOutcome::Withheld {
+                face: HeadGazeFaceProposalWithheld::NoTarget,
+                overlay: CharacterHeadOverlayDisposition::WithheldNoMapping(overlay),
+            }
         );
     }
 

@@ -234,9 +234,10 @@ pub use goal_input::{
 };
 #[cfg(feature = "agent-runtime")]
 pub use head_gaze_physical_admission::{
-    AdmittedPhysicalHeadGazeFaceProposal, BoundHeadGazeReviewEvidence,
+    AdmittedPhysicalCharacterHeadProposal, AdmittedPhysicalHeadGazeFaceProposal,
+    BoundHeadGazeReviewEvidence, CharacterHeadOverlayDisposition,
     EvidenceBoundPhysicalHeadGazePolicy, EvidenceBoundPhysicalHeadGazePolicyError,
-    PhysicalHeadGazeFaceOutcome,
+    PhysicalCharacterHeadOutcome, PhysicalHeadGazeFaceOutcome,
 };
 #[cfg(feature = "agent-runtime")]
 pub use head_gaze_policy::{

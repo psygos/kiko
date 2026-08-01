@@ -62,6 +62,12 @@
         "yaw_ticks_per_radian": ${HEAD_GAZE_UNVALIDATED_YAW_RIGHT_YAW_TICKS_PER_RADIAN},
         "roll_ticks_per_radian": 0.0
       }
+    },
+    "character_positive_full_scale_encoder_offsets_ticks": {
+      "bow_ticks": ${HEAD_CHARACTER_UNVALIDATED_BOW_POSITIVE_FULL_SCALE_TICKS},
+      "curl_ticks": ${HEAD_CHARACTER_UNVALIDATED_CURL_POSITIVE_FULL_SCALE_TICKS},
+      "yaw_ticks": ${HEAD_CHARACTER_UNVALIDATED_YAW_POSITIVE_FULL_SCALE_TICKS},
+      "roll_ticks": ${HEAD_CHARACTER_UNVALIDATED_ROLL_POSITIVE_FULL_SCALE_TICKS}
     }
   },
   "controller_declaration": {

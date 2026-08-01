@@ -15,7 +15,7 @@ const TEMPLATE: &str = include_str!(concat!(
     "/../../configs/nano-wheels-off-qualification-template/head-gaze-policy-v1.json.template"
 ));
 
-const UNRESOLVED_SENTINELS: [&str; 31] = [
+const UNRESOLVED_SENTINELS: [&str; 35] = [
     "${HEAD_ASSEMBLY_DECLARATION_ID}",
     "${HEAD_GAZE_UNVALIDATED_PROPOSAL_EVIDENCE_ID}",
     "${HEAD_GAZE_UNVALIDATED_PROPOSAL_EVIDENCE_CONTENT_SHA256}",
@@ -30,6 +30,10 @@ const UNRESOLVED_SENTINELS: [&str; 31] = [
     "${HEAD_GAZE_UNVALIDATED_PITCH_DOWN_BOW_TICKS_PER_RADIAN}",
     "${HEAD_GAZE_UNVALIDATED_PITCH_DOWN_CURL_TICKS_PER_RADIAN}",
     "${HEAD_GAZE_UNVALIDATED_YAW_RIGHT_YAW_TICKS_PER_RADIAN}",
+    "${HEAD_CHARACTER_UNVALIDATED_BOW_POSITIVE_FULL_SCALE_TICKS}",
+    "${HEAD_CHARACTER_UNVALIDATED_CURL_POSITIVE_FULL_SCALE_TICKS}",
+    "${HEAD_CHARACTER_UNVALIDATED_YAW_POSITIVE_FULL_SCALE_TICKS}",
+    "${HEAD_CHARACTER_UNVALIDATED_ROLL_POSITIVE_FULL_SCALE_TICKS}",
     "${HEAD_GAZE_UNVALIDATED_CONTROL_PERIOD_NS}",
     "${HEAD_GAZE_UNVALIDATED_MAXIMUM_TICK_LATENESS_NS}",
     "${HEAD_GAZE_UNVALIDATED_PROPOSAL_TTL_NS}",
@@ -82,6 +86,22 @@ fn render_parser_fixture() -> String {
         (
             "${HEAD_GAZE_UNVALIDATED_YAW_RIGHT_YAW_TICKS_PER_RADIAN}",
             "300.0",
+        ),
+        (
+            "${HEAD_CHARACTER_UNVALIDATED_BOW_POSITIVE_FULL_SCALE_TICKS}",
+            "100",
+        ),
+        (
+            "${HEAD_CHARACTER_UNVALIDATED_CURL_POSITIVE_FULL_SCALE_TICKS}",
+            "-100",
+        ),
+        (
+            "${HEAD_CHARACTER_UNVALIDATED_YAW_POSITIVE_FULL_SCALE_TICKS}",
+            "150",
+        ),
+        (
+            "${HEAD_CHARACTER_UNVALIDATED_ROLL_POSITIVE_FULL_SCALE_TICKS}",
+            "100",
         ),
         ("${HEAD_GAZE_UNVALIDATED_CONTROL_PERIOD_NS}", "20000000"),
         (
@@ -202,6 +222,18 @@ fn rendered_contract_is_typed_proposal_only_with_exact_known_geometry() {
             .positions()
             .map(|position| position.get()),
         [2174, 2570, 1637, 3047]
+    );
+    let character = policy
+        .character_mapping()
+        .expect("template retains an explicit proposal-only four-joint mapping");
+    assert_eq!(
+        [
+            character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Bow),
+            character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Curl),
+            character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Yaw),
+            character.full_scale_tick_offset(kiko_head_protocol::HeadJoint::Roll),
+        ],
+        [100, -100, 150, 100]
     );
 
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
