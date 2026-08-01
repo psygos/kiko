@@ -273,8 +273,10 @@ suspect sample into controller state:
    immediately.
 2. An initially high energized temperature freezes all physical output for the
    transaction and does not prepare or commit a planner generation.
-3. The actor waits 10 ms and obtains two more fresh responses for the same
-   joint, with both reads sharing one bounded transaction budget.
+3. The actor waits 100 ms before each of two fresh responses for the same
+   joint. Each read has its own configured transaction deadline, so the
+   complete confirmation is bounded while neither read borrows time from the
+   fixed inter-sample interval.
 4. Any admitted temperature among the three produces typed transient evidence
    retaining all raw responses. Gaze actuation is also suppressed for that
    service transaction.
@@ -307,3 +309,14 @@ natural return, USB3 camera transport, expression activity, and sustained
 software liveness for that interval. It does not prove physical petting feel,
 minimum stable torque, thermal calibration, face-detection quality, complete
 head-tracking geometry, locomotion, MPC, or SLAM.
+
+The first guardian run then supplied stronger evidence than the manual run.
+At 171.79 seconds it received three high Bow bytes `150`, `88`, and `97` over
+25 ms and correctly latched off. With the head retry still latched and torque
+and goal retained, 20 read-only probes at approximately 50 ms request spacing
+observed the ordinary raw value `38`, one isolated `150`, ordinary `38` again
+85 ms later, one admitted `50`, and then only `38`. This proves that 10 ms
+confirmations can remain inside one response-corruption burst on this bus. It
+does not prove a universal maximum burst length. The deployed confirmation
+interval is therefore 100 ms, beyond the observed 85 ms recovery, and retains
+two confirmation samples over 200 ms before a genuine three-high fail-stop.

@@ -39,7 +39,11 @@ use crate::transport::{
 };
 
 const ACTOR_MAILBOX_CAPACITY: usize = 1;
-const ENERGIZED_TEMPERATURE_CONFIRMATION_INTERVAL: Duration = Duration::from_millis(10);
+// Live read-only Nano evidence showed a checksum-valid 150 raw sample followed
+// by the ordinary 38 raw value 85 ms later. Confirmation is deliberately
+// outside that observed corruption burst; an actual thermal trip remains
+// fail-stopped after two bounded reads over 200 ms.
+const ENERGIZED_TEMPERATURE_CONFIRMATION_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Deliberate opt-in required before the actor can enable servo torque.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -3961,27 +3965,22 @@ where
         let mut completed_responses = Vec::with_capacity(3);
         completed_responses.push(initial);
 
-        tokio::time::sleep(ENERGIZED_TEMPERATURE_CONFIRMATION_INTERVAL).await;
-        self.check_health_control(commands, control, joint)
-            .map_err(|source| HeadGazeServiceError::CompliantControl(Box::new(source)))?;
-        let budget =
-            HeadCompliantObservationBudget::new(self.clock.now(), observation_transaction_timeout);
         let request = build_full_telemetry_read(joint.servo_id());
-        for confirmation_index in 0..2 {
-            if confirmation_index != 0 {
-                tokio::time::sleep(ENERGIZED_TEMPERATURE_CONFIRMATION_INTERVAL).await;
-                if let Err(source) = self.check_health_control(commands, control, joint) {
-                    return Err(
-                        HeadGazeServiceError::CompliantTemperatureConfirmationInterrupted {
-                            joint,
-                            completed_responses,
-                            source: Box::new(HeadGazeServiceError::CompliantControl(Box::new(
-                                source,
-                            ))),
-                        },
-                    );
-                }
+        for _ in 0..2 {
+            tokio::time::sleep(ENERGIZED_TEMPERATURE_CONFIRMATION_INTERVAL).await;
+            if let Err(source) = self.check_health_control(commands, control, joint) {
+                return Err(
+                    HeadGazeServiceError::CompliantTemperatureConfirmationInterrupted {
+                        joint,
+                        completed_responses,
+                        source: Box::new(HeadGazeServiceError::CompliantControl(Box::new(source))),
+                    },
+                );
             }
+            let budget = HeadCompliantObservationBudget::new(
+                self.clock.now(),
+                observation_transaction_timeout,
+            );
             match self.read_compliant_telemetry(joint, &request, budget).await {
                 Ok(response) => completed_responses.push(response),
                 Err(source) => {
