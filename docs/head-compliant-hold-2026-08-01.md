@@ -254,3 +254,56 @@ it does not rewrite the head's retained goal, while blindly restarting a
 tension-preserving head takeover can re-adopt a sagged pose after a partial
 startup. A typed head fault therefore leaves the last torque/goal state intact
 and the expression child alive instead of creating an actuation retry loop.
+
+## Energized-temperature confirmation and live handoff
+
+The first typed compliant run ended safely after 18.24 seconds when one
+checksum-valid Bow response carried raw temperature `72` against the exclusive
+energized limit `65`. Long-running evidence from the retained STS owner had
+independently shown isolated raw temperature bytes `65`, `97`, and `122`
+immediately followed by ordinary values around `39..41`. That is evidence for a
+recurrent response-level transient; it is not evidence that every future high
+sample is corrupt or that the physical thermal limit may be relaxed.
+
+The compliant boundary now distinguishes the two cases without admitting the
+suspect sample into controller state:
+
+1. The complete four-joint response set is parsed once. Voltage, device status,
+   identity, framing, ordering, span, and freshness faults still fail
+   immediately.
+2. An initially high energized temperature freezes all physical output for the
+   transaction and does not prepare or commit a planner generation.
+3. The actor waits 10 ms and obtains two more fresh responses for the same
+   joint, with both reads sharing one bounded transaction budget.
+4. Any admitted temperature among the three produces typed transient evidence
+   retaining all raw responses. Gaze actuation is also suppressed for that
+   service transaction.
+5. Three consecutive high responses produce a distinct confirmed-temperature
+   fail-stop retaining all three responses. A failed confirmation read,
+   nonzero device status, or voltage violation remains its own typed error and
+   is never relabelled as a transient.
+
+On 2026-08-01 the Orin Nano release binary built from local commit `f82b4d1`
+(Nano-applied commit `3b912ca`) completed an attended tension-preserving
+takeover from `[2163,2572,1633,3041]` ticks. It retained enabled torque, used
+one bounded return waypoint toward the reviewed
+`[2174,2570,1637,3047]` target, and reported raw startup temperatures
+`[39,36,38,39]`. The manual typed owner then remained live for 92 seconds,
+beyond the previous 18.24-second exit, and handled SIGTERM by recording
+`RequestedHoldPreservingRelease` without a torque-disable write.
+
+The updated singleton guardian subsequently started at
+`2026-08-01T11:55:01+05:30`. After 77 seconds of observation its typed head
+child still exclusively owned `/dev/ttyACM1`; its expression child ran with
+`--no-head` and exclusively owned `/dev/ttyACM2`; `/dev/ttyACM0` remained
+unowned. The OAK process reported `camera_ready usb=SUPER`, and `lsusb -t`
+placed the OAK vendor interface at `5000M` beneath the Orin `10000M` root/hub
+path. Eye-state logs continued through `IDLE`, `SLEEPY`, blink, perk-up, and
+sweep acts while the head owner remained separate. The installed crontab has
+both an `@reboot` guardian entry and a minute-level singleton recovery entry.
+
+This proves process/serial ownership, tension-preserving startup, bounded
+natural return, USB3 camera transport, expression activity, and sustained
+software liveness for that interval. It does not prove physical petting feel,
+minimum stable torque, thermal calibration, face-detection quality, complete
+head-tracking geometry, locomotion, MPC, or SLAM.
