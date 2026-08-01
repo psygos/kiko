@@ -54,10 +54,10 @@ class CompliantHeadPolicyTests(unittest.TestCase):
             raw["compliant_hold"], raw["torque_limit_permille"])
         self.assertEqual(
             policy.holding_torque_limit_permille, (600, 500, 250, 300))
-        self.assertEqual(policy.contact_entry_error_ticks, (10, 12, 10, 10))
-        self.assertEqual(policy.contact_release_error_ticks, (4, 5, 4, 4))
+        self.assertEqual(policy.contact_entry_error_ticks, (14, 18, 10, 10))
+        self.assertEqual(policy.contact_release_error_ticks, (5, 7, 4, 4))
         self.assertEqual(policy.contact_acquisition_samples, 2)
-        self.assertEqual(policy.follow_fraction, 0.8)
+        self.assertEqual(policy.follow_fraction, 0.5)
 
     def test_boundary_rejects_unknown_and_missing_fields(self):
         raw = policy_json()
@@ -72,6 +72,12 @@ class CompliantHeadPolicyTests(unittest.TestCase):
     def test_release_band_must_be_strictly_inside_entry_band(self):
         raw = policy_json()
         raw["contact_release_error_ticks"][2] = 18
+        with self.assertRaises(CompliantConfigError):
+            CompliantHeadPolicy.parse(raw, [650, 550, 400, 400])
+
+    def test_follow_gain_must_preserve_release_hysteresis(self):
+        raw = policy_json()
+        raw["follow_permille"] = 600
         with self.assertRaises(CompliantConfigError):
             CompliantHeadPolicy.parse(raw, [650, 550, 400, 400])
 
