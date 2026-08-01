@@ -28,12 +28,11 @@ import numpy as np
 import serial
 
 from compliant_head import (
-    CompliantHeadController, CompliantHeadPolicy, FOLLOWING, RECOVERING,
-    RELEASE_DWELL, YIELDING,
+    CompliantHeadController, CompliantHeadPolicy, FOLLOWING,
 )
 from head_thermal import ThermalDerateController, ThermalDeratePolicy
 from organic_motion import (
-    EyeIntent, OrganicEyeDynamics, OrganicMotionAxis,
+    EyeIntent, OrganicEyeDynamics, OrganicMotionAxis, PetEyeChoreographer,
     parse_head_motion_policies,
 )
 
@@ -1446,6 +1445,7 @@ def main():
 
     engine = CharacterEngine(cfg)
     eye_dynamics = OrganicEyeDynamics()
+    pet_eyes = PetEyeChoreographer()
     yaw_rad_est = 0.0
     pitch_rad_est = 0.0
     smoothing = {"x": None, "y": None, "w": None}
@@ -1553,22 +1553,16 @@ def main():
                     head.telemetry_check()
 
             if eyes is not None:
+                pet_state = FOLLOWING
+                pet_directions = (0, 0, 0, 0)
+                recovery_progress = 0.0
                 if head is not None and head.compliance is not None:
                     pet_state = head.compliance.state
-                    if pet_state in (YIELDING, RELEASE_DWELL):
-                        # Held contact gets a sustained, unmistakable warm
-                        # squint. Head compliance still owns all movement;
-                        # this is only its eye-level acknowledgement.
-                        intent = intent.with_overrides(
-                            lid=330, pupil=720, brightness=900,
-                            expression="greet", blink=False,
-                            color=(255, 125, 175),
-                        )
-                    elif pet_state == RECOVERING:
-                        intent = intent.with_overrides(
-                            lid=180, pupil=650, brightness=820,
-                            expression="greet", color=(255, 175, 105),
-                        )
+                    pet_directions = head.compliance.contact_directions
+                    recovery_progress = head.compliance.recovery_progress(loop_t0)
+                intent = pet_eyes.apply(
+                    loop_t0, intent, pet_state, pet_directions,
+                    recovery_progress)
                 try:
                     intent = eye_dynamics.step(loop_t0, intent)
                     eyes.apply(**intent.wire_values())

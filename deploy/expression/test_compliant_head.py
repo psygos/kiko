@@ -1,4 +1,5 @@
 import json
+import itertools
 import os
 import sys
 import unittest
@@ -8,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from compliant_head import (
     CompliantConfigError, CompliantHeadController, CompliantHeadPolicy,
     CompliantObservationError, CONFIRMING, FAULT_HELD, FOLLOWING,
-    RECOVERING, RELEASE_DWELL, YIELDING,
+    RECOVERING, RELEASE_DWELL, RESTING, YIELDING,
 )
 
 
@@ -20,6 +21,8 @@ def policy_json():
         "contact_entry_error_ticks": [18, 18, 18, 18],
         "contact_release_error_ticks": [8, 8, 8, 8],
         "maximum_yield_ticks": [30, 30, 30, 30],
+        "contact_rest_pose_offset_ticks": [-6, 12, 0, 0],
+        "contact_directional_rest_offset_ticks": [0, 0, 8, 8],
         "maximum_command_step_ticks": [3, 3, 3, 3],
         "maximum_observed_step_ticks": [64, 64, 64, 64],
         "quiet_command_step_ticks": [1, 1, 1, 1],
@@ -29,7 +32,11 @@ def policy_json():
         "contact_arm_dwell_ms": 1000,
         "contact_acquisition_samples": 3,
         "release_dwell_ms": 600,
+        "rest_dwell_ms": 400,
+        "rest_per_additional_joint_ms": 200,
+        "maximum_rest_dwell_ms": 1000,
         "recovery_duration_ms": 2400,
+        "recovery_per_additional_joint_permille": 150,
         "follow_permille": 350,
     }
 
@@ -58,6 +65,9 @@ class CompliantHeadPolicyTests(unittest.TestCase):
         self.assertEqual(policy.contact_release_error_ticks, (5, 7, 4, 4))
         self.assertEqual(policy.contact_acquisition_samples, 2)
         self.assertEqual(policy.follow_fraction, 0.5)
+        self.assertEqual(policy.contact_rest_pose_offset_ticks, (-8, 18, 0, 0))
+        self.assertEqual(
+            policy.contact_directional_rest_offset_ticks, (0, 0, 12, 10))
 
     def test_boundary_rejects_unknown_and_missing_fields(self):
         raw = policy_json()
@@ -78,6 +88,12 @@ class CompliantHeadPolicyTests(unittest.TestCase):
     def test_follow_gain_must_preserve_release_hysteresis(self):
         raw = policy_json()
         raw["follow_permille"] = 600
+        with self.assertRaises(CompliantConfigError):
+            CompliantHeadPolicy.parse(raw, [650, 550, 400, 400])
+
+    def test_contextual_rest_pose_must_fit_yield_envelope(self):
+        raw = policy_json()
+        raw["contact_directional_rest_offset_ticks"][0] = 25
         with self.assertRaises(CompliantConfigError):
             CompliantHeadPolicy.parse(raw, [650, 550, 400, 400])
 
@@ -103,7 +119,8 @@ class CompliantHeadControllerTests(unittest.TestCase):
         self.assertEqual(third.event, "pet_contact")
         self.assertEqual(third.residual_error_ticks, (24, 0, 0, 0))
         # 35% of 24 ticks rounds to 8, but one physical command may move only 3.
-        self.assertEqual(third.target_ticks, (103, 100, 100, 100))
+        # The touch is followed while a small supervised bow/curl tuck begins.
+        self.assertEqual(third.target_ticks, (103, 103, 100, 100))
 
     def test_settled_gravity_bias_is_not_misclassified_as_touch(self):
         controller = make_controller()
@@ -143,22 +160,87 @@ class CompliantHeadControllerTests(unittest.TestCase):
         service(controller, 1.2, (122, 100, 100, 100), moving=True)
         contact = service(controller, 1.3, (124, 100, 100, 100), moving=True)
         self.assertEqual(contact.state, YIELDING)
-        previous = contact.target_ticks[0]
+        previous = contact.target_ticks
         for index in range(7):
             result = service(controller, 1.4 + index * 0.1,
-                             (previous, 100, 100, 100), moving=False)
-            self.assertLessEqual(abs(result.target_ticks[0] - previous), 3)
-            previous = result.target_ticks[0]
-        self.assertEqual(result.state, RECOVERING)
-        self.assertEqual(result.event, "pet_recovering")
+                             previous, moving=False)
+            self.assertTrue(all(
+                abs(actual - old) <= 3
+                for actual, old in zip(result.target_ticks, previous)))
+            previous = result.target_ticks
+        self.assertEqual(result.state, RESTING)
+        self.assertEqual(result.event, "pet_resting")
         at = 2.1
-        while at <= 4.7 and controller.state != FOLLOWING:
+        saw_recovery = False
+        while at <= 5.5 and controller.state != FOLLOWING:
             result = service(controller, at, result.target_ticks, moving=False)
-            self.assertLessEqual(abs(result.target_ticks[0] - previous), 3)
-            previous = result.target_ticks[0]
+            self.assertTrue(all(
+                abs(actual - old) <= 3
+                for actual, old in zip(result.target_ticks, previous)))
+            previous = result.target_ticks
+            saw_recovery = saw_recovery or result.event == "pet_recovering"
             at += 0.1
+        self.assertTrue(saw_recovery)
         self.assertEqual(controller.state, FOLLOWING)
         self.assertEqual(controller.target, (100, 100, 100, 100))
+
+    def test_multi_axis_pet_selects_contextual_pose_and_longer_grace(self):
+        controller = make_controller()
+        self.arm(controller)
+        touched = (124, 100, 124, 76)
+        service(controller, 1.1, touched, moving=True)
+        service(controller, 1.2, touched, moving=True)
+        result = service(controller, 1.3, touched, moving=True)
+        self.assertEqual(result.state, YIELDING)
+        self.assertEqual(controller.contact_directions, (1, 0, 1, -1))
+        self.assertEqual(controller.contact_rest_pose, (-6, 12, 8, -8))
+        self.assertAlmostEqual(controller.active_rest_duration_s, 0.8)
+        self.assertAlmostEqual(controller.active_recovery_duration_s, 3.12)
+
+    def test_every_nonempty_four_axis_touch_pattern_stays_bounded(self):
+        for directions in itertools.product((-1, 0, 1), repeat=4):
+            if directions == (0, 0, 0, 0):
+                continue
+            controller = make_controller()
+            self.arm(controller)
+            touched = tuple(100 + 24 * direction
+                            for direction in directions)
+            service(controller, 1.1, touched, moving=True)
+            service(controller, 1.2, touched, moving=True)
+            result = service(controller, 1.3, touched, moving=True)
+            self.assertEqual(result.state, YIELDING)
+            self.assertEqual(controller.contact_directions, directions)
+            active = sum(direction != 0 for direction in directions)
+            self.assertAlmostEqual(
+                controller.active_rest_duration_s,
+                min(1.0, 0.4 + 0.2 * (active - 1)))
+            self.assertAlmostEqual(
+                controller.active_recovery_duration_s,
+                2.4 * (1.0 + 0.15 * (active - 1)))
+            for joint, (target, rest) in enumerate(zip(
+                    result.target_ticks, controller.contact_rest_pose)):
+                self.assertLessEqual(abs(target - 100), 3)
+                self.assertLessEqual(
+                    abs(rest), controller.policy.maximum_yield_ticks[joint])
+
+    def test_touch_during_rest_cancels_return_and_yields_again(self):
+        controller = make_controller()
+        self.arm(controller)
+        for at, position in ((1.1, (124, 100, 100, 100)),
+                             (1.2, (124, 100, 100, 100)),
+                             (1.3, (124, 100, 100, 100))):
+            result = service(controller, at, position, moving=True)
+        for index in range(7):
+            result = service(controller, 1.4 + index * 0.1,
+                             result.target_ticks, moving=False)
+        self.assertEqual(result.state, RESTING)
+        for at in (2.1, 2.2, 2.3):
+            position = list(result.target_ticks)
+            position[2] += 20
+            result = service(controller, at, tuple(position), moving=True)
+        self.assertEqual(result.state, YIELDING)
+        self.assertEqual(result.event, "pet_recontact")
+        self.assertEqual(controller.contact_directions, (0, 0, 1, 0))
 
     def test_large_observation_jump_faults_closed(self):
         controller = make_controller()

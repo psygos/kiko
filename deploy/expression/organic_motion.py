@@ -27,6 +27,15 @@ def _finite_number(value, field):
     return parsed
 
 
+def _input_finite_number(value, field):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MotionInputError(f"{field} must be a finite number")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise MotionInputError(f"{field} must be a finite number")
+    return parsed
+
+
 def _plain_int(value, field):
     if isinstance(value, bool) or not isinstance(value, int):
         raise MotionConfigError(f"{field} must be an integer")
@@ -264,6 +273,130 @@ class EyeIntent:
             "brightness": self.brightness, "expression": self.expression,
             "blink": self.blink, "color": self.color,
         }
+
+
+class PetEyeChoreographer:
+    """Continuous, touch-derived eye behavior shared with head compliance.
+
+    This is deliberately not a list of canned animations. The direction and
+    number of displaced joints select a visual field, while the compliant
+    state and recovery progress continuously shape it.
+    """
+
+    PET_STATES = frozenset((
+        "YIELDING", "RELEASE_DWELL", "RESTING", "RECOVERING"))
+
+    def __init__(self):
+        self.previous_state = None
+        self.state_since = None
+        self.previous_recovery_progress = 0.0
+
+    @staticmethod
+    def _directions(value):
+        if (not isinstance(value, (list, tuple)) or len(value) != 4 or
+                any(isinstance(item, bool) or item not in (-1, 0, 1)
+                    for item in value)):
+            raise MotionInputError(
+                "pet directions must contain four values from {-1, 0, 1}")
+        return tuple(value)
+
+    @staticmethod
+    def _blend(start, finish, progress):
+        return start + (finish - start) * progress
+
+    @classmethod
+    def _blend_color(cls, start, finish, progress):
+        return tuple(cls._blend(a, b, progress)
+                     for a, b in zip(start, finish))
+
+    @staticmethod
+    def _palette(directions, active_joints):
+        bow, curl, yaw, roll = directions
+        if active_joints >= 3:
+            return (255, 128, 184)       # full-body cuddle: blush
+        if yaw != 0 and roll != 0:
+            return (205, 145, 255)       # compound side nuzzle: lavender
+        if yaw != 0:
+            return (125, 205, 255)       # turn: clear sky
+        if roll != 0:
+            return (215, 155, 255)       # tilt: lilac
+        if bow != 0 and curl != 0:
+            return (255, 156, 118)       # deep nod: peach
+        return (255, 184, 105)           # single pitch touch: honey
+
+    def apply(self, now, base, state, directions, recovery_progress=0.0):
+        if not isinstance(base, EyeIntent):
+            raise MotionInputError("pet choreography requires an EyeIntent")
+        admitted_now = _input_finite_number(now, "pet eye time")
+        admitted_directions = self._directions(directions)
+        if not isinstance(state, str):
+            raise MotionInputError("pet state must be text")
+        if state not in self.PET_STATES:
+            self.previous_state = state
+            self.state_since = admitted_now
+            self.previous_recovery_progress = 0.0
+            return base
+        progress = _input_finite_number(
+            recovery_progress, "recovery_progress")
+        if not 0.0 <= progress <= 1.0:
+            raise MotionInputError("recovery_progress must be in [0, 1]")
+
+        state_changed = state != self.previous_state
+        if state_changed:
+            self.state_since = admitted_now
+            self.previous_recovery_progress = 0.0
+        elif admitted_now < self.state_since:
+            raise MotionInputError("pet eye clock regressed")
+        elapsed = admitted_now - self.state_since
+        active_joints = max(
+            1, sum(direction != 0 for direction in admitted_directions))
+        bow, curl, yaw, roll = admitted_directions
+        side = yaw if yaw != 0 else roll
+        pitch_weight = abs(bow) + abs(curl)
+        color = self._palette(admitted_directions, active_joints)
+        breathe = math.sin(elapsed * 2.0 * math.pi * 0.28
+                           + active_joints * 0.55)
+
+        if state in ("YIELDING", "RELEASE_DWELL"):
+            result = base.with_overrides(
+                gaze_x=side * (120 + 55 * active_joints),
+                gaze_y=-210 - 35 * active_joints - 24 * pitch_weight,
+                lid=300 + 28 * active_joints + 10 * breathe,
+                pupil=690 + 35 * active_joints,
+                brightness=850 + 45 * breathe,
+                expression="greet", blink=False, color=color)
+        elif state == "RESTING":
+            result = base.with_overrides(
+                gaze_x=side * (80 + 25 * active_joints),
+                gaze_y=-390 - 24 * pitch_weight,
+                lid=520 + 35 * active_joints + 14 * breathe,
+                pupil=650 + 25 * active_joints,
+                brightness=610 + 35 * breathe,
+                expression="sleepy", blink=state_changed,
+                color=self._blend_color(color, (70, 75, 135), 0.38))
+        else:  # RECOVERING
+            arc = math.sin(math.pi * progress)
+            start_gaze_x = side * (95 + 25 * active_joints)
+            start_gaze_y = -360 - 20 * pitch_weight
+            mid_blink = (self.previous_recovery_progress < 0.52
+                         <= progress)
+            result = base.with_overrides(
+                gaze_x=self._blend(start_gaze_x, base.gaze_x, progress),
+                gaze_y=(self._blend(start_gaze_y, base.gaze_y, progress)
+                        + 85 * arc),
+                lid=(self._blend(455 + 25 * active_joints,
+                                 base.lid, progress) - 55 * arc),
+                pupil=(self._blend(680 + 25 * active_joints,
+                                   base.pupil, progress) + 75 * arc),
+                brightness=self._blend(690, base.brightness, progress),
+                expression=("greet" if progress < 0.72
+                            else base.expression),
+                blink=state_changed or mid_blink,
+                color=self._blend_color(color, base.color, progress))
+
+        self.previous_state = state
+        self.previous_recovery_progress = progress
+        return result
 
 
 class OrganicEyeDynamics:
