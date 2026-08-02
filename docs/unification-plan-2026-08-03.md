@@ -114,6 +114,20 @@ the architecturally stricter Rust controllers, followed by one switchover.
 11. Acts: scheduler inputs (derate/proximity/burst), sigh, bow_bob, greet
     style 3, breath/blink unification. The whimsy tier (arousal scalar,
     familiarity greeting, REM rest) ports last, after parity.
+12. **Interoception (operator principle, 2026-08-03: "not prompted — a
+    core routine Kiko just does").** Subsystems publish body-state FACTS
+    (booting, admission recovery, thermal derate, firmware flash in
+    progress, park/shutdown, fault recovery, base moving); the character
+    engine holds standing reflexes that render them — wake ritual,
+    groggy recovery, tired derate, matrix-green flash dreaming,
+    anesthesia/wake around eye reflashes, goodnight on park. Nothing
+    outside the character engine may request an expression; the rule is
+    facts in, behavior owned by Kiko. This is additive to the
+    render_character boundary widening in item 8 (body-state joins
+    person/proximity/derate as an input struct) and costs no new sensing
+    for most events: the engine itself performs admission, release,
+    derate, and shutdown, and an STM32 reflash is visible as ST-Link
+    re-enumeration without owning any device.
 
 ## 6. Phase 4 — lifecycle and supervision
 
