@@ -2,8 +2,8 @@
 
 Targets may change abruptly; emitted trajectories cannot. Each scalar channel
 is a softly overdamped spring whose acceleration is jerk-, acceleration-, and
-velocity-bounded. A long scheduler gap freezes the channel instead of
-integrating a catch-up jump.
+velocity-bounded. A long scheduler gap integrates a clamped interval —
+no catch-up jump, no permanent freeze, graceful degradation when slow.
 """
 
 from dataclasses import dataclass
@@ -167,10 +167,15 @@ class OrganicMotionAxis:
         if elapsed == 0:
             return MotionAxisStep(
                 self.position, self.velocity, self.acceleration)
-        if elapsed > self.policy.maximum_interval_s:
-            self.velocity = 0.0
-            self.acceleration = 0.0
-            return MotionAxisStep(self.position, 0.0, 0.0, True)
+        gap = elapsed > self.policy.maximum_interval_s
+        if gap:
+            # Late tick: integrate with the interval clamped to the reviewed
+            # maximum. Clamping alone forbids a catch-up lunge (one step can
+            # never exceed maximum_velocity * maximum_interval_s), and the
+            # velocity/acceleration state stays valid, so a chronically slow
+            # loop degrades to proportionally slower tracking instead of the
+            # prior permanent freeze or a zero-velocity crawl.
+            elapsed = self.policy.maximum_interval_s
 
         omega = 2.0 * math.pi * self.policy.response_hz
         desired_acceleration = (
@@ -209,7 +214,7 @@ class OrganicMotionAxis:
         self.velocity = next_velocity
         self.acceleration = next_acceleration
         return MotionAxisStep(
-            self.position, self.velocity, self.acceleration)
+            self.position, self.velocity, self.acceleration, gap)
 
 
 EYE_EXPRESSIONS = frozenset(

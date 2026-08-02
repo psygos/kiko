@@ -29,6 +29,7 @@ import serial
 
 from compliant_head import (
     CompliantHeadController, CompliantHeadPolicy, FOLLOWING,
+    RELEASE_DWELL, YIELDING,
 )
 from head_thermal import ThermalDerateController, ThermalDeratePolicy
 from organic_motion import (
@@ -55,7 +56,7 @@ DEFAULT_CONFIG = {
     "track_speed_max": 135,
     "return_step_ticks": 2,   # goal advance per 20 Hz cycle => 40 t/s
     "goal_deadband_ticks": 3,
-    "head_motion_response_hz": [0.62, 0.70, 0.82, 0.74],
+    "head_motion_response_hz": [0.40, 0.85, 0.82, 0.74],  # slow base, quick tip: S-curve neck
     "head_motion_max_velocity_ticks_s": [70, 115, 165, 110],
     "head_motion_max_acceleration_ticks_s2": [180, 280, 420, 280],
     "head_motion_max_jerk_ticks_s3": [900, 1400, 2100, 1400],
@@ -79,6 +80,11 @@ DEFAULT_CONFIG = {
     "eye_y_sign": 1,
     "temp_abort_raw": 58,
     "preengage_temp_limit_raw": 55,
+    "temp_plausible_max_raw": 95,  # raw bytes above this are bus corruption
+    "temp_unreadable_abort_samples": 300,  # ~30 s of pure garbage => park
+    "temp_overtemp_abort_samples": 3,   # consecutive plausible-hot => park
+    "span_skip_abort_s": 30.0,          # compliance starved this long => park
+    "returning_divergence_abort_ticks": 160,  # jam allowance while RETURNING
     "volt_min_raw": 90,
     "volt_max_raw": 135,
     "head_offset_up_m": 0.18,    # head center above camera origin (operator)
@@ -88,6 +94,9 @@ DEFAULT_CONFIG = {
     "person_lost_grace_s": 2.0,
     "greet_cooldown_s": 6.0,
     "sleepy_after_idle_s": 60.0,
+    "rest_after_idle_s": 20.0,  # no person this long => head settles to natural
+    "rest_ease_s": 6.0,         # living-motion fade-out duration
+    "pet_log_path": "/home/makerspace/kiko-pet-sessions.jsonl",
     "fx_fallback": 465.0,
 }
 
@@ -128,10 +137,20 @@ class StsBus:
                   expect_response=True):
         frame = bytes([servo_id, len(params) + 2, instruction]) + bytes(params)
         wire = b"\xff\xff" + frame + bytes([self._checksum(frame)])
-        with self.lock:
+        # Bounded lock acquisition: a thread that dies holding this lock (the
+        # 2026-08-02 21-hour futex hang) must surface as a typed fault in the
+        # caller, never as an unbounded wait inside park or telemetry paths.
+        if not self.lock.acquire(timeout=1.0):
+            raise StsError(f"servo {servo_id}: bus lock unavailable for 1.0s")
+        try:
+            # No port.flush() anywhere in here: flush is tcdrain, which
+            # pyserial does NOT bound by write_timeout — an unbounded
+            # syscall inside the bus lock is exactly the hang class this
+            # rework removes. At 1 Mbaud a frame leaves the kernel in
+            # ~130 us; the read timeout (reply path) and the settle sleep
+            # (write path) both dwarf it.
             self.port.reset_input_buffer()
             self.port.write(wire)
-            self.port.flush()
             if not expect_response:
                 # Servos run response level 0: only READ/PING answer. A write
                 # gets host-write completion evidence only, per the Rust owner.
@@ -139,6 +158,15 @@ class StsBus:
                 return b""
             want = 6 + expect_params
             raw = self.port.read(want)
+            if len(raw) == 0:
+                # One bounded retry, and only on total silence (a lost
+                # reply). A partial frame is NOT retried: re-driving a
+                # half-duplex bus mid-frame manufactures header garbage.
+                self.port.reset_input_buffer()
+                self.port.write(wire)
+                raw = self.port.read(want)
+        finally:
+            self.lock.release()
         if len(raw) < 6:
             raise StsError(f"servo {servo_id}: short response {raw.hex()}")
         if raw[0] != 0xFF or raw[1] != 0xFF:
@@ -497,11 +525,30 @@ class HeadController:
             cfg["compliant_hold"], cfg["torque_limit_permille"])
         self.compliance = None
         self.compliance_probe_due = 0.0
+        # Streak-based runtime temperature supervision (no sleeps in the
+        # control path): consecutive plausible-hot samples confirm an abort;
+        # consecutive implausible samples eventually prove the telemetry
+        # channel itself is broken.
+        self.overtemp_streak = [0, 0, 0, 0]
+        self.implausible_streak = [0, 0, 0, 0]
+        self.overtemp_log_due = [0.0, 0.0, 0.0, 0.0]
+        self.span_skip_streak = 0
+        self.span_skip_since = None
+        self.pet_log_path = cfg.get("pet_log_path") or ""
+        self.pet_log_failed = False
+        self.torque_softened = False
 
     def _confirm_temperature(self, joint, servo_id, telemetry, limit, stage):
+        # Plausibility ceiling: raw bytes above this are bus corruption, not
+        # heat — a servo that still answers, moves, and reports sane voltage
+        # cannot be at 100+ C. The 2026-08-02 incident aborted the run on
+        # checksum-valid garbage (78->150->140); implausible samples must
+        # never count as confirmation evidence.
+        plausible_max = self.cfg.get("temp_plausible_max_raw", 95)
         if telemetry["temperature_raw"] <= limit:
             return telemetry
         temperatures = [telemetry["temperature_raw"]]
+        confirmed_hot = 0 if temperatures[0] > plausible_max else 1
         for _ in range(2):
             time.sleep(0.100)
             telemetry = self.bus.read_telemetry(servo_id)
@@ -514,6 +561,18 @@ class HeadController:
                     flush=True,
                 )
                 return telemetry
+            if telemetry["temperature_raw"] <= plausible_max:
+                confirmed_hot += 1
+        if confirmed_hot < 2:
+            # Persistent but implausible values: classify as telemetry
+            # corruption. Log loudly, do not kill the run on garbage.
+            print(
+                f"telemetry_temperature_implausible stage={stage} "
+                f"joint={JOINT_NAMES[joint]} "
+                f"samples={'->'.join(map(str, temperatures))}",
+                flush=True,
+            )
+            return telemetry
         raise StsError(
             f"{JOINT_NAMES[joint]} confirmed {stage} overtemp "
             f"{'->'.join(map(str, temperatures))}")
@@ -528,10 +587,25 @@ class HeadController:
                 self.cfg["preengage_temp_limit_raw"], "preengage")
             poses.append(verified_position)
             window = self.cfg["admission_window_ticks"]
-            if abs(verified_position - self.natural[joint]) > window:
-                raise StsError(
-                    f"{JOINT_NAMES[joint]} pose {verified_position} outside "
-                    f"natural±{window}")
+            distance = abs(verified_position - self.natural[joint])
+            if distance > window:
+                # A pose beyond the normal window but inside the reviewed
+                # physical envelope is what an interrupted park leaves
+                # behind. Refusing it forever bricked the robot (fail ->
+                # guardian restart -> identical fail). Engaging at the
+                # present pose is a zero-jump write and RETURNING slews home
+                # at the bounded return rate — the same recovery an operator
+                # performs by hand. Only a pose outside the envelope is
+                # abnormal enough to demand attended recovery.
+                low = self.compliant_policy.minimum_ticks[joint]
+                high = self.compliant_policy.maximum_ticks[joint]
+                if not low <= verified_position <= high:
+                    raise StsError(
+                        f"{JOINT_NAMES[joint]} pose {verified_position} "
+                        f"outside reviewed envelope [{low}, {high}]")
+                print(f"admission_recovery joint={JOINT_NAMES[joint]} "
+                      f"pose={verified_position} distance={distance} "
+                      f"window={window}", flush=True)
             if not (self.cfg["volt_min_raw"] <= t["voltage_raw"]
                     <= self.cfg["volt_max_raw"]):
                 raise StsError(f"{JOINT_NAMES[joint]} voltage out of range: "
@@ -612,7 +686,7 @@ class HeadController:
                 self.offsets = [step.position for step in planned]
                 if (any(step.gap_reset for step in planned) and
                         now >= self.motion_gap_log_due):
-                    print("head_motion_gap trajectory_frozen", flush=True)
+                    print("head_motion_gap resumed_from_rest", flush=True)
                     self.motion_gap_log_due = now + 1.0
                 self._write_planned(self._target_ticks())
 
@@ -623,28 +697,80 @@ class HeadController:
     def _read_safe_observation(self):
         started = time.monotonic()
         telemetry = []
+        pending_logs = []
         for joint, servo_id in enumerate(SERVO_IDS):
             t = self.bus.read_telemetry(servo_id)
-            if t["temperature_raw"] >= self.cfg["temp_abort_raw"]:
-                t = self._confirm_temperature(
-                    joint, servo_id, t,
-                    self.cfg["temp_abort_raw"] - 1, "energized")
-                # Confirmation occupied more than the admitted observation
-                # span. Freeze output and acquire a complete fresh set next
-                # control slot rather than mixing timestamps.
-                return None
+            # Runtime overtemp policy is streak-based across control slots
+            # (~100 ms apart) instead of sleeping 100 ms inline: the old
+            # inline confirmation blew the observation span, starved the
+            # remaining joints, and never reached the derate controller.
+            raw = t["temperature_raw"]
+            if raw > self.cfg["temp_plausible_max_raw"]:
+                # Corruption-band byte: no thermal evidence either way. The
+                # consecutive-streak abort below is a pure-garbage detector
+                # (any plausible byte resets it); mixed corruption is
+                # tolerated because a real hot streak survives it — garbage
+                # does not reset overtemp_streak.
+                self.implausible_streak[joint] += 1
+                if self.implausible_streak[joint] % 100 == 1:
+                    pending_logs.append(
+                        f"telemetry_temperature_implausible "
+                        f"joint={JOINT_NAMES[joint]} raw={raw} "
+                        f"streak={self.implausible_streak[joint]}")
+                if (self.implausible_streak[joint]
+                        >= self.cfg["temp_unreadable_abort_samples"]):
+                    raise StsError(
+                        f"{JOINT_NAMES[joint]} temperature unreadable for "
+                        f"{self.implausible_streak[joint]} consecutive "
+                        f"samples")
+            else:
+                self.implausible_streak[joint] = 0
+                if raw >= self.cfg["temp_abort_raw"]:
+                    self.overtemp_streak[joint] += 1
+                    # A joint dithering one degree across the threshold must
+                    # not flood the unrotated log: streak restarts are rate
+                    # limited, genuine escalation (streak >= 2) always logs.
+                    if (self.overtemp_streak[joint] > 1 or
+                            started >= self.overtemp_log_due[joint]):
+                        pending_logs.append(
+                            f"telemetry_overtemp_sample "
+                            f"joint={JOINT_NAMES[joint]} raw={raw} "
+                            f"streak={self.overtemp_streak[joint]}")
+                        self.overtemp_log_due[joint] = started + 5.0
+                    if (self.overtemp_streak[joint]
+                            >= self.cfg["temp_overtemp_abort_samples"]):
+                        raise StsError(
+                            f"{JOINT_NAMES[joint]} confirmed energized "
+                            f"overtemp raw={raw} consecutive="
+                            f"{self.overtemp_streak[joint]}")
+                else:
+                    self.overtemp_streak[joint] = 0
             if not (self.cfg["volt_min_raw"] <= t["voltage_raw"]
                     <= self.cfg["volt_max_raw"]):
                 raise StsError(f"{JOINT_NAMES[joint]} voltage "
                                f"{t['voltage_raw']}")
             if self.goal is not None:
                 divergence = abs(t["position"] - self.goal[joint])
-                if divergence > self.cfg["goal_divergence_abort_ticks"]:
+                # RETURNING drives toward natural with no compliance layer:
+                # a hard jam must be caught within ~4 s of ramp (160 ticks
+                # at the 40 t/s ramp), while a merely slow joint following
+                # at >=27 t/s never accumulates 160 over even a full 480-
+                # tick recovery slew — so legitimate admission recoveries
+                # cannot false-abort.
+                limit = (self.cfg["returning_divergence_abort_ticks"]
+                         if self.state == "RETURNING"
+                         else self.cfg["goal_divergence_abort_ticks"])
+                if divergence > limit:
                     raise StsError(
                         f"{JOINT_NAMES[joint]} diverged {divergence} ticks "
-                        f"(pos={t['position']} goal={self.goal[joint]})")
+                        f"(pos={t['position']} goal={self.goal[joint]} "
+                        f"state={self.state})")
             telemetry.append(t)
         span = time.monotonic() - started
+        # Logging happens outside the timed span so a stalled log filesystem
+        # can never push an observation over the reviewed budget.
+        for line in pending_logs:
+            print(line, flush=True)
         thermal = self.thermal.update(tuple(
             item["temperature_raw"] for item in telemetry))
         if thermal.event is not None:
@@ -661,13 +787,48 @@ class HeadController:
         return self.thermal.active
 
     def _service_compliance(self, now):
-        observed = self._read_safe_observation()
-        if observed is None:
-            # Preserve the last verified target while fresh temperature
-            # confirmation consumed this control slot.
-            self.compliance.next_service_due = time.monotonic()
+        telemetry, span = self._read_safe_observation()
+        if (span > self.compliant_policy.maximum_observation_span_s
+                and self.torque_softened):
+            # A starvation window must not run on soft servos: without this,
+            # the early return below would skip the profile block and bow
+            # could sit at yield torque for the whole span_skip_abort budget
+            # with only the wide goal-divergence bound watching it.
+            profile = self.compliant_policy.holding_torque_limit_permille
+            for joint, servo_id in enumerate(SERVO_IDS):
+                self.bus.write_torque_limit(servo_id, profile[joint])
+            self.torque_softened = False
+            print(f"torque_profile holding limits={list(profile)} "
+                  "(span-skip restore)", flush=True)
+        if span > self.compliant_policy.maximum_observation_span_s:
+            # A slow bus cycle (e.g. one retried read at the 0.1 s serial
+            # timeout) costs one skipped control slot, never the run: the
+            # compliance admission layer treats an over-span observation as
+            # a fault, so acquire a fresh set next slot instead. The skipped
+            # slot breaks observation adjacency — without note_observation_
+            # gap the next fast set would trip the discontinuity check and
+            # latch FAULT_HELD on ordinary tracking motion. Chronic skipping
+            # would leave petting silently dead at full holding torque, so
+            # it escalates like unreadable temperature does.
+            self.span_skip_streak += 1
+            if self.span_skip_since is None:
+                self.span_skip_since = time.monotonic()
+            if self.span_skip_streak % 20 == 1:
+                print(f"compliance_observation_slow "
+                      f"span_ms={span * 1000:.0f} skipped_cycle "
+                      f"streak={self.span_skip_streak}", flush=True)
+            starved_s = time.monotonic() - self.span_skip_since
+            if starved_s >= self.cfg["span_skip_abort_s"]:
+                raise StsError(
+                    f"compliance starved for {starved_s:.0f}s "
+                    f"({self.span_skip_streak} consecutive over-span "
+                    f"observations)")
+            self.compliance.note_observation_gap()
+            self.compliance.next_service_due = (
+                time.monotonic() + self.compliant_policy.control_period_s)
             return
-        telemetry, span = observed
+        self.span_skip_streak = 0
+        self.span_skip_since = None
         observed_command = tuple(self.goal)
         step = self.compliance.service(
             now,
@@ -676,6 +837,31 @@ class HeadController:
             tuple(bool(item["moving"]) for item in telemetry),
             span,
         )
+        # Backdrivability: while yielding, servos go soft so a hand can
+        # physically move the head; rest and recovery need full authority
+        # back (the nuzzle and the rise both move against load). Gravity
+        # axes (bow/curl) soften ONLY when the touch is actually on them —
+        # yaw/roll are gravity-neutral and soften for every pet so the head
+        # feels loose laterally. Tension is never zero: the parser floors
+        # the soft profile.
+        soft = step.state in (YIELDING, RELEASE_DWELL)
+        if soft != self.torque_softened:
+            holding = self.compliant_policy.holding_torque_limit_permille
+            if soft:
+                dirs = self.compliance.contact_directions
+                yield_profile = self.compliant_policy.yield_torque_limit_permille
+                profile = tuple(
+                    yield_profile[joint]
+                    if (dirs[joint] != 0 or joint in (YAW, ROLL))
+                    else holding[joint]
+                    for joint in range(4))
+            else:
+                profile = holding
+            for joint, servo_id in enumerate(SERVO_IDS):
+                self.bus.write_torque_limit(servo_id, profile[joint])
+            self.torque_softened = soft
+            print(f"torque_profile {'yield_soft' if soft else 'holding'} "
+                  f"limits={list(profile)}", flush=True)
         desired = list(step.target_ticks)
         for joint, servo_id in enumerate(SERVO_IDS):
             if desired[joint] != self.goal[joint]:
@@ -687,6 +873,29 @@ class HeadController:
                   f"target={list(step.target_ticks)} "
                   f"residual={list(step.residual_error_ticks)} "
                   f"baseline={list(self.compliance.baseline_error)}", flush=True)
+        if (self.pet_log_path and not self.pet_log_failed and
+                (step.event is not None or step.state != FOLLOWING)):
+            # Field study: every 10 Hz slot of every pet interaction goes to
+            # a durable JSONL so thresholds get tuned from how real humans
+            # actually pet the robot, not from guesses. Never run-fatal.
+            try:
+                with open(self.pet_log_path, "a") as pet_log:
+                    pet_log.write(json.dumps({
+                        "wall": round(time.time(), 2),
+                        "state": step.state,
+                        "event": step.event,
+                        "residual": list(step.residual_error_ticks),
+                        "position": [item["position"] for item in telemetry],
+                        "target": list(step.target_ticks),
+                        "goal": list(observed_command),
+                        "baseline": list(self.compliance.baseline_error),
+                        "dirs": list(self.compliance.contact_directions),
+                        "moving": [bool(item["moving"])
+                                   for item in telemetry],
+                    }, separators=(",", ":")) + "\n")
+            except OSError as exc:
+                self.pet_log_failed = True
+                print(f"pet_log_disabled {exc!r}", flush=True)
         # A bounded, rate-limited near-threshold trace makes attended tuning
         # observable without turning ordinary encoder noise into a touch or
         # flooding the long-running owner log.
@@ -712,35 +921,84 @@ class HeadController:
 
     def park_and_release(self):
         """Return to natural at bounded speed and release I/O, retaining torque."""
+        parked = False
+        residuals = None
         try:
             print("park_begin", flush=True)
             self.compliance = None
-            deadline = time.monotonic() + 15.0
-            while time.monotonic() < deadline:
-                pending = False
+            # Unconditional full-torque restore: a run that dies mid-yield
+            # (soft profile installed) must never park at reduced tension.
+            # Idempotent and cheap when already at holding torque.
+            for joint, servo_id in enumerate(SERVO_IDS):
+                self.bus.write_torque_limit(
+                    servo_id, self.cfg["torque_limit_permille"][joint])
+            self.torque_softened = False
+            if self.goal is not None:
+                # Seed the ramp from the measured pose: after a fault or a
+                # compliant yield the last commanded goal can sit far from
+                # where the head actually is.
                 for joint, servo_id in enumerate(SERVO_IDS):
-                    want = self.natural[joint]
-                    have = self.goal[joint] if self.goal else want
-                    if want != have:
-                        pending = True
-                        move = max(-self.cfg["return_step_ticks"],
-                                   min(self.cfg["return_step_ticks"],
-                                       want - have))
-                        self.goal[joint] = have + move
-                        self.bus.write_goal(servo_id, self.goal[joint],
-                                            self.cfg["return_speed_ticks_s"])
-                if not pending:
+                    try:
+                        self.goal[joint] = self.bus.read_position_redundant(
+                            servo_id)["position"]
+                    except Exception:
+                        # Any read failure (StsError, SerialException, a USB
+                        # re-enumeration OSError): keep the last commanded
+                        # goal as the ramp origin — the ramp must still run.
+                        pass
+                # Budget covers the worst admissible distance (full +-480
+                # yaw range at 80 ticks/s = 6 s) with 2x margin. The prior
+                # 2 ticks / 0.1 s ramp could cover only 300 ticks in its
+                # window and then claimed completion anyway.
+                step_ticks = 4
+                # Servo speed register must outrun the 80 t/s goal ramp or
+                # the mechanism trails the commanded goal and the settle
+                # check below reads a false residual.
+                park_speed = max(self.cfg["return_speed_ticks_s"], 100)
+                deadline = time.monotonic() + 14.0
+                while time.monotonic() < deadline:
+                    pending = False
+                    for joint, servo_id in enumerate(SERVO_IDS):
+                        want = self.natural[joint]
+                        have = self.goal[joint]
+                        if want != have:
+                            pending = True
+                            move = max(-step_ticks,
+                                       min(step_ticks, want - have))
+                            self.goal[joint] = have + move
+                            self.bus.write_goal(
+                                servo_id, self.goal[joint], park_speed)
+                    if not pending:
+                        break
+                    time.sleep(0.05)
+            # Truth check: read the mechanism back instead of trusting the
+            # commanded ramp. Park is complete only if the head measurably
+            # settles at natural within the settle budget.
+            settle_deadline = time.monotonic() + 5.0
+            while True:
+                residuals = []
+                for joint, servo_id in enumerate(SERVO_IDS):
+                    try:
+                        position = self.bus.read_position_redundant(
+                            servo_id)["position"]
+                    except Exception:
+                        position = None
+                    residuals.append(None if position is None
+                                     else position - self.natural[joint])
+                parked = all(r is not None and abs(r) <= 12
+                             for r in residuals)
+                if parked or time.monotonic() >= settle_deadline:
                     break
-                time.sleep(0.1)
-            time.sleep(1.0)  # let motion settle before ownership release
+                time.sleep(0.25)
         except Exception as exc:
             print(f"park_error {exc!r} (torque remains enabled)", flush=True)
         # OPERATOR HARD RULE (2026-07-21): the mechanism must NEVER lose
         # tension — a torque-off collapse reached bow=1733. Every exit path
-        # parks at natural and leaves all four servos holding.
-        print("park_complete torque_hold=ENABLED tension_preserved=true",
-              flush=True)
-        return True
+        # leaves all four servos holding, parked or not.
+        verdict = "park_complete" if parked else "park_incomplete"
+        print(f"{verdict} torque_hold=ENABLED tension_preserved=true "
+              f"residual_ticks={residuals}", flush=True)
+        return parked
 
 
 # ----------------------------------------------------------------------------
@@ -981,6 +1239,34 @@ def _build_daydream(rng, ctx):
         {"gx": gx, "gy": gy, "bright_mul": _keys_pulse(-0.25, 0.3, 0.7)})
 
 
+def _build_sigh(rng, ctx):
+    # One slow exhale: the neck sinks from the base, lids soften, light dims,
+    # then everything drifts back up. Episodic bow use — never a tremor.
+    dip = rng.uniform(10, 16)
+    return ActPerformance(
+        "sigh", rng.uniform(2.6, 3.4),
+        {"pitch": [(0.0, 0.0), (0.30, -dip), (0.55, -dip * 0.92), (1.0, 0.0)],
+         "lid_add": [(0.0, 0.0), (0.30, 90), (0.60, 70), (1.0, 0.0)],
+         "bright_mul": [(0.0, 0.0), (0.35, -0.25), (1.0, 0.0)]},
+        uses_pitch=True)
+
+
+def _build_bow_bob(rng, ctx):
+    # Excitement signature: two quick bird-bobs of the neck base.
+    dip = rng.uniform(16, 24)
+    keys = [(0.0, 0.0)]
+    for i in range(2):
+        base = (i + 0.5) / 2.5
+        keys.append((base - 0.10, -dip))
+        keys.append((base + 0.10, dip * 0.25))
+    keys.append((1.0, 0.0))
+    return ActPerformance(
+        "bow_bob", rng.uniform(1.0, 1.4),
+        {"pitch": sorted(keys), "bright_mul": _keys_pulse(0.3),
+         "pupil_add": _keys_pulse(rng.uniform(120, 200))},
+        expression="greet", uses_pitch=True)
+
+
 def _build_stretch(rng, ctx):
     return ActPerformance(
         "stretch", rng.uniform(2.6, 3.6),
@@ -1092,6 +1378,8 @@ ACT_LIBRARY = [
     ("head_bob", _build_head_bob, ("TRACK",), 1.8, 13.0),
     ("sneeze", _build_sneeze, ("TRACK", "IDLE"), 0.7, 45.0),
     ("dance", _build_dance, ("TRACK", "IDLE"), 1.3, 30.0),
+    ("sigh", _build_sigh, ("TRACK", "IDLE"), 1.4, 30.0),
+    ("bow_bob", _build_bow_bob, ("TRACK",), 1.2, 12.0),
 ]
 
 
@@ -1124,6 +1412,10 @@ class CharacterEngine:
         self.still_since = time.monotonic()
         self.prev_proximity = 0.0
         self.greet_style = 0
+        self.resting = False
+        self.prev_heading = 0.0
+        self.prev_heading_at = None
+        self.turn_dip = 0.0
 
     # -- mode machine ---------------------------------------------------------
     def _enter(self, mode, now):
@@ -1140,8 +1432,11 @@ class CharacterEngine:
             if self.mode in ("IDLE", "SLEEPY", "SEARCH", "LOST"):
                 if now - self.last_person_at > self.cfg["greet_cooldown_s"]:
                     self._enter("GREET", now)
-                    self.greet_until = now + self.rng.uniform(0.9, 1.4)
-                    self.greet_style = self.rng.randrange(3)
+                    self.greet_style = self.rng.randrange(4)
+                    # Style 3 is the formal bow — it needs time to land.
+                    self.greet_until = now + (
+                        self.rng.uniform(1.6, 2.1) if self.greet_style == 3
+                        else self.rng.uniform(0.9, 1.4))
                 else:
                     self._enter("TRACK", now)
             self.last_person_at = now
@@ -1163,6 +1458,11 @@ class CharacterEngine:
     def _maybe_start_act(self, now, derate, proximity):
         if self.act is not None or self.mode not in ("TRACK", "IDLE"):
             return
+        if (self.mode == "IDLE" and
+                now - self.last_person_at > self.cfg["rest_after_idle_s"]):
+            # Resting: no self-initiated head acts until someone appears —
+            # the head must genuinely sit at natural when alone.
+            return
         burst = (proximity - self.prev_proximity) > 0.30
         if now < self.next_act_at and not burst:
             return
@@ -1176,6 +1476,8 @@ class CharacterEngine:
             w *= 0.25 ** self.history[-4:].count(name)  # novelty suppression
             if burst and name == "excited_wiggle":
                 w *= 8.0
+            if burst and name == "bow_bob":
+                w *= 6.0
             if now - self.still_since > 3.0 and name in ("curious_tilt", "lean_in", "nod"):
                 w *= 2.2
             pool.append((name, builder, w))
@@ -1259,6 +1561,10 @@ class CharacterEngine:
                          brightness=820, pupil=680, blink=blink),
                     dict(expression="curious", color=(255, 120, 150),
                          brightness=760, pupil=800, blink=blink),
+                    # The formal bow: warm gold, soft lids, gaze held on the
+                    # person while the neck dips.
+                    dict(expression="greet", color=(255, 205, 120),
+                         brightness=780, pupil=700, blink=False),
                 ]
                 style = styles[self.greet_style]
                 intent = EyeIntent.bounded(
@@ -1314,9 +1620,25 @@ class CharacterEngine:
                        else (act.color if act and act.color else base_color)))
 
         # Head: tracking aim + act overlay, all as bounded offsets.
+        # Rest envelope: with nobody around for rest_after_idle_s the head
+        # eases every self-generated channel to zero over rest_ease_s and
+        # genuinely rests at natural; a person's arrival restores it at once
+        # (the organic axes keep the wake-up smooth).
+        idle_for = now - self.last_person_at
+        rest_envelope = 1.0
+        if not person and idle_for > cfg["rest_after_idle_s"]:
+            rest_envelope = max(0.0, 1.0 - (idle_for - cfg["rest_after_idle_s"])
+                                / max(cfg["rest_ease_s"], 0.1))
+        if rest_envelope == 0.0 and not self.resting:
+            self.resting = True
+            print("head_rest settled_at_natural", flush=True)
+        elif person and self.resting:
+            self.resting = False
+            print("head_rest woken", flush=True)
         living_t = now - self.created_at
         p = self.life_phases
         living_scale = 0.35 if self.mode == "SLEEPY" else 1.0
+        living_scale *= rest_envelope
         living_pitch = living_scale * (
             7.0 * math.sin(living_t * 0.43 + p[0])
             + 3.0 * math.sin(living_t * 0.91 + p[1]))
@@ -1336,25 +1658,54 @@ class CharacterEngine:
         if self.mode == "GREET":
             u = min(1.0, (now - self.mode_since) / max(0.4, self.greet_until - self.mode_since))
             pulse = math.sin(math.pi * u)
-            side = 1 if self.greet_style % 2 == 0 else -1
-            mode_roll = side * 95.0 * pulse
-            mode_pitch = 34.0 * pulse
+            if self.greet_style == 3:
+                # The formal bow: a whole-neck dip (the dynamic share sends
+                # roughly half of it through the base hinge), no roll.
+                mode_pitch = -52.0 * pulse
+            else:
+                side = 1 if self.greet_style % 2 == 0 else -1
+                mode_roll = side * 95.0 * pulse
+                mode_pitch = 34.0 * pulse
         elif self.mode == "SEARCH":
             sweep_phase = ((now - self.mode_since) * 2.0 * math.pi
                            * self.search_rate_hz * self.search_direction)
             mode_yaw = 165.0 * math.sin(sweep_phase)
             mode_roll = 38.0 * math.sin(sweep_phase * 0.5)
-        pitch_total = (pitch_aim + act_values.get("pitch", 0.0)
-                       + mode_pitch + living_pitch)
+        # Weight shift: the head dips into a fast turn, dying off in ~300 ms.
+        # Deadbanded well above tracking jitter so steady tracking carries no
+        # standing bow offset; envelope-gated so a resting head never stirs.
+        heading = yaw_aim + mode_yaw
+        turn_rate = 0.0
+        if self.prev_heading_at is not None:
+            dt = now - self.prev_heading_at
+            if 0.0 < dt < 0.5:
+                turn_rate = (heading - self.prev_heading) / dt
+        self.prev_heading = heading
+        self.prev_heading_at = now
+        raw_dip = -min(26.0, 0.08 * max(0.0, abs(turn_rate) - 120.0))
+        self.turn_dip = min(raw_dip, self.turn_dip * 0.85)
+
+        pitch_total = (pitch_aim + rest_envelope * (act_values.get("pitch", 0.0)
+                       + mode_pitch + self.turn_dip) + living_pitch)
         if derate:
             pitch_total = 0.0
-        curl_t = cfg["curl_sign"] * cfg["curl_pitch_share"] * pitch_total
-        bow_t = -cfg["curl_sign"] * cfg["bow_pitch_share"] * pitch_total
-        yaw_t = yaw_aim + act_values.get("yaw", 0.0) + mode_yaw + living_yaw
+        # The neck recruits its base for big moves: bow's share of pitch
+        # grows from the configured base toward one half as demand nears
+        # 140 ticks. Small tracking corrections stay on the quick, light
+        # curl; large gestures engage the whole neck.
+        bow_share = min(0.5, cfg["bow_pitch_share"]
+                        + (0.5 - cfg["bow_pitch_share"])
+                        * min(1.0, abs(pitch_total) / 140.0))
+        curl_share = 1.0 - bow_share
+        curl_t = cfg["curl_sign"] * curl_share * pitch_total
+        bow_t = -cfg["curl_sign"] * bow_share * pitch_total
+        yaw_t = yaw_aim + rest_envelope * (act_values.get("yaw", 0.0)
+                                           + mode_yaw) + living_yaw
         turn_cant = max(-24.0, min(24.0, -0.055 * yaw_aim))
-        roll_t = cfg["roll_sign"] * (act_values.get("roll", 0.0) + mode_roll
+        roll_t = cfg["roll_sign"] * (rest_envelope * (act_values.get("roll", 0.0)
+                                     + mode_roll + turn_cant)
                                      + 34.0 * proximity + living_roll
-                                     + turn_cant) + breathing
+                                     ) + rest_envelope * breathing
         desired4 = [bow_t, curl_t, yaw_t, roll_t]
         return intent, desired4
 
@@ -1385,14 +1736,25 @@ def main():
     parser.add_argument("--axis-dance", action="store_true",
                         help="announce firmware gaze directions for operator "
                              "axis confirmation before the main loop")
+    parser.add_argument("--head-axis-dance", action="store_true",
+                        help="drive one head axis at a time to labeled "
+                             "offsets so the operator can verify physical "
+                             "signs after a re-mount")
     parser.add_argument("--snapshot", action="store_true",
                         help="save annotated frames to /tmp/follow-snap.jpg")
+    parser.add_argument("--heartbeat-file", default="",
+                        help="path the main loop touches every second so a "
+                             "supervisor can distinguish hung from alive "
+                             "(the 2026-08-02 futex hang passed kill -0 "
+                             "for 21 hours)")
     parser.add_argument("--duration-s", type=float, default=1800.0)
     args = parser.parse_args()
     cfg = load_config(args.config)
     if args.no_camera:
-        # Performer mode: no person detection exists, so never doze off.
+        # Performer mode: no person detection exists, so never doze off and
+        # never idle-settle to natural — person is permanently False here.
         cfg["sleepy_after_idle_s"] = float("inf")
+        cfg["rest_after_idle_s"] = float("inf")
 
     stop = threading.Event()
 
@@ -1424,7 +1786,6 @@ def main():
     if not args.no_head:
         bus = StsBus(cfg["head_device"])
         head = HeadController(bus, cfg)
-        head.admit_and_engage()
 
     if eyes is not None and args.axis_dance:
         dance = [
@@ -1457,10 +1818,73 @@ def main():
     started = time.monotonic()
     tick = 0
     exit_code = 0
+    heartbeat_path = args.heartbeat_file or None
+    if heartbeat_path:
+        try:
+            with open(heartbeat_path + ".tmp", "w") as hb:
+                hb.write(f"{time.time():.0f}\n")
+            os.replace(heartbeat_path + ".tmp", heartbeat_path)
+        except OSError as exc:
+            # Log and keep the path: the in-loop writer retries forever. A
+            # transient failure here must not silence the heartbeat for the
+            # whole run — the guardian would recycle a healthy child.
+            print(f"heartbeat_write_failed {exc!r}", flush=True)
 
     try:
+        if head is not None:
+            # Admission runs inside the supervised region: a pose outside the
+            # window (e.g. after an interrupted park) must flow through the
+            # same fault -> park -> shutdown path as any runtime fault, never
+            # escape as an uncaught traceback that latches the guardian with
+            # the head un-parked.
+            head.admit_and_engage()
+        if head is not None and args.head_axis_dance:
+            # Physical sign verification (post re-mount): one axis at a time,
+            # labeled, out and back, so the operator can report the true
+            # direction of each channel against config signs.
+            while head.state != "TRACKING" and not stop.is_set():
+                head.step([0, 0, 0, 0], time.monotonic())
+                time.sleep(0.05)
+            for label, offsets in (
+                    ("yaw_plus_200", [0, 0, 200, 0]),
+                    ("yaw_minus_200", [0, 0, -200, 0]),
+                    ("curl_plus_80", [0, 80, 0, 0]),
+                    ("curl_minus_80", [0, -80, 0, 0]),
+                    ("bow_plus_50", [50, 0, 0, 0]),
+                    ("bow_minus_50", [-50, 0, 0, 0]),
+                    ("roll_plus_80", [0, 0, 0, 80]),
+                    ("roll_minus_80", [0, 0, 0, -80])):
+                if stop.is_set():
+                    break
+                print(f"head_axis_dance {label}", flush=True)
+                for target in (offsets, [0, 0, 0, 0]):
+                    end = time.monotonic() + 2.5
+                    while time.monotonic() < end and not stop.is_set():
+                        head.step(target, time.monotonic())
+                        time.sleep(0.05)
+            if not stop.is_set():
+                print("head_axis_dance complete", flush=True)
+            # The dance consumed ~40 s of the engine's idle clock; reset it
+            # so the main loop does not start half-way to rest/sleep.
+            engine.last_person_at = time.monotonic()
         while not stop.is_set():
             loop_t0 = time.monotonic()
+            if heartbeat_path and tick % 5 == 0:
+                # Loop-liveness proof for the guardian: written from the main
+                # loop itself, so a hung bus lock or futex-dead loop stops
+                # the file going fresh even while the process stays alive.
+                # Every 5 ticks: even a badly degraded loop (~2 s/tick on a
+                # retrying bus) still beats well inside the guardian's stale
+                # threshold. Write failures are retried forever — a missing
+                # heartbeat now means the guardian recycles the run, so
+                # giving up on the first OSError would be self-destruction.
+                try:
+                    with open(heartbeat_path + ".tmp", "w") as hb:
+                        hb.write(f"{time.time():.0f}\n")
+                    os.replace(heartbeat_path + ".tmp", heartbeat_path)
+                except OSError as exc:
+                    if tick % 1200 == 0:  # log once a minute, keep trying
+                        print(f"heartbeat_write_failed {exc!r}", flush=True)
             if loop_t0 - started > args.duration_s:
                 print("duration_reached", flush=True)
                 break
@@ -1549,7 +1973,11 @@ def main():
                                  / (cfg["curl_sign"]
                                     * cfg["pitch_ticks_per_rad"]
                                     * cfg["curl_pitch_share"]))
-                if tick % 20 == 0 and head.compliance is None:
+                if tick % 2 == 0 and head.compliance is None:
+                    # 10 Hz supervision while RETURNING (compliance not yet
+                    # constructed): a jammed joint must trip the RETURNING
+                    # divergence bound within ~2 s, not after a 1 Hz check
+                    # lets the ramp push it for most of the slew.
                     head.telemetry_check()
 
             if eyes is not None:
@@ -1621,7 +2049,11 @@ def main():
             eyes.release(reason=1)
             eyes.close()
         if head is not None:
-            head.park_and_release()  # parks at natural; torque stays ON
+            # Torque stays ON either way; a park the mechanism did not
+            # actually reach must surface in the exit code so the guardian
+            # and operator see it (admission recovery slews home next run).
+            if not head.park_and_release() and exit_code == 0:
+                exit_code = 3
         if bus is not None:
             bus.close()
         if camera is not None:

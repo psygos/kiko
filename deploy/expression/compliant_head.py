@@ -11,6 +11,8 @@ import math
 
 
 JOINT_COUNT = 4
+YAW = 2
+ROLL = 3
 FOLLOWING = "FOLLOWING_EXPRESSION"
 CONFIRMING = "CONFIRMING_CONTACT"
 YIELDING = "YIELDING"
@@ -81,6 +83,10 @@ class CompliantHeadPolicy:
     recovery_duration_s: float
     recovery_per_additional_joint_fraction: float
     follow_fraction: float
+    yield_static_release_s: float
+    maximum_yield_dwell_s: float
+    comfort_roll_tilt_ticks: int
+    yield_torque_limit_permille: tuple
 
     @classmethod
     def parse(cls, raw, installed_torque_limits):
@@ -100,6 +106,8 @@ class CompliantHeadPolicy:
             "rest_per_additional_joint_ms", "maximum_rest_dwell_ms",
             "recovery_duration_ms",
             "recovery_per_additional_joint_permille", "follow_permille",
+            "yield_static_release_ms", "maximum_yield_dwell_ms",
+            "comfort_roll_tilt_ticks", "yield_torque_limit_permille",
         }
         unknown = sorted(set(raw) - expected)
         missing = sorted(expected - set(raw))
@@ -177,8 +185,45 @@ class CompliantHeadPolicy:
             raw["recovery_per_additional_joint_permille"],
             "recovery_per_additional_joint_permille")
         follow_permille = _plain_int(raw["follow_permille"], "follow_permille")
+        static_release_ms = _plain_int(
+            raw["yield_static_release_ms"], "yield_static_release_ms")
+        maximum_yield_dwell_ms = _plain_int(
+            raw["maximum_yield_dwell_ms"], "maximum_yield_dwell_ms")
+        comfort_tilt = _plain_int(
+            raw["comfort_roll_tilt_ticks"], "comfort_roll_tilt_ticks")
+        if comfort_tilt < 0:
+            raise CompliantConfigError(
+                "comfort_roll_tilt_ticks must be non-negative")
+        # Backdrivable yield: the serial owner drops torque limits to this
+        # profile while YIELDING so a hand can physically move the head.
+        # Floors are the OPERATOR HARD RULE in parser form, per joint from
+        # the 2026-08-02 bench staircase: bow held statically at 300
+        # permille (7 ticks drift) and curl at 200 (4 ticks) with the head
+        # at natural; gravity-neutral yaw/roll get the generic 150 floor.
+        yield_torque = _int4(raw["yield_torque_limit_permille"],
+                             "yield_torque_limit_permille", 150, 1000)
+        yield_floor = (300, 200, 150, 150)
+        for joint in range(JOINT_COUNT):
+            if yield_torque[joint] < yield_floor[joint]:
+                raise CompliantConfigError(
+                    f"joint {joint} yield torque below measured static-hold "
+                    f"floor {yield_floor[joint]}")
+            if yield_torque[joint] > holding_torque[joint]:
+                raise CompliantConfigError(
+                    f"joint {joint} yield torque exceeds holding torque")
+        if (abs(rest_pose[ROLL]) + directional_rest[ROLL] + comfort_tilt
+                > maximum_yield[ROLL]):
+            raise CompliantConfigError(
+                "comfort roll tilt plus rest offsets exceeds roll yield")
         if control_ms <= 0 or observation_ms <= 0 or observation_ms > control_ms:
             raise CompliantConfigError("observation span must fit inside control period")
+        if static_release_ms < 3 * control_ms:
+            raise CompliantConfigError(
+                "yield_static_release_ms needs at least three control periods "
+                "of evidence")
+        if maximum_yield_dwell_ms <= static_release_ms:
+            raise CompliantConfigError(
+                "maximum_yield_dwell_ms must exceed yield_static_release_ms")
         if (arm_ms <= 0 or release_ms <= 0 or rest_ms <= 0 or
                 recovery_ms <= 0):
             raise CompliantConfigError("compliant dwell/recovery durations must be positive")
@@ -211,6 +256,10 @@ class CompliantHeadPolicy:
             recovery_ms / 1000.0,
             recovery_additional_permille / 1000.0,
             follow_permille / 1000.0,
+            static_release_ms / 1000.0,
+            maximum_yield_dwell_ms / 1000.0,
+            comfort_tilt,
+            yield_torque,
         )
 
 
@@ -250,11 +299,23 @@ class CompliantHeadController:
         self.active_recovery_duration_s = self.policy.recovery_duration_s
         self.next_service_due = started_at
         self.fault = None
+        self.yield_entered_at = None
+        self.yield_stable_since = None
+        self.yield_stable_reference = None
+        self.rest_settled_at = None
+        self.rest_prev_residual = None
+        self.comfort_tilt_side = None
 
     @property
     def active(self):
         return self.state in (
             CONFIRMING, YIELDING, RELEASE_DWELL, RESTING, RECOVERING)
+
+    def note_observation_gap(self):
+        """A control slot was skipped (slow bus cycle): the next observation
+        is not adjacent to the previous one, so the per-slot discontinuity
+        check must not treat ordinary motion across the gap as a yank."""
+        self.previous_observation = None
 
     def _admit_command_pose(self, pose, field):
         if not isinstance(pose, (list, tuple)) or len(pose) != JOINT_COUNT:
@@ -374,16 +435,32 @@ class CompliantHeadController:
             float(now) - self.recovery_started_at,
             self.active_recovery_duration_s)
 
-    def _enter_yield(self, positions, directions, event="pet_contact"):
+    def _enter_yield(self, now, positions, directions, event="pet_contact"):
         active_joints = max(1, sum(direction != 0 for direction in directions))
         additional_joints = active_joints - 1
         self.contact_directions = tuple(directions)
-        self.contact_rest_pose = tuple(
+        residual = self._residual_errors(positions)
+        rest_pose = [
             base + direction * directional
             for base, direction, directional in zip(
                 self.policy.contact_rest_pose_offset_ticks,
                 directions,
-                self.policy.contact_directional_rest_offset_ticks))
+                self.policy.contact_directional_rest_offset_ticks)]
+        if directions[ROLL] == 0 and self.policy.comfort_roll_tilt_ticks > 0:
+            # A pet on bow/curl alone still tilts the head into the hand,
+            # cat-style. The side is chosen ONCE per contact episode, on the
+            # fresh pet_contact whose residual is measured against an
+            # untilted target — re-entries reuse it, because their residual
+            # embeds the previous tilt and re-deriving would deterministically
+            # flip the head side to side. Roll hint only when it clears
+            # noise; else the yaw lean decides; favorite side when centered.
+            if event == "pet_contact" or self.comfort_tilt_side is None:
+                hint = (residual[ROLL] if abs(residual[ROLL]) >= 3
+                        else residual[YAW])
+                self.comfort_tilt_side = -1 if hint < 0 else 1
+            rest_pose[ROLL] += (self.comfort_tilt_side
+                                * self.policy.comfort_roll_tilt_ticks)
+        self.contact_rest_pose = tuple(rest_pose)
         self.active_rest_duration_s = min(
             self.policy.maximum_rest_dwell_s,
             self.policy.rest_dwell_s
@@ -396,12 +473,28 @@ class CompliantHeadController:
         self.rest_started_at = None
         self.reacquire_directions = None
         self.reacquire_samples = 0
-        residual = self._residual_errors(positions)
+        self.yield_entered_at = float(now)
+        self.yield_stable_since = float(now)
+        self.yield_stable_reference = None
+        self.rest_settled_at = None
+        self.rest_prev_residual = None
         self.target = self._yield_target(positions)
         return CompliantStep(self.state, self.target, residual, event)
 
     def _recontact_confirmed(self, positions):
         directions = self._directions(positions)
+        # Stillness rule, same as YIELDING's static release: only a residual
+        # that MOVES is a returning pet. A static over-threshold residual is
+        # pose sag or a motionless hand; counting it re-entered yield forever
+        # (sag > entry knead-cycled indefinitely and face-follow never
+        # resumed) and raced the rest-pose travel so bow never went comfy.
+        residual = self._residual_errors(positions)
+        varying = (self.rest_prev_residual is not None and any(
+            abs(actual - previous) > 3
+            for actual, previous in zip(residual, self.rest_prev_residual)))
+        self.rest_prev_residual = residual
+        if not varying and directions != (0, 0, 0, 0):
+            return False
         if directions == (0, 0, 0, 0):
             self.reacquire_directions = None
             self.reacquire_samples = 0
@@ -488,7 +581,7 @@ class CompliantHeadController:
                     self.candidate_directions = directions
                     self.candidate_samples = 1
                     if self.policy.contact_acquisition_samples == 1:
-                        result = self._enter_yield(positions, directions)
+                        result = self._enter_yield(now, positions, directions)
                         event = result.event
                     else:
                         self.state = CONFIRMING
@@ -518,7 +611,7 @@ class CompliantHeadController:
                     self.candidate_samples += 1
                     if self.candidate_samples >= self.policy.contact_acquisition_samples:
                         result = self._enter_yield(
-                            positions, self.candidate_directions)
+                            now, positions, self.candidate_directions)
                         event = result.event
 
         elif self.state in (YIELDING, RELEASE_DWELL):
@@ -526,26 +619,94 @@ class CompliantHeadController:
             if released:
                 if self.quiet_since is None:
                     self.quiet_since = now
+                # The stability clock must not keep accruing across a
+                # YIELDING<->RELEASE_DWELL bounce, or static release fires
+                # early with stale evidence.
+                self.yield_stable_reference = None
+                self.yield_stable_since = now
                 self.state = RELEASE_DWELL
                 if now - self.quiet_since >= self.policy.release_dwell_s:
                     self.state = RESTING
                     self.rest_started_at = now
+                    self.rest_settled_at = None
+                    self.rest_prev_residual = None
                     self.reacquire_directions = None
                     self.reacquire_samples = 0
                     event = "pet_resting"
             else:
                 self.quiet_since = None
                 self.state = YIELDING
-                self.target = self._yield_target(positions)
+                # YIELDING means ACTIVE contact: a live pet varies the
+                # residual sample to sample. A statue-still residual is a
+                # resting hand or pose-dependent gravity sag (2026-08-02
+                # trance: bow sag differed 11 ticks between poses while the
+                # release band is 5, so release was unreachable and the head
+                # froze mid-pet for 20 minutes). Both belong in RESTING —
+                # recontact detection catches a real hand, and recovery
+                # re-learns the baseline, absorbing the sag.
+                #
+                # DESIGN NOTE (2026-08-02, operator-directed): at the
+                # deployed follow fraction (0.65) the post-yield residual
+                # sits just outside the release band by construction, so
+                # this static exit is the PRIMARY end of a pet, not a
+                # backstop — stillness is what a settling cat responds to.
+                # The +-3 epsilon is deliberately at or below every joint's
+                # maximum_command_step, so a residual still converging with
+                # the target resets the reference and can never fake
+                # stillness; only genuinely sub-epsilon contact sustains it.
+                residual = self._residual_errors(positions)
+                stable = (self.yield_stable_reference is not None and all(
+                    abs(actual - reference) <= 3
+                    for actual, reference in zip(
+                        residual, self.yield_stable_reference)))
+                if not stable:
+                    self.yield_stable_reference = residual
+                    self.yield_stable_since = now
+                if (now - self.yield_stable_since
+                        >= self.policy.yield_static_release_s):
+                    event = "pet_release_static"
+                elif (self.yield_entered_at is not None and
+                      now - self.yield_entered_at
+                      >= self.policy.maximum_yield_dwell_s):
+                    # Bounds a continuously-varying residual with no
+                    # recontact opportunity. A persistent active hand will
+                    # re-enter yield from RESTING — that cycle is by design,
+                    # not a hostage cap.
+                    event = "pet_yield_timeout"
+                if event is not None:
+                    self.state = RESTING
+                    self.rest_started_at = now
+                    self.rest_settled_at = None
+                    self.rest_prev_residual = None
+                    self.reacquire_directions = None
+                    self.reacquire_samples = 0
+                else:
+                    self.target = self._yield_target(positions)
 
         elif self.state == RESTING:
             if self._recontact_confirmed(positions):
                 result = self._enter_yield(
-                    positions, self.reacquire_directions, "pet_recontact")
+                    now, positions, self.reacquire_directions, "pet_recontact")
                 event = result.event
             else:
-                self.target = self._command_step(self._rest_target())
-                if now - self.rest_started_at >= self.active_rest_duration_s:
+                rest_target = self._rest_target()
+                self.target = self._command_step(rest_target)
+                if self.rest_settled_at is None and self.target == rest_target:
+                    # Comfy pose reached: the pause is measured from HERE.
+                    # Measuring from rest entry let travel eat the whole
+                    # dwell, so the head stood up the instant it settled —
+                    # which read as no pause at all.
+                    self.rest_settled_at = now
+                    event = "pet_comfy"
+                settled = (self.rest_settled_at is not None and
+                           now - self.rest_settled_at
+                           >= self.active_rest_duration_s)
+                # From-entry backstop covers a rest pose that stays out of
+                # reach (a hand blocking travel) without a recontact firing:
+                # worst travel is under 3 s at the per-joint command step.
+                overdue = (now - self.rest_started_at
+                           >= self.policy.maximum_rest_dwell_s + 3.0)
+                if settled or overdue:
                     self.state = RECOVERING
                     self.recovery_start = self.target
                     self.recovery_started_at = now
@@ -556,7 +717,7 @@ class CompliantHeadController:
         elif self.state == RECOVERING:
             if self._recontact_confirmed(positions):
                 result = self._enter_yield(
-                    positions, self.reacquire_directions, "pet_recontact")
+                    now, positions, self.reacquire_directions, "pet_recontact")
                 event = result.event
             else:
                 elapsed = now - self.recovery_started_at
@@ -572,6 +733,7 @@ class CompliantHeadController:
                     self.quiescent_since = None
                     self.contact_armed = False
                     self.baseline_error = (0, 0, 0, 0)
+                    self.comfort_tilt_side = None
                     event = "pet_returned"
 
         self.previous_expression_target = expression_target

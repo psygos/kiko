@@ -47,14 +47,35 @@ class OrganicMotionAxisTests(unittest.TestCase):
         self.assertLessEqual(maximum_position, 81.0)
         self.assertAlmostEqual(axis.position, 80.0, places=3)
 
-    def test_long_gap_freezes_instead_of_catching_up(self):
+    def test_long_gap_cannot_lunge_but_still_advances(self):
         axis = OrganicMotionAxis(axis_policy(), 0.0, 0.0)
         moving = axis.step(80.0, 0.05)
-        gap = axis.step(80.0, 0.50)
+        gap = axis.step(80.0, 5.00)
         self.assertTrue(gap.gap_reset)
-        self.assertEqual(gap.position, moving.position)
-        self.assertEqual(gap.velocity, 0.0)
-        self.assertEqual(gap.acceleration, 0.0)
+        # The interval is clamped to maximum_interval_s, so a 5 s stall can
+        # never buy a catch-up jump larger than one bounded 0.15 s step —
+        # and the axis keeps moving instead of freezing forever.
+        self.assertGreater(gap.position, moving.position)
+        self.assertLessEqual(gap.position - moving.position,
+                             30.0 * 0.15 + 1e-9)
+        self.assertLessEqual(abs(gap.velocity), 30.0 + 1e-9)
+
+    def test_chronically_slow_loop_converges_at_bounded_rate(self):
+        axis = OrganicMotionAxis(axis_policy(), 0.0, 0.0)
+        now = 0.0
+        previous = 0.0
+        step = None
+        for _ in range(60):
+            now += 0.4  # every tick far beyond maximum_interval_s
+            step = axis.step(80.0, now)
+            # Per-step advance stays inside one clamped interval's travel.
+            self.assertLessEqual(step.position - previous, 30.0 * 0.15 + 1e-9)
+            previous = step.position
+        # Effective tracking rate degrades proportionally (0.15/0.4), not to
+        # a crawl: 60 late ticks are ample for an 80-tick move. The coarse
+        # clamped steps cost a slightly larger (still small) overshoot.
+        self.assertGreater(step.position, 70.0)
+        self.assertLessEqual(step.position, 84.0)
 
     def test_invalid_target_and_regressed_clock_are_rejected(self):
         axis = OrganicMotionAxis(axis_policy(), 0.0, 1.0)

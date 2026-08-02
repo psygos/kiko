@@ -38,6 +38,10 @@ def policy_json():
         "recovery_duration_ms": 2400,
         "recovery_per_additional_joint_permille": 150,
         "follow_permille": 350,
+        "yield_static_release_ms": 4000,
+        "maximum_yield_dwell_ms": 30000,
+        "comfort_roll_tilt_ticks": 6,
+        "yield_torque_limit_permille": [400, 300, 200, 200],
     }
 
 
@@ -60,14 +64,28 @@ class CompliantHeadPolicyTests(unittest.TestCase):
         policy = CompliantHeadPolicy.parse(
             raw["compliant_hold"], raw["torque_limit_permille"])
         self.assertEqual(
-            policy.holding_torque_limit_permille, (600, 500, 250, 300))
-        self.assertEqual(policy.contact_entry_error_ticks, (14, 18, 10, 10))
+            policy.holding_torque_limit_permille, (650, 550, 400, 400))
+        self.assertEqual(policy.contact_entry_error_ticks, (18, 24, 32, 18))
         self.assertEqual(policy.contact_release_error_ticks, (5, 7, 4, 4))
         self.assertEqual(policy.contact_acquisition_samples, 2)
-        self.assertEqual(policy.follow_fraction, 0.5)
-        self.assertEqual(policy.contact_rest_pose_offset_ticks, (-8, 18, 0, 0))
+        # Exaggerated pet profile (operator-directed 2026-08-02): deeper
+        # yield led by bow, theatrical rest lean, slower min-jerk rise.
+        self.assertEqual(policy.follow_fraction, 0.65)
+        self.assertEqual(policy.maximum_yield_ticks, (40, 48, 80, 36))
+        self.assertEqual(policy.contact_rest_pose_offset_ticks, (-24, 30, 0, 0))
         self.assertEqual(
-            policy.contact_directional_rest_offset_ticks, (0, 0, 12, 10))
+            policy.contact_directional_rest_offset_ticks, (0, 0, 20, 16))
+        self.assertEqual(policy.rest_dwell_s, 1.2)
+        self.assertEqual(policy.recovery_duration_s, 3.0)
+        # Cat choreography: stillness settles the head in 1.8 s — at 0.65
+        # follow the post-yield residual sits outside the release band by
+        # construction, so static release is the PRIMARY pet exit.
+        self.assertEqual(policy.yield_static_release_s, 1.8)
+        self.assertEqual(policy.maximum_yield_dwell_s, 30.0)
+        self.assertEqual(policy.comfort_roll_tilt_ticks, 14)
+        # Backdrivable yield: soft but never near-zero (parser floors 150).
+        self.assertEqual(policy.yield_torque_limit_permille,
+                         (450, 350, 220, 250))
 
     def test_boundary_rejects_unknown_and_missing_fields(self):
         raw = policy_json()
@@ -119,8 +137,9 @@ class CompliantHeadControllerTests(unittest.TestCase):
         self.assertEqual(third.event, "pet_contact")
         self.assertEqual(third.residual_error_ticks, (24, 0, 0, 0))
         # 35% of 24 ticks rounds to 8, but one physical command may move only 3.
-        # The touch is followed while a small supervised bow/curl tuck begins.
-        self.assertEqual(third.target_ticks, (103, 103, 100, 100))
+        # The touch is followed while a small supervised tuck begins — bow,
+        # curl, and (via the comfort tilt) an anticipatory roll lean.
+        self.assertEqual(third.target_ticks, (103, 103, 100, 103))
 
     def test_settled_gravity_bias_is_not_misclassified_as_touch(self):
         controller = make_controller()
@@ -234,13 +253,39 @@ class CompliantHeadControllerTests(unittest.TestCase):
             result = service(controller, 1.4 + index * 0.1,
                              result.target_ticks, moving=False)
         self.assertEqual(result.state, RESTING)
-        for at in (2.1, 2.2, 2.3):
+        # A returning hand APPROACHES — the residual sweeps as it presses.
+        # (A perfectly constant offset is the sag signature and must not
+        # recontact; see test_static_pin_during_rest_does_not_recontact.)
+        for at, poke in ((2.1, 20), (2.2, 26), (2.3, 32), (2.4, 38)):
             position = list(result.target_ticks)
-            position[2] += 20
+            position[2] += poke
             result = service(controller, at, tuple(position), moving=True)
         self.assertEqual(result.state, YIELDING)
         self.assertEqual(result.event, "pet_recontact")
         self.assertEqual(controller.contact_directions, (0, 0, 1, 0))
+
+    def test_static_pin_during_rest_does_not_recontact(self):
+        # A sag (or motionless hand) above entry used to knead-cycle forever:
+        # RESTING -> recontact -> YIELDING -> static release -> RESTING ...
+        # and face-follow never resumed. Statue-still residual must let the
+        # rest complete and recovery re-learn the baseline instead.
+        controller = make_controller()
+        self.enter_yield(controller)
+        at = 1.3
+        events = []
+        result = None
+        for _ in range(200):
+            at += 0.1
+            sagged = tuple(target + (23 if joint == 0 else 0)
+                           for joint, target in enumerate(controller.target))
+            result = service(controller, at, sagged)
+            if result.event:
+                events.append(result.event)
+            if result.state == FOLLOWING:
+                break
+        self.assertEqual(result.state, FOLLOWING)
+        self.assertIn("pet_comfy", events)
+        self.assertNotIn("pet_recontact", events)
 
     def test_large_observation_jump_faults_closed(self):
         controller = make_controller()
@@ -276,6 +321,133 @@ class CompliantHeadControllerTests(unittest.TestCase):
                              position=command, command=command)
         self.assertEqual(result.state, FOLLOWING)
         self.assertFalse(controller.contact_armed)
+
+    def enter_yield(self, controller):
+        self.arm(controller)
+        service(controller, 1.1, (120, 100, 100, 100), moving=True)
+        service(controller, 1.2, (122, 100, 100, 100), moving=True)
+        result = service(controller, 1.3, (124, 100, 100, 100), moving=True)
+        self.assertEqual(result.state, YIELDING)
+        return result
+
+    def test_static_sag_residual_releases_and_self_heals(self):
+        # The 2026-08-02 live trance: the hand leaves, but pose-dependent
+        # gravity sag keeps bow a constant ~11 ticks off target — outside
+        # the 8-tick release band — so the machine yielded for 20 minutes
+        # (frozen head, white pet-eyes). From here the servo just tracks
+        # whatever is commanded, always with that 11-tick sag; the machine
+        # must classify the statue-still residual as static contact, rest,
+        # recover, and re-learn the sag into a fresh baseline.
+        controller = make_controller()
+        self.enter_yield(controller)
+        at = 1.3
+        events = []
+        result = None
+        for _ in range(120):
+            at += 0.1
+            sagged = tuple(target + (11 if joint == 0 else 0)
+                           for joint, target in enumerate(controller.target))
+            result = service(controller, at, sagged)
+            if result.event:
+                events.append(result.event)
+            if result.state == FOLLOWING:
+                break
+        self.assertIn("pet_release_static", events)
+        self.assertIn("pet_recovering", events)
+        self.assertIn("pet_returned", events)
+        self.assertEqual(result.state, FOLLOWING)
+        self.assertLess(at, 1.3 + 12.0)  # seconds of trance, never minutes
+
+    def test_live_pet_with_varying_residual_keeps_yielding(self):
+        controller = make_controller()
+        self.enter_yield(controller)
+        at = 1.3
+        for step in range(70):  # 7 s of active stroking
+            at += 0.1
+            wobble = 124 + (10 if step % 2 == 0 else -10)
+            result = service(controller, at, (wobble, 100, 100, 100),
+                             moving=True)
+            self.assertEqual(result.state, YIELDING)
+
+    def test_relentless_contact_hits_hard_timeout_into_rest(self):
+        controller = make_controller()
+        self.enter_yield(controller)
+        at = 1.3
+        result = None
+        for step in range(400):  # far past maximum_yield_dwell_ms
+            at += 0.1
+            wobble = 124 + (10 if step % 2 == 0 else -10)
+            result = service(controller, at, (wobble, 100, 100, 100),
+                             moving=True)
+            if result.state != YIELDING:
+                break
+        self.assertEqual(result.event, "pet_yield_timeout")
+        self.assertEqual(result.state, RESTING)
+        self.assertLess(at, 1.3 + 31.0)
+
+    def test_yield_dwell_bounds_are_validated(self):
+        raw = policy_json()
+        raw["maximum_yield_dwell_ms"] = 4000  # not above static release
+        with self.assertRaises(CompliantConfigError):
+            CompliantHeadPolicy.parse(raw, [650, 550, 400, 400])
+        raw = policy_json()
+        raw["yield_static_release_ms"] = 200  # under three control periods
+        with self.assertRaises(CompliantConfigError):
+            CompliantHeadPolicy.parse(raw, [650, 550, 400, 400])
+        raw = policy_json()
+        raw["comfort_roll_tilt_ticks"] = 23  # 0 + 8 + 23 > roll yield 30
+        with self.assertRaises(CompliantConfigError):
+            CompliantHeadPolicy.parse(raw, [650, 550, 400, 400])
+        raw = policy_json()
+        raw["yield_torque_limit_permille"] = [700, 300, 200, 200]  # > holding
+        with self.assertRaises(CompliantConfigError):
+            CompliantHeadPolicy.parse(raw, [650, 550, 400, 400])
+        raw = policy_json()
+        raw["yield_torque_limit_permille"] = [100, 300, 200, 200]  # below floor
+        with self.assertRaises(CompliantConfigError):
+            CompliantHeadPolicy.parse(raw, [650, 550, 400, 400])
+        raw = policy_json()
+        # Below the measured bow static-hold floor (300, bench 2026-08-02).
+        raw["yield_torque_limit_permille"] = [250, 300, 200, 200]
+        with self.assertRaises(CompliantConfigError):
+            CompliantHeadPolicy.parse(raw, [650, 550, 400, 400])
+
+    def run_to_event(self, controller, at, wanted, position_of, limit=200):
+        events = []
+        for _ in range(limit):
+            at += 0.1
+            result = service(controller, at, position_of(controller))
+            if result.event:
+                events.append((round(at, 1), result.event))
+                if result.event == wanted:
+                    return at, events, result
+        self.fail(f"{wanted} never fired; saw {events}")
+
+    def test_cat_sequence_tilts_sinks_pauses_then_rises(self):
+        # Operator-specified feel: press -> yield -> tilt -> get comfy ->
+        # real pause -> slow rise. Bow-only contact must still tilt roll.
+        controller = make_controller()
+        self.enter_yield(controller)
+
+        def sagged(c):
+            return tuple(target + (11 if joint == 0 else 0)
+                         for joint, target in enumerate(c.target))
+
+        at, _, _ = self.run_to_event(
+            controller, 1.3, "pet_release_static", sagged)
+        comfy_at, _, _ = self.run_to_event(
+            controller, at, "pet_comfy", sagged)
+        # Tilt: roll rest target carries the comfort tilt even though the
+        # contact was pure bow (helper tilt 6, favorite side +1).
+        self.assertEqual(controller.target[3], 106)
+        # Sink: bow rest target sits below the return pose (rest offset -6).
+        self.assertEqual(controller.target[0], 94)
+        rise_at, _, _ = self.run_to_event(
+            controller, comfy_at, "pet_recovering", sagged)
+        # Pause: dwell is measured from settling, not from rest entry.
+        self.assertGreaterEqual(rise_at - comfy_at,
+                                controller.active_rest_duration_s - 1e-6)
+        self.run_to_event(controller, rise_at, "pet_returned", sagged)
 
 
 if __name__ == "__main__":

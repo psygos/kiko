@@ -82,6 +82,41 @@ class ThermalDerateControllerTests(unittest.TestCase):
         with self.assertRaises(ThermalObservationError):
             controller.update((43, True, 39, 39))
 
+    def engage(self, controller):
+        for _ in range(3):
+            controller.update((49, 48, 39, 39))
+        self.assertTrue(controller.active)
+
+    def test_implausible_bytes_never_engage_derate(self):
+        controller = self.make_controller()
+        for _ in range(5):
+            step = controller.update((150, 140, 39, 39))
+        self.assertFalse(step.active)
+
+    def test_implausible_byte_holds_clear_counter(self):
+        controller = self.make_controller()
+        self.engage(controller)
+        for _ in range(9):
+            controller.update((43, 44, 39, 39))
+        # Corruption-band byte: no evidence either way, counter holds at 9.
+        self.assertTrue(controller.update((150, 44, 39, 39)).active)
+        step = controller.update((43, 44, 39, 39))
+        self.assertFalse(step.active)
+        self.assertEqual(step.event, "thermal_derate_off")
+
+    def test_isolated_warm_sample_decrements_instead_of_resetting(self):
+        controller = self.make_controller()
+        self.engage(controller)
+        for _ in range(9):
+            controller.update((43, 44, 39, 39))
+        # Plausible warm byte inside a cooling trend costs one count (9->8),
+        # not the whole streak; two more cool samples clear the derate.
+        self.assertTrue(controller.update((47, 44, 39, 39)).active)
+        self.assertTrue(controller.update((43, 44, 39, 39)).active)
+        step = controller.update((43, 44, 39, 39))
+        self.assertFalse(step.active)
+        self.assertEqual(step.event, "thermal_derate_off")
+
 
 if __name__ == "__main__":
     unittest.main()
