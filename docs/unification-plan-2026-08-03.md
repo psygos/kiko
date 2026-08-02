@@ -172,6 +172,38 @@ wheel gates and plant calibration, MPC out of shadow
 (`navigation/mpc.rs` is transport-free by design today), and expression
 that leans into base motion instead of being suspended by it.
 
+## 8a. SLAM readiness track (parallel to phases 1-4; audit 2026-08-03)
+
+Findings: the SLAM core is frozen since 2026-07-20 (0.86% of the 12-day
+diff), correct and fail-closed, but (a) live SLAM has never run on this
+branch and NO instrument in the tree can emit a live SLAM rate — only
+replay paths print FPS; (b) nano-agent enables neither `ort-cuda` nor
+`ort-tensorrt`, and backend "auto" silently falls back to CPU, so
+SuperPoint x2 + LightGlue run on the same CPU cores the expression engine
+will share; (c) the fast stack — projected tracker (19.38 FPS replay vs
+6.21 LightGlue-only), VIO, 2048-keypoint models, the benchmark harness —
+is stranded on the unmerged February-divergent
+`codex/ort-session-placement-evidence` branch, whose own README revokes
+the historical CUDA-placement claim; (d) tracker has zero IMU fusion
+(gyro-only yaw extrapolation in navigation), loop closure runs on
+downgraded deterministic descriptors, the OAK EEPROM has no IMU
+calibration, and zero thermal/power data exists.
+
+Track items, independent of the head merge-back:
+S1. Port the benchmark/telemetry harness (or a minimal live-rate
+    instrument) into this branch — without it the first live SLAM run
+    cannot even be measured.
+S2. Decide GPU inference: enable `ort-cuda`/`ort-tensorrt` in the
+    nano-agent feature graph and make backend fallback LOUD, or accept
+    CPU and measure the joint expression+SLAM CPU budget explicitly.
+S3. Cherry-pick the projected tracker + 2048-keypoint models from the
+    ORT-evidence branch with fresh placement analysis (do not inherit
+    the revoked claims).
+S4. First live SLAM run remains gated behind the Phase 5 handoff (one
+    owner per device — no coexistence evidence is possible before it);
+    schedule it as the first post-switchover session, with tegrastats
+    thermal/CPU capture alongside.
+
 ## 9. Ordering constraints
 
 - Phases 1-4 run while the Python owner keeps the robot alive; zero
