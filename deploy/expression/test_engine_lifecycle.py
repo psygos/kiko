@@ -52,6 +52,8 @@ class FakeBus:
         self.stalled = set(stalled)
         self.goal_writes = []
         self.torque_writes = []
+        self.torque_switch = [1, 1, 1, 1]
+        self.switch_writes = []
 
     def read_position_redundant(self, servo_id):
         joint = kff.SERVO_IDS.index(servo_id)
@@ -66,8 +68,13 @@ class FakeBus:
     def write_torque_limit(self, servo_id, permille):
         self.torque_writes.append((kff.SERVO_IDS.index(servo_id), permille))
 
+    def read_torque_switch(self, servo_id):
+        return self.torque_switch[kff.SERVO_IDS.index(servo_id)]
+
     def write_torque_switch(self, servo_id, enabled):
-        pass
+        joint = kff.SERVO_IDS.index(servo_id)
+        self.switch_writes.append((joint, bool(enabled)))
+        self.torque_switch[joint] = 1 if enabled else 0
 
 
 class TelemetryBus(FakeBus):
@@ -418,6 +425,51 @@ class PetTorqueTests(unittest.TestCase):
                          [(joint, full[joint]) for joint in range(4)])
 
 
+class TorqueSwitchWatchdogTests(unittest.TestCase):
+    """The 2026-08-03 limp-head incident: a supply dip cleared every torque
+    switch involuntarily and nothing in the engine could notice."""
+
+    def make_tracking_head(self):
+        head = make_head(FakeBus([0, 0, 0, 0]))
+        head.bus.positions = list(head.natural)
+        head.goal = list(head.natural)
+        head.state = "TRACKING"
+        return head
+
+    def test_lost_switch_reengages_at_measured_pose(self):
+        head = self.make_tracking_head()
+        head.bus.positions[kff.BOW] = head.natural[kff.BOW] - 300  # limp fell
+        head.bus.torque_switch = [0, 0, 1, 1]
+        head._verify_torque_switches()
+        # Zero-jump: goals seeded from where the head actually is.
+        self.assertEqual(head.goal[kff.BOW], head.natural[kff.BOW] - 300)
+        self.assertEqual(head.state, "RETURNING")
+        self.assertIsNone(head.compliance)
+        self.assertEqual(head.bus.torque_switch, [1, 1, 1, 1])
+        full = head.cfg["torque_limit_permille"]
+        self.assertEqual(head.bus.torque_writes[-4:],
+                         [(joint, full[joint]) for joint in range(4)])
+        # Goal write precedes the switch write for every joint (a brownout
+        # that cleared the switch may have cleared the goal register too).
+        self.assertEqual(head.bus.switch_writes,
+                         [(joint, True) for joint in range(4)])
+
+    def test_healthy_switches_do_nothing(self):
+        head = self.make_tracking_head()
+        head._verify_torque_switches()
+        self.assertEqual(head.state, "TRACKING")
+        self.assertEqual(head.bus.switch_writes, [])
+
+    def test_repeated_loss_escalates_to_park(self):
+        head = self.make_tracking_head()
+        for _ in range(3):
+            head.bus.torque_switch = [0, 1, 1, 1]
+            head._verify_torque_switches()
+        head.bus.torque_switch = [0, 1, 1, 1]
+        with self.assertRaises(kff.StsError):
+            head._verify_torque_switches()
+
+
 class CharacterEngineRestTests(unittest.TestCase):
     def make_engine(self):
         cfg = kff.load_config(
@@ -450,6 +502,24 @@ class CharacterEngineRestTests(unittest.TestCase):
         # bow rivals curl instead of trailing at a third.
         self.assertGreater(abs(desired4[kff.BOW]),
                            0.6 * abs(desired4[kff.CURL]))
+
+    def test_touch_reactions_pick_the_right_social_answer(self):
+        engine, _cfg = self.make_engine()
+        now = engine.created_at + 5.0
+        engine.note_pet_episode(
+            {"tap": True, "duration_s": 0.6, "mean_delta": 2.0,
+             "reached_comfy": False}, now)
+        self.assertEqual(engine.act.name, "startle_boop")
+        engine.note_pet_episode(
+            {"tap": False, "duration_s": 2.0, "mean_delta": 9.5,
+             "reached_comfy": False}, now + 3.0)
+        self.assertEqual(engine.act.name, "play_bow")
+        # Consecutive play raises energy: reactions scale up.
+        self.assertGreater(engine.playfulness, 0.6)
+        engine.note_pet_episode(
+            {"tap": False, "duration_s": 6.0, "mean_delta": 1.5,
+             "reached_comfy": True}, now + 8.0)
+        self.assertEqual(engine.act.name, "affection_melt")
 
     def test_person_arrival_wakes_the_head_immediately(self):
         engine, _cfg = self.make_engine()

@@ -181,6 +181,9 @@ class StsBus:
             raise StsError(f"servo {servo_id}: device status 0x{raw[4]:02x}")
         return raw[5:-1]
 
+    def read_torque_switch(self, servo_id):
+        return self._transact(servo_id, 0x02, [STS_TORQUE_REG, 1], 1)[0]
+
     def read_telemetry(self, servo_id):
         p = self._transact(servo_id, 0x02, [STS_TELEMETRY_REG, STS_TELEMETRY_BYTES],
                            STS_TELEMETRY_BYTES)
@@ -523,6 +526,22 @@ class HeadController:
         self.thermal = ThermalDerateController(ThermalDeratePolicy.parse(cfg))
         self.compliant_policy = CompliantHeadPolicy.parse(
             cfg["compliant_hold"], cfg["torque_limit_permille"])
+        for joint in range(4):
+            margin = min(
+                self.natural[joint]
+                - self.compliant_policy.minimum_ticks[joint],
+                self.compliant_policy.maximum_ticks[joint]
+                - self.natural[joint])
+            if self.limits[joint] > margin:
+                # A saturated expression channel must never land beyond the
+                # compliant command envelope: today's config sits exactly ON
+                # the boundary for bow/curl, and any retune that widens a
+                # limit past the envelope would turn a big act (play_bow
+                # saturates curl) into a latched compliance fault.
+                raise StsError(
+                    f"{JOINT_NAMES[joint]} expression limit "
+                    f"{self.limits[joint]} exceeds compliant envelope "
+                    f"margin {margin}")
         self.compliance = None
         self.compliance_probe_due = 0.0
         # Streak-based runtime temperature supervision (no sleeps in the
@@ -537,6 +556,8 @@ class HeadController:
         self.pet_log_path = cfg.get("pet_log_path") or ""
         self.pet_log_failed = False
         self.torque_softened = False
+        self.torque_check_counter = 0
+        self.torque_reengage_count = 0
 
     def _confirm_temperature(self, joint, servo_id, telemetry, limit, stage):
         # Plausibility ceiling: raw bytes above this are bus corruption, not
@@ -648,9 +669,47 @@ class HeadController:
             self.bus.write_goal(
                 servo_id, want, self.cfg["track_speed_max"])
 
+    def _verify_torque_switches(self):
+        """The 2026-08-03 incident: a supply dip cleared every torque switch
+        involuntarily (nothing in this program ever writes them off) and the
+        head went limp while all other telemetry looked healthy — register
+        40 was never read anywhere. A zero here is unambiguous. Response is
+        the existing engage sequence at the measured pose (goal BEFORE
+        switch: the same dip may have cleared the goal register), then the
+        bounded RETURNING ramp brings the head home. Repeated loss is a
+        power fault a human must see, not something to paper over."""
+        lost = [joint for joint, servo_id in enumerate(SERVO_IDS)
+                if self.bus.read_torque_switch(servo_id) == 0]
+        if not lost:
+            return
+        self.torque_reengage_count += 1
+        print(f"torque_switch_lost joints="
+              f"{[JOINT_NAMES[j] for j in lost]} "
+              f"reengage={self.torque_reengage_count}", flush=True)
+        if self.torque_reengage_count > 3:
+            raise StsError(
+                f"torque switch lost {self.torque_reengage_count} times: "
+                f"persistent servo power fault")
+        for joint, servo_id in enumerate(SERVO_IDS):
+            position = self.bus.read_position_redundant(servo_id)["position"]
+            self.bus.write_torque_limit(
+                servo_id, self.cfg["torque_limit_permille"][joint])
+            self.bus.write_goal(servo_id, position,
+                                self.cfg["return_speed_ticks_s"])
+            self.bus.write_torque_switch(servo_id, True)
+            self.goal[joint] = position
+        self.torque_softened = False
+        self.compliance = None
+        self.state = "RETURNING"
+        print(f"torque_reengaged_at={self.goal} returning", flush=True)
+
     def step(self, desired_offsets, now=None):
         """One 20 Hz control step toward natural + bounded 4-DOF offsets."""
         now = time.monotonic() if now is None else now
+        self.torque_check_counter += 1
+        if self.torque_check_counter >= 20 and self.goal is not None:
+            self.torque_check_counter = 0
+            self._verify_torque_switches()
         if not isinstance(desired_offsets, (list, tuple)) or len(desired_offsets) != 4:
             raise StsError("head expression must contain four offsets")
         desired = []
@@ -918,6 +977,18 @@ class HeadController:
 
     def telemetry_check(self):
         self._read_safe_observation()
+
+    def log_pet_episode(self, episode):
+        if not self.pet_log_path or self.pet_log_failed:
+            return
+        try:
+            with open(self.pet_log_path, "a") as pet_log:
+                pet_log.write(json.dumps(
+                    {"wall": round(time.time(), 2), "episode": episode},
+                    separators=(",", ":")) + "\n")
+        except OSError as exc:
+            self.pet_log_failed = True
+            print(f"pet_log_disabled {exc!r}", flush=True)
 
     def park_and_release(self):
         """Return to natural at bounded speed and release I/O, retaining torque."""
@@ -1267,6 +1338,63 @@ def _build_bow_bob(rng, ctx):
         expression="greet", uses_pitch=True)
 
 
+def _build_startle_boop(rng, ctx):
+    # Touch reaction: recoil up wide-eyed, then a springy bow-led double
+    # bounce forward with a bright flash. Scales with play energy.
+    energy = 1.0 + 0.6 * ctx.get("energy", 0.0)
+    recoil = rng.uniform(34, 50) * energy
+    dip = rng.uniform(40, 60) * energy
+    return ActPerformance(
+        "startle_boop", rng.uniform(1.6, 2.1),
+        {"pitch": [(0.0, 0.0), (0.10, recoil), (0.30, recoil * 0.6),
+                   (0.48, -dip), (0.62, dip * 0.30), (0.78, -dip * 0.45),
+                   (1.0, 0.0)],
+         "roll": _keys_pulse(rng.uniform(30, 60) * rng.choice((-1, 1)),
+                             0.15, 0.6),
+         "lid_add": [(0.0, 0.0), (0.08, -60), (0.5, 20), (1.0, 0.0)],
+         "pupil_add": [(0.0, 0.0), (0.08, 260), (0.6, 120), (1.0, 0.0)],
+         "bright_mul": _keys_pulse(0.5, 0.1, 0.7)},
+        color=_hsv_to_rgb(rng.uniform(0.10, 0.16), 0.95, 1.0),
+        expression="greet", blinks=(0.05, 0.9), uses_pitch=True)
+
+
+def _build_play_bow(rng, ctx):
+    # Touch reaction: the universal "let's play!" — a deep bow-led dive
+    # (the dynamic share sends about half through the base hinge), a roll
+    # wiggle while down, then spring up with an overshoot bounce.
+    energy = 1.0 + 0.5 * ctx.get("energy", 0.0)
+    depth = rng.uniform(90, 130) * energy
+    wiggle = rng.uniform(55, 85)
+    keys_pitch = [(0.0, 0.0), (0.18, -depth), (0.55, -depth * 0.92),
+                  (0.72, depth * 0.22), (0.85, -depth * 0.08), (1.0, 0.0)]
+    keys_roll = [(0.0, 0.0), (0.18, 0.0)]
+    for i in range(4):
+        keys_roll.append((0.22 + i * 0.08,
+                          wiggle * (1 if i % 2 == 0 else -1)))
+    keys_roll += [(0.60, 0.0), (1.0, 0.0)]
+    return ActPerformance(
+        "play_bow", rng.uniform(2.4, 3.2),
+        {"pitch": keys_pitch, "roll": keys_roll,
+         "yaw": _keys_pulse(rng.uniform(-70, 70), 0.2, 0.75),
+         "gy": [(0.0, 0.0), (0.2, 500), (0.7, 300), (1.0, 0.0)],
+         "pupil_add": _keys_pulse(rng.uniform(200, 300), 0.15, 0.8),
+         "bright_mul": _keys_pulse(0.45, 0.15, 0.8)},
+        color=_hsv_to_rgb(rng.uniform(0.28, 0.40), 0.9, 1.0),
+        expression="greet", blinks=(0.16,), uses_pitch=True)
+
+
+def _build_affection_melt(rng, ctx):
+    # Touch reaction afterglow: the trust blink — lids drift half closed
+    # and hold, warm amber, one slow bow-led nod.
+    return ActPerformance(
+        "affection_melt", rng.uniform(2.8, 3.6),
+        {"pitch": [(0.0, 0.0), (0.4, -rng.uniform(18, 30)), (1.0, 0.0)],
+         "lid_add": [(0.0, 0.0), (0.35, 240), (0.55, 240), (1.0, 0.0)],
+         "pupil_add": _keys_pulse(rng.uniform(120, 200), 0.3, 0.8),
+         "bright_mul": [(0.0, 0.0), (0.4, -0.2), (1.0, 0.0)]},
+        color=(255, 150, 90), expression="greet", uses_pitch=True)
+
+
 def _build_stretch(rng, ctx):
     return ActPerformance(
         "stretch", rng.uniform(2.6, 3.6),
@@ -1380,8 +1508,16 @@ ACT_LIBRARY = [
     ("dance", _build_dance, ("TRACK", "IDLE"), 1.3, 30.0),
     ("sigh", _build_sigh, ("TRACK", "IDLE"), 1.4, 30.0),
     ("bow_bob", _build_bow_bob, ("TRACK",), 1.2, 12.0),
+    ("play_bow", _build_play_bow, ("TRACK",), 0.9, 25.0),
 ]
 
+# Touch reactions are event-driven, not scheduled: the compliance layer
+# reports a finished episode's character and the engine answers socially.
+PET_REACTIONS = {
+    "boop": _build_startle_boop,
+    "play": _build_play_bow,
+    "affection": _build_affection_melt,
+}
 
 class CharacterEngine:
     """Mood state machine + act scheduler. Returns (eye_intent, desired4)."""
@@ -1416,6 +1552,8 @@ class CharacterEngine:
         self.prev_heading = 0.0
         self.prev_heading_at = None
         self.turn_dip = 0.0
+        self.playfulness = 0.0
+        self.playful_decay_at = None
 
     # -- mode machine ---------------------------------------------------------
     def _enter(self, mode, now):
@@ -1478,6 +1616,11 @@ class CharacterEngine:
                 w *= 8.0
             if burst and name == "bow_bob":
                 w *= 6.0
+            if (self.playfulness > 0.3 and
+                    name in ("dance", "excited_wiggle", "bow_bob",
+                             "play_bow")):
+                # A recently-played-with Kiko stays in the mood.
+                w *= 1.0 + 2.0 * self.playfulness
             if now - self.still_since > 3.0 and name in ("curious_tilt", "lean_in", "nod"):
                 w *= 2.2
             pool.append((name, builder, w))
@@ -1513,9 +1656,39 @@ class CharacterEngine:
             return {}, False
         return self.act.sample(frac), self.act.take_blink(frac)
 
+    def note_pet_episode(self, episode, now):
+        """Answer a finished touch episode socially: the compliance layer
+        judged the force; this judges the character. A boop gets a startled
+        bounce, a jostle gets the play bow, a long calm pet gets the melt.
+        Reactions preempt whatever act was queued: being touched outranks
+        daydreaming."""
+        if episode.get("tap"):
+            kind = "boop"
+        elif (episode.get("mean_delta", 0.0) >= 6.0
+                and not episode.get("reached_comfy")):
+            kind = "play"
+        else:
+            kind = "affection"
+        if kind in ("boop", "play"):
+            self.playfulness = min(1.0, self.playfulness + 0.45)
+        act = PET_REACTIONS[kind](self.rng, {"energy": self.playfulness})
+        self.act = act
+        self.act_started = now
+        self.last_run[act.name] = now
+        self.history.append(act.name)
+        del self.history[:-8]
+        print(f"pet_reaction {kind} act={act.name} "
+              f"energy={self.playfulness:.2f} "
+              f"dur={episode.get('duration_s')} "
+              f"mean_delta={episode.get('mean_delta')}", flush=True)
+
     # -- main tick ------------------------------------------------------------
     def compute(self, now, person, bearings, residual, proximity, derate):
         cfg = self.cfg
+        if self.playful_decay_at is not None:
+            self.playfulness = max(
+                0.0, self.playfulness - (now - self.playful_decay_at) / 45.0)
+        self.playful_decay_at = now
         self._update_mode(person, now)
 
         if person and abs(bearings[0] - self.still_ref) > 0.035:
@@ -1979,6 +2152,12 @@ def main():
                     # divergence bound within ~2 s, not after a 1 Hz check
                     # lets the ramp push it for most of the slew.
                     head.telemetry_check()
+                if head.compliance is not None:
+                    episode = head.compliance.last_episode
+                    if episode is not None:
+                        head.compliance.last_episode = None
+                        engine.note_pet_episode(episode, loop_t0)
+                        head.log_pet_episode(episode)
 
             if eyes is not None:
                 pet_state = FOLLOWING

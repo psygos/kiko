@@ -87,6 +87,8 @@ class CompliantHeadPolicy:
     maximum_yield_dwell_s: float
     comfort_roll_tilt_ticks: int
     yield_torque_limit_permille: tuple
+    tap_max_contact_s: float
+    tap_recovery_s: float
 
     @classmethod
     def parse(cls, raw, installed_torque_limits):
@@ -108,6 +110,7 @@ class CompliantHeadPolicy:
             "recovery_per_additional_joint_permille", "follow_permille",
             "yield_static_release_ms", "maximum_yield_dwell_ms",
             "comfort_roll_tilt_ticks", "yield_torque_limit_permille",
+            "tap_max_contact_ms", "tap_recovery_ms",
         }
         unknown = sorted(set(raw) - expected)
         missing = sorted(expected - set(raw))
@@ -211,6 +214,16 @@ class CompliantHeadPolicy:
             if yield_torque[joint] > holding_torque[joint]:
                 raise CompliantConfigError(
                     f"joint {joint} yield torque exceeds holding torque")
+        # Tap fast path: a brief single contact skips the rest liturgy and
+        # recovers quickly so the character layer can answer with play.
+        tap_contact_ms = _plain_int(
+            raw["tap_max_contact_ms"], "tap_max_contact_ms")
+        tap_recovery_ms = _plain_int(raw["tap_recovery_ms"], "tap_recovery_ms")
+        if tap_contact_ms <= 0 or tap_recovery_ms <= 0:
+            raise CompliantConfigError("tap timings must be positive")
+        if tap_recovery_ms > recovery_ms:
+            raise CompliantConfigError(
+                "tap recovery must not exceed the full recovery duration")
         if (abs(rest_pose[ROLL]) + directional_rest[ROLL] + comfort_tilt
                 > maximum_yield[ROLL]):
             raise CompliantConfigError(
@@ -260,6 +273,8 @@ class CompliantHeadPolicy:
             maximum_yield_dwell_ms / 1000.0,
             comfort_tilt,
             yield_torque,
+            tap_contact_ms / 1000.0,
+            tap_recovery_ms / 1000.0,
         )
 
 
@@ -305,6 +320,12 @@ class CompliantHeadController:
         self.rest_settled_at = None
         self.rest_prev_residual = None
         self.comfort_tilt_side = None
+        # Touch-style field record: one dict per completed contact episode,
+        # consumed by the character layer to choose a social response
+        # (boop / play / affection). Facts only — no behavior in here.
+        self.episode = None
+        self.episode_prev_residual = None
+        self.last_episode = None
 
     @property
     def active(self):
@@ -478,6 +499,24 @@ class CompliantHeadController:
         self.yield_stable_reference = None
         self.rest_settled_at = None
         self.rest_prev_residual = None
+        if event == "pet_contact" or self.episode is None:
+            self.episode = {
+                "started_at": float(now),
+                "yield_entries": 0,
+                "samples": 0,
+                "peak_residual": [0, 0, 0, 0],
+                "delta_accum": 0.0,
+                "delta_samples": 0,
+                "reached_rest": False,
+                "reached_comfy": False,
+                "tap": False,
+            }
+            self.episode_prev_residual = None
+        else:
+            # A recontact converts any tap into a sustained episode: the
+            # boop flag must not survive into a long pet's classification.
+            self.episode["tap"] = False
+        self.episode["yield_entries"] += 1
         self.target = self._yield_target(positions)
         return CompliantStep(self.state, self.target, residual, event)
 
@@ -615,6 +654,20 @@ class CompliantHeadController:
                         event = result.event
 
         elif self.state in (YIELDING, RELEASE_DWELL):
+            if self.episode is not None:
+                current = self._residual_errors(positions)
+                self.episode["samples"] += 1
+                for joint in range(JOINT_COUNT):
+                    self.episode["peak_residual"][joint] = max(
+                        self.episode["peak_residual"][joint],
+                        abs(current[joint]))
+                if self.episode_prev_residual is not None:
+                    self.episode["delta_accum"] += max(
+                        abs(actual - previous)
+                        for actual, previous in zip(
+                            current, self.episode_prev_residual))
+                    self.episode["delta_samples"] += 1
+                self.episode_prev_residual = current
             released = self._inside_release(positions) and not any(moving)
             if released:
                 if self.quiet_since is None:
@@ -625,7 +678,26 @@ class CompliantHeadController:
                 self.yield_stable_reference = None
                 self.yield_stable_since = now
                 self.state = RELEASE_DWELL
-                if now - self.quiet_since >= self.policy.release_dwell_s:
+                tap = (self.episode is not None and
+                       self.episode["yield_entries"] == 1 and
+                       not self.episode["reached_rest"] and
+                       self.yield_entered_at is not None and
+                       now - self.yield_entered_at
+                       <= self.policy.tap_max_contact_s + 1e-9)
+                if tap:
+                    # A brief single touch is a boop, not a request to
+                    # settle: skip the rest liturgy, recover fast, and let
+                    # the character layer answer with play.
+                    self.episode["tap"] = True
+                    self.state = RECOVERING
+                    self.recovery_start = self.target
+                    self.recovery_started_at = now
+                    self.active_recovery_duration_s = (
+                        self.policy.tap_recovery_s)
+                    self.reacquire_directions = None
+                    self.reacquire_samples = 0
+                    event = "pet_tap"
+                elif now - self.quiet_since >= self.policy.release_dwell_s:
                     self.state = RESTING
                     self.rest_started_at = now
                     self.rest_settled_at = None
@@ -633,6 +705,8 @@ class CompliantHeadController:
                     self.reacquire_directions = None
                     self.reacquire_samples = 0
                     event = "pet_resting"
+                    if self.episode is not None:
+                        self.episode["reached_rest"] = True
             else:
                 self.quiet_since = None
                 self.state = YIELDING
@@ -680,6 +754,8 @@ class CompliantHeadController:
                     self.rest_prev_residual = None
                     self.reacquire_directions = None
                     self.reacquire_samples = 0
+                    if self.episode is not None:
+                        self.episode["reached_rest"] = True
                 else:
                     self.target = self._yield_target(positions)
 
@@ -698,6 +774,8 @@ class CompliantHeadController:
                     # which read as no pause at all.
                     self.rest_settled_at = now
                     event = "pet_comfy"
+                    if self.episode is not None:
+                        self.episode["reached_comfy"] = True
                 settled = (self.rest_settled_at is not None and
                            now - self.rest_settled_at
                            >= self.active_rest_duration_s)
@@ -734,6 +812,16 @@ class CompliantHeadController:
                     self.contact_armed = False
                     self.baseline_error = (0, 0, 0, 0)
                     self.comfort_tilt_side = None
+                    if self.episode is not None:
+                        episode = self.episode
+                        episode["duration_s"] = round(
+                            float(now) - episode["started_at"], 2)
+                        episode["mean_delta"] = round(
+                            episode["delta_accum"]
+                            / max(1, episode["delta_samples"]), 2)
+                        self.last_episode = episode
+                        self.episode = None
+                        self.episode_prev_residual = None
                     event = "pet_returned"
 
         self.previous_expression_target = expression_target

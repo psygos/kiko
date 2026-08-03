@@ -42,6 +42,8 @@ def policy_json():
         "maximum_yield_dwell_ms": 30000,
         "comfort_roll_tilt_ticks": 6,
         "yield_torque_limit_permille": [400, 300, 200, 200],
+        "tap_max_contact_ms": 1200,
+        "tap_recovery_ms": 800,
     }
 
 
@@ -86,6 +88,9 @@ class CompliantHeadPolicyTests(unittest.TestCase):
         # Backdrivable yield: soft but never near-zero (parser floors 150).
         self.assertEqual(policy.yield_torque_limit_permille,
                          (450, 350, 220, 250))
+        # Tap fast path: boops skip the rest liturgy.
+        self.assertEqual(policy.tap_max_contact_s, 1.2)
+        self.assertEqual(policy.tap_recovery_s, 0.8)
 
     def test_boundary_rejects_unknown_and_missing_fields(self):
         raw = policy_json()
@@ -179,9 +184,15 @@ class CompliantHeadControllerTests(unittest.TestCase):
         service(controller, 1.2, (122, 100, 100, 100), moving=True)
         contact = service(controller, 1.3, (124, 100, 100, 100), moving=True)
         self.assertEqual(contact.state, YIELDING)
+        # Hold the touch past the tap window so this exercises the FULL
+        # arc (a shorter contact now takes the tap fast path by design).
+        for index in range(13):
+            contact = service(controller, 1.4 + index * 0.1,
+                              (124 + (index % 2), 100, 100, 100),
+                              moving=True)
         previous = contact.target_ticks
         for index in range(7):
-            result = service(controller, 1.4 + index * 0.1,
+            result = service(controller, 2.7 + index * 0.1,
                              previous, moving=False)
             self.assertTrue(all(
                 abs(actual - old) <= 3
@@ -189,9 +200,9 @@ class CompliantHeadControllerTests(unittest.TestCase):
             previous = result.target_ticks
         self.assertEqual(result.state, RESTING)
         self.assertEqual(result.event, "pet_resting")
-        at = 2.1
+        at = 3.5
         saw_recovery = False
-        while at <= 5.5 and controller.state != FOLLOWING:
+        while at <= 9.0 and controller.state != FOLLOWING:
             result = service(controller, at, result.target_ticks, moving=False)
             self.assertTrue(all(
                 abs(actual - old) <= 3
@@ -249,14 +260,18 @@ class CompliantHeadControllerTests(unittest.TestCase):
                              (1.2, (124, 100, 100, 100)),
                              (1.3, (124, 100, 100, 100))):
             result = service(controller, at, position, moving=True)
-        for index in range(7):
+        # Hold past the tap window so release takes the full rest path.
+        for index in range(13):
             result = service(controller, 1.4 + index * 0.1,
+                             (124 + (index % 2), 100, 100, 100), moving=True)
+        for index in range(7):
+            result = service(controller, 2.7 + index * 0.1,
                              result.target_ticks, moving=False)
         self.assertEqual(result.state, RESTING)
         # A returning hand APPROACHES — the residual sweeps as it presses.
         # (A perfectly constant offset is the sag signature and must not
         # recontact; see test_static_pin_during_rest_does_not_recontact.)
-        for at, poke in ((2.1, 20), (2.2, 26), (2.3, 32), (2.4, 38)):
+        for at, poke in ((3.5, 20), (3.6, 26), (3.7, 32), (3.8, 38)):
             position = list(result.target_ticks)
             position[2] += poke
             result = service(controller, at, tuple(position), moving=True)
@@ -384,6 +399,87 @@ class CompliantHeadControllerTests(unittest.TestCase):
         self.assertEqual(result.event, "pet_yield_timeout")
         self.assertEqual(result.state, RESTING)
         self.assertLess(at, 1.3 + 31.0)
+
+    def test_quick_tap_skips_rest_and_recovers_fast(self):
+        # A boop is not a request to settle: single brief contact must go
+        # straight to a fast recovery, never through RESTING, and hand the
+        # character layer a tap-flagged episode to answer with play.
+        controller = make_controller()
+        self.enter_yield(controller)
+        at = 1.3
+        events = []
+        result = None
+        for _ in range(40):
+            at += 0.1
+            # Hand gone instantly; servo tracks the command exactly.
+            result = service(controller, at, tuple(controller.target))
+            if result.event:
+                events.append(result.event)
+            if result.state == FOLLOWING:
+                break
+        self.assertIn("pet_tap", events)
+        self.assertNotIn("pet_resting", events)
+        self.assertNotIn("pet_comfy", events)
+        self.assertIn("pet_returned", events)
+        self.assertLess(at, 1.3 + 2.5)  # fast bounce, not a 6 s liturgy
+        episode = controller.last_episode
+        self.assertIsNotNone(episode)
+        self.assertTrue(episode["tap"])
+        self.assertEqual(episode["yield_entries"], 1)
+
+    def test_recontact_clears_the_tap_flag(self):
+        # A boop followed by a real pet must classify as the pet, not the
+        # boop: the tap flag dies on recontact.
+        controller = make_controller()
+        self.enter_yield(controller)
+        at = 1.3
+        # Instant release -> tap fast path into RECOVERING.
+        result = None
+        while controller.state != RECOVERING:
+            at += 0.1
+            result = service(controller, at, tuple(controller.target))
+        self.assertTrue(controller.episode["tap"])
+        # The hand comes back with approach dynamics during recovery.
+        for poke in (20, 26, 32, 38):
+            at += 0.1
+            position = list(controller.target)
+            position[0] += poke
+            result = service(controller, at, tuple(position), moving=True)
+        self.assertEqual(result.state, YIELDING)
+        self.assertEqual(result.event, "pet_recontact")
+        self.assertFalse(controller.episode["tap"])
+        self.assertEqual(controller.episode["yield_entries"], 2)
+        # Ride out to completion with a sagged-tracking servo.
+        for _ in range(200):
+            at += 0.1
+            sagged = tuple(target + (11 if joint == 0 else 0)
+                           for joint, target in enumerate(controller.target))
+            result = service(controller, at, sagged)
+            if result.state == FOLLOWING:
+                break
+        episode = controller.last_episode
+        self.assertIsNotNone(episode)
+        self.assertFalse(episode["tap"])
+
+    def test_full_pet_episode_summary_is_recorded(self):
+        controller = make_controller()
+        self.enter_yield(controller)
+        at = 1.3
+        result = None
+        for _ in range(200):
+            at += 0.1
+            sagged = tuple(target + (11 if joint == 0 else 0)
+                           for joint, target in enumerate(controller.target))
+            result = service(controller, at, sagged)
+            if result.state == FOLLOWING:
+                break
+        episode = controller.last_episode
+        self.assertIsNotNone(episode)
+        self.assertFalse(episode["tap"])
+        self.assertTrue(episode["reached_rest"])
+        self.assertTrue(episode["reached_comfy"])
+        self.assertGreater(episode["duration_s"], 3.0)
+        self.assertGreaterEqual(episode["peak_residual"][0], 11)
 
     def test_yield_dwell_bounds_are_validated(self):
         raw = policy_json()

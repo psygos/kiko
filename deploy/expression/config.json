@@ -158,7 +158,9 @@
       350,
       220,
       250
-    ]
+    ],
+    "tap_max_contact_ms": 1200,
+    "tap_recovery_ms": 800
   },
   "goal_divergence_abort_ticks": 260
 }
