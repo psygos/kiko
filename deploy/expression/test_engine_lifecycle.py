@@ -470,6 +470,30 @@ class TorqueSwitchWatchdogTests(unittest.TestCase):
             head._verify_torque_switches()
 
 
+class EasingShapeTests(unittest.TestCase):
+    def test_segment_shapes_have_distinct_characters(self):
+        # Uniform cosine easing gave every act one curve character; the
+        # vocabulary must be genuinely distinct at the midpoint.
+        half = {name: kff._ease(0.0, 1.0, 0.5, name)
+                for name in ("wind", "cos", "snap")}
+        self.assertLess(half["wind"], half["cos"])
+        self.assertLess(half["cos"], half["snap"])
+        spring = [kff._ease(0.0, 1.0, u, "spring")
+                  for u in (0.2, 0.3, 0.4, 0.5, 0.6)]
+        self.assertGreater(max(spring), 1.0)  # rings past the target
+        self.assertAlmostEqual(kff._ease(0.0, 1.0, 1.0, "spring"), 1.0,
+                               places=1)
+
+    def test_act_segments_honor_their_shape_tags(self):
+        act = kff.ActPerformance(
+            "probe", 1.0,
+            {"pitch": [(0.0, 0.0), (0.5, 10.0, "snap"), (1.0, 0.0, "wind")]})
+        # Snap: most of the travel lands early in the segment.
+        self.assertGreater(act.sample(0.25)["pitch"], 8.0)
+        # Wind: the return barely leaves at first (slow start).
+        self.assertGreater(act.sample(0.75)["pitch"], 8.0)
+
+
 class CharacterEngineRestTests(unittest.TestCase):
     def make_engine(self):
         cfg = kff.load_config(

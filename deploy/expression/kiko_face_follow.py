@@ -1102,12 +1102,44 @@ def _hsv_to_rgb(h, s, v):
     return (int(r * 255), int(g * 255), int(b * 255))
 
 
-def _ease(a, b, u):
-    return a + (b - a) * (1 - math.cos(math.pi * max(0.0, min(1.0, u)))) / 2
+def _shape_cos(u):
+    return (1 - math.cos(math.pi * u)) / 2
+
+
+def _shape_snap(u):
+    # Attack-heavy: launches immediately, eases into the destination.
+    return 1.0 - (1.0 - u) ** 3
+
+
+def _shape_wind(u):
+    # Anticipation: slow start gathering itself, accelerating out.
+    return u ** 3
+
+
+def _shape_spring(u):
+    # Arrives early then rings around the destination and settles.
+    return 1.0 - math.exp(-5.0 * u) * math.cos(2.5 * math.pi * u)
+
+
+# Per-segment temporal signatures. Uniform cosine easing on every keyframe
+# pair made every act share one curve character; the shape belongs to the
+# DESTINATION keyframe: (frac, value, "snap") means "arrive there snappily".
+_EASE_SHAPES = {
+    "cos": _shape_cos,
+    "snap": _shape_snap,
+    "wind": _shape_wind,
+    "spring": _shape_spring,
+    "lin": lambda u: u,
+}
+
+
+def _ease(a, b, u, shape="cos"):
+    u = max(0.0, min(1.0, u))
+    return a + (b - a) * _EASE_SHAPES[shape](u)
 
 
 class ActPerformance:
-    """One running act: per-channel keyframes with cosine easing.
+    """One running act: per-channel keyframes with per-segment easing.
 
     Channels: yaw, pitch, roll (head ticks, additive), gx, gy (gaze bias),
     lid_add, pupil_add, bright_mul, colorw (0..1 blend toward color).
@@ -1134,7 +1166,8 @@ class ActPerformance:
                 if frac <= point[0]:
                     span = point[0] - previous[0]
                     u = 1.0 if span <= 0 else (frac - previous[0]) / span
-                    value = _ease(previous[1], point[1], u)
+                    shape = point[2] if len(point) > 2 else "cos"
+                    value = _ease(previous[1], point[1], u, shape)
                     break
                 previous = point
             out[channel] = value
@@ -1179,7 +1212,8 @@ def _build_excited_wiggle(rng, ctx):
     cycles = rng.choice((2, 3, 3, 4))
     keys_roll = [(0.0, 0.0)]
     for i in range(cycles * 2):
-        keys_roll.append(((i + 1) / (cycles * 2 + 1), amp * (1 if i % 2 == 0 else -1)))
+        keys_roll.append(((i + 1) / (cycles * 2 + 1),
+                          amp * (1 if i % 2 == 0 else -1), "snap"))
     keys_roll.append((1.0, 0.0))
     return ActPerformance(
         "excited_wiggle", rng.uniform(1.6, 2.6),
@@ -1204,7 +1238,8 @@ def _build_nod(rng, ctx):
     dip = rng.uniform(36, 68)
     return ActPerformance(
         "nod", rng.uniform(1.6, 2.3),
-        {"pitch": [(0.0, 0.0), (0.22, -dip * 0.85), (0.45, -dip), (0.68, dip * 0.4),
+        {"pitch": [(0.0, 0.0), (0.22, -dip * 0.85, "snap"), (0.45, -dip),
+                   (0.68, dip * 0.4, "spring"),
                    (0.85, dip * 0.15), (1.0, 0.0)]},
         uses_pitch=True)
 
@@ -1333,8 +1368,8 @@ def _build_bow_bob(rng, ctx):
     keys = [(0.0, 0.0)]
     for i in range(2):
         base = (i + 0.5) / 2.5
-        keys.append((base - 0.10, -dip))
-        keys.append((base + 0.10, dip * 0.25))
+        keys.append((base - 0.10, -dip, "snap"))
+        keys.append((base + 0.10, dip * 0.25, "spring"))
     keys.append((1.0, 0.0))
     return ActPerformance(
         "bow_bob", rng.uniform(1.0, 1.4),
@@ -1351,9 +1386,10 @@ def _build_startle_boop(rng, ctx):
     dip = rng.uniform(40, 60) * energy
     return ActPerformance(
         "startle_boop", rng.uniform(1.6, 2.1),
-        {"pitch": [(0.0, 0.0), (0.10, recoil), (0.30, recoil * 0.6),
-                   (0.48, -dip), (0.62, dip * 0.30), (0.78, -dip * 0.45),
-                   (1.0, 0.0)],
+        {"pitch": [(0.0, 0.0), (0.10, recoil, "snap"),
+                   (0.30, recoil * 0.6), (0.48, -dip, "snap"),
+                   (0.62, dip * 0.30, "spring"), (0.78, -dip * 0.45),
+                   (1.0, 0.0, "spring")],
          "roll": _keys_pulse(rng.uniform(30, 60) * rng.choice((-1, 1)),
                              0.15, 0.6),
          "lid_add": [(0.0, 0.0), (0.08, -60), (0.5, 20), (1.0, 0.0)],
@@ -1370,8 +1406,9 @@ def _build_play_bow(rng, ctx):
     energy = 1.0 + 0.5 * ctx.get("energy", 0.0)
     depth = rng.uniform(90, 130) * energy
     wiggle = rng.uniform(55, 85)
-    keys_pitch = [(0.0, 0.0), (0.18, -depth), (0.55, -depth * 0.92),
-                  (0.72, depth * 0.22), (0.85, -depth * 0.08), (1.0, 0.0)]
+    keys_pitch = [(0.0, 0.0), (0.18, -depth, "snap"),
+                  (0.55, -depth * 0.92), (0.72, depth * 0.22, "spring"),
+                  (0.85, -depth * 0.08), (1.0, 0.0, "spring")]
     keys_roll = [(0.0, 0.0), (0.18, 0.0)]
     for i in range(4):
         keys_roll.append((0.22 + i * 0.08,
@@ -1443,12 +1480,15 @@ def _build_sneeze(rng, ctx):
     kick = rng.uniform(14, 26) * rng.choice((-1, 1))
     return ActPerformance(
         "sneeze", rng.uniform(2.4, 3.2),
-        {"pitch": [(0.0, 0.0), (0.18, up * 0.5), (0.34, up * 0.85), (0.46, up),
-                   (0.56, down), (0.68, down * 0.55), (0.80, -shiver),
-                   (0.90, shiver * 0.6), (1.0, 0.0)],
+        {"pitch": [(0.0, 0.0), (0.18, up * 0.5, "wind"),
+                   (0.34, up * 0.85, "wind"), (0.46, up, "wind"),
+                   (0.56, down, "snap"), (0.68, down * 0.55),
+                   (0.80, -shiver, "spring"),
+                   (0.90, shiver * 0.6), (1.0, 0.0, "spring")],
          "roll": [(0.0, 0.0), (0.22, shiver), (0.30, -shiver), (0.38, shiver),
                   (0.46, -shiver * 0.5), (0.56, kick), (0.75, 0.0), (1.0, 0.0)],
-         "gy": [(0.0, 0.0), (0.45, 300), (0.56, -450), (0.8, 0.0), (1.0, 0.0)],
+         "gy": [(0.0, 0.0), (0.45, 300, "wind"), (0.56, -450, "snap"),
+                (0.8, 0.0), (1.0, 0.0)],
          "lid_add": [(0.0, 0.0), (0.4, 350), (0.52, 900), (0.66, 500),
                      (0.85, 0.0), (1.0, 0.0)],
          "bright_mul": [(0.0, 0.0), (0.45, 0.25), (0.56, 0.6), (0.7, 0.0),
@@ -1817,6 +1857,12 @@ class CharacterEngine:
         p = self.life_phases
         living_scale = 0.35 if self.mode == "SLEEPY" else 1.0
         living_scale *= rest_envelope
+        # Energy tides: two slow incommensurate envelopes make the idle
+        # texture ebb and flow over minutes instead of repeating one
+        # stationary sum-of-sines forever. Breathing stays metronomic.
+        living_scale *= 0.72 + 0.28 * (
+            math.sin(living_t * 0.021 + p[1])
+            * math.sin(living_t * 0.013 + p[3]))
         living_pitch = living_scale * (
             9.0 * math.sin(living_t * 0.43 + p[0])
             + 4.0 * math.sin(living_t * 0.91 + p[1]))

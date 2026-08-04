@@ -53,7 +53,7 @@
   "head_motion_max_interval_ms": 150,
   "admission_window_ticks": 128,
   "temp_abort_raw": 65,
-  "preengage_temp_limit_raw": 55,
+  "preengage_temp_limit_raw": 60,
   "temp_plausible_max_raw": 95,
   "temp_unreadable_abort_samples": 300,
   "temp_overtemp_abort_samples": 3,
