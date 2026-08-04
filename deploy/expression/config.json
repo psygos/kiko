@@ -1,9 +1,9 @@
 {
   "natural_ticks": [
-    2174,
-    2570,
-    1637,
-    3047
+    2186,
+    2509,
+    1639,
+    3041
   ],
   "head_offset_up_m": 0.25,
   "head_offset_back_m": 0.2,
@@ -19,30 +19,30 @@
   "curl_limit_ticks": 180,
   "bow_limit_ticks": 110,
   "roll_limit_ticks": 160,
-  "track_speed_max": 210,
+  "track_speed_max": 380,
   "head_motion_response_hz": [
     0.4,
     0.85,
-    0.82,
-    0.74
+    1.05,
+    0.9
   ],
   "head_motion_max_velocity_ticks_s": [
-    80,
-    130,
-    190,
-    125
+    100,
+    170,
+    320,
+    200
   ],
   "head_motion_max_acceleration_ticks_s2": [
-    320,
-    480,
-    760,
-    500
+    400,
+    640,
+    1600,
+    1000
   ],
   "head_motion_max_jerk_ticks_s3": [
-    2400,
-    3800,
-    5600,
-    3800
+    3200,
+    5200,
+    14000,
+    9000
   ],
   "head_motion_damping_ratio": [
     1.4,
@@ -62,8 +62,8 @@
   "rest_after_idle_s": 20.0,
   "rest_ease_s": 6.0,
   "pet_log_path": "/home/makerspace/kiko-pet-sessions.jsonl",
-  "derate_temp_raw": 48,
-  "derate_clear_temp_raw": 45,
+  "derate_temp_raw": 60,
+  "derate_clear_temp_raw": 56,
   "derate_confirm_samples": 3,
   "derate_clear_samples": 10,
   "torque_limit_permille": [
@@ -74,16 +74,16 @@
   ],
   "compliant_hold": {
     "minimum_ticks": [
-      2064,
-      2390,
-      1157,
-      2887
+      2076,
+      2329,
+      1159,
+      2881
     ],
     "maximum_ticks": [
-      2284,
-      2750,
-      2117,
-      3207
+      2296,
+      2689,
+      2119,
+      3201
     ],
     "maximum_baseline_error_ticks": [
       32,
@@ -168,5 +168,18 @@
     "tap_max_contact_ms": 1200,
     "tap_recovery_ms": 800
   },
-  "goal_divergence_abort_ticks": 260
+  "goal_divergence_abort_ticks": 260,
+  "sleep_droop_ticks": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "rest_torque_limit_permille": [
+    300,
+    250,
+    400,
+    400
+  ],
+  "derate_soft_start_raw": 53
 }

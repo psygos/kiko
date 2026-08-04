@@ -82,6 +82,7 @@ class ThermalDerateController:
     def __init__(self, policy):
         self.policy = policy
         self.active = False
+        self.last_pitch_hottest = 0
         self._engage_count = 0
         self._clear_count = 0
 
@@ -112,6 +113,7 @@ class ThermalDerateController:
                for value in pitch_pair):
             return ThermalDerateStep(self.active, max(pitch_pair), None)
         pitch_hottest = max(pitch_pair)
+        self.last_pitch_hottest = pitch_hottest
         event = None
         if not self.active:
             self._clear_count = 0

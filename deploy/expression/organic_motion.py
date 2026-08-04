@@ -1,8 +1,10 @@
 """Time-based organic motion primitives for Kiko's head and eyes.
 
 Targets may change abruptly; emitted trajectories cannot. Each scalar channel
-is a softly overdamped spring whose acceleration is jerk-, acceleration-, and
-velocity-bounded. A long scheduler gap integrates a clamped interval —
+is a spring whose acceleration is jerk-, acceleration-, and velocity-bounded,
+with an attack envelope: a large target jump transiently stiffens the spring
+and sheds damping (the cat-toy snap-and-ring), decaying back to the gentle
+steady-follow character. A long scheduler gap integrates a clamped interval —
 no catch-up jump, no permanent freeze, graceful degradation when slow.
 """
 
@@ -125,11 +127,24 @@ class MotionAxisStep:
 
 
 class OrganicMotionAxis:
+    # Attack envelope (the cat-toy reflex): a large target jump transiently
+    # stiffens the spring, sheds damping, and raises the accel/jerk budget,
+    # then decays back to the gentle steady-follow character. Velocity caps
+    # are never raised — snappiness comes from launch, not top speed.
+    ATTACK_TRIGGER_FRACTION = 0.05   # of full range
+    ATTACK_RESPONSE_GAIN = 1.5       # response_hz multiplier at full attack
+    ATTACK_DAMPING_CUT = 0.25        # springy catch at arrival
+    ATTACK_ACCEL_GAIN = 1.0
+    ATTACK_JERK_GAIN = 1.5
+    ATTACK_DECAY_S = 0.35
+
     def __init__(self, policy, initial_position, started_at):
         self.policy = policy
         self.position = self._admit_position(initial_position, "initial_position")
         self.velocity = 0.0
         self.acceleration = 0.0
+        self.attack = 0.0
+        self.previous_target = self.position
         self.last_update_at = self._admit_time(started_at, "started_at")
 
     @staticmethod
@@ -163,6 +178,8 @@ class OrganicMotionAxis:
         self.last_update_at = admitted_now
         self.velocity = 0.0
         self.acceleration = 0.0
+        self.attack = 0.0
+        self.previous_target = self.position
         return MotionAxisStep(self.position, 0.0, 0.0)
 
     def step(self, target, now):
@@ -185,16 +202,31 @@ class OrganicMotionAxis:
             # prior permanent freeze or a zero-velocity crawl.
             elapsed = self.policy.maximum_interval_s
 
-        omega = 2.0 * math.pi * self.policy.response_hz
+        if self.previous_target is not None:
+            jump = abs(admitted_target - self.previous_target)
+            if jump > self.ATTACK_TRIGGER_FRACTION * (
+                    self.policy.maximum - self.policy.minimum):
+                self.attack = 1.0
+        self.previous_target = admitted_target
+
+        omega = 2.0 * math.pi * self.policy.response_hz * (
+            1.0 + self.ATTACK_RESPONSE_GAIN * self.attack)
+        damping = self.policy.damping_ratio * (
+            1.0 - self.ATTACK_DAMPING_CUT * self.attack)
+        accel_cap = self.policy.maximum_acceleration * (
+            1.0 + self.ATTACK_ACCEL_GAIN * self.attack)
+        jerk_cap = self.policy.maximum_jerk * (
+            1.0 + self.ATTACK_JERK_GAIN * self.attack)
+        self.attack *= math.exp(-elapsed / self.ATTACK_DECAY_S)
+
         desired_acceleration = (
             omega * omega * (admitted_target - self.position)
-            - 2.0 * self.policy.damping_ratio * omega * self.velocity)
+            - 2.0 * damping * omega * self.velocity)
         desired_acceleration = max(
-            -self.policy.maximum_acceleration,
-            min(self.policy.maximum_acceleration, desired_acceleration))
+            -accel_cap, min(accel_cap, desired_acceleration))
         next_acceleration = self._move_toward(
             self.acceleration, desired_acceleration,
-            self.policy.maximum_jerk * elapsed)
+            jerk_cap * elapsed)
         next_velocity = self.velocity + (
             self.acceleration + next_acceleration) * 0.5 * elapsed
         next_velocity = max(

@@ -563,6 +563,18 @@ class HeadController:
         self.torque_softened = False
         self.torque_check_counter = 0
         self.torque_reengage_count = 0
+        # Load observer: per-joint EMA of the STS load register (magnitude
+        # in bits 0-9, direction bit 10). Units are unqualified — only
+        # relative comparisons are used: the sleep seek minimizes it, the
+        # field log qualifies it for CoG-aware pitch splitting later.
+        self.load_ema = [0.0, 0.0, 0.0, 0.0]
+        self.load_dir = [0, 0, 0, 0]
+        self.resting_mode = False
+        self.rest_torque_active = False
+        self.droop_trim = 0.0
+        self.droop_seek_dir = -1.0
+        self.droop_seek_at = 0.0
+        self.droop_seek_prev = None
 
     def _confirm_temperature(self, joint, servo_id, telemetry, limit, stage):
         # Plausibility ceiling: raw bytes above this are bus corruption, not

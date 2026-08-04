@@ -34,18 +34,55 @@ class OrganicMotionAxisTests(unittest.TestCase):
         axis = OrganicMotionAxis(axis_policy(), 0.0, 0.0)
         previous_acceleration = 0.0
         maximum_position = 0.0
+        # Bounds are asserted at the ATTACK ceilings: a step this large
+        # triggers the cat-toy envelope (accel x2, jerk x2.5). Velocity is
+        # never raised by attack.
         for tick in range(1, 401):
             step = axis.step(80.0, tick * 0.05)
             self.assertGreaterEqual(step.position, -100.0)
             self.assertLessEqual(step.position, 100.0)
             self.assertLessEqual(abs(step.velocity), 30.0 + 1e-9)
-            self.assertLessEqual(abs(step.acceleration), 60.0 + 1e-9)
+            self.assertLessEqual(abs(step.acceleration), 120.0 + 1e-9)
             self.assertLessEqual(
-                abs(step.acceleration - previous_acceleration), 12.0 + 1e-8)
+                abs(step.acceleration - previous_acceleration), 30.0 + 1e-8)
             maximum_position = max(maximum_position, step.position)
             previous_acceleration = step.acceleration
-        self.assertLessEqual(maximum_position, 81.0)
+        self.assertLessEqual(maximum_position, 84.0)
         self.assertAlmostEqual(axis.position, 80.0, places=3)
+
+    def test_target_jump_snaps_while_steady_follow_stays_gentle(self):
+        # Cat-toy reflex: one big jump arrives far sooner than the same
+        # distance fed as a creeping target that never triggers attack.
+        pounce = OrganicMotionAxis(axis_policy(), 0.0, 0.0)
+        creep = OrganicMotionAxis(axis_policy(), 0.0, 0.0)
+        now = 0.0
+        for tick in range(1, 25):  # 1.2 s
+            now = tick * 0.05
+            pounce.step(80.0, now)
+            creep.step(min(80.0, tick * 4.0), now)  # 4/tick: below trigger
+            if tick == 12:
+                # The pounce advantage lives in the launch, before both
+                # axes saturate at the helper policy's tiny velocity cap.
+                self.assertGreater(pounce.position, creep.position * 1.3)
+        self.assertGreater(pounce.position, 20.0)
+
+    def test_attack_with_underdamping_arrives_fast_and_rings(self):
+        # A policy with real dynamic budget (roll-like damping): the pounce
+        # must arrive quickly AND ring visibly past the target, then settle.
+        springy = MotionAxisPolicy(-100.0, 100.0, 0.8, 200.0, 800.0, 8000.0,
+                                   0.15, 0.85)
+        axis = OrganicMotionAxis(springy, 0.0, 0.0)
+        peak = 0.0
+        arrived_at = None
+        for tick in range(1, 201):
+            step = axis.step(80.0, tick * 0.05)
+            peak = max(peak, step.position)
+            if arrived_at is None and step.position >= 72.0:
+                arrived_at = tick * 0.05
+        self.assertLess(arrived_at, 0.6)
+        self.assertGreater(peak, 80.3)   # rings past the target
+        self.assertLess(peak, 92.0)      # bounded, not a fling
+        self.assertAlmostEqual(axis.position, 80.0, places=2)
 
     def test_long_gap_cannot_lunge_but_still_advances(self):
         axis = OrganicMotionAxis(axis_policy(), 0.0, 0.0)

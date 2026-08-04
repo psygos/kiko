@@ -26,7 +26,10 @@ class ThermalDeratePolicyTests(unittest.TestCase):
         with open(os.path.join(os.path.dirname(__file__), "config.json")) as source:
             raw = json.load(source)
         policy = ThermalDeratePolicy.parse(raw)
-        self.assertEqual(policy, ThermalDeratePolicy(48, 45, 65, 3, 10))
+        # Derate band sits ABOVE idle-holding warmth (bow idles 54-58 in a
+        # warm room): it must catch activity heat, not ambient. Abort 65
+        # with the 3-consecutive streak rule remains the hard ceiling.
+        self.assertEqual(policy, ThermalDeratePolicy(60, 56, 65, 3, 10))
         self.assertEqual(raw["bow_pitch_share"], 0.25)
 
     def test_invalid_hysteresis_and_boolean_samples_are_rejected(self):
