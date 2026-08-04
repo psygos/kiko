@@ -57,9 +57,14 @@ DEFAULT_CONFIG = {
     "return_step_ticks": 2,   # goal advance per 20 Hz cycle => 40 t/s
     "goal_deadband_ticks": 3,
     "head_motion_response_hz": [0.40, 0.85, 0.82, 0.74],  # slow base, quick tip: S-curve neck
-    "head_motion_max_velocity_ticks_s": [70, 115, 165, 110],
-    "head_motion_max_acceleration_ticks_s2": [180, 280, 420, 280],
-    "head_motion_max_jerk_ticks_s3": [900, 1400, 2100, 1400],
+    # Impulse-shaped motion: acceleration/jerk high relative to velocity so
+    # moves launch hard and ease in early instead of cruising at constant
+    # speed. Yaw slightly underdamped (arrival overshoot), roll clearly so
+    # (settle wiggle) — the follow-through axes; pitch stays overdamped.
+    "head_motion_max_velocity_ticks_s": [80, 130, 190, 125],
+    "head_motion_max_acceleration_ticks_s2": [320, 480, 760, 500],
+    "head_motion_max_jerk_ticks_s3": [2400, 3800, 5600, 3800],
+    "head_motion_damping_ratio": [1.4, 1.4, 1.15, 0.85],
     "head_motion_max_interval_ms": 150,
     "bow_limit_ticks": 45,
     "curl_limit_ticks": 90,
@@ -1813,15 +1818,15 @@ class CharacterEngine:
         living_scale = 0.35 if self.mode == "SLEEPY" else 1.0
         living_scale *= rest_envelope
         living_pitch = living_scale * (
-            7.0 * math.sin(living_t * 0.43 + p[0])
-            + 3.0 * math.sin(living_t * 0.91 + p[1]))
+            9.0 * math.sin(living_t * 0.43 + p[0])
+            + 4.0 * math.sin(living_t * 0.91 + p[1]))
         living_yaw = living_scale * (
-            12.0 * math.sin(living_t * 0.31 + p[2])
-            + 5.0 * math.sin(living_t * 0.67 + p[3]))
+            16.0 * math.sin(living_t * 0.31 + p[2])
+            + 7.0 * math.sin(living_t * 0.67 + p[3]))
         living_roll = living_scale * (
-            8.0 * math.sin(living_t * 0.27 + p[4])
-            + 4.0 * math.sin(living_t * 0.73 + p[5]))
-        breathing = 7.0 * math.sin(living_t * 2 * math.pi * 0.18 + p[4])
+            11.0 * math.sin(living_t * 0.27 + p[4])
+            + 6.0 * math.sin(living_t * 0.73 + p[5]))
+        breathing = 9.0 * math.sin(living_t * 2 * math.pi * 0.18 + p[4])
         if person:
             yaw_aim = cfg["yaw_sign"] * cfg["yaw_ticks_per_rad"] * bearings[0]
             pitch_aim = cfg["pitch_ticks_per_rad"] * bearings[1]
@@ -1834,16 +1839,16 @@ class CharacterEngine:
             if self.greet_style == 3:
                 # The formal bow: a whole-neck dip (the dynamic share sends
                 # roughly half of it through the base hinge), no roll.
-                mode_pitch = -52.0 * pulse
+                mode_pitch = -64.0 * pulse
             else:
                 side = 1 if self.greet_style % 2 == 0 else -1
-                mode_roll = side * 95.0 * pulse
-                mode_pitch = 34.0 * pulse
+                mode_roll = side * 130.0 * pulse
+                mode_pitch = 44.0 * pulse
         elif self.mode == "SEARCH":
             sweep_phase = ((now - self.mode_since) * 2.0 * math.pi
                            * self.search_rate_hz * self.search_direction)
-            mode_yaw = 165.0 * math.sin(sweep_phase)
-            mode_roll = 38.0 * math.sin(sweep_phase * 0.5)
+            mode_yaw = 230.0 * math.sin(sweep_phase)
+            mode_roll = 55.0 * math.sin(sweep_phase * 0.5)
         # Weight shift: the head dips into a fast turn, dying off in ~300 ms.
         # Deadbanded well above tracking jitter so steady tracking carries no
         # standing bow offset; envelope-gated so a resting head never stirs.
@@ -1874,10 +1879,10 @@ class CharacterEngine:
         bow_t = -cfg["curl_sign"] * bow_share * pitch_total
         yaw_t = yaw_aim + rest_envelope * (act_values.get("yaw", 0.0)
                                            + mode_yaw) + living_yaw
-        turn_cant = max(-24.0, min(24.0, -0.055 * yaw_aim))
+        turn_cant = max(-32.0, min(32.0, -0.065 * yaw_aim))
         roll_t = cfg["roll_sign"] * (rest_envelope * (act_values.get("roll", 0.0)
                                      + mode_roll + turn_cant)
-                                     + 34.0 * proximity + living_roll
+                                     + 44.0 * proximity + living_roll
                                      ) + rest_envelope * breathing
         desired4 = [bow_t, curl_t, yaw_t, roll_t]
         return intent, desired4

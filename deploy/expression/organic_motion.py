@@ -62,12 +62,14 @@ class MotionAxisPolicy:
     maximum_acceleration: float
     maximum_jerk: float
     maximum_interval_s: float
+    damping_ratio: float = 1.4
 
     def __post_init__(self):
         values = (
             self.minimum, self.maximum, self.response_hz,
             self.maximum_velocity, self.maximum_acceleration,
             self.maximum_jerk, self.maximum_interval_s,
+            self.damping_ratio,
         )
         if any(not math.isfinite(value) for value in values):
             raise MotionConfigError("motion policy values must be finite")
@@ -77,6 +79,10 @@ class MotionAxisPolicy:
                 self.maximum_acceleration <= 0 or self.maximum_jerk <= 0 or
                 self.maximum_interval_s <= 0):
             raise MotionConfigError("motion dynamics must be positive")
+        if not 0.5 <= self.damping_ratio <= 2.0:
+            # Below 0.5 the settle-wiggle turns into visible ringing on a
+            # physical neck; above 2.0 motion goes syrupy.
+            raise MotionConfigError("damping_ratio must be in [0.5, 2.0]")
 
 
 def parse_head_motion_policies(raw, limits):
@@ -91,6 +97,10 @@ def parse_head_motion_policies(raw, limits):
     acceleration = _float4(
         raw, "head_motion_max_acceleration_ticks_s2", 0.0)
     jerk = _float4(raw, "head_motion_max_jerk_ticks_s3", 0.0)
+    if "head_motion_damping_ratio" in raw:
+        damping = _float4(raw, "head_motion_damping_ratio", 0.0)
+    else:
+        damping = (1.4, 1.4, 1.4, 1.4)
     maximum_interval_ms = _plain_int(
         raw.get("head_motion_max_interval_ms"),
         "head_motion_max_interval_ms")
@@ -101,7 +111,7 @@ def parse_head_motion_policies(raw, limits):
     return tuple(
         MotionAxisPolicy(
             -float(limit), float(limit), response[index], velocity[index],
-            acceleration[index], jerk[index], interval)
+            acceleration[index], jerk[index], interval, damping[index])
         for index, limit in enumerate(limits)
     )
 
@@ -115,8 +125,6 @@ class MotionAxisStep:
 
 
 class OrganicMotionAxis:
-    DAMPING_RATIO = 1.4
-
     def __init__(self, policy, initial_position, started_at):
         self.policy = policy
         self.position = self._admit_position(initial_position, "initial_position")
@@ -180,7 +188,7 @@ class OrganicMotionAxis:
         omega = 2.0 * math.pi * self.policy.response_hz
         desired_acceleration = (
             omega * omega * (admitted_target - self.position)
-            - 2.0 * self.DAMPING_RATIO * omega * self.velocity)
+            - 2.0 * self.policy.damping_ratio * omega * self.velocity)
         desired_acceleration = max(
             -self.policy.maximum_acceleration,
             min(self.policy.maximum_acceleration, desired_acceleration))

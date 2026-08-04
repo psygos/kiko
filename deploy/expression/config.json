@@ -19,7 +19,7 @@
   "curl_limit_ticks": 180,
   "bow_limit_ticks": 110,
   "roll_limit_ticks": 160,
-  "track_speed_max": 175,
+  "track_speed_max": 210,
   "head_motion_response_hz": [
     0.4,
     0.85,
@@ -27,22 +27,28 @@
     0.74
   ],
   "head_motion_max_velocity_ticks_s": [
-    70,
-    115,
-    165,
-    110
+    80,
+    130,
+    190,
+    125
   ],
   "head_motion_max_acceleration_ticks_s2": [
-    180,
-    280,
-    420,
-    280
+    320,
+    480,
+    760,
+    500
   ],
   "head_motion_max_jerk_ticks_s3": [
-    900,
-    1400,
-    2100,
-    1400
+    2400,
+    3800,
+    5600,
+    3800
+  ],
+  "head_motion_damping_ratio": [
+    1.4,
+    1.4,
+    1.15,
+    0.85
   ],
   "head_motion_max_interval_ms": 150,
   "admission_window_ticks": 128,
