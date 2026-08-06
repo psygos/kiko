@@ -30,7 +30,9 @@ class ThermalDeratePolicyTests(unittest.TestCase):
         # warm room): it must catch activity heat, not ambient. Abort 65
         # with the 3-consecutive streak rule remains the hard ceiling.
         self.assertEqual(policy, ThermalDeratePolicy(60, 56, 65, 3, 10))
-        self.assertEqual(raw["bow_pitch_share"], 0.25)
+        # Bow-forward era (operator, 2026-08-04): rest is free at the
+        # balance natural, so bow carries a bigger share of every pitch.
+        self.assertEqual(raw["bow_pitch_share"], 0.35)
 
     def test_invalid_hysteresis_and_boolean_samples_are_rejected(self):
         raw = policy_json()

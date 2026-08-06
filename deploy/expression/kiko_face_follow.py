@@ -1368,7 +1368,7 @@ def _build_sigh(rng, ctx):
     dip = rng.uniform(10, 16)
     return ActPerformance(
         "sigh", rng.uniform(2.6, 3.4),
-        {"pitch": [(0.0, 0.0), (0.30, -dip), (0.55, -dip * 0.92), (1.0, 0.0)],
+        {"posture": [(0.0, 0.0), (0.30, -dip), (0.55, -dip * 0.92), (1.0, 0.0)],
          "lid_add": [(0.0, 0.0), (0.30, 90), (0.60, 70), (1.0, 0.0)],
          "bright_mul": [(0.0, 0.0), (0.35, -0.25), (1.0, 0.0)]},
         uses_pitch=True)
@@ -1385,7 +1385,7 @@ def _build_bow_bob(rng, ctx):
     keys.append((1.0, 0.0))
     return ActPerformance(
         "bow_bob", rng.uniform(1.0, 1.4),
-        {"pitch": sorted(keys), "bright_mul": _keys_pulse(0.3),
+        {"posture": sorted(keys), "bright_mul": _keys_pulse(0.3),
          "pupil_add": _keys_pulse(rng.uniform(120, 200))},
         expression="greet", uses_pitch=True)
 
@@ -1398,7 +1398,7 @@ def _build_startle_boop(rng, ctx):
     dip = rng.uniform(40, 60) * energy
     return ActPerformance(
         "startle_boop", rng.uniform(1.6, 2.1),
-        {"pitch": [(0.0, 0.0), (0.10, recoil, "snap"),
+        {"posture": [(0.0, 0.0), (0.10, recoil, "snap"),
                    (0.30, recoil * 0.6), (0.48, -dip, "snap"),
                    (0.62, dip * 0.30, "spring"), (0.78, -dip * 0.45),
                    (1.0, 0.0, "spring")],
@@ -1428,7 +1428,7 @@ def _build_play_bow(rng, ctx):
     keys_roll += [(0.60, 0.0), (1.0, 0.0)]
     return ActPerformance(
         "play_bow", rng.uniform(2.4, 3.2),
-        {"pitch": keys_pitch, "roll": keys_roll,
+        {"posture": keys_pitch, "roll": keys_roll,
          "yaw": _keys_pulse(rng.uniform(-70, 70), 0.2, 0.75),
          "gy": [(0.0, 0.0), (0.2, 500), (0.7, 300), (1.0, 0.0)],
          "pupil_add": _keys_pulse(rng.uniform(200, 300), 0.15, 0.8),
@@ -1548,8 +1548,8 @@ ACT_LIBRARY = [
     ("double_take", _build_double_take, ("TRACK",), 2.0, 16.0),
     ("excited_wiggle", _build_excited_wiggle, ("TRACK",), 1.6, 14.0),
     ("lean_in", _build_lean_in, ("TRACK",), 2.0, 15.0),
-    ("nod", _build_nod, ("TRACK",), 2.2, 11.0),
-    ("soft_nod", _build_soft_nod, ("TRACK",), 2.4, 12.0),
+    ("nod", _build_nod, ("TRACK",), 2.6, 10.0),
+    ("soft_nod", _build_soft_nod, ("TRACK",), 2.8, 11.0),
     ("happy_squint", _build_happy_squint, ("TRACK",), 2.0, 12.0),
     ("puppy_eyes", _build_puppy_eyes, ("TRACK",), 1.6, 18.0),
     ("shy_dip", _build_shy_dip, ("TRACK",), 0.9, 25.0),
@@ -1563,9 +1563,9 @@ ACT_LIBRARY = [
     ("head_bob", _build_head_bob, ("TRACK",), 1.8, 13.0),
     ("sneeze", _build_sneeze, ("TRACK", "IDLE"), 0.7, 45.0),
     ("dance", _build_dance, ("TRACK", "IDLE"), 1.3, 30.0),
-    ("sigh", _build_sigh, ("TRACK", "IDLE"), 1.4, 30.0),
-    ("bow_bob", _build_bow_bob, ("TRACK",), 1.2, 12.0),
-    ("play_bow", _build_play_bow, ("TRACK",), 0.9, 25.0),
+    ("sigh", _build_sigh, ("TRACK", "IDLE"), 1.8, 22.0),
+    ("bow_bob", _build_bow_bob, ("TRACK",), 1.6, 9.0),
+    ("play_bow", _build_play_bow, ("TRACK",), 1.2, 20.0),
 ]
 
 # Touch reactions are event-driven, not scheduled: the compliance layer
@@ -1922,19 +1922,33 @@ class CharacterEngine:
         self.turn_dip = min(raw_dip, self.turn_dip * 0.85)
 
         pitch_total = (pitch_aim + rest_envelope * (act_values.get("pitch", 0.0)
-                       + mode_pitch + self.turn_dip) + living_pitch)
+                       + mode_pitch) + living_pitch)
+        # Posture: the neck's BODY moves while the gaze holds — equal tick
+        # deltas on bow and curl cancel in gaze space (dual-axis pitch,
+        # operator insight 2026-08-04). Bobs, sighs, dives, weight shifts
+        # and breath live here; the person never leaves the eyes.
+        living_posture = living_scale * (
+            6.0 * math.sin(living_t * 0.37 + p[0])
+            + 3.0 * math.sin(living_t * 0.83 + p[5]))
+        posture_total = (rest_envelope * (act_values.get("posture", 0.0)
+                         + self.turn_dip
+                         + 4.0 * math.sin(living_t * 2 * math.pi * 0.18
+                                          + p[2]))
+                         + living_posture)
         if derate:
             pitch_total = 0.0
+            posture_total = 0.0
         # The neck recruits its base for big moves: bow's share of pitch
         # grows from the configured base toward one half as demand nears
         # 140 ticks. Small tracking corrections stay on the quick, light
         # curl; large gestures engage the whole neck.
-        bow_share = min(0.5, cfg["bow_pitch_share"]
-                        + (0.5 - cfg["bow_pitch_share"])
+        bow_share = min(0.6, cfg["bow_pitch_share"]
+                        + (0.6 - cfg["bow_pitch_share"])
                         * min(1.0, abs(pitch_total) / 140.0))
         curl_share = 1.0 - bow_share
-        curl_t = cfg["curl_sign"] * curl_share * pitch_total
-        bow_t = -cfg["curl_sign"] * bow_share * pitch_total
+        curl_t = cfg["curl_sign"] * curl_share * pitch_total + posture_total
+        bow_t = (-cfg["curl_sign"] * bow_share * pitch_total
+                 + posture_total)
         yaw_t = yaw_aim + rest_envelope * (act_values.get("yaw", 0.0)
                                            + mode_yaw) + living_yaw
         turn_cant = max(-32.0, min(32.0, -0.065 * yaw_aim))

@@ -1,9 +1,9 @@
 {
   "natural_ticks": [
-    2186,
-    2509,
-    1639,
-    3041
+    1505,
+    3937,
+    1551,
+    3018
   ],
   "head_offset_up_m": 0.25,
   "head_offset_back_m": 0.2,
@@ -14,9 +14,9 @@
   "yaw_limit_ticks": 480,
   "yaw_ticks_per_rad": 1050.0,
   "pitch_ticks_per_rad": 620.0,
-  "curl_pitch_share": 0.75,
-  "bow_pitch_share": 0.25,
-  "curl_limit_ticks": 180,
+  "curl_pitch_share": 0.65,
+  "bow_pitch_share": 0.35,
+  "curl_limit_ticks": 150,
   "bow_limit_ticks": 110,
   "roll_limit_ticks": 160,
   "track_speed_max": 380,
@@ -74,16 +74,16 @@
   ],
   "compliant_hold": {
     "minimum_ticks": [
-      2076,
-      2329,
-      1159,
-      2881
+      1395,
+      3787,
+      1071,
+      2858
     ],
     "maximum_ticks": [
-      2296,
-      2689,
-      2119,
-      3201
+      1615,
+      4087,
+      2031,
+      3178
     ],
     "maximum_baseline_error_ticks": [
       32,
