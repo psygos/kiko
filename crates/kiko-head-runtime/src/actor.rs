@@ -1034,6 +1034,7 @@ pub struct VerifiedHeadHealthEvidence {
     completed_at: MonotonicTime,
     hold_target: HeadHoldTarget,
     tolerance: PositionAgreementTicks,
+    torque_switches: [ResponseEvidence<TorqueSwitchObservation>; 4],
     joints: [HeadHealthJointEvidence; 4],
 }
 
@@ -1054,6 +1055,11 @@ impl VerifiedHeadHealthEvidence {
         self.tolerance
     }
 
+    /// Exact canonical register-40 observations made before pose telemetry.
+    pub const fn torque_switches(&self) -> &[ResponseEvidence<TorqueSwitchObservation>; 4] {
+        &self.torque_switches
+    }
+
     /// Evidence in the exact canonical order defined by [`HeadJoint::ALL`].
     pub const fn joints(&self) -> &[HeadHealthJointEvidence; 4] {
         &self.joints
@@ -1062,6 +1068,8 @@ impl VerifiedHeadHealthEvidence {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HeadHealthClockBoundary {
+    TorqueSwitchRequestWriteCompleted { joint: HeadJoint },
+    TorqueSwitchResponseReceived { joint: HeadJoint },
     RequestWriteCompleted { joint: HeadJoint },
     ResponseReceived { joint: HeadJoint },
     CheckCompleted,
@@ -1078,6 +1086,21 @@ pub enum HeadHealthFailure {
     TelemetryRead {
         joint: HeadJoint,
         source: RequestError,
+    },
+    TorqueSwitchRead {
+        joint: HeadJoint,
+        source: RequestError,
+    },
+    TorqueSwitchClockRegression {
+        boundary: HeadHealthClockBoundary,
+        previous: MonotonicTime,
+        observed: MonotonicTime,
+        current_response: Option<Box<ResponseEvidence<TorqueSwitchObservation>>>,
+    },
+    TorqueNotEnabled {
+        joint: HeadJoint,
+        observed: ObservedTorqueSwitch,
+        response: ResponseEvidence<TorqueSwitchObservation>,
     },
     ClockRegression {
         boundary: HeadHealthClockBoundary,
@@ -1122,10 +1145,14 @@ impl fmt::Display for HeadHealthFailure {
 impl std::error::Error for HeadHealthFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::TelemetryRead { source, .. } => Some(source),
+            Self::TelemetryRead { source, .. } | Self::TorqueSwitchRead { source, .. } => {
+                Some(source)
+            }
             Self::TelemetrySafety { source, .. } => Some(source),
             Self::Cancelled { .. }
             | Self::ClockRegression { .. }
+            | Self::TorqueSwitchClockRegression { .. }
+            | Self::TorqueNotEnabled { .. }
             | Self::DeviceStatus { .. }
             | Self::Moving { .. }
             | Self::PositionMismatch { .. } => None,
@@ -1141,6 +1168,7 @@ impl std::error::Error for HeadHealthFailure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadHealthObservationError {
     started_at: MonotonicTime,
+    accepted_torque_switch_prefix: [Option<ResponseEvidence<TorqueSwitchObservation>>; 4],
     accepted_prefix: [Option<HeadHealthJointEvidence>; 4],
     failure: HeadHealthFailure,
 }
@@ -1152,6 +1180,12 @@ impl HeadHealthObservationError {
 
     pub const fn accepted_prefix(&self) -> &[Option<HeadHealthJointEvidence>; 4] {
         &self.accepted_prefix
+    }
+
+    pub const fn accepted_torque_switch_prefix(
+        &self,
+    ) -> &[Option<ResponseEvidence<TorqueSwitchObservation>>; 4] {
+        &self.accepted_torque_switch_prefix
     }
 
     pub const fn failure(&self) -> &HeadHealthFailure {
@@ -5419,6 +5453,8 @@ where
     ) -> Result<VerifiedHeadHealthEvidence, HeadHealthObservationError> {
         let started_at = self.clock.now();
         let tolerance = self.config.readback_tolerance();
+        let mut accepted_torque_switch_prefix: [Option<ResponseEvidence<TorqueSwitchObservation>>;
+            4] = std::array::from_fn(|_| None);
         let mut accepted_prefix: [Option<HeadHealthJointEvidence>; 4] =
             std::array::from_fn(|_| None);
         let mut previous_at = started_at;
@@ -5427,6 +5463,79 @@ where
             if let Err(failure) = self.check_health_control(commands, control, joint) {
                 return Err(HeadHealthObservationError {
                     started_at,
+                    accepted_torque_switch_prefix,
+                    accepted_prefix,
+                    failure,
+                });
+            }
+            let request = build_torque_switch_read(joint.servo_id());
+            let response = match self.read_torque_switch(joint, &request).await {
+                Ok(response) => response,
+                Err(source) => {
+                    return Err(HeadHealthObservationError {
+                        started_at,
+                        accepted_torque_switch_prefix,
+                        accepted_prefix,
+                        failure: HeadHealthFailure::TorqueSwitchRead { joint, source },
+                    });
+                }
+            };
+            let write_completed_at = response.request_write().completed_at();
+            if write_completed_at < previous_at {
+                return Err(HeadHealthObservationError {
+                    started_at,
+                    accepted_torque_switch_prefix,
+                    accepted_prefix,
+                    failure: HeadHealthFailure::TorqueSwitchClockRegression {
+                        boundary: HeadHealthClockBoundary::TorqueSwitchRequestWriteCompleted {
+                            joint,
+                        },
+                        previous: previous_at,
+                        observed: write_completed_at,
+                        current_response: Some(Box::new(response)),
+                    },
+                });
+            }
+            let received_at = response.received_at();
+            if received_at < write_completed_at {
+                return Err(HeadHealthObservationError {
+                    started_at,
+                    accepted_torque_switch_prefix,
+                    accepted_prefix,
+                    failure: HeadHealthFailure::TorqueSwitchClockRegression {
+                        boundary: HeadHealthClockBoundary::TorqueSwitchResponseReceived { joint },
+                        previous: write_completed_at,
+                        observed: received_at,
+                        current_response: Some(Box::new(response)),
+                    },
+                });
+            }
+            let observed = response.value().state();
+            if observed != ObservedTorqueSwitch::Enabled {
+                return Err(HeadHealthObservationError {
+                    started_at,
+                    accepted_torque_switch_prefix,
+                    accepted_prefix,
+                    failure: HeadHealthFailure::TorqueNotEnabled {
+                        joint,
+                        observed,
+                        response,
+                    },
+                });
+            }
+            accepted_torque_switch_prefix[index] = Some(response);
+            previous_at = received_at;
+        }
+
+        let torque_switches = accepted_torque_switch_prefix.clone().map(|evidence| {
+            evidence.expect("all four torque switches were admitted on the telemetry path")
+        });
+
+        for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+            if let Err(failure) = self.check_health_control(commands, control, joint) {
+                return Err(HeadHealthObservationError {
+                    started_at,
+                    accepted_torque_switch_prefix,
                     accepted_prefix,
                     failure,
                 });
@@ -5438,6 +5547,7 @@ where
                 Err(source) => {
                     return Err(HeadHealthObservationError {
                         started_at,
+                        accepted_torque_switch_prefix,
                         accepted_prefix,
                         failure: HeadHealthFailure::TelemetryRead { joint, source },
                     });
@@ -5448,6 +5558,7 @@ where
             if write_completed_at < previous_at {
                 return Err(HeadHealthObservationError {
                     started_at,
+                    accepted_torque_switch_prefix,
                     accepted_prefix,
                     failure: HeadHealthFailure::ClockRegression {
                         boundary: HeadHealthClockBoundary::RequestWriteCompleted { joint },
@@ -5461,6 +5572,7 @@ where
             if received_at < write_completed_at {
                 return Err(HeadHealthObservationError {
                     started_at,
+                    accepted_torque_switch_prefix,
                     accepted_prefix,
                     failure: HeadHealthFailure::ClockRegression {
                         boundary: HeadHealthClockBoundary::ResponseReceived { joint },
@@ -5475,6 +5587,7 @@ where
             if telemetry.device_status_raw() != 0 {
                 return Err(HeadHealthObservationError {
                     started_at,
+                    accepted_torque_switch_prefix,
                     accepted_prefix,
                     failure: HeadHealthFailure::DeviceStatus {
                         joint,
@@ -5490,6 +5603,7 @@ where
             {
                 return Err(HeadHealthObservationError {
                     started_at,
+                    accepted_torque_switch_prefix,
                     accepted_prefix,
                     failure: HeadHealthFailure::TelemetrySafety {
                         joint,
@@ -5501,6 +5615,7 @@ where
             if telemetry.is_moving() {
                 return Err(HeadHealthObservationError {
                     started_at,
+                    accepted_torque_switch_prefix,
                     accepted_prefix,
                     failure: HeadHealthFailure::Moving {
                         joint,
@@ -5515,6 +5630,7 @@ where
             if absolute_difference_ticks > tolerance.get() {
                 return Err(HeadHealthObservationError {
                     started_at,
+                    accepted_torque_switch_prefix,
                     accepted_prefix,
                     failure: HeadHealthFailure::PositionMismatch {
                         joint,
@@ -5540,6 +5656,7 @@ where
         if completed_at < previous_at {
             return Err(HeadHealthObservationError {
                 started_at,
+                accepted_torque_switch_prefix,
                 accepted_prefix,
                 failure: HeadHealthFailure::ClockRegression {
                     boundary: HeadHealthClockBoundary::CheckCompleted,
@@ -5558,6 +5675,7 @@ where
             completed_at,
             hold_target,
             tolerance,
+            torque_switches,
             joints,
         })
     }
@@ -7192,10 +7310,24 @@ mod tests {
     }
 
     fn health_reads(positions: [u16; 4]) -> Vec<ReadAction> {
+        enabled_torque_reads()
+            .into_iter()
+            .chain(telemetry_reads(positions))
+            .collect()
+    }
+
+    fn telemetry_reads(positions: [u16; 4]) -> Vec<ReadAction> {
         HeadJoint::ALL
             .into_iter()
             .zip(positions)
             .map(|(joint, position)| ReadAction::Bytes(telemetry_response(joint, position)))
+            .collect()
+    }
+
+    fn enabled_torque_reads() -> Vec<ReadAction> {
+        HeadJoint::ALL
+            .into_iter()
+            .map(|joint| ReadAction::Bytes(torque_switch_response(joint, 1)))
             .collect()
     }
 
@@ -7843,9 +7975,9 @@ mod tests {
         ])
         .unwrap();
         let natural_positions = natural.positions().map(PositionTicks::get);
-        let mut reads = health_reads(natural_positions);
-        reads.extend(health_reads(natural_positions));
-        reads.extend(health_reads([
+        let mut reads = telemetry_reads(natural_positions);
+        reads.extend(telemetry_reads(natural_positions));
+        reads.extend(telemetry_reads([
             natural.position(HeadJoint::Bow).get() + 20,
             natural.position(HeadJoint::Curl).get(),
             natural.position(HeadJoint::Yaw).get(),
@@ -7926,9 +8058,9 @@ mod tests {
         ])
         .unwrap();
         let natural_positions = natural.positions().map(PositionTicks::get);
-        let mut reads = health_reads(natural_positions);
-        reads.extend(health_reads(natural_positions));
-        reads.extend(health_reads([
+        let mut reads = telemetry_reads(natural_positions);
+        reads.extend(telemetry_reads(natural_positions));
+        reads.extend(telemetry_reads([
             natural.position(HeadJoint::Bow).get() + 20,
             natural.position(HeadJoint::Curl).get(),
             natural.position(HeadJoint::Yaw).get(),
@@ -7937,7 +8069,7 @@ mod tests {
         reads.extend(HeadJoint::ALL.into_iter().map(|joint| {
             ReadAction::Bytes(goal_position_response(joint, yielded.position(joint).get()))
         }));
-        reads.extend(health_reads(yielded.positions().map(PositionTicks::get)));
+        reads.extend(telemetry_reads(yielded.positions().map(PositionTicks::get)));
         let (mut actor, shared) = goal_register_actor(reads);
         let compliant_config = pet_compliant_hold_config(natural);
         actor.control_mode = HeadControlMode::Gaze(
@@ -8036,9 +8168,9 @@ mod tests {
     async fn partial_softening_restores_all_holding_limits_and_faults_the_candidate() {
         let natural = goal_register_target();
         let natural_positions = natural.positions().map(PositionTicks::get);
-        let mut reads = health_reads(natural_positions);
-        reads.extend(health_reads(natural_positions));
-        reads.extend(health_reads([
+        let mut reads = telemetry_reads(natural_positions);
+        reads.extend(telemetry_reads(natural_positions));
+        reads.extend(telemetry_reads([
             natural.position(HeadJoint::Bow).get() + 20,
             natural.position(HeadJoint::Curl).get(),
             natural.position(HeadJoint::Yaw).get(),
@@ -8123,9 +8255,9 @@ mod tests {
         ])
         .unwrap();
         let natural_positions = natural.positions().map(PositionTicks::get);
-        let mut reads = health_reads(natural_positions);
-        reads.extend(health_reads(natural_positions));
-        reads.extend(health_reads([
+        let mut reads = telemetry_reads(natural_positions);
+        reads.extend(telemetry_reads(natural_positions));
+        reads.extend(telemetry_reads([
             natural.position(HeadJoint::Bow).get() + 20,
             natural.position(HeadJoint::Curl).get(),
             natural.position(HeadJoint::Yaw).get(),
@@ -8227,7 +8359,7 @@ mod tests {
     #[tokio::test]
     async fn compliant_observation_rejects_a_complete_set_at_the_exact_transaction_deadline() {
         let natural = goal_register_target();
-        let reads = health_reads([
+        let reads = telemetry_reads([
             natural.position(HeadJoint::Bow).get() + 20,
             natural.position(HeadJoint::Curl).get(),
             natural.position(HeadJoint::Yaw).get(),
@@ -8279,8 +8411,8 @@ mod tests {
     async fn compliant_temperature_deferral_freezes_output_without_inline_rereads() {
         let natural = goal_register_target();
         let natural_positions = natural.positions().map(PositionTicks::get);
-        let mut reads = health_reads(natural_positions);
-        reads.extend(health_reads(natural_positions));
+        let mut reads = telemetry_reads(natural_positions);
+        reads.extend(telemetry_reads(natural_positions));
         reads.extend(temperature_reads(natural, [72, 30, 30, 30]));
         reads.extend(temperature_reads(natural, [41, 42, 43, 44]));
         let (mut actor, shared) = goal_register_actor(reads);
@@ -8360,8 +8492,8 @@ mod tests {
     async fn isolated_implausible_temperature_does_not_starve_the_other_joints() {
         let natural = goal_register_target();
         let natural_positions = natural.positions().map(PositionTicks::get);
-        let mut reads = health_reads(natural_positions);
-        reads.extend(health_reads(natural_positions));
+        let mut reads = telemetry_reads(natural_positions);
+        reads.extend(telemetry_reads(natural_positions));
         reads.extend(temperature_reads(natural, [150, 30, 30, 30]));
         let (mut actor, shared) = goal_register_actor(reads);
         actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
@@ -8401,8 +8533,8 @@ mod tests {
     async fn three_high_compliant_temperature_samples_fail_stop_with_exact_evidence() {
         let natural = goal_register_target();
         let natural_positions = natural.positions().map(PositionTicks::get);
-        let mut reads = health_reads(natural_positions);
-        reads.extend(health_reads(natural_positions));
+        let mut reads = telemetry_reads(natural_positions);
+        reads.extend(telemetry_reads(natural_positions));
         for _ in 0..3 {
             reads.extend(temperature_reads(natural, [72, 30, 30, 30]));
         }
@@ -8470,8 +8602,8 @@ mod tests {
     async fn read_failure_after_temperature_deferral_retains_the_exact_transport_error() {
         let natural = goal_register_target();
         let natural_positions = natural.positions().map(PositionTicks::get);
-        let mut reads = health_reads(natural_positions);
-        reads.extend(health_reads(natural_positions));
+        let mut reads = telemetry_reads(natural_positions);
+        reads.extend(telemetry_reads(natural_positions));
         reads.extend(temperature_reads(natural, [72, 30, 30, 30]));
         reads.push(ReadAction::Failure(TransportFailure::timed_out(
             TransportOperation::Read,
@@ -8536,8 +8668,8 @@ mod tests {
     async fn chronic_implausible_temperature_is_typed_as_unreadable_not_hot() {
         let natural = goal_register_target();
         let natural_positions = natural.positions().map(PositionTicks::get);
-        let mut reads = health_reads(natural_positions);
-        reads.extend(health_reads(natural_positions));
+        let mut reads = telemetry_reads(natural_positions);
+        reads.extend(telemetry_reads(natural_positions));
         reads.extend(temperature_reads(natural, [150, 30, 30, 30]));
         let (mut actor, shared) = goal_register_actor(reads);
         actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
@@ -8645,9 +8777,9 @@ mod tests {
     async fn partial_compliant_write_faults_only_the_transactional_override() {
         let natural = goal_register_target();
         let natural_positions = natural.positions().map(PositionTicks::get);
-        let mut reads = health_reads(natural_positions);
-        reads.extend(health_reads(natural_positions));
-        reads.extend(health_reads([
+        let mut reads = telemetry_reads(natural_positions);
+        reads.extend(telemetry_reads(natural_positions));
+        reads.extend(telemetry_reads([
             natural.position(HeadJoint::Bow).get() + 20,
             natural.position(HeadJoint::Curl).get(),
             natural.position(HeadJoint::Yaw).get(),
@@ -10431,6 +10563,7 @@ mod tests {
     async fn health_check_retains_all_raw_values_identity_order_and_timing() {
         let positions = [2_127_u16, 2_558, 2_925, 2_930];
         let mut reads = successful_reads();
+        reads.extend(enabled_torque_reads());
         for (index, (joint, position)) in HeadJoint::ALL.into_iter().zip(positions).enumerate() {
             let speed = 100_u16 + u16::try_from(index).expect("small test index");
             let load = 200_u16 + u16::try_from(index).expect("small test index");
@@ -10470,6 +10603,28 @@ mod tests {
         ));
         assert_eq!(evidence.tolerance().get(), 20);
         assert!(evidence.started_at() <= evidence.completed_at());
+        for (index, (joint, response)) in HeadJoint::ALL
+            .into_iter()
+            .zip(evidence.torque_switches())
+            .enumerate()
+        {
+            assert_eq!(response.value().id(), joint.servo_id());
+            assert_eq!(response.value().state(), ObservedTorqueSwitch::Enabled);
+            assert_eq!(index, joint as usize);
+            assert!(response.request_write().completed_at() <= response.received_at());
+        }
+        assert!(evidence
+            .torque_switches()
+            .windows(2)
+            .all(|pair| pair[0].received_at() <= pair[1].request_write().completed_at()));
+        assert!(
+            evidence
+                .torque_switches()
+                .last()
+                .expect("four torque switches")
+                .received_at()
+                <= evidence.joints()[0].response().request_write().completed_at()
+        );
         for (index, (joint, sample)) in HeadJoint::ALL
             .into_iter()
             .zip(evidence.joints())
@@ -10535,9 +10690,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn torque_switch_loss_is_reported_before_pose_telemetry_without_reengagement() {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads.push(ReadAction::Bytes(torque_switch_response(HeadJoint::Bow, 0)));
+        reads.extend(health_reads(positions));
+        let (handle, receipt, task, shared) = spawn_fake(reads, valid_config(1));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+
+        let error = handle
+            .check_health()
+            .await
+            .expect_err("a cleared torque switch is not a healthy hold");
+        let observation = health_observation_error(error);
+        assert!(observation
+            .accepted_torque_switch_prefix()
+            .iter()
+            .all(Option::is_none));
+        assert!(observation.accepted_prefix().iter().all(Option::is_none));
+        assert!(matches!(
+            observation.failure(),
+            HeadHealthFailure::TorqueNotEnabled {
+                joint: HeadJoint::Bow,
+                observed: ObservedTorqueSwitch::Disabled,
+                response,
+            } if response.value().id() == HeadJoint::Bow.servo_id()
+        ));
+        handle
+            .check_health()
+            .await
+            .expect("a later enabled observation remains distinguishable from the fault");
+        {
+            let shared = shared.lock().expect("fake state");
+            assert!(shared.writes[36..]
+                .iter()
+                .any(|write| write[4..=6] == [2, 40, 1]));
+            assert!(shared.writes[36..]
+                .iter()
+                .all(|write| write[4..=6] != [3, 40, 1]));
+        }
+
+        handle.shutdown().await.expect("shutdown");
+        task.join().await.expect("actor task");
+    }
+
+    #[tokio::test]
     async fn health_check_rejects_position_outside_natural_hold_tolerance() {
         let positions = [2_127_u16, 2_558, 2_925, 2_930];
         let mut reads = successful_reads();
+        reads.extend(enabled_torque_reads());
         reads.push(ReadAction::Bytes(telemetry_response(
             HeadJoint::Bow,
             positions[0] + 21,
@@ -10588,6 +10793,7 @@ mod tests {
     async fn health_check_reports_moving_and_device_status_without_conflation() {
         let positions = [2_127_u16, 2_558, 2_925, 2_930];
         let mut moving_reads = successful_reads();
+        moving_reads.extend(enabled_torque_reads());
         moving_reads.push(ReadAction::Bytes(telemetry_response_with_moving(
             HeadJoint::Bow,
             positions[0],
@@ -10616,6 +10822,7 @@ mod tests {
         moving_task.join().await.expect("actor task");
 
         let mut status_reads = successful_reads();
+        status_reads.extend(enabled_torque_reads());
         status_reads.push(ReadAction::Bytes(telemetry_response_with_status(
             HeadJoint::Bow,
             positions[0],
@@ -10649,6 +10856,7 @@ mod tests {
     async fn production_health_check_surfaces_raw_limit_fault_without_dropping_tension() {
         let positions = [2_127_u16, 2_558, 2_925, 2_930];
         let mut reads = successful_reads();
+        reads.extend(enabled_torque_reads());
         reads.push(ReadAction::Bytes(
             telemetry_response_with_voltage_temperature(
                 HeadJoint::Bow,
@@ -10734,6 +10942,7 @@ mod tests {
     async fn health_transport_failure_is_exact_and_the_actor_can_be_queried_again() {
         let positions = [2_127_u16, 2_558, 2_925, 2_930];
         let mut reads = successful_reads();
+        reads.extend(enabled_torque_reads());
         reads.push(ReadAction::Failure(TransportFailure::timed_out(
             TransportOperation::Read,
             0,
@@ -10776,6 +10985,7 @@ mod tests {
     async fn health_check_rejects_a_response_outside_canonical_identity_order() {
         let positions = [2_127_u16, 2_558, 2_925, 2_930];
         let mut reads = successful_reads();
+        reads.extend(enabled_torque_reads());
         reads.push(ReadAction::Bytes(telemetry_response(
             HeadJoint::Curl,
             positions[1],
@@ -10831,7 +11041,7 @@ mod tests {
             .expect("queue health request");
         drop(cancelled_receiver);
         loop {
-            if shared.lock().expect("fake state").writes.len() >= 40 {
+            if shared.lock().expect("fake state").writes.len() >= 44 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -10843,13 +11053,11 @@ mod tests {
             .expect("actor remains usable after the query receiver disappears");
         {
             let shared = shared.lock().expect("fake state");
-            assert_eq!(shared.writes.len(), 44);
-            assert!(
-                shared.writes[36..44]
-                    .iter()
-                    .all(|write| write[4..=6] == [2, 56, 15]),
-                "health requests are read-only and receiver cancellation adds no disable write"
-            );
+            assert_eq!(shared.writes.len(), 52);
+            assert!(shared.writes[36..52].chunks_exact(8).all(|health| {
+                health[..4].iter().all(|write| write[4..=6] == [2, 40, 1])
+                    && health[4..].iter().all(|write| write[4..=6] == [2, 56, 15])
+            }));
         }
 
         handle.shutdown().await.expect("shutdown");
@@ -10880,7 +11088,14 @@ mod tests {
                 .all(|joint| joint.telemetry().device_status_raw() == 0
                     && !joint.telemetry().is_moving())
         );
-        assert_eq!(shared.lock().expect("fake state").writes.len(), 44);
+        assert!(
+            first
+                .torque_switches()
+                .iter()
+                .chain(second.torque_switches())
+                .all(|response| response.value().state() == ObservedTorqueSwitch::Enabled)
+        );
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 52);
 
         handle.shutdown().await.expect("shutdown");
         task.join().await.expect("actor task");
@@ -10890,6 +11105,7 @@ mod tests {
     async fn health_clock_regression_is_a_typed_framing_failure() {
         let positions = [2_127_u16, 2_558, 2_925, 2_930];
         let mut reads = successful_reads();
+        reads.extend(enabled_torque_reads());
         reads.push(ReadAction::SetClockAndBytes {
             milliseconds: 0,
             bytes: telemetry_response(HeadJoint::Bow, positions[0]),
@@ -10994,8 +11210,8 @@ mod tests {
         assert_eq!(exit.termination(), &ActorTermination::RequestedShutdown);
 
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.read_calls, 176);
-        assert_eq!(shared.writes.len(), 68);
+        assert_eq!(shared.read_calls, 192);
+        assert_eq!(shared.writes.len(), 72);
         assert_eq!(
             shared
                 .writes
