@@ -23,6 +23,7 @@ use kiko_head_protocol::{
     ExactHeadTargetPose, FullTelemetry, HeadJoint, HeadTorqueLimits, PositionTicks,
 };
 
+use crate::energized_temperature::EnergizedTemperatureAdmission;
 use crate::{HeadTelemetrySafetyLimits, HeadTelemetrySafetyViolation, MonotonicTime};
 
 const JOINT_COUNT: usize = 4;
@@ -468,6 +469,46 @@ impl CompliantHeadObservation {
         maximum_span: Duration,
         ttl: Duration,
     ) -> Result<Self, CompliantHeadObservationError> {
+        Self::try_from_timed_telemetry_inner(
+            samples,
+            received_at,
+            admitted_at,
+            safety,
+            maximum_span,
+            ttl,
+            None,
+        )
+    }
+
+    pub(crate) fn try_from_supervised_timed_telemetry(
+        samples: [FullTelemetry; JOINT_COUNT],
+        received_at: [MonotonicTime; JOINT_COUNT],
+        admitted_at: MonotonicTime,
+        safety: HeadTelemetrySafetyLimits,
+        maximum_span: Duration,
+        ttl: Duration,
+        temperature_admission: EnergizedTemperatureAdmission,
+    ) -> Result<Self, CompliantHeadObservationError> {
+        Self::try_from_timed_telemetry_inner(
+            samples,
+            received_at,
+            admitted_at,
+            safety,
+            maximum_span,
+            ttl,
+            Some(temperature_admission),
+        )
+    }
+
+    fn try_from_timed_telemetry_inner(
+        samples: [FullTelemetry; JOINT_COUNT],
+        received_at: [MonotonicTime; JOINT_COUNT],
+        admitted_at: MonotonicTime,
+        safety: HeadTelemetrySafetyLimits,
+        maximum_span: Duration,
+        ttl: Duration,
+        temperature_admission: Option<EnergizedTemperatureAdmission>,
+    ) -> Result<Self, CompliantHeadObservationError> {
         let mut positions = [PositionTicks::MIN; JOINT_COUNT];
         let mut moving = [false; JOINT_COUNT];
         let mut load_raw = [0; JOINT_COUNT];
@@ -523,7 +564,25 @@ impl CompliantHeadObservation {
                     raw: sample.device_status_raw(),
                 });
             }
-            match safety.admit_energized(sample.voltage_raw(), sample.temperature_raw()) {
+            let telemetry_admission = if let Some(temperature_admission) = temperature_admission {
+                if !temperature_admission.admits(
+                    index,
+                    sample.temperature_raw(),
+                    received_at[index],
+                ) {
+                    return Err(
+                        CompliantHeadObservationError::TemperatureAdmissionMismatch {
+                            joint,
+                            observed_raw: sample.temperature_raw(),
+                            observed_at: received_at[index],
+                        },
+                    );
+                }
+                safety.admit_energized_voltage(sample.voltage_raw())
+            } else {
+                safety.admit_energized(sample.voltage_raw(), sample.temperature_raw())
+            };
+            match telemetry_admission {
                 Ok(()) => {}
                 Err(
                     source @ HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
@@ -629,6 +688,11 @@ pub enum CompliantHeadObservationError {
         joint: HeadJoint,
         source: HeadTelemetrySafetyViolation,
     },
+    TemperatureAdmissionMismatch {
+        joint: HeadJoint,
+        observed_raw: u8,
+        observed_at: MonotonicTime,
+    },
 }
 
 impl fmt::Display for CompliantHeadObservationError {
@@ -647,6 +711,7 @@ impl std::error::Error for CompliantHeadObservationError {
             | Self::SetExpired { .. }
             | Self::ServoIdMismatch { .. }
             | Self::DeviceStatus { .. } => None,
+            Self::TemperatureAdmissionMismatch { .. } => None,
         }
     }
 }

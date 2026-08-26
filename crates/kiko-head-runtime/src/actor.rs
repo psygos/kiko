@@ -23,6 +23,10 @@ use crate::config::{
     HeadPoseBoundsAdmissionError, HeadPoseWithinConfiguredBounds, HeadReturnPlan,
     HeadRuntimeConfig, HeadTelemetrySafetyViolation, OperationTimeout, ReturnToTargetConfig,
 };
+use crate::energized_temperature::{
+    EnergizedTemperatureChannelStatus, EnergizedTemperatureSample, EnergizedTemperatureSupervision,
+    EnergizedTemperatureSupervisor,
+};
 use crate::framing::{FrameReadError, read_response_frame};
 use crate::gaze_control::{
     HeadGazeCommitReceipt, HeadGazeControlConfig, HeadGazeController, HeadGazeControllerInitError,
@@ -39,11 +43,6 @@ use crate::transport::{
 };
 
 const ACTOR_MAILBOX_CAPACITY: usize = 1;
-// Live read-only Nano evidence showed a checksum-valid 150 raw sample followed
-// by the ordinary 38 raw value 85 ms later. Confirmation is deliberately
-// outside that observed corruption burst; an actual thermal trip remains
-// fail-stopped after two bounded reads over 200 ms.
-const ENERGIZED_TEMPERATURE_CONFIRMATION_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Deliberate opt-in required before the actor can enable servo torque.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1923,36 +1922,33 @@ pub struct VerifiedHeadCompliantHoldStep {
     hardware: HeadGazeHardwareApplication,
 }
 
-/// Three fresh, checksum-valid responses proving that an initially high raw
-/// temperature byte was not repeated. The compliant owner freezes physical
-/// output for this transaction and does not advance planner state.
+/// One complete, structurally valid telemetry set whose temperature channels
+/// cannot yet authorize motion. The compliant owner freezes physical output
+/// and schedules the next sample at the ordinary control period; it never
+/// sleeps or rereads one joint inside this transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedEnergizedTemperatureTransient {
-    joint: HeadJoint,
-    responses: Box<[ResponseEvidence<FullTelemetry>; 3]>,
-    maximum_raw_exclusive: u8,
+pub struct DeferredEnergizedTemperatureObservation {
+    responses: Box<[ResponseEvidence<FullTelemetry>; 4]>,
+    channels: [EnergizedTemperatureChannelStatus; 4],
 }
 
-impl VerifiedEnergizedTemperatureTransient {
-    pub const fn joint(&self) -> HeadJoint {
-        self.joint
-    }
-
-    pub const fn responses(&self) -> &[ResponseEvidence<FullTelemetry>; 3] {
+impl DeferredEnergizedTemperatureObservation {
+    pub const fn responses(&self) -> &[ResponseEvidence<FullTelemetry>; 4] {
         &self.responses
     }
 
-    pub const fn maximum_raw_exclusive(&self) -> u8 {
-        self.maximum_raw_exclusive
+    pub const fn channels(&self) -> &[EnergizedTemperatureChannelStatus; 4] {
+        &self.channels
     }
 }
 
-/// Three consecutive checksum-valid responses at or above the energized
-/// temperature limit. This is a fail-stop condition, not a filtered sample.
+/// Three plausible-hot samples observed on separate compliant control slots.
+/// Implausible corruption-band bytes are absent from this evidence and cannot
+/// confirm or clear the streak.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfirmedEnergizedTemperatureFault {
     joint: HeadJoint,
-    responses: Box<[ResponseEvidence<FullTelemetry>; 3]>,
+    samples: [EnergizedTemperatureSample; 3],
     maximum_raw_exclusive: u8,
 }
 
@@ -1961,8 +1957,8 @@ impl ConfirmedEnergizedTemperatureFault {
         self.joint
     }
 
-    pub const fn responses(&self) -> &[ResponseEvidence<FullTelemetry>; 3] {
-        &self.responses
+    pub const fn samples(&self) -> &[EnergizedTemperatureSample; 3] {
+        &self.samples
     }
 
     pub const fn maximum_raw_exclusive(&self) -> u8 {
@@ -1970,9 +1966,38 @@ impl ConfirmedEnergizedTemperatureFault {
     }
 }
 
+/// A temperature channel remained in the checksum-valid corruption band for
+/// the complete bounded streak. This is a telemetry-integrity fault, not an
+/// overtemperature claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnreadableEnergizedTemperatureFault {
+    joint: HeadJoint,
+    last_sample: EnergizedTemperatureSample,
+    consecutive_implausible: std::num::NonZeroU16,
+    maximum_plausible_raw_inclusive: u8,
+}
+
+impl UnreadableEnergizedTemperatureFault {
+    pub const fn joint(&self) -> HeadJoint {
+        self.joint
+    }
+
+    pub const fn last_sample(&self) -> EnergizedTemperatureSample {
+        self.last_sample
+    }
+
+    pub const fn consecutive_implausible(&self) -> std::num::NonZeroU16 {
+        self.consecutive_implausible
+    }
+
+    pub const fn maximum_plausible_raw_inclusive(&self) -> u8 {
+        self.maximum_plausible_raw_inclusive
+    }
+}
+
 enum HeadCompliantHoldExecution {
     RetainedExpressionTarget,
-    TemperatureTransient(Box<VerifiedEnergizedTemperatureTransient>),
+    TemperatureDeferred(Box<DeferredEnergizedTemperatureObservation>),
     Applied(VerifiedHeadCompliantHoldStep),
 }
 
@@ -2030,7 +2055,7 @@ pub enum HeadGazeServiceOutcome {
         observed_at: MonotonicTime,
     },
     Compliant(Box<VerifiedHeadCompliantHoldStep>),
-    CompliantTemperatureTransient(Box<VerifiedEnergizedTemperatureTransient>),
+    CompliantTemperatureDeferred(Box<DeferredEnergizedTemperatureObservation>),
     Applied(Box<VerifiedHeadGazeControlStep>),
 }
 
@@ -2065,16 +2090,8 @@ pub enum HeadGazeServiceError {
         source: Option<RequestError>,
     },
     CompliantObservation(CompliantHeadObservationError),
-    CompliantTemperatureConfirmationInterrupted {
-        joint: HeadJoint,
-        completed_responses: Vec<ResponseEvidence<FullTelemetry>>,
-        source: Box<HeadGazeServiceError>,
-    },
-    CompliantTemperatureConfirmationRejected {
-        responses: Box<[ResponseEvidence<FullTelemetry>; 3]>,
-        source: CompliantHeadObservationError,
-    },
     ConfirmedEnergizedTemperature(Box<ConfirmedEnergizedTemperatureFault>),
+    UnreadableEnergizedTemperature(Box<UnreadableEnergizedTemperatureFault>),
     CompliantPlanner(CompliantHoldPrepareError),
     CompliantGoalRegisters {
         source: Box<HeadGoalRegisterError>,
@@ -2115,10 +2132,6 @@ impl std::error::Error for HeadGazeServiceError {
                 .map(|source| source as &(dyn std::error::Error + 'static)),
             Self::CompliantControl(source) => Some(source.as_ref()),
             Self::CompliantObservation(source) => Some(source),
-            Self::CompliantTemperatureConfirmationInterrupted { source, .. } => {
-                Some(source.as_ref())
-            }
-            Self::CompliantTemperatureConfirmationRejected { source, .. } => Some(source),
             Self::CompliantPlanner(source) => Some(source),
             Self::CompliantGoalRegisters { source, .. } => Some(source.as_ref()),
             Self::CompliantCommitAfterVerifiedApplication { source, .. } => Some(source),
@@ -2128,7 +2141,8 @@ impl std::error::Error for HeadGazeServiceError {
             Self::CommandBeforeReviewedReturn
             | Self::CommandAlreadyInProgress
             | Self::NotConfigured
-            | Self::ConfirmedEnergizedTemperature(_) => None,
+            | Self::ConfirmedEnergizedTemperature(_)
+            | Self::UnreadableEnergizedTemperature(_) => None,
         }
     }
 }
@@ -2673,6 +2687,11 @@ where
 {
     let (commands, receiver) = mpsc::channel(ACTOR_MAILBOX_CAPACITY);
     let (startup_sender, startup_result) = oneshot::channel();
+    let energized_temperature = EnergizedTemperatureSupervisor::kiko_field_profile(
+        config
+            .telemetry_safety_limits()
+            .maximum_energized_temperature_raw_exclusive(),
+    );
     let actor = HeadActor {
         transport,
         clock,
@@ -2681,6 +2700,8 @@ where
         startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
         return_plan,
         control_mode,
+        energized_temperature,
+        temperature_deferred_until: None,
     };
     let task = runtime.spawn(async move {
         actor
@@ -2716,6 +2737,11 @@ where
 {
     let (commands, receiver) = mpsc::channel(ACTOR_MAILBOX_CAPACITY);
     let (startup_sender, startup_result) = oneshot::channel();
+    let energized_temperature = EnergizedTemperatureSupervisor::kiko_field_profile(
+        config
+            .telemetry_safety_limits()
+            .maximum_energized_temperature_raw_exclusive(),
+    );
     let actor = HeadActor {
         transport,
         clock,
@@ -2724,6 +2750,8 @@ where
         startup_torque_policy: control_mode.startup_torque_policy(),
         return_plan,
         control_mode,
+        energized_temperature,
+        temperature_deferred_until: None,
     };
     let task = runtime.spawn(async move {
         actor
@@ -3011,6 +3039,8 @@ struct HeadActor<T, C> {
     startup_torque_policy: StartupTorquePolicy,
     return_plan: Option<HeadReturnPlan>,
     control_mode: HeadControlMode,
+    energized_temperature: EnergizedTemperatureSupervisor,
+    temperature_deferred_until: Option<MonotonicTime>,
 }
 
 struct ControlState {
@@ -3489,9 +3519,9 @@ where
                     }
                     Some(Ok(compliant)) => {
                         let now = self.clock.now();
-                        if now < compliant.next_service_due() {
-                            let delay = compliant
-                                .next_service_due()
+                        let next_service_due = self.compliant_service_due(compliant);
+                        if now < next_service_due {
+                            let delay = next_service_due
                                 .checked_duration_since(now)
                                 .expect("ordered monotonic timestamps have a duration");
                             tokio::select! {
@@ -3522,7 +3552,7 @@ where
                                 }
                                 Ok(
                                     HeadCompliantHoldExecution::RetainedExpressionTarget
-                                    | HeadCompliantHoldExecution::TemperatureTransient(_),
+                                    | HeadCompliantHoldExecution::TemperatureDeferred(_),
                                 ) => {}
                                 Err(source) => {
                                     if let Some(termination) = control.termination.clone() {
@@ -3726,6 +3756,17 @@ where
     ) -> Result<HeadGazeServiceOutcome, HeadGazeServiceError> {
         if let Some(compliant) = compliant {
             let now = self.clock.now();
+            if self
+                .temperature_deferred_until
+                .is_some_and(|scheduled_for| now < scheduled_for)
+            {
+                return Ok(HeadGazeServiceOutcome::BeforeScheduledTick {
+                    scheduled_for: self
+                        .temperature_deferred_until
+                        .expect("the guarded deferred deadline is present"),
+                    observed_at: now,
+                });
+            }
             if now < compliant.next_service_due() {
                 if compliant.state().suppresses_expression_motion() {
                     return Ok(HeadGazeServiceOutcome::BeforeScheduledTick {
@@ -3753,8 +3794,8 @@ where
                     HeadCompliantHoldExecution::Applied(evidence) => {
                         return Ok(HeadGazeServiceOutcome::Compliant(Box::new(evidence)));
                     }
-                    HeadCompliantHoldExecution::TemperatureTransient(evidence) => {
-                        return Ok(HeadGazeServiceOutcome::CompliantTemperatureTransient(
+                    HeadCompliantHoldExecution::TemperatureDeferred(evidence) => {
+                        return Ok(HeadGazeServiceOutcome::CompliantTemperatureDeferred(
                             evidence,
                         ));
                     }
@@ -3829,6 +3870,13 @@ where
         }
     }
 
+    fn compliant_service_due(&self, compliant: &HeadCompliantHoldController) -> MonotonicTime {
+        self.temperature_deferred_until
+            .map_or(compliant.next_service_due(), |deferred| {
+                deferred.max(compliant.next_service_due())
+            })
+    }
+
     async fn execute_compliant_hold_step(
         &mut self,
         expression_target: ExactHeadTargetPose,
@@ -3862,41 +3910,100 @@ where
         let samples = responses.each_ref().map(|response| *response.value());
         let received_at = responses.each_ref().map(|response| response.received_at());
         let now = self.clock.now();
-        let observation = match CompliantHeadObservation::try_from_timed_telemetry(
+        let observation_result = CompliantHeadObservation::try_from_timed_telemetry(
             samples,
             received_at,
             now,
             self.config.telemetry_safety_limits(),
             compliant_config.maximum_observation_span(),
             compliant_config.observation_ttl(),
-        ) {
-            Ok(observation) => observation,
+        );
+        let temperature_samples = std::array::from_fn(|index| {
+            EnergizedTemperatureSample::new(samples[index].temperature_raw(), received_at[index])
+        });
+        let observation = match observation_result {
+            Ok(observation) => match self.energized_temperature.observe(temperature_samples) {
+                EnergizedTemperatureSupervision::Admitted { .. } => {
+                    self.temperature_deferred_until = None;
+                    observation
+                }
+                EnergizedTemperatureSupervision::AdmittedWithImplausible { .. }
+                | EnergizedTemperatureSupervision::Deferred { .. }
+                | EnergizedTemperatureSupervision::ConfirmedOvertemperature { .. }
+                | EnergizedTemperatureSupervision::Unreadable { .. } => {
+                    unreachable!(
+                        "telemetry admitted below the normal limit cannot produce a thermal streak event"
+                    )
+                }
+            },
             Err(CompliantHeadObservationError::TelemetrySafety {
-                joint,
                 source:
                     HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
-                        maximum_raw_exclusive,
                         ..
                     },
-            }) => {
-                let index = HeadJoint::ALL
-                    .into_iter()
-                    .position(|candidate| candidate == joint)
-                    .expect("the canonical joint set contains every head joint");
-                let evidence = self
-                    .confirm_energized_temperature(
-                        joint,
-                        responses[index].clone(),
-                        maximum_raw_exclusive,
-                        compliant_config.observation_transaction_timeout(),
-                        commands,
-                        control,
+                ..
+            }) => match self.energized_temperature.observe(temperature_samples) {
+                EnergizedTemperatureSupervision::AdmittedWithImplausible { admission, .. } => {
+                    self.temperature_deferred_until = None;
+                    CompliantHeadObservation::try_from_supervised_timed_telemetry(
+                        samples,
+                        received_at,
+                        now,
+                        self.config.telemetry_safety_limits(),
+                        compliant_config.maximum_observation_span(),
+                        compliant_config.observation_ttl(),
+                        admission,
                     )
-                    .await?;
-                return Ok(HeadCompliantHoldExecution::TemperatureTransient(Box::new(
-                    evidence,
-                )));
-            }
+                    .map_err(HeadGazeServiceError::CompliantObservation)?
+                }
+                EnergizedTemperatureSupervision::Deferred { channels } => {
+                    let due_duration = now
+                        .duration_since_origin()
+                        .checked_add(compliant_config.control_period())
+                        .unwrap_or(Duration::MAX);
+                    self.temperature_deferred_until =
+                        Some(MonotonicTime::from_duration_since_origin(due_duration));
+                    return Ok(HeadCompliantHoldExecution::TemperatureDeferred(Box::new(
+                        DeferredEnergizedTemperatureObservation {
+                            responses: Box::new(responses),
+                            channels,
+                        },
+                    )));
+                }
+                EnergizedTemperatureSupervision::ConfirmedOvertemperature {
+                    joint,
+                    samples,
+                    maximum_raw_exclusive,
+                } => {
+                    return Err(HeadGazeServiceError::ConfirmedEnergizedTemperature(
+                        Box::new(ConfirmedEnergizedTemperatureFault {
+                            joint,
+                            samples,
+                            maximum_raw_exclusive,
+                        }),
+                    ));
+                }
+                EnergizedTemperatureSupervision::Unreadable {
+                    joint,
+                    last_sample,
+                    consecutive_implausible,
+                    maximum_plausible_raw_inclusive,
+                } => {
+                    return Err(HeadGazeServiceError::UnreadableEnergizedTemperature(
+                        Box::new(UnreadableEnergizedTemperatureFault {
+                            joint,
+                            last_sample,
+                            consecutive_implausible,
+                            maximum_plausible_raw_inclusive,
+                        }),
+                    ));
+                }
+                EnergizedTemperatureSupervision::Admitted { .. } => {
+                    unreachable!(
+                        "a telemetry set rejected for temperature cannot be thermally admitted"
+                    )
+                }
+            },
             Err(source) => return Err(HeadGazeServiceError::CompliantObservation(source)),
         };
         let prepared = compliant
@@ -3951,104 +4058,6 @@ where
                 hardware,
             },
         ))
-    }
-
-    async fn confirm_energized_temperature(
-        &mut self,
-        joint: HeadJoint,
-        initial: ResponseEvidence<FullTelemetry>,
-        maximum_raw_exclusive: u8,
-        observation_transaction_timeout: Duration,
-        commands: &mut mpsc::Receiver<HeadCommand>,
-        control: &mut ControlState,
-    ) -> Result<VerifiedEnergizedTemperatureTransient, HeadGazeServiceError> {
-        let mut completed_responses = Vec::with_capacity(3);
-        completed_responses.push(initial);
-
-        let request = build_full_telemetry_read(joint.servo_id());
-        for _ in 0..2 {
-            tokio::time::sleep(ENERGIZED_TEMPERATURE_CONFIRMATION_INTERVAL).await;
-            if let Err(source) = self.check_health_control(commands, control, joint) {
-                return Err(
-                    HeadGazeServiceError::CompliantTemperatureConfirmationInterrupted {
-                        joint,
-                        completed_responses,
-                        source: Box::new(HeadGazeServiceError::CompliantControl(Box::new(source))),
-                    },
-                );
-            }
-            let budget = HeadCompliantObservationBudget::new(
-                self.clock.now(),
-                observation_transaction_timeout,
-            );
-            match self.read_compliant_telemetry(joint, &request, budget).await {
-                Ok(response) => completed_responses.push(response),
-                Err(source) => {
-                    return Err(
-                        HeadGazeServiceError::CompliantTemperatureConfirmationInterrupted {
-                            joint,
-                            completed_responses,
-                            source: Box::new(source),
-                        },
-                    );
-                }
-            }
-        }
-
-        let responses: [ResponseEvidence<FullTelemetry>; 3] = completed_responses
-            .try_into()
-            .expect("one initial and two confirmation responses are collected");
-        let safety = self.config.telemetry_safety_limits();
-        let mut observed_normal_temperature = false;
-        for response in &responses {
-            let sample = response.value();
-            let device_status_raw = sample.device_status_raw();
-            if device_status_raw != 0 {
-                return Err(
-                    HeadGazeServiceError::CompliantTemperatureConfirmationRejected {
-                        responses: Box::new(responses),
-                        source: CompliantHeadObservationError::DeviceStatus {
-                            joint,
-                            raw: device_status_raw,
-                        },
-                    },
-                );
-            }
-            match safety.admit_energized(sample.voltage_raw(), sample.temperature_raw()) {
-                Ok(()) => observed_normal_temperature = true,
-                Err(
-                    HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
-                        ..
-                    },
-                ) => {}
-                Err(source) => {
-                    return Err(
-                        HeadGazeServiceError::CompliantTemperatureConfirmationRejected {
-                            responses: Box::new(responses),
-                            source: CompliantHeadObservationError::TelemetrySafety {
-                                joint,
-                                source,
-                            },
-                        },
-                    );
-                }
-            }
-        }
-        if observed_normal_temperature {
-            Ok(VerifiedEnergizedTemperatureTransient {
-                joint,
-                responses: Box::new(responses),
-                maximum_raw_exclusive,
-            })
-        } else {
-            Err(HeadGazeServiceError::ConfirmedEnergizedTemperature(
-                Box::new(ConfirmedEnergizedTemperatureFault {
-                    joint,
-                    responses: Box::new(responses),
-                    maximum_raw_exclusive,
-                }),
-            ))
-        }
     }
 
     async fn read_compliant_telemetry(
@@ -6685,6 +6694,10 @@ mod tests {
         config_with_freshness(write_attempts, 250)
     }
 
+    fn test_energized_temperature() -> EnergizedTemperatureSupervisor {
+        EnergizedTemperatureSupervisor::kiko_field_profile(65)
+    }
+
     fn config_with_freshness(write_attempts: u8, arming_freshness_ms: u64) -> HeadRuntimeConfig {
         HeadRuntimeConfig::parse(HeadRuntimeConfigInput {
             device_path: "/dev/serial/by-id/usb-Kiko_head_test".to_owned(),
@@ -6787,6 +6800,33 @@ mod tests {
             .zip(positions)
             .map(|(joint, position)| ReadAction::Bytes(telemetry_response(joint, position)))
             .collect()
+    }
+
+    fn temperature_reads(target: ExactHeadTargetPose, temperature_raw: [u8; 4]) -> Vec<ReadAction> {
+        HeadJoint::ALL
+            .into_iter()
+            .zip(temperature_raw)
+            .map(|(joint, temperature_raw)| {
+                ReadAction::Bytes(telemetry_response_with_voltage_temperature(
+                    joint,
+                    target.position(joint).get(),
+                    false,
+                    0,
+                    120,
+                    temperature_raw,
+                ))
+            })
+            .collect()
+    }
+
+    fn advance_to_temperature_retry(actor: &mut HeadActor<FakeTransport, TestClock>) {
+        let due = actor
+            .temperature_deferred_until
+            .expect("a deferred thermal observation schedules its next control slot");
+        actor.clock.set_milliseconds(
+            u64::try_from(due.duration_since_origin().as_millis())
+                .expect("test time fits milliseconds"),
+        );
     }
 
     fn successful_reads() -> Vec<ReadAction> {
@@ -7046,6 +7086,8 @@ mod tests {
                 startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
                 return_plan: None,
                 control_mode: HeadControlMode::NaturalHold,
+                energized_temperature: test_energized_temperature(),
+                temperature_deferred_until: None,
             },
             shared,
         )
@@ -7461,33 +7503,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compliant_temperature_transient_freezes_output_and_retains_all_three_samples() {
+    async fn compliant_temperature_deferral_freezes_output_without_inline_rereads() {
         let natural = goal_register_target();
         let natural_positions = natural.positions().map(PositionTicks::get);
         let mut reads = health_reads(natural_positions);
         reads.extend(health_reads(natural_positions));
-        reads.extend(HeadJoint::ALL.into_iter().map(|joint| {
-            ReadAction::Bytes(telemetry_response_with_voltage_temperature(
-                joint,
-                natural.position(joint).get(),
-                false,
-                0,
-                120,
-                if joint == HeadJoint::Bow { 72 } else { 30 },
-            ))
-        }));
-        for temperature_raw in [41, 42] {
-            reads.push(ReadAction::Bytes(
-                telemetry_response_with_voltage_temperature(
-                    HeadJoint::Bow,
-                    natural.position(HeadJoint::Bow).get(),
-                    false,
-                    0,
-                    120,
-                    temperature_raw,
-                ),
-            ));
-        }
+        reads.extend(temperature_reads(natural, [72, 30, 30, 30]));
+        reads.extend(temperature_reads(natural, [41, 42, 43, 44]));
         let (mut actor, shared) = goal_register_actor(reads);
         actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
         let mut gaze =
@@ -7510,33 +7532,96 @@ mod tests {
             &mut control,
         )
         .await;
-        let next_service_due = compliant.next_service_due();
         let outcome = actor
             .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
             .await
-            .expect("one normal confirmation classifies only the raw sample as transient");
-        drop(commands);
+            .expect("the first plausible-hot slot is deferred");
 
-        let HeadGazeServiceOutcome::CompliantTemperatureTransient(evidence) = outcome else {
-            panic!("the frozen transaction must expose transient evidence");
+        let HeadGazeServiceOutcome::CompliantTemperatureDeferred(evidence) = outcome else {
+            panic!("the frozen transaction must expose deferred evidence");
         };
-        assert_eq!(evidence.joint(), HeadJoint::Bow);
-        assert_eq!(evidence.maximum_raw_exclusive(), 65);
         assert_eq!(
             evidence
                 .responses()
                 .each_ref()
                 .map(|response| response.value().temperature_raw()),
-            [72, 41, 42]
+            [72, 30, 30, 30]
         );
+        assert!(matches!(
+            evidence.channels()[0],
+            EnergizedTemperatureChannelStatus::PlausibleHot {
+                consecutive_plausible_hot,
+                abort_after,
+                ..
+            } if consecutive_plausible_hot.get() == 1 && abort_after.get() == 3
+        ));
         assert_eq!(gaze.committed_target(), natural);
         assert_eq!(compliant.committed_target(), natural);
-        assert_eq!(compliant.next_service_due(), next_service_due);
         assert_eq!(
             shared.lock().unwrap().writes.len(),
-            14,
-            "eight arming reads plus four frozen-set reads and two confirmations only"
+            12,
+            "eight arming reads plus exactly one complete four-joint thermal slot"
         );
+
+        let before_due = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect("an early caller receives the scheduled boundary");
+        assert!(matches!(
+            before_due,
+            HeadGazeServiceOutcome::BeforeScheduledTick { .. }
+        ));
+        assert_eq!(shared.lock().unwrap().writes.len(), 12);
+
+        advance_to_temperature_retry(&mut actor);
+        actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect("a normal complete set clears the deferral without extra reads");
+        drop(commands);
+        assert!(actor.temperature_deferred_until.is_none());
+        assert_eq!(shared.lock().unwrap().writes.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn isolated_implausible_temperature_does_not_starve_the_other_joints() {
+        let natural = goal_register_target();
+        let natural_positions = natural.positions().map(PositionTicks::get);
+        let mut reads = health_reads(natural_positions);
+        reads.extend(health_reads(natural_positions));
+        reads.extend(temperature_reads(natural, [150, 30, 30, 30]));
+        let (mut actor, shared) = goal_register_actor(reads);
+        actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
+        let mut gaze =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .unwrap();
+        let mut compliant = HeadCompliantHoldController::try_new(
+            compliant_hold_config(natural),
+            natural,
+            MonotonicTime::ZERO,
+        )
+        .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        arm_compliance_actor(
+            &mut actor,
+            &mut gaze,
+            &mut compliant,
+            &mut receiver,
+            &mut control,
+        )
+        .await;
+        let outcome = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect("one corruption-band byte has explicit supervised admission");
+        drop(commands);
+
+        assert!(matches!(outcome, HeadGazeServiceOutcome::Applied(_)));
+        assert!(actor.temperature_deferred_until.is_none());
+        assert_eq!(compliant.state(), CompliantHoldState::FollowingExpression);
+        assert_eq!(shared.lock().unwrap().writes.len(), 12);
     }
 
     #[tokio::test]
@@ -7545,27 +7630,8 @@ mod tests {
         let natural_positions = natural.positions().map(PositionTicks::get);
         let mut reads = health_reads(natural_positions);
         reads.extend(health_reads(natural_positions));
-        reads.extend(HeadJoint::ALL.into_iter().map(|joint| {
-            ReadAction::Bytes(telemetry_response_with_voltage_temperature(
-                joint,
-                natural.position(joint).get(),
-                false,
-                0,
-                120,
-                if joint == HeadJoint::Bow { 72 } else { 30 },
-            ))
-        }));
-        for _ in 0..2 {
-            reads.push(ReadAction::Bytes(
-                telemetry_response_with_voltage_temperature(
-                    HeadJoint::Bow,
-                    natural.position(HeadJoint::Bow).get(),
-                    false,
-                    0,
-                    120,
-                    72,
-                ),
-            ));
+        for _ in 0..3 {
+            reads.extend(temperature_reads(natural, [72, 30, 30, 30]));
         }
         let (mut actor, shared) = goal_register_actor(reads);
         actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
@@ -7589,10 +7655,25 @@ mod tests {
             &mut control,
         )
         .await;
+        for _ in 0..2 {
+            assert!(matches!(
+                actor
+                    .execute_gaze_control_step(
+                        &mut gaze,
+                        Some(&mut compliant),
+                        &mut receiver,
+                        &mut control,
+                    )
+                    .await
+                    .expect("the first two hot control slots defer"),
+                HeadGazeServiceOutcome::CompliantTemperatureDeferred(_)
+            ));
+            advance_to_temperature_retry(&mut actor);
+        }
         let error = actor
             .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
             .await
-            .expect_err("three high samples are a confirmed fail-stop");
+            .expect_err("the third plausible-hot control slot is a confirmed fail-stop");
         drop(commands);
 
         let HeadGazeServiceError::ConfirmedEnergizedTemperature(evidence) = error else {
@@ -7600,44 +7681,25 @@ mod tests {
         };
         assert_eq!(evidence.joint(), HeadJoint::Bow);
         assert_eq!(evidence.maximum_raw_exclusive(), 65);
-        assert_eq!(
+        assert_eq!(evidence.samples().map(|sample| sample.raw()), [72; 3]);
+        assert!(
             evidence
-                .responses()
-                .each_ref()
-                .map(|response| response.value().temperature_raw()),
-            [72; 3]
+                .samples()
+                .windows(2)
+                .all(|pair| pair[0].received_at() < pair[1].received_at())
         );
         assert_eq!(gaze.committed_target(), natural);
         assert_eq!(compliant.committed_target(), natural);
-        assert_eq!(shared.lock().unwrap().writes.len(), 14);
+        assert_eq!(shared.lock().unwrap().writes.len(), 20);
     }
 
     #[tokio::test]
-    async fn compliant_temperature_confirmation_read_failure_is_not_relabeled_transient() {
+    async fn read_failure_after_temperature_deferral_retains_the_exact_transport_error() {
         let natural = goal_register_target();
         let natural_positions = natural.positions().map(PositionTicks::get);
         let mut reads = health_reads(natural_positions);
         reads.extend(health_reads(natural_positions));
-        reads.extend(HeadJoint::ALL.into_iter().map(|joint| {
-            ReadAction::Bytes(telemetry_response_with_voltage_temperature(
-                joint,
-                natural.position(joint).get(),
-                false,
-                0,
-                120,
-                if joint == HeadJoint::Bow { 72 } else { 30 },
-            ))
-        }));
-        reads.push(ReadAction::Bytes(
-            telemetry_response_with_voltage_temperature(
-                HeadJoint::Bow,
-                natural.position(HeadJoint::Bow).get(),
-                false,
-                0,
-                120,
-                41,
-            ),
-        ));
+        reads.extend(temperature_reads(natural, [72, 30, 30, 30]));
         reads.push(ReadAction::Failure(TransportFailure::timed_out(
             TransportOperation::Read,
             7,
@@ -7664,26 +7726,95 @@ mod tests {
             &mut control,
         )
         .await;
+        assert!(matches!(
+            actor
+                .execute_gaze_control_step(
+                    &mut gaze,
+                    Some(&mut compliant),
+                    &mut receiver,
+                    &mut control,
+                )
+                .await
+                .expect("the first hot control slot defers"),
+            HeadGazeServiceOutcome::CompliantTemperatureDeferred(_)
+        ));
+        advance_to_temperature_retry(&mut actor);
         let error = actor
             .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
             .await
-            .expect_err("an incomplete confirmation remains an exact read fault");
+            .expect_err("the next independent slot retains its exact read fault");
         drop(commands);
 
         assert!(matches!(
             error,
-            HeadGazeServiceError::CompliantTemperatureConfirmationInterrupted {
+            HeadGazeServiceError::CompliantTelemetryRead {
                 joint: HeadJoint::Bow,
-                completed_responses,
-                source,
-            } if completed_responses.len() == 2
-                && completed_responses[0].value().temperature_raw() == 72
-                && completed_responses[1].value().temperature_raw() == 41
-                && matches!(*source, HeadGazeServiceError::CompliantTelemetryRead { .. })
+                source: RequestError::ResponseFrame(FrameReadError::Transport { source, .. }),
+                ..
+            } if source.kind() == TransportFailureKind::TimedOut
+                && source.bytes_transferred() == 7
         ));
         assert_eq!(gaze.committed_target(), natural);
         assert_eq!(compliant.committed_target(), natural);
-        assert_eq!(shared.lock().unwrap().writes.len(), 14);
+        assert_eq!(shared.lock().unwrap().writes.len(), 13);
+    }
+
+    #[tokio::test]
+    async fn chronic_implausible_temperature_is_typed_as_unreadable_not_hot() {
+        let natural = goal_register_target();
+        let natural_positions = natural.positions().map(PositionTicks::get);
+        let mut reads = health_reads(natural_positions);
+        reads.extend(health_reads(natural_positions));
+        reads.extend(temperature_reads(natural, [150, 30, 30, 30]));
+        let (mut actor, shared) = goal_register_actor(reads);
+        actor.control_mode = HeadControlMode::Gaze(gaze_with_compliance(natural));
+        let mut gaze =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .unwrap();
+        let mut compliant = HeadCompliantHoldController::try_new(
+            compliant_hold_config(natural),
+            natural,
+            MonotonicTime::ZERO,
+        )
+        .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        arm_compliance_actor(
+            &mut actor,
+            &mut gaze,
+            &mut compliant,
+            &mut receiver,
+            &mut control,
+        )
+        .await;
+        for slot in 1..300 {
+            let at = MonotonicTime::from_duration_since_origin(Duration::from_millis(slot));
+            assert!(matches!(
+                actor.energized_temperature.observe([
+                    EnergizedTemperatureSample::new(150, at),
+                    EnergizedTemperatureSample::new(30, at),
+                    EnergizedTemperatureSample::new(30, at),
+                    EnergizedTemperatureSample::new(30, at),
+                ]),
+                EnergizedTemperatureSupervision::AdmittedWithImplausible { .. }
+            ));
+        }
+        let error = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect_err("the 300th corruption-band slot is an unreadable-channel fault");
+        drop(commands);
+
+        assert!(matches!(
+            error,
+            HeadGazeServiceError::UnreadableEnergizedTemperature(evidence)
+                if evidence.joint() == HeadJoint::Bow
+                    && evidence.last_sample().raw() == 150
+                    && evidence.consecutive_implausible().get() == 300
+                    && evidence.maximum_plausible_raw_inclusive() == 95
+        ));
+        assert_eq!(shared.lock().unwrap().writes.len(), 12);
     }
 
     #[tokio::test]
@@ -10134,6 +10265,8 @@ mod tests {
             startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: Some(plan()),
             control_mode: HeadControlMode::NaturalHold,
+            energized_temperature: test_energized_temperature(),
+            temperature_deferred_until: None,
         };
         let (commands, mut receiver) = mpsc::channel(1);
         let mut control = ControlState::new();
@@ -10180,6 +10313,8 @@ mod tests {
             startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: Some(plan()),
             control_mode: HeadControlMode::NaturalHold,
+            energized_temperature: test_energized_temperature(),
+            temperature_deferred_until: None,
         };
         let (commands, mut receiver) = mpsc::channel(1);
         let mut control = ControlState::new();
@@ -10231,6 +10366,8 @@ mod tests {
             startup_torque_policy: StartupTorquePolicy::CommissioningDisableFirst,
             return_plan: None,
             control_mode: HeadControlMode::NaturalHold,
+            energized_temperature: test_energized_temperature(),
+            temperature_deferred_until: None,
         };
         let positions =
             kiko_head_protocol::ExactHeadTargetPose::try_from_ticks([2_127, 2_558, 2_925, 2_930])

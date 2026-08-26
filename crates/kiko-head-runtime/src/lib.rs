@@ -5,6 +5,7 @@ mod actor;
 mod base_motion_interlock;
 pub mod compliant_hold;
 mod config;
+mod energized_temperature;
 mod framing;
 pub mod gaze_control;
 mod motion;
@@ -14,26 +15,27 @@ mod transport;
 pub use actor::{
     ActorExit, ActorTermination, ArmingFreshnessCheck,
     AttendedCompliantCommissioningTakeoverConsent, CancellationCause,
-    ConfirmedEnergizedTemperatureFault, FrameWriteError, HeadActorHandle, HeadActorSpawnError,
-    HeadActorStartError, HeadActorTask, HeadCommandError, HeadGazeActuationConfig,
-    HeadGazeActuationConfigError, HeadGazeHardwareApplication, HeadGazeProposalCommandError,
-    HeadGazeServiceError, HeadGazeServiceOutcome, HeadGoalRegisterBoundary,
-    HeadGoalRegisterBoundaryEvidence, HeadGoalRegisterError, HeadGoalRegisterFailure,
-    HeadHealthCheckError, HeadHealthClockBoundary, HeadHealthFailure, HeadHealthJointEvidence,
-    HeadHealthObservationError, HeadHealthRequestError, HeadHoldTarget, HeadReturnActorHandle,
-    HeadReturnError, HeadRuntimeError, HeadStartupApplicationEvidence, HeadStartupTorqueEvidence,
-    HeadTelemetrySetEvidence, HeadWaypointBatchFailure, HeadWaypointBatchWriteError,
-    HeadWaypointEvidence, HoldPreservingOwnershipReleaseEvidence, HostAppliedObservedHoldEvidence,
-    InterruptedTelemetryRead, PhysicalHeadMotionConsent, PhysicalTorqueEnableConsent,
-    PositionObservationEvidence, ProductionTensionPreservingTakeoverConsent, ReadbackEvidence,
-    RequestError, ResponseEvidence, RetainedEnabledHoldEvidence, RuntimeStage, ShutdownError,
-    StartupReceipt, StartupReceiptError, TensionPreservingHeadActorExit,
-    TensionPreservingHeadActorTask, TensionPreservingHeadGazeActorHandle,
-    TensionPreservingHeadReturnActorHandle, TorqueDisableJointOutcome, TorqueDisableReport,
-    VerificationSample, VerifiedEnergizedTemperatureTransient, VerifiedHeadCompliantHoldStep,
-    VerifiedHeadGazeControlStep, VerifiedHeadGoalRegisterEvidence, VerifiedHeadHealthEvidence,
-    VerifiedHeadReturnEvidence, VerifiedNaturalHoldEvidence, WriteEvidence, WritePurpose,
-    spawn_head_actor, spawn_head_return_actor, spawn_tension_preserving_head_gaze_actor,
+    ConfirmedEnergizedTemperatureFault, DeferredEnergizedTemperatureObservation, FrameWriteError,
+    HeadActorHandle, HeadActorSpawnError, HeadActorStartError, HeadActorTask, HeadCommandError,
+    HeadGazeActuationConfig, HeadGazeActuationConfigError, HeadGazeHardwareApplication,
+    HeadGazeProposalCommandError, HeadGazeServiceError, HeadGazeServiceOutcome,
+    HeadGoalRegisterBoundary, HeadGoalRegisterBoundaryEvidence, HeadGoalRegisterError,
+    HeadGoalRegisterFailure, HeadHealthCheckError, HeadHealthClockBoundary, HeadHealthFailure,
+    HeadHealthJointEvidence, HeadHealthObservationError, HeadHealthRequestError, HeadHoldTarget,
+    HeadReturnActorHandle, HeadReturnError, HeadRuntimeError, HeadStartupApplicationEvidence,
+    HeadStartupTorqueEvidence, HeadTelemetrySetEvidence, HeadWaypointBatchFailure,
+    HeadWaypointBatchWriteError, HeadWaypointEvidence, HoldPreservingOwnershipReleaseEvidence,
+    HostAppliedObservedHoldEvidence, InterruptedTelemetryRead, PhysicalHeadMotionConsent,
+    PhysicalTorqueEnableConsent, PositionObservationEvidence,
+    ProductionTensionPreservingTakeoverConsent, ReadbackEvidence, RequestError, ResponseEvidence,
+    RetainedEnabledHoldEvidence, RuntimeStage, ShutdownError, StartupReceipt, StartupReceiptError,
+    TensionPreservingHeadActorExit, TensionPreservingHeadActorTask,
+    TensionPreservingHeadGazeActorHandle, TensionPreservingHeadReturnActorHandle,
+    TorqueDisableJointOutcome, TorqueDisableReport, UnreadableEnergizedTemperatureFault,
+    VerificationSample, VerifiedHeadCompliantHoldStep, VerifiedHeadGazeControlStep,
+    VerifiedHeadGoalRegisterEvidence, VerifiedHeadHealthEvidence, VerifiedHeadReturnEvidence,
+    VerifiedNaturalHoldEvidence, WriteEvidence, WritePurpose, spawn_head_actor,
+    spawn_head_return_actor, spawn_tension_preserving_head_gaze_actor,
     spawn_tension_preserving_head_return_actor, start_serial_head_actor,
     start_serial_head_return_actor,
     start_serial_tension_preserving_head_compliant_commission_actor,
@@ -59,6 +61,7 @@ pub use config::{
     ObservedHoldConfigParseError, OperationTimeout, ReturnToTargetConfig,
     ReturnToTargetConfigInput, ReturnToTargetConfigParseError, WriteAttemptLimit,
 };
+pub use energized_temperature::{EnergizedTemperatureChannelStatus, EnergizedTemperatureSample};
 pub use framing::{FrameReadError, MAX_RESPONSE_BYTES};
 pub use motion::HeadMotionError;
 pub use probe::{

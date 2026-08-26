@@ -369,7 +369,7 @@ impl HeadTelemetrySafetyLimits {
         voltage_raw: u8,
         temperature_raw: u8,
     ) -> Result<(), HeadTelemetrySafetyViolation> {
-        self.admit_voltage(voltage_raw)?;
+        self.admit_energized_voltage(voltage_raw)?;
         if temperature_raw >= self.maximum_energized_temperature_raw_exclusive {
             return Err(
                 HeadTelemetrySafetyViolation::EnergizedTemperatureAtOrAboveExclusiveMaximum {
@@ -379,6 +379,13 @@ impl HeadTelemetrySafetyLimits {
             );
         }
         Ok(())
+    }
+
+    pub(crate) fn admit_energized_voltage(
+        self,
+        voltage_raw: u8,
+    ) -> Result<(), HeadTelemetrySafetyViolation> {
+        self.admit_voltage(voltage_raw)
     }
 
     fn admit_voltage(self, observed_raw: u8) -> Result<(), HeadTelemetrySafetyViolation> {
