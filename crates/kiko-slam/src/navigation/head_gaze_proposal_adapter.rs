@@ -20,7 +20,7 @@ use kiko_expression_core::{
 };
 use kiko_expression_runtime::{
     CameraGazeTargetError, CameraRayHeadProposalError, FaceTargetState, FaceTrackingUpdate,
-    HeadGazeTargetProposal, OakCameraTargetRay,
+    HeadGazeMappingDeclaration, HeadGazeTargetProposal, HeadRelativeGaze, OakCameraTargetRay,
 };
 use kiko_head_runtime::gaze_control::HeadProposalTtl;
 
@@ -158,6 +158,7 @@ impl FreshCurrentFaceGazeTarget {
 pub struct HeadGazeFaceProposal {
     face: FreshCurrentFaceGazeTarget,
     camera_ray: OakCameraTargetRay,
+    gaze: HeadRelativeGaze,
     target: HeadGazeTargetProposal,
 }
 
@@ -168,6 +169,13 @@ impl HeadGazeFaceProposal {
 
     pub const fn camera_ray(self) -> OakCameraTargetRay {
         self.camera_ray
+    }
+
+    /// Desired gaze in the neutral-head angular domain used by the exact
+    /// physical mapping. Retaining it prevents a later eye/head coordinator
+    /// from reconstructing angles from normalized image coordinates.
+    pub const fn gaze(self) -> HeadRelativeGaze {
+        self.gaze
     }
 
     pub const fn target(self) -> HeadGazeTargetProposal {
@@ -285,6 +293,10 @@ impl HeadGazeFaceProposalAdapter {
         self.return_trigger
     }
 
+    pub const fn mapping(&self) -> &HeadGazeMappingDeclaration {
+        self.policy.mapping()
+    }
+
     /// Evaluate one accepted face-tracker update at an exact process-local
     /// monotonic timestamp.
     ///
@@ -302,15 +314,18 @@ impl HeadGazeFaceProposalAdapter {
             Err(reason) => return Ok(HeadGazeFaceProposalOutcome::Withheld(reason)),
         };
         let camera_ray = projection.ray_for(face)?;
-        let target = self
-            .policy
-            .mapping()
-            .proposal_for_camera_ray(camera_ray)
-            .map_err(HeadGazeFaceProposalError::Mapping)?;
+        let mapping = self.policy.mapping();
+        let gaze = mapping.gaze_for_camera_ray(camera_ray).map_err(|source| {
+            HeadGazeFaceProposalError::Mapping(CameraRayHeadProposalError::Projection(source))
+        })?;
+        let target = mapping.proposal_for_gaze(gaze).map_err(|source| {
+            HeadGazeFaceProposalError::Mapping(CameraRayHeadProposalError::Mapping(source))
+        })?;
         Ok(HeadGazeFaceProposalOutcome::Proposed(
             HeadGazeFaceProposal {
                 face,
                 camera_ray,
+                gaze,
                 target,
             },
         ))
@@ -629,6 +644,13 @@ mod tests {
         assert_eq!(
             proposal.face().transition(),
             FreshFaceGazeTransition::Tracked
+        );
+        assert_eq!(
+            proposal.gaze(),
+            policy
+                .mapping()
+                .gaze_for_camera_ray(proposal.camera_ray())
+                .unwrap()
         );
         assert_eq!(
             proposal.target().position(HeadJoint::Yaw).get(),

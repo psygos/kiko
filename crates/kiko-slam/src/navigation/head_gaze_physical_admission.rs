@@ -16,7 +16,7 @@ use kiko_device_inventory::{
 use kiko_expression_core::MonotonicTimestamp;
 use kiko_expression_runtime::{
     CharacterHeadMappingDeclaration, CharacterHeadOverlay, CharacterHeadOverlayMappingError,
-    FaceTrackingUpdate,
+    CommandedHeadGaze, CommandedHeadGazeEstimateError, FaceTrackingUpdate,
 };
 use kiko_head_protocol::ExactHeadTargetPose;
 use kiko_head_runtime::{
@@ -98,6 +98,7 @@ pub enum CharacterHeadOverlayDisposition {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AdmittedPhysicalCharacterHeadProposal {
     face: Option<HeadGazeFaceProposal>,
+    face_withheld: Option<HeadGazeFaceProposalWithheld>,
     command_target: ExactHeadTargetPose,
     overlay: CharacterHeadOverlayDisposition,
 }
@@ -105,6 +106,12 @@ pub struct AdmittedPhysicalCharacterHeadProposal {
 impl AdmittedPhysicalCharacterHeadProposal {
     pub const fn face(self) -> Option<HeadGazeFaceProposal> {
         self.face
+    }
+
+    /// Exact reason current face policy withheld a head target when the
+    /// character overlay independently produced this proposal.
+    pub const fn face_withheld(self) -> Option<HeadGazeFaceProposalWithheld> {
+        self.face_withheld
     }
 
     pub const fn command_target(self) -> ExactHeadTargetPose {
@@ -249,6 +256,17 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
         self.character_mapping
     }
 
+    /// Reconstruct the logical optical-axis gaze from an exact target that
+    /// the sole actor has already committed and verified.
+    pub fn estimate_commanded_gaze(
+        &self,
+        target: ExactHeadTargetPose,
+    ) -> Result<CommandedHeadGaze, CommandedHeadGazeEstimateError> {
+        self.adapter
+            .mapping()
+            .estimate_commanded_gaze(target.positions())
+    }
+
     /// Evaluate and activate one face update under this exact retained policy.
     ///
     /// The conversion to a command target is private to this owner, so a
@@ -313,6 +331,7 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
                 Ok(PhysicalCharacterHeadOutcome::Proposed(
                     AdmittedPhysicalCharacterHeadProposal {
                         face: Some(face),
+                        face_withheld: None,
                         command_target: ExactHeadTargetPose::from_positions(bow, curl, yaw, roll),
                         overlay: overlay_disposition,
                     },
@@ -337,6 +356,7 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
                         Ok(PhysicalCharacterHeadOutcome::Proposed(
                             AdmittedPhysicalCharacterHeadProposal {
                                 face: None,
+                                face_withheld: Some(face),
                                 command_target: ExactHeadTargetPose::from_positions(
                                     bow, curl, yaw, roll,
                                 ),
@@ -781,6 +801,10 @@ mod tests {
             panic!("reviewed non-natural overlay must propose");
         };
         assert_eq!(proposal.face(), None);
+        assert_eq!(
+            proposal.face_withheld(),
+            Some(HeadGazeFaceProposalWithheld::NoTarget)
+        );
         assert_eq!(
             proposal
                 .command_target()

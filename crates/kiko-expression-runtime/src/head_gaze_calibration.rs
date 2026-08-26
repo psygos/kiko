@@ -25,16 +25,18 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::fmt;
 
+use kiko_eye_protocol::{NORMALIZED_SCALE, SignedUnit};
 use kiko_head_protocol::{
     AngleRadians, FrameBuildError, HeadJoint, JointCalibration, JointCalibrationError,
     JointDirection, JointLimitsRadians, PositionTicks,
 };
+use libm::{fma, trunc};
 
 use crate::{
     CHARACTER_HEAD_SCALE, CameraForwardDepthMeters, CameraGazeTargetError,
     CameraToHeadGazeExtrinsics, CameraToHeadGazeExtrinsicsInput, CharacterHeadAmount,
     CharacterHeadOverlay, GazeExtrinsicsParseError, HeadRelativeGaze, OakCameraTargetRay,
-    RayHeadGazeProjectionError,
+    RayHeadGazeProjectionError, TrackingEyeGaze,
 };
 
 /// Declared Kiko head-centre origin in OAK coordinates, in metres.
@@ -56,6 +58,12 @@ pub const HEAD_GAZE_FOCUS_PLANE_CAMERA_FORWARD_DEPTH_M: f64 = 1.5;
 
 /// Largest retained assembly or calibration-provenance identifier.
 pub const MAX_HEAD_GAZE_IDENTIFIER_BYTES: usize = 96;
+
+/// Retained Fable logical eye excursion per radian of head-relative residual.
+///
+/// This is expressed in KEP2 normalized units, not pixels, encoder ticks, or
+/// a panel-mounting polarity. Firmware owns the physical panel transform.
+pub const KIKO_EYE_GAZE_UNITS_PER_RADIAN: f64 = 2_100.0;
 
 /// Weak, explicitly ordered natural encoder positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -536,6 +544,125 @@ pub enum HeadGazeCoordinate {
     YawRight,
 }
 
+/// Best-fit optical-axis gaze reconstructed from one verified head target.
+///
+/// This is an observation derived through the reviewed linear mapping, not a
+/// command and not a claim that the servos physically reached the target.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CommandedHeadGaze {
+    yaw_right: AngleRadians,
+    pitch_down: AngleRadians,
+}
+
+// Construction admits finite coordinates only, so equality is reflexive.
+impl Eq for CommandedHeadGaze {}
+
+impl CommandedHeadGaze {
+    pub const fn yaw_right_rad(self) -> f64 {
+        self.yaw_right.get()
+    }
+
+    pub const fn pitch_down_rad(self) -> f64 {
+        self.pitch_down.get()
+    }
+}
+
+/// Desired neutral-head gaze minus the verified commanded optical-axis gaze.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeadGazeResidual {
+    yaw_right: AngleRadians,
+    pitch_down: AngleRadians,
+}
+
+// Construction admits finite coordinates only, so equality is reflexive.
+impl Eq for HeadGazeResidual {}
+
+impl HeadGazeResidual {
+    pub fn try_between(
+        desired: HeadRelativeGaze,
+        commanded: CommandedHeadGaze,
+    ) -> Result<Self, HeadGazeResidualError> {
+        let yaw_right_rad = desired.yaw_right_rad() - commanded.yaw_right_rad();
+        let pitch_down_rad = desired.pitch_down_rad() - commanded.pitch_down_rad();
+        let yaw_right = AngleRadians::try_new(yaw_right_rad).map_err(|_| {
+            HeadGazeResidualError::NonFiniteCoordinate {
+                coordinate: HeadGazeCoordinate::YawRight,
+                value_rad: yaw_right_rad,
+            }
+        })?;
+        let pitch_down = AngleRadians::try_new(pitch_down_rad).map_err(|_| {
+            HeadGazeResidualError::NonFiniteCoordinate {
+                coordinate: HeadGazeCoordinate::PitchDown,
+                value_rad: pitch_down_rad,
+            }
+        })?;
+        Ok(Self {
+            yaw_right,
+            pitch_down,
+        })
+    }
+
+    pub const fn yaw_right_rad(self) -> f64 {
+        self.yaw_right.get()
+    }
+
+    pub const fn pitch_down_rad(self) -> f64 {
+        self.pitch_down.get()
+    }
+
+    /// Map the residual to logical KEP2 eye coordinates.
+    ///
+    /// Positive yaw is protocol-right. Positive pitch-down is protocol-down,
+    /// hence the sign inversion for KEP2's positive-up `gaze_y`. Saturation is
+    /// explicit at the renderer domain boundary. Truncation toward zero
+    /// deliberately retains the field engine's symmetric integer conversion
+    /// for behavior-trace compatibility.
+    pub fn tracking_eye_gaze(self) -> TrackingEyeGaze {
+        TrackingEyeGaze::new(
+            eye_axis_from_radians(self.yaw_right.get()),
+            eye_axis_from_radians(-self.pitch_down.get()),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HeadGazeResidualError {
+    NonFiniteCoordinate {
+        coordinate: HeadGazeCoordinate,
+        value_rad: f64,
+    },
+}
+
+impl fmt::Display for HeadGazeResidualError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "cannot form head-gaze residual: {self:?}")
+    }
+}
+
+impl core::error::Error for HeadGazeResidualError {}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CommandedHeadGazeEstimateError {
+    PositionOutsideHardEnvelope {
+        joint: HeadJoint,
+        position: PositionTicks,
+        minimum: PositionTicks,
+        maximum: PositionTicks,
+    },
+    NonFiniteCoordinate {
+        coordinate: HeadGazeCoordinate,
+        value_rad: f64,
+    },
+}
+
+impl fmt::Display for CommandedHeadGazeEstimateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "cannot estimate commanded head gaze: {self:?}")
+    }
+}
+
+impl core::error::Error for CommandedHeadGazeEstimateError {}
+
 /// Which identifier failed to parse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HeadGazeIdentifierField {
@@ -706,6 +833,84 @@ impl HeadGazeMappingDeclaration {
         self.tick_offsets_per_radian.coefficient(coordinate, joint)
     }
 
+    /// Reconstruct the best-fit optical-axis gaze for one exact verified
+    /// target using the pseudoinverse of the declared sparse mapping.
+    ///
+    /// Bow and curl jointly encode pitch, so their contribution is solved as
+    /// a numerically scaled least-squares projection. This remains well
+    /// defined when a character overlay adds a component outside the pure
+    /// gaze column. Roll is validated against its hard envelope but lies in
+    /// the declared gaze mapping's null space.
+    pub fn estimate_commanded_gaze(
+        &self,
+        positions: [PositionTicks; 4],
+    ) -> Result<CommandedHeadGaze, CommandedHeadGazeEstimateError> {
+        for joint in HeadJoint::ALL {
+            let position = positions[joint_index(joint)];
+            let envelope = self.hard_envelope(joint);
+            if !envelope.contains(position) {
+                return Err(
+                    CommandedHeadGazeEstimateError::PositionOutsideHardEnvelope {
+                        joint,
+                        position,
+                        minimum: envelope.minimum(),
+                        maximum: envelope.maximum(),
+                    },
+                );
+            }
+        }
+
+        let bow_delta = signed_tick_delta(
+            positions[joint_index(HeadJoint::Bow)],
+            self.natural.position(HeadJoint::Bow),
+        );
+        let curl_delta = signed_tick_delta(
+            positions[joint_index(HeadJoint::Curl)],
+            self.natural.position(HeadJoint::Curl),
+        );
+        let bow_coefficient =
+            self.tick_offset_per_radian(HeadGazeCoordinate::PitchDown, HeadJoint::Bow);
+        let curl_coefficient =
+            self.tick_offset_per_radian(HeadGazeCoordinate::PitchDown, HeadJoint::Curl);
+        let pitch_down_rad =
+            stable_two_row_pseudoinverse(bow_coefficient, bow_delta, curl_coefficient, curl_delta);
+
+        let yaw_delta = signed_tick_delta(
+            positions[joint_index(HeadJoint::Yaw)],
+            self.natural.position(HeadJoint::Yaw),
+        );
+        let yaw_coefficient =
+            self.tick_offset_per_radian(HeadGazeCoordinate::YawRight, HeadJoint::Yaw);
+        let yaw_right_rad = yaw_delta / yaw_coefficient;
+
+        let yaw_right = AngleRadians::try_new(yaw_right_rad).map_err(|_| {
+            CommandedHeadGazeEstimateError::NonFiniteCoordinate {
+                coordinate: HeadGazeCoordinate::YawRight,
+                value_rad: yaw_right_rad,
+            }
+        })?;
+        let pitch_down = AngleRadians::try_new(pitch_down_rad).map_err(|_| {
+            CommandedHeadGazeEstimateError::NonFiniteCoordinate {
+                coordinate: HeadGazeCoordinate::PitchDown,
+                value_rad: pitch_down_rad,
+            }
+        })?;
+        Ok(CommandedHeadGaze {
+            yaw_right,
+            pitch_down,
+        })
+    }
+
+    /// Project one camera ray through this exact assembly declaration while
+    /// retaining the typed neutral-head gaze used by downstream coordination.
+    pub fn gaze_for_camera_ray(
+        &self,
+        ray: OakCameraTargetRay,
+    ) -> Result<HeadRelativeGaze, RayHeadGazeProjectionError> {
+        self.camera_to_head
+            .project_ray_at_forward_depth(ray, self.focus_plane)
+    }
+
     /// Produce one non-command proposal from projected gaze without clamping.
     pub fn proposal_for_gaze(
         &self,
@@ -743,12 +948,37 @@ impl HeadGazeMappingDeclaration {
         ray: OakCameraTargetRay,
     ) -> Result<HeadGazeTargetProposal, CameraRayHeadProposalError> {
         let gaze = self
-            .camera_to_head
-            .project_ray_at_forward_depth(ray, self.focus_plane)
+            .gaze_for_camera_ray(ray)
             .map_err(CameraRayHeadProposalError::Projection)?;
         self.proposal_for_gaze(gaze)
             .map_err(CameraRayHeadProposalError::Mapping)
     }
+}
+
+fn signed_tick_delta(position: PositionTicks, natural: PositionTicks) -> f64 {
+    f64::from(position.get()) - f64::from(natural.get())
+}
+
+fn stable_two_row_pseudoinverse(
+    first_coefficient: f64,
+    first_delta: f64,
+    second_coefficient: f64,
+    second_delta: f64,
+) -> f64 {
+    let scale = first_coefficient.abs().max(second_coefficient.abs());
+    debug_assert!(scale.is_finite() && scale > 0.0);
+    let first = first_coefficient / scale;
+    let second = second_coefficient / scale;
+    let numerator = fma(first, first_delta, second * second_delta);
+    let squared_norm = fma(first, first, second * second);
+    (numerator / squared_norm) / scale
+}
+
+fn eye_axis_from_radians(angle_rad: f64) -> SignedUnit {
+    let limit = f64::from(NORMALIZED_SCALE);
+    let scaled = (angle_rad * KIKO_EYE_GAZE_UNITS_PER_RADIAN).clamp(-limit, limit);
+    let value = trunc(scaled) as i16;
+    SignedUnit::try_new(value).expect("explicit KEP2 saturation produces a signed unit")
 }
 
 const fn joint_index(joint: HeadJoint) -> usize {
@@ -1390,6 +1620,69 @@ mod tests {
             down.position(HeadJoint::Yaw),
             natural.position(HeadJoint::Yaw)
         );
+    }
+
+    #[test]
+    fn verified_target_inverse_recovers_the_declared_gaze_without_using_roll() {
+        let calibration = HeadGazeMappingDeclaration::parse(valid_input()).unwrap();
+        let desired = gaze(0.2, 0.2);
+        let proposal = calibration.proposal_for_gaze(desired).unwrap();
+        let commanded = calibration
+            .estimate_commanded_gaze(proposal.positions())
+            .unwrap();
+        assert!((commanded.yaw_right_rad() - 0.2).abs() < f64::EPSILON);
+        assert!((commanded.pitch_down_rad() - 0.2).abs() < f64::EPSILON);
+
+        let mut with_roll = proposal.positions();
+        with_roll[joint_index(HeadJoint::Roll)] =
+            calibration.hard_envelope(HeadJoint::Roll).maximum();
+        assert_eq!(
+            calibration.estimate_commanded_gaze(with_roll).unwrap(),
+            commanded
+        );
+    }
+
+    #[test]
+    fn inverse_uses_a_stable_least_squares_projection_for_character_offsets() {
+        let calibration = HeadGazeMappingDeclaration::parse(valid_input()).unwrap();
+        let natural = calibration.natural_declaration().positions();
+        let mut displaced = natural;
+        displaced[joint_index(HeadJoint::Bow)] = PositionTicks::try_new(2_184).unwrap();
+        let commanded = calibration.estimate_commanded_gaze(displaced).unwrap();
+        // (-100 * 10 + 200 * 0) / ((-100)^2 + 200^2)
+        assert!((commanded.pitch_down_rad() - -0.02).abs() < f64::EPSILON);
+        assert_eq!(commanded.yaw_right_rad(), 0.0);
+
+        displaced[joint_index(HeadJoint::Yaw)] = PositionTicks::try_new(1_898).unwrap();
+        assert!(matches!(
+            calibration.estimate_commanded_gaze(displaced),
+            Err(
+                CommandedHeadGazeEstimateError::PositionOutsideHardEnvelope {
+                    joint: HeadJoint::Yaw,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn residual_eye_mapping_retains_logical_axes_and_field_saturation() {
+        let calibration = HeadGazeMappingDeclaration::parse(valid_input()).unwrap();
+        let natural = calibration
+            .estimate_commanded_gaze(calibration.natural_declaration().positions())
+            .unwrap();
+        let residual = HeadGazeResidual::try_between(gaze(0.2, 0.1), natural).unwrap();
+        assert!((residual.yaw_right_rad() - 0.2).abs() < f64::EPSILON);
+        assert!((residual.pitch_down_rad() - 0.1).abs() < f64::EPSILON);
+        let eyes = residual.tracking_eye_gaze();
+        assert_eq!(eyes.x_right().get(), 419);
+        assert_eq!(eyes.y_up().get(), -209);
+
+        let saturated = HeadGazeResidual::try_between(gaze(0.8, -0.8), natural)
+            .unwrap()
+            .tracking_eye_gaze();
+        assert_eq!(saturated.x_right().get(), 1_000);
+        assert_eq!(saturated.y_up().get(), 1_000);
     }
 
     #[test]

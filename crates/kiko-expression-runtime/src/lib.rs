@@ -36,7 +36,8 @@ pub use autonomic::{
     CharacterFaceAttentionState, CharacterHeadAmount, CharacterHeadAmountError, CharacterHeadAxis,
     CharacterHeadOverlay, CharacterHeadOverlayParseError, CharacterInputs, CharacterMode,
     CharacterPetEpisode, CharacterPetEpisodeError, CharacterPetReaction, CharacterPetState,
-    CharacterThermalState, PreparedCharacterFrame,
+    CharacterThermalState, PreparedCharacterFrame, TrackingEyeGaze,
+    TrackingEyeGazeReplacementError,
 };
 pub use face_tracking::{
     AcquiringFaceTarget, CloserFaceWidthRatio, CoastingFaceTarget, ConsecutiveFaceResults,
@@ -59,14 +60,15 @@ pub use gaze_geometry::{
 };
 pub use head_gaze_calibration::{
     CameraRayHeadProposalError, CharacterHeadMappingDeclaration,
-    CharacterHeadMappingDeclarationParseError, CharacterHeadOverlayMappingError,
-    DECLARED_HEAD_ORIGIN_IN_OAK_CAMERA_M, DECLARED_NEUTRAL_HEAD_FROM_OAK_ROTATION_ROWS,
-    HEAD_GAZE_FOCUS_PLANE_CAMERA_FORWARD_DEPTH_M, HeadAssemblyId, HeadCalibrationProvenanceId,
-    HeadGazeCoordinate, HeadGazeIdentifierError, HeadGazeIdentifierField,
-    HeadGazeMappingDeclaration, HeadGazeMappingDeclarationInput,
-    HeadGazeMappingDeclarationParseError, HeadGazeProposalMappingError, HeadGazeTargetProposal,
-    HeadGazeTickOffsetsPerRadianInput, HeadNaturalPoseDeclaration, HeadTickEnvelope,
-    HeadTickEnvelopeBound, HeadTickEnvelopeInput, MAX_HEAD_GAZE_IDENTIFIER_BYTES,
+    CharacterHeadMappingDeclarationParseError, CharacterHeadOverlayMappingError, CommandedHeadGaze,
+    CommandedHeadGazeEstimateError, DECLARED_HEAD_ORIGIN_IN_OAK_CAMERA_M,
+    DECLARED_NEUTRAL_HEAD_FROM_OAK_ROTATION_ROWS, HEAD_GAZE_FOCUS_PLANE_CAMERA_FORWARD_DEPTH_M,
+    HeadAssemblyId, HeadCalibrationProvenanceId, HeadGazeCoordinate, HeadGazeIdentifierError,
+    HeadGazeIdentifierField, HeadGazeMappingDeclaration, HeadGazeMappingDeclarationInput,
+    HeadGazeMappingDeclarationParseError, HeadGazeProposalMappingError, HeadGazeResidual,
+    HeadGazeResidualError, HeadGazeTargetProposal, HeadGazeTickOffsetsPerRadianInput,
+    HeadNaturalPoseDeclaration, HeadTickEnvelope, HeadTickEnvelopeBound, HeadTickEnvelopeInput,
+    KIKO_EYE_GAZE_UNITS_PER_RADIAN, MAX_HEAD_GAZE_IDENTIFIER_BYTES,
     NamedCharacterHeadFullScaleTickOffsetsInput, NamedHeadTickEnvelopesInput,
     NamedHeadTickOffsetsPerRadianInput, NamedNaturalHeadTicksInput,
 };

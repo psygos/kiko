@@ -53,10 +53,14 @@ use kiko_expression_core::{Deadline, NonZeroDuration};
 use kiko_expression_core::{MonotonicTimestamp, StreamEpochId};
 use kiko_expression_runtime::{
     CharacterBaseMotionState, CharacterHeadOverlay, CharacterPetEpisode, CharacterPetState,
-    CharacterThermalState, PreparedCharacterFrame, PreparedEyeIntent,
+    CharacterThermalState, PreparedCharacterFrame, PreparedEyeIntent, TrackingEyeGaze,
+    TrackingEyeGazeReplacementError,
 };
 #[cfg(feature = "nano-agent")]
-use kiko_expression_runtime::{CharacterPetEpisodeError, FaceTrackingConfig, MAX_FACE_DETECTIONS};
+use kiko_expression_runtime::{
+    CharacterPetEpisodeError, CommandedHeadGazeEstimateError, FaceTrackingConfig, HeadGazeResidual,
+    HeadGazeResidualError, HeadRelativeGaze, MAX_FACE_DETECTIONS,
+};
 use kiko_eye_runtime::{
     ActorExit as EyeActorExit, ActorTermination as EyeActorTermination, ClockError, EyeActorHandle,
     EyeActorStartError, EyeActorTask, EyeRuntimeConfig, EyeRuntimeFault,
@@ -65,6 +69,8 @@ use kiko_eye_runtime::{
     StartupEvidence as EyeStartupEvidence, StartupReceiptError as EyeStartupReceiptError,
     StaticEyeRuntimeConfig,
 };
+#[cfg(feature = "nano-agent")]
+use kiko_head_protocol::ExactHeadTargetPose;
 #[cfg(feature = "nano-agent")]
 use kiko_head_runtime::compliant_hold::{CompliantHoldDisposition, CompliantPetEpisodeSummary};
 #[cfg(feature = "nano-agent")]
@@ -106,8 +112,8 @@ use super::nano_face_perception::{
 use super::{
     EvidenceBoundPhysicalHeadGazePolicy, EvidenceBoundPhysicalHeadGazePolicyError,
     HeadGazeFaceProposalAdapter, HeadGazeFaceProposalAdapterError, HeadGazeFaceProposalError,
-    HeadGazeFaceProposalOutcome, HeadGazePolicyLifecycleClaim, HeadGazePolicyV1,
-    PhysicalCharacterHeadOutcome, RgbFacePinholeProjection,
+    HeadGazeFaceProposalOutcome, HeadGazeFaceProposalWithheld, HeadGazePolicyLifecycleClaim,
+    HeadGazePolicyV1, PhysicalCharacterHeadOutcome, RgbFacePinholeProjection,
 };
 use super::{
     ManifestBoundNanoAgentPolicyConfigV3, NanoRgbExpressionConfig, RgbExpressionBridge,
@@ -1955,6 +1961,9 @@ pub enum NanoPhysicalHeadGazeRuntimeError {
     PetRecoveryProgressOutOfRange {
         progress_millionths: u32,
     },
+    CommandedGaze(CommandedHeadGazeEstimateError),
+    GazeResidual(HeadGazeResidualError),
+    CommandedTargetUnavailable,
 }
 
 #[cfg(feature = "nano-agent")]
@@ -1977,11 +1986,14 @@ impl std::error::Error for NanoPhysicalHeadGazeRuntimeError {
             Self::ServiceCommand(source) => Some(source),
             Self::Service(source) => Some(source.as_ref()),
             Self::PetEpisode(source) => Some(source),
+            Self::CommandedGaze(source) => Some(source),
+            Self::GazeResidual(source) => Some(source),
             Self::ProjectionGridMismatch { .. }
             | Self::ProposalSequenceExhausted { .. }
             | Self::PetEpisodeTimestampOutOfRange { .. }
             | Self::PetContactCandidateHasZeroSamples
-            | Self::PetRecoveryProgressOutOfRange { .. } => None,
+            | Self::PetRecoveryProgressOutOfRange { .. }
+            | Self::CommandedTargetUnavailable => None,
         }
     }
 }
@@ -2005,6 +2017,7 @@ pub enum NanoAccessoryTerminalFault {
     EyeApply(EyeHandleRequestError),
     #[cfg(feature = "nano-agent")]
     PetEvidence(NanoPetEvidenceJournalRuntimeError),
+    CharacterCoordination(TrackingEyeGazeReplacementError),
     RgbIngressDisconnected,
     RgbChannelPoisoned,
     ReadinessObserverDropped,
@@ -2028,6 +2041,7 @@ impl std::error::Error for NanoAccessoryTerminalFault {
             Self::EyeApply(source) => Some(source),
             #[cfg(feature = "nano-agent")]
             Self::PetEvidence(source) => Some(source),
+            Self::CharacterCoordination(source) => Some(source),
             Self::HeadHealthStatusPoisoned
             | Self::RgbHealthStatusPoisoned
             | Self::RgbIngressDisconnected
@@ -3854,10 +3868,11 @@ impl AccessoryPetControllerEvidence {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AccessoryPetFeedback {
+struct AccessoryHeadFeedback {
     state: Option<CharacterPetState>,
     thermal_state: Option<CharacterThermalState>,
     completed_episode: Option<AccessoryPetEpisode>,
+    tracking_eye_gaze: Option<TrackingEyeGaze>,
 }
 
 #[cfg(feature = "nano-agent")]
@@ -3942,9 +3957,9 @@ fn adapt_pet_state(
 #[cfg(feature = "nano-agent")]
 fn adapt_pet_feedback(
     evidence: &kiko_head_runtime::VerifiedHeadCompliantHoldStep,
-) -> Result<AccessoryPetFeedback, NanoPhysicalHeadGazeRuntimeError> {
+) -> Result<AccessoryHeadFeedback, NanoPhysicalHeadGazeRuntimeError> {
     let controller = evidence.controller();
-    Ok(AccessoryPetFeedback {
+    Ok(AccessoryHeadFeedback {
         state: Some(adapt_pet_state(controller.disposition())?),
         thermal_state: evidence
             .thermal_derate()
@@ -3953,6 +3968,7 @@ fn adapt_pet_feedback(
             .completed_episode()
             .map(adapt_pet_episode)
             .transpose()?,
+        tracking_eye_gaze: None,
     })
 }
 
@@ -3982,7 +3998,7 @@ trait ReviewedNaturalHeadPort<F> {
         &mut self,
         _frame: &F,
         _character_head: CharacterHeadOverlay,
-    ) -> Result<Option<AccessoryPetFeedback>, Self::GazeError> {
+    ) -> Result<Option<AccessoryHeadFeedback>, Self::GazeError> {
         Ok(None)
     }
     fn character_base_motion_state(&self) -> CharacterBaseMotionState {
@@ -4021,6 +4037,10 @@ trait AccessoryCharacterIntent: Copy {
     type EyeIntent;
 
     fn head_overlay(self) -> CharacterHeadOverlay;
+    fn replace_tracking_gaze(
+        self,
+        gaze: TrackingEyeGaze,
+    ) -> Result<Self, TrackingEyeGazeReplacementError>;
     fn into_eye(self) -> Self::EyeIntent;
 }
 
@@ -4029,6 +4049,13 @@ impl AccessoryCharacterIntent for PreparedCharacterFrame {
 
     fn head_overlay(self) -> CharacterHeadOverlay {
         self.head()
+    }
+
+    fn replace_tracking_gaze(
+        self,
+        gaze: TrackingEyeGaze,
+    ) -> Result<Self, TrackingEyeGazeReplacementError> {
+        PreparedCharacterFrame::replace_tracking_gaze(self, gaze)
     }
 
     fn into_eye(self) -> Self::EyeIntent {
@@ -4044,6 +4071,14 @@ impl AccessoryCharacterIntent for u64 {
         CharacterHeadOverlay::NATURAL
     }
 
+    fn replace_tracking_gaze(
+        self,
+        gaze: TrackingEyeGaze,
+    ) -> Result<Self, TrackingEyeGazeReplacementError> {
+        let encoded = i32::from(gaze.x_right().get()) + 1_000;
+        Ok(u64::try_from(encoded).expect("test tracking gaze encodes into 0..=2000"))
+    }
+
     fn into_eye(self) -> Self::EyeIntent {
         self
     }
@@ -4057,6 +4092,7 @@ enum CoreTerminalFault<H, G, B, E> {
     RgbHealthStatusPoisoned,
     Bridge(B),
     EyeApply(E),
+    CharacterCoordination(TrackingEyeGazeReplacementError),
     #[cfg(feature = "nano-agent")]
     PetEvidence(NanoPetEvidenceJournalRuntimeError),
     IngressDisconnected,
@@ -4202,45 +4238,56 @@ where
                                 .await
                             {
                                 Err(source) => Some(CoreTerminalFault::HeadGaze(source)),
-                                Ok(pet_feedback) => {
+                                Ok(head_feedback) => {
                                     let mut completed_episode = None;
-                                    if let Some(pet_feedback) = pet_feedback {
-                                        if let Some(state) = pet_feedback.state {
+                                    let mut tracking_eye_gaze = None;
+                                    if let Some(head_feedback) = head_feedback {
+                                        if let Some(state) = head_feedback.state {
                                             bridge.note_pet_state(state);
                                         }
-                                        if let Some(state) = pet_feedback.thermal_state {
+                                        if let Some(state) = head_feedback.thermal_state {
                                             bridge.note_thermal_state(state);
                                         }
-                                        completed_episode = pet_feedback.completed_episode;
+                                        completed_episode = head_feedback.completed_episode;
+                                        tracking_eye_gaze = head_feedback.tracking_eye_gaze;
                                     }
-                                    #[cfg(feature = "nano-agent")]
-                                    let pet_evidence_fault = completed_episode
-                                        .and_then(|episode| {
-                                            pet_evidence_journal.as_deref_mut().map(|journal| {
-                                                episode.controller_evidence.try_append(journal)
-                                            })
-                                        })
-                                        .and_then(Result::err)
-                                        .map(CoreTerminalFault::PetEvidence);
-                                    #[cfg(not(feature = "nano-agent"))]
-                                    let pet_evidence_fault = None;
-                                    if let Some(fault) = pet_evidence_fault {
-                                        Some(fault)
-                                    } else {
-                                        if let Some(pet_episode) = completed_episode {
-                                            bridge.note_pet_episode(pet_episode);
-                                        }
-                                        match eye.apply(intent.into_eye()).await {
-                                    Ok(()) => match channel.counters.record_processed_successfully() {
-                                        Ok(()) => None,
-                                        Err(
-                                            NanoAccessoryHealthStatusError::Poisoned
-                                            | NanoAccessoryHealthStatusError::OwnerNotRunning { .. }
-                                            | NanoAccessoryHealthStatusError::IngressDisconnected
-                                            | NanoAccessoryHealthStatusError::ChannelPoisoned,
-                                        ) => Some(CoreTerminalFault::RgbHealthStatusPoisoned),
-                                    },
-                                    Err(source) => Some(CoreTerminalFault::EyeApply(source)),
+                                    let intent = match tracking_eye_gaze {
+                                        Some(gaze) => intent.replace_tracking_gaze(gaze),
+                                        None => Ok(intent),
+                                    };
+                                    match intent {
+                                        Err(source) => Some(CoreTerminalFault::CharacterCoordination(source)),
+                                        Ok(intent) => {
+                                            #[cfg(feature = "nano-agent")]
+                                            let pet_evidence_fault = completed_episode
+                                                .and_then(|episode| {
+                                                    pet_evidence_journal.as_deref_mut().map(|journal| {
+                                                        episode.controller_evidence.try_append(journal)
+                                                    })
+                                                })
+                                                .and_then(Result::err)
+                                                .map(CoreTerminalFault::PetEvidence);
+                                            #[cfg(not(feature = "nano-agent"))]
+                                            let pet_evidence_fault = None;
+                                            if let Some(fault) = pet_evidence_fault {
+                                                Some(fault)
+                                            } else {
+                                                if let Some(pet_episode) = completed_episode {
+                                                    bridge.note_pet_episode(pet_episode);
+                                                }
+                                                match eye.apply(intent.into_eye()).await {
+                                                    Ok(()) => match channel.counters.record_processed_successfully() {
+                                                        Ok(()) => None,
+                                                        Err(
+                                                            NanoAccessoryHealthStatusError::Poisoned
+                                                            | NanoAccessoryHealthStatusError::OwnerNotRunning { .. }
+                                                            | NanoAccessoryHealthStatusError::IngressDisconnected
+                                                            | NanoAccessoryHealthStatusError::ChannelPoisoned,
+                                                        ) => Some(CoreTerminalFault::RgbHealthStatusPoisoned),
+                                                    },
+                                                    Err(source) => Some(CoreTerminalFault::EyeApply(source)),
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -4413,6 +4460,10 @@ struct ActiveHeadActor {
     head_return: VerifiedHeadReturnEvidence,
     #[cfg(feature = "nano-agent")]
     physical_gaze: Option<NanoPhysicalHeadGazeConfig>,
+    #[cfg(feature = "nano-agent")]
+    committed_target: Option<ExactHeadTargetPose>,
+    #[cfg(feature = "nano-agent")]
+    last_face_gaze: Option<HeadRelativeGaze>,
 }
 
 struct SerialReviewedNaturalHeadPort {
@@ -4496,13 +4547,13 @@ impl SerialReviewedNaturalHeadPort {
 
     #[cfg(feature = "nano-agent")]
     async fn process_physical_gaze_frame(
-        &self,
+        &mut self,
         frame: &NanoFaceTrackedRgbFrame,
         character_head: CharacterHeadOverlay,
-    ) -> Result<Option<AccessoryPetFeedback>, NanoPhysicalHeadGazeRuntimeError> {
+    ) -> Result<Option<AccessoryHeadFeedback>, NanoPhysicalHeadGazeRuntimeError> {
         let active = self
             .active
-            .as_ref()
+            .as_mut()
             .expect("gaze frames are processed only after head readiness");
         let Some(physical) = active.physical_gaze.as_ref() else {
             return Ok(None);
@@ -4532,6 +4583,22 @@ impl SerialReviewedNaturalHeadPort {
                 character_head,
             )
             .map_err(NanoPhysicalHeadGazeRuntimeError::Proposal)?;
+        let (current_face_gaze, face_withheld) = match outcome {
+            PhysicalCharacterHeadOutcome::Proposed(proposal) => (
+                proposal.face().map(|face| face.gaze()),
+                proposal.face_withheld(),
+            ),
+            PhysicalCharacterHeadOutcome::Withheld { face, .. } => (None, Some(face)),
+        };
+        let desired_gaze = if let Some(gaze) = current_face_gaze {
+            active.last_face_gaze = Some(gaze);
+            Some(gaze)
+        } else if matches!(face_withheld, Some(HeadGazeFaceProposalWithheld::Coasting)) {
+            active.last_face_gaze
+        } else {
+            active.last_face_gaze = None;
+            None
+        };
         let handle = active
             .handle
             .gaze()
@@ -4563,18 +4630,45 @@ impl SerialReviewedNaturalHeadPort {
             .await
             .map_err(NanoPhysicalHeadGazeRuntimeError::ServiceCommand)?
             .map_err(|source| NanoPhysicalHeadGazeRuntimeError::Service(Box::new(source)))?;
+        let mut feedback = AccessoryHeadFeedback {
+            state: None,
+            thermal_state: None,
+            completed_episode: None,
+            tracking_eye_gaze: None,
+        };
         match outcome {
-            HeadGazeServiceOutcome::Compliant(evidence) => adapt_pet_feedback(&evidence).map(Some),
+            HeadGazeServiceOutcome::Compliant(evidence) => {
+                active.committed_target = Some(evidence.controller().committed_target());
+                feedback = adapt_pet_feedback(&evidence)?;
+            }
             HeadGazeServiceOutcome::Applied(evidence) => {
-                Ok(evidence.thermal_derate().map(|step| AccessoryPetFeedback {
-                    state: None,
-                    thermal_state: Some(adapt_thermal_state(step.state())),
-                    completed_episode: None,
-                }))
+                active.committed_target = Some(evidence.controller().committed_target());
+                feedback.thermal_state = evidence
+                    .thermal_derate()
+                    .map(|step| adapt_thermal_state(step.state()));
             }
             HeadGazeServiceOutcome::BeforeScheduledTick { .. }
-            | HeadGazeServiceOutcome::CompliantTemperatureDeferred(_) => Ok(None),
+            | HeadGazeServiceOutcome::CompliantTemperatureDeferred(_) => {}
         }
+        if let Some(desired_gaze) = desired_gaze {
+            let committed_target = active
+                .committed_target
+                .ok_or(NanoPhysicalHeadGazeRuntimeError::CommandedTargetUnavailable)?;
+            let commanded_gaze = physical
+                .policy
+                .estimate_commanded_gaze(committed_target)
+                .map_err(NanoPhysicalHeadGazeRuntimeError::CommandedGaze)?;
+            feedback.tracking_eye_gaze = Some(
+                HeadGazeResidual::try_between(desired_gaze, commanded_gaze)
+                    .map_err(NanoPhysicalHeadGazeRuntimeError::GazeResidual)?
+                    .tracking_eye_gaze(),
+            );
+        }
+        let has_feedback = feedback.state.is_some()
+            || feedback.thermal_state.is_some()
+            || feedback.completed_episode.is_some()
+            || feedback.tracking_eye_gaze.is_some();
+        Ok(has_feedback.then_some(feedback))
     }
 }
 
@@ -4620,6 +4714,10 @@ impl<F: NanoHeadGazeFrame> ReviewedNaturalHeadPort<F> for SerialReviewedNaturalH
         let physical_actuation = physical_gaze
             .as_ref()
             .map(|physical| physical.policy.actuation_config());
+        #[cfg(feature = "nano-agent")]
+        let initial_committed_target = physical_actuation
+            .as_ref()
+            .map(|actuation| actuation.controller().natural_pose());
         #[cfg(feature = "nano-agent")]
         let (serial, handle, receipt, task) = match physical_actuation {
             Some(actuation) => {
@@ -4724,6 +4822,10 @@ impl<F: NanoHeadGazeFrame> ReviewedNaturalHeadPort<F> for SerialReviewedNaturalH
             head_return: head_return.clone(),
             #[cfg(feature = "nano-agent")]
             physical_gaze,
+            #[cfg(feature = "nano-agent")]
+            committed_target: initial_committed_target,
+            #[cfg(feature = "nano-agent")]
+            last_face_gaze: None,
         });
         Ok(NanoHeadReadyEvidence {
             serial,
@@ -4748,7 +4850,7 @@ impl<F: NanoHeadGazeFrame> ReviewedNaturalHeadPort<F> for SerialReviewedNaturalH
         &mut self,
         frame: &F,
         character_head: CharacterHeadOverlay,
-    ) -> Result<Option<AccessoryPetFeedback>, Self::GazeError> {
+    ) -> Result<Option<AccessoryHeadFeedback>, Self::GazeError> {
         #[cfg(feature = "nano-agent")]
         {
             let Some(frame) = frame.tracked_face_frame() else {
@@ -5246,6 +5348,9 @@ fn map_production_core_fault(
             NanoAccessoryTerminalFault::FacePerception(source)
         }
         CoreTerminalFault::EyeApply(source) => NanoAccessoryTerminalFault::EyeApply(source),
+        CoreTerminalFault::CharacterCoordination(source) => {
+            NanoAccessoryTerminalFault::CharacterCoordination(source)
+        }
         #[cfg(feature = "nano-agent")]
         CoreTerminalFault::PetEvidence(source) => NanoAccessoryTerminalFault::PetEvidence(source),
         CoreTerminalFault::IngressDisconnected => {
@@ -6392,6 +6497,7 @@ mod tests {
         fail_gaze: bool,
         emit_pet_episode: bool,
         emit_thermal_derate: bool,
+        tracking_eye_gaze: Option<TrackingEyeGaze>,
         fail_health_at: Option<usize>,
     }
 
@@ -6431,12 +6537,19 @@ mod tests {
             &mut self,
             _frame: &F,
             _character_head: CharacterHeadOverlay,
-        ) -> Result<Option<AccessoryPetFeedback>, Self::GazeError> {
+        ) -> Result<Option<AccessoryHeadFeedback>, Self::GazeError> {
             if self.fail_gaze {
                 self.log.lock().unwrap().push("head_gaze");
                 Err("head_gaze")
+            } else if let Some(tracking_eye_gaze) = self.tracking_eye_gaze {
+                Ok(Some(AccessoryHeadFeedback {
+                    state: None,
+                    thermal_state: None,
+                    completed_episode: None,
+                    tracking_eye_gaze: Some(tracking_eye_gaze),
+                }))
             } else if self.emit_pet_episode {
-                Ok(Some(AccessoryPetFeedback {
+                Ok(Some(AccessoryHeadFeedback {
                     state: Some(CharacterPetState::Ready),
                     thermal_state: None,
                     completed_episode: Some(AccessoryPetEpisode {
@@ -6454,12 +6567,14 @@ mod tests {
                             fake_tap_evidence(),
                         ),
                     }),
+                    tracking_eye_gaze: None,
                 }))
             } else if self.emit_thermal_derate {
-                Ok(Some(AccessoryPetFeedback {
+                Ok(Some(AccessoryHeadFeedback {
                     state: None,
                     thermal_state: Some(CharacterThermalState::PitchDerated),
                     completed_episode: None,
+                    tracking_eye_gaze: None,
                 }))
             } else {
                 Ok(None)
@@ -6493,8 +6608,12 @@ mod tests {
             }
         }
 
-        async fn apply(&mut self, _intent: u64) -> Result<(), Self::ApplyError> {
-            self.log.lock().unwrap().push("eye_apply");
+        async fn apply(&mut self, intent: u64) -> Result<(), Self::ApplyError> {
+            self.log.lock().unwrap().push(if intent == 1_777 {
+                "eye_apply_coordinated"
+            } else {
+                "eye_apply"
+            });
             if self.fail_apply {
                 Err("eye_apply")
             } else {
@@ -6584,6 +6703,7 @@ mod tests {
                 fail_gaze: false,
                 emit_pet_episode: false,
                 emit_thermal_derate: false,
+                tracking_eye_gaze: None,
                 fail_health_at,
             },
             FakeEye {
@@ -6720,6 +6840,50 @@ mod tests {
         assert_eq!(failed_channel.counters.snapshot().processed_successfully, 0);
         failed_channel.request_shutdown();
         assert!(matches!(task.await.unwrap(), CoreExit::Shutdown { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verified_head_feedback_replaces_tracking_gaze_before_eye_application() {
+        let (mut head, eye, bridge, log, _) = fakes(false, false, false, false, None);
+        head.tracking_eye_gaze = Some(TrackingEyeGaze::new(
+            kiko_eye_protocol::SignedUnit::try_new(777).unwrap(),
+            kiko_eye_protocol::SignedUnit::try_new(-250).unwrap(),
+        ));
+        let channel = Arc::new(LatestFrameChannel::new());
+        let task_channel = Arc::clone(&channel);
+        let task = tokio::spawn(async move {
+            run_accessory_core(
+                head,
+                eye,
+                bridge,
+                task_channel,
+                health_period(50),
+                None,
+                CoreObservers {
+                    ready: |_, _| true,
+                    record_health: |_| true,
+                    publish_fault: |_| {},
+                    latch_fault: || {},
+                },
+            )
+            .await
+        });
+        assert_eq!(
+            channel.submit(7_u64),
+            NanoAccessoryFrameSubmitOutcome::Enqueued
+        );
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while channel.counters.snapshot().processed_successfully == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("coordinated eye acknowledgement within bounded test time");
+        channel.request_shutdown();
+        assert!(matches!(task.await.unwrap(), CoreExit::Shutdown { .. }));
+        let log = log.lock().unwrap();
+        assert!(log.contains(&"eye_apply_coordinated"));
+        assert!(!log.contains(&"eye_apply"));
     }
 
     #[tokio::test(flavor = "current_thread")]

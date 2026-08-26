@@ -240,6 +240,7 @@ impl CharacterHeadOverlay {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreparedCharacterFrame {
     eye: PreparedEyeIntent,
+    tracking_gaze: Option<TrackingEyeGaze>,
     head: CharacterHeadOverlay,
     mode: CharacterMode,
     act: Option<CharacterAct>,
@@ -249,6 +250,7 @@ impl PreparedCharacterFrame {
     pub const fn eyes_only(eye: PreparedEyeIntent) -> Self {
         Self {
             eye,
+            tracking_gaze: None,
             head: CharacterHeadOverlay::NATURAL,
             mode: CharacterMode::Idle,
             act: None,
@@ -257,12 +259,14 @@ impl PreparedCharacterFrame {
 
     const fn new(
         eye: PreparedEyeIntent,
+        tracking_gaze: Option<TrackingEyeGaze>,
         head: CharacterHeadOverlay,
         mode: CharacterMode,
         act: Option<CharacterAct>,
     ) -> Self {
         Self {
             eye,
+            tracking_gaze,
             head,
             mode,
             act,
@@ -271,6 +275,48 @@ impl PreparedCharacterFrame {
 
     pub const fn eye(self) -> PreparedEyeIntent {
         self.eye
+    }
+
+    /// Logical KEP2 gaze contributed by the associated face before character
+    /// decoration. `None` means this frame has no replaceable face-tracking
+    /// component; it is not inferred to mean centred eyes.
+    pub const fn tracking_gaze(self) -> Option<TrackingEyeGaze> {
+        self.tracking_gaze
+    }
+
+    /// Replace only the associated-face contribution after the physical head
+    /// owner has reported its same-frame committed target.
+    ///
+    /// Character saccades, act offsets, lids, pupil, brightness, expression,
+    /// blink, colour, and reaction freshness remain unchanged. Replacing a
+    /// frame with no associated face is an error rather than a silent no-op.
+    pub fn replace_tracking_gaze(
+        mut self,
+        replacement: TrackingEyeGaze,
+    ) -> Result<Self, TrackingEyeGazeReplacementError> {
+        let previous = self
+            .tracking_gaze
+            .ok_or(TrackingEyeGazeReplacementError::NoTrackingContribution)?;
+        let current = self.eye.intent();
+        let gaze_x = i32::from(current.gaze_x().get()) - i32::from(previous.x_right().get())
+            + i32::from(replacement.x_right().get());
+        let gaze_y = i32::from(current.gaze_y().get()) - i32::from(previous.y_up().get())
+            + i32::from(replacement.y_up().get());
+        let intent = EyeIntent::new(
+            SignedUnit::try_new(clamp_signed(gaze_x))
+                .expect("clamped gaze x is a valid signed unit"),
+            SignedUnit::try_new(clamp_signed(gaze_y))
+                .expect("clamped gaze y is a valid signed unit"),
+            current.lid(),
+            current.pupil(),
+            current.brightness(),
+            current.expression(),
+            current.flags(),
+            current.color_rgb(),
+        );
+        self.eye = self.eye.with_intent(intent);
+        self.tracking_gaze = Some(replacement);
+        Ok(self)
     }
 
     /// Compatibility projection for diagnostics that previously received an
@@ -291,6 +337,50 @@ impl PreparedCharacterFrame {
         self.act
     }
 }
+
+/// Logical face-tracking gaze in KEP2 normalized coordinates.
+///
+/// Positive `x_right` means protocol-right and positive `y_up` means
+/// protocol-up. Physical panel mounting polarity remains firmware-owned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackingEyeGaze {
+    x_right: SignedUnit,
+    y_up: SignedUnit,
+}
+
+impl TrackingEyeGaze {
+    pub const fn new(x_right: SignedUnit, y_up: SignedUnit) -> Self {
+        Self { x_right, y_up }
+    }
+
+    const fn from_intent(intent: EyeIntent) -> Self {
+        Self::new(intent.gaze_x(), intent.gaze_y())
+    }
+
+    pub const fn x_right(self) -> SignedUnit {
+        self.x_right
+    }
+
+    pub const fn y_up(self) -> SignedUnit {
+        self.y_up
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackingEyeGazeReplacementError {
+    NoTrackingContribution,
+}
+
+impl fmt::Display for TrackingEyeGazeReplacementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot replace character tracking gaze: {self:?}"
+        )
+    }
+}
+
+impl core::error::Error for TrackingEyeGazeReplacementError {}
 
 /// High-level autonomic state. This is eye-rendering state, not navigation or
 /// physical authority.
@@ -1162,6 +1252,10 @@ impl AutonomicCharacterEngine {
         inputs: CharacterInputs,
         prepared: PreparedEyeIntent,
     ) -> PreparedCharacterFrame {
+        let tracking_gaze = inputs
+            .attention()
+            .face()
+            .map(|_| TrackingEyeGaze::from_intent(prepared.intent()));
         let now_ns = now.nanos_since_epoch();
         self.initialize_if_needed(now_ns);
         self.decay_playfulness(now_ns);
@@ -1214,6 +1308,7 @@ impl AutonomicCharacterEngine {
         head.roll = head.roll * rest_envelope / SCALE;
         PreparedCharacterFrame::new(
             prepared.with_intent(fields.into_intent()),
+            tracking_gaze,
             CharacterHeadOverlay::from_clamped(head),
             self.mode,
             self.active_act(),
@@ -2727,6 +2822,61 @@ mod tests {
         assert_eq!(
             output.valid_until_exclusive(),
             input.valid_until_exclusive()
+        );
+    }
+
+    #[test]
+    fn physical_residual_replaces_only_the_face_tracking_component() {
+        let now = NS_PER_SECOND;
+        let base = prepared(now);
+        let base_intent = base.intent();
+        let tracking = TrackingEyeGaze::new(
+            SignedUnit::try_new(400).unwrap(),
+            SignedUnit::try_new(-300).unwrap(),
+        );
+        let base = base.with_intent(EyeIntent::new(
+            tracking.x_right(),
+            tracking.y_up(),
+            base_intent.lid(),
+            base_intent.pupil(),
+            base_intent.brightness(),
+            base_intent.expression(),
+            base_intent.flags(),
+            base_intent.color_rgb(),
+        ));
+        let mut engine = AutonomicCharacterEngine::new(37);
+        let rendered = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(now),
+            character_inputs(true, now),
+            base,
+        );
+        assert_eq!(rendered.tracking_gaze(), Some(tracking));
+        let before = rendered.eye().intent();
+        let replacement = TrackingEyeGaze::new(
+            SignedUnit::try_new(-125).unwrap(),
+            SignedUnit::try_new(80).unwrap(),
+        );
+        let replaced = rendered.replace_tracking_gaze(replacement).unwrap();
+        let after = replaced.eye().intent();
+        assert_eq!(
+            after.gaze_x().get(),
+            (i32::from(before.gaze_x().get()) - 400 - 125).clamp(-1_000, 1_000) as i16
+        );
+        assert_eq!(
+            after.gaze_y().get(),
+            (i32::from(before.gaze_y().get()) + 300 + 80).clamp(-1_000, 1_000) as i16
+        );
+        assert_eq!(after.lid(), before.lid());
+        assert_eq!(after.pupil(), before.pupil());
+        assert_eq!(after.brightness(), before.brightness());
+        assert_eq!(after.expression(), before.expression());
+        assert_eq!(after.flags(), before.flags());
+        assert_eq!(after.color_rgb(), before.color_rgb());
+        assert_eq!(replaced.tracking_gaze(), Some(replacement));
+
+        assert_eq!(
+            PreparedCharacterFrame::eyes_only(prepared(now)).replace_tracking_gaze(replacement),
+            Err(TrackingEyeGazeReplacementError::NoTrackingContribution)
         );
     }
 
