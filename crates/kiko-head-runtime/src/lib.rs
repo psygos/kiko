@@ -9,6 +9,7 @@ mod energized_temperature;
 mod framing;
 pub mod gaze_control;
 mod motion;
+mod organic_motion;
 mod probe;
 #[cfg(test)]
 mod servo_plant;
@@ -66,6 +67,11 @@ pub use config::{
 pub use energized_temperature::{EnergizedTemperatureChannelStatus, EnergizedTemperatureSample};
 pub use framing::{FrameReadError, MAX_RESPONSE_BYTES};
 pub use motion::HeadMotionError;
+pub use organic_motion::{
+    OrganicDerivedQuantity, OrganicHeadMotionBindingError, OrganicHeadMotionPolicy,
+    OrganicJointMotionPolicy, OrganicJointMotionPolicyError, OrganicJointMotionPolicyField,
+    OrganicJointMotionPolicyInput,
+};
 pub use probe::{
     HeadProbeError, HeadProbeReport, ProbeRequest, ProbeResponseEvidence, SerialHeadProbeError,
     ServoProbeReport, probe_serial_head,

@@ -29,6 +29,10 @@ use std::{
 
 use kiko_head_protocol::{ExactHeadTargetPose, HeadJoint, PositionStepLimit, PositionTicks};
 
+use crate::organic_motion::{
+    BoundOrganicHeadMotionPolicy, OrganicHeadMotionBindingError, OrganicHeadMotionPolicy,
+    OrganicHeadMotionState, OrganicMotionStepError,
+};
 use crate::transport::MonotonicTime;
 
 const JOINT_COUNT: usize = 4;
@@ -464,6 +468,7 @@ pub struct HeadGazeControlConfig {
     natural_pose: ExactHeadTargetPose,
     motion_limits: HeadMotionLimits,
     error_band: HeadGazeErrorBand,
+    organic_motion_policy: Option<OrganicHeadMotionPolicy>,
 }
 
 impl HeadGazeControlConfig {
@@ -490,7 +495,24 @@ impl HeadGazeControlConfig {
             natural_pose,
             motion_limits,
             error_band,
+            organic_motion_policy: None,
         })
+    }
+
+    /// Add one fully parsed organic target-shaping policy.
+    ///
+    /// Binding converts SI rates to the exact declared control period and
+    /// rejects any organic velocity or acceleration budget that could outrun
+    /// the existing discrete safety planner.
+    pub fn try_with_organic_motion(
+        mut self,
+        policy: OrganicHeadMotionPolicy,
+    ) -> Result<Self, HeadGazeControlConfigError> {
+        policy
+            .bind(self.timing.control_period(), self.motion_limits)
+            .map_err(HeadGazeControlConfigError::OrganicMotion)?;
+        self.organic_motion_policy = Some(policy);
+        Ok(self)
     }
 
     pub const fn timing(self) -> HeadGazeTiming {
@@ -508,6 +530,10 @@ impl HeadGazeControlConfig {
     pub const fn error_band(self) -> HeadGazeErrorBand {
         self.error_band
     }
+
+    pub const fn organic_motion_policy(self) -> Option<OrganicHeadMotionPolicy> {
+        self.organic_motion_policy
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -518,6 +544,7 @@ pub enum HeadGazeControlConfigError {
         minimum: PositionTicks,
         maximum: PositionTicks,
     },
+    OrganicMotion(OrganicHeadMotionBindingError),
 }
 
 impl fmt::Display for HeadGazeControlConfigError {
@@ -529,7 +556,14 @@ impl fmt::Display for HeadGazeControlConfigError {
     }
 }
 
-impl std::error::Error for HeadGazeControlConfigError {}
+impl std::error::Error for HeadGazeControlConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OrganicMotion(source) => Some(source),
+            Self::NaturalPoseOutOfRange { .. } => None,
+        }
+    }
+}
 
 /// Strictly positive identity for one perception proposal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -696,6 +730,9 @@ pub enum HeadGazeFaultReason {
         joint: HeadJoint,
     },
     MotionArithmeticOverflow {
+        joint: HeadJoint,
+    },
+    OrganicMotionArithmeticOverflow {
         joint: HeadJoint,
     },
 }
@@ -953,6 +990,8 @@ pub struct HeadGazeController {
     state: HeadGazeControlState,
     pose: ExactHeadTargetPose,
     velocity: HeadServoVelocity,
+    bound_organic_motion: Option<BoundOrganicHeadMotionPolicy>,
+    organic_motion: Option<OrganicHeadMotionState>,
     pending: Option<AdmittedHeadGazeProposal>,
     active: Option<AdmittedHeadGazeProposal>,
     last_admitted_id: Option<HeadGazeProposalId>,
@@ -996,6 +1035,11 @@ impl HeadGazeController {
         } else {
             HeadGazeControlState::ReturningNatural
         };
+        let bound_organic_motion = config.organic_motion_policy().map(|policy| {
+            policy
+                .bind(config.timing().control_period(), config.motion_limits())
+                .expect("parsed organic policy remains bound to its immutable control declaration")
+        });
         Ok(Self {
             instance_id,
             generation: HeadGazePlannerGeneration(0),
@@ -1003,6 +1047,9 @@ impl HeadGazeController {
             state,
             pose: initial_committed_target,
             velocity: HeadServoVelocity::ZERO,
+            bound_organic_motion,
+            organic_motion: bound_organic_motion
+                .map(|_| OrganicHeadMotionState::new(initial_committed_target)),
             pending: None,
             active: None,
             last_admitted_id: None,
@@ -1275,6 +1322,8 @@ impl HeadGazeController {
             state: self.state,
             pose: self.pose,
             velocity: self.velocity,
+            bound_organic_motion: self.bound_organic_motion,
+            organic_motion: self.organic_motion,
             pending: self.pending,
             active: self.active,
             last_admitted_id: self.last_admitted_id,
@@ -1334,6 +1383,18 @@ impl HeadGazeController {
         }
 
         let target = self.target_for_step();
+        let target = match (self.organic_motion.as_mut(), self.bound_organic_motion) {
+            (Some(organic), Some(policy)) => match organic.step(target, policy) {
+                Ok(target) => target,
+                Err(OrganicMotionStepError::ArithmeticOverflow { joint }) => {
+                    let reason = HeadGazeFaultReason::OrganicMotionArithmeticOverflow { joint };
+                    self.latch_fault(reason);
+                    return Err(HeadGazeTickError::FaultLatched(reason));
+                }
+            },
+            (None, None) => target,
+            _ => unreachable!("organic state and parsed control policy are constructed together"),
+        };
         let (next_pose, next_velocity) = match plan_pose(
             self.pose,
             self.velocity,
@@ -1481,7 +1542,12 @@ impl HeadGazeController {
     }
 
     fn is_natural_and_stopped(&self) -> bool {
-        self.pose == self.config.natural_pose() && self.velocity == HeadServoVelocity::ZERO
+        self.pose == self.config.natural_pose()
+            && self.velocity == HeadServoVelocity::ZERO
+            && self
+                .organic_motion
+                .as_ref()
+                .is_none_or(|organic| organic.is_settled_at(self.config.natural_pose()))
     }
 
     fn latch_fault(&mut self, reason: HeadGazeFaultReason) {
@@ -1661,6 +1727,7 @@ fn discrete_braking_distance(speed: u64, acceleration: u64) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{OrganicJointMotionPolicy, OrganicJointMotionPolicyInput};
 
     fn at(nanoseconds: u64) -> MonotonicTime {
         MonotonicTime::from_duration_since_origin(Duration::from_nanos(nanoseconds))
@@ -1717,6 +1784,37 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    fn organic_config() -> HeadGazeControlConfig {
+        let limit = motion_limit();
+        let config = HeadGazeControlConfig::try_new(
+            HeadGazeTiming::new(
+                HeadControlPeriod::try_new(Duration::from_millis(20)).unwrap(),
+                HeadTickLateness::new(Duration::from_millis(5)),
+                HeadProposalTtl::try_new(Duration::from_secs(1)).unwrap(),
+                HeadAcquisitionProposalCount::try_new(1).unwrap(),
+            ),
+            pose(1_000),
+            HeadMotionLimits::new(limit, limit, limit, limit),
+            HeadGazeErrorBand::try_new(
+                HeadDeadbandTicks::try_new(1).unwrap(),
+                HeadResumeThresholdTicks::try_new(3).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let axis = OrganicJointMotionPolicy::parse(OrganicJointMotionPolicyInput {
+            response_millihertz: 400,
+            damping_permille: 1_400,
+            maximum_velocity_ticks_per_second: 100,
+            maximum_acceleration_ticks_per_second_squared: 400,
+            maximum_jerk_ticks_per_second_cubed: 3_200,
+        })
+        .unwrap();
+        config
+            .try_with_organic_motion(OrganicHeadMotionPolicy::new(axis, axis, axis, axis))
+            .unwrap()
     }
 
     fn proposal(id: u64, observed_at: u64, yaw_ticks: u16) -> HeadGazeProposal {
@@ -1778,6 +1876,57 @@ mod tests {
         assert_eq!(prepared_again.token(), prepared.token());
         assert_eq!(prepared_again.planned_target(), prepared.planned_target());
         assert_eq!(controller.generation(), generation);
+    }
+
+    #[test]
+    fn organic_prefilter_is_transactional_and_cannot_turn_a_jump_into_a_step() {
+        let mut controller = natural_controller(organic_config(), at(0));
+        controller
+            .admit_proposal(proposal(1, 0, 1_100), at(0))
+            .unwrap();
+
+        let first = controller.prepare_tick(at(0)).unwrap();
+        let repeated = controller.prepare_tick(at(0)).unwrap();
+        assert_eq!(first.planned_target(), pose(1_000));
+        assert_eq!(repeated.planned_target(), first.planned_target());
+        assert_eq!(controller.committed_target(), pose(1_000));
+        controller.commit_prepared(first).unwrap();
+
+        let mut previous = controller.committed_target().position(HeadJoint::Yaw);
+        let mut moved = false;
+        for tick in 1..=40_u64 {
+            let now = tick * 20_000_000;
+            let receipt = controller.tick(at(now)).unwrap();
+            let current = receipt.committed_target().position(HeadJoint::Yaw);
+            assert!(current.get().abs_diff(previous.get()) <= 4);
+            moved |= current != previous;
+            previous = current;
+        }
+        assert!(moved, "the filtered target eventually becomes visible");
+        assert!(controller.committed_target().position(HeadJoint::Yaw).get() < 1_100);
+    }
+
+    #[test]
+    fn organic_prefilter_returns_to_exact_natural_after_proposal_expiry() {
+        let mut controller = natural_controller(organic_config(), at(0));
+        controller
+            .admit_proposal(proposal(1, 0, 1_100), at(0))
+            .unwrap();
+        for tick in 0..=4_000_u64 {
+            controller.tick(at(tick * 20_000_000)).unwrap();
+            if tick > 50 && controller.state() == HeadGazeControlState::NaturalHold {
+                break;
+            }
+        }
+        assert_eq!(controller.state(), HeadGazeControlState::NaturalHold);
+        assert_eq!(controller.committed_target(), pose(1_000));
+        assert_eq!(controller.velocity(), HeadServoVelocity::ZERO);
+        assert!(
+            controller
+                .organic_motion
+                .expect("configured organic state")
+                .is_settled_at(pose(1_000))
+        );
     }
 
     #[test]
