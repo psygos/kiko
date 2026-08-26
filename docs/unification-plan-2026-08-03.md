@@ -85,30 +85,47 @@ remaining work; a passing host test is never presented as physical evidence.
   remain a separate edge that selects the later social act. Intent: let Kiko
   visibly receive touch while it is happening and preserve the face facts
   required by later character policy without inventing range or servo facts.
+- `27df4f6`: Fable's fourth greeting style is retained as a distinct, longer,
+  blink-free warm-gold bow/curl gesture using the same minimum-jerk character
+  overlay as the other four-axis acts. The overlay remains semantic; reviewed
+  hardware mapping still owns servo signs and tick conversion. Intent: recover
+  the formal whole-neck greeting without smuggling mechanical assumptions into
+  the character engine.
+- `23173cc`: the sole accessory owner publishes a monotonic liveness sequence
+  only after complete four-joint health transactions. The OAK capture loop is
+  the only watchdog sender and kicks systemd only after observing that sequence
+  advance; a PID or detached timer cannot mask a stuck expression, eye,
+  gaze/compliance, or head-bus operation. The process boundary parses the exact
+  60-second systemd contract once, refuses a fault-latched owner, sends
+  `STOPPING=1` before coordinated teardown, and the byte-qualified unit applies
+  15-second failure backoff plus a five-in-ten-minute start limiter. Intent:
+  retire the shell guardian's reason to exist without ever starting a second
+  hardware owner alongside a retained first one.
 
-Host evidence at this checkpoint is 93/93 `kiko-expression-runtime` unit
+Host evidence at this checkpoint is 95/95 `kiko-expression-runtime` unit
 tests plus its compile-fail doctest, warning-free expression and Nano
 compile-only Clippy, 170 `kiko-head-runtime` library tests plus 11 binary
-tests, 1,366 `kiko-slam` Nano-commissioning library tests, and 82/82 Python
-behavior tests. Native OAK linking and physical feel are deliberately not
-claimed by those results.
+tests, 1,367 `kiko-slam` Nano-commissioning library tests, 80/80 Nano-agent
+binary tests, all 6 deployment-gate tests, and 82/82 Python behavior tests.
+The Linux-aarch64 standard-library abstract notify-socket API was compiled
+directly. A complete Linux-aarch64 dependency cross-check remains unclaimed
+because this Mac does not have `aarch64-linux-gnu-gcc`; native OAK linking,
+PID-1/systemd execution, restart behavior, and physical feel are also not
+claimed by these host results.
 
 ### Remaining before the single-owner handoff is complete
 
 1. Complete the now-typed character boundary with commanded-head feedback,
    metric proximity when depth has valid association evidence, thermal/body
    state, and base-motion facts. Then port dynamic bow/curl recruitment,
-   turn-dip weight shift, formal bow greeting, and the remaining interoceptive
-   acts. Image-plane face bearing, apparent-width proximity cue, and continuous
-   pet-state eye choreography are complete; apparent width is not relabeled as
-   metric range.
-2. Add accessory-loop heartbeat, `sd_notify` watchdog, bounded restart/backoff
-   policy, and failure-latched ownership admission. A watchdog must never
-   create a competing camera, eye, head, or STM32 owner.
-3. Add format-compatible behavior/pet NDJSON evidence and replay comparisons;
+   turn-dip weight shift, and the remaining interoceptive acts. Image-plane
+   face bearing, apparent-width proximity cue, continuous pet-state eye
+   choreography, and the formal bow greeting are complete; apparent width is
+   not relabeled as metric range.
+2. Add format-compatible behavior/pet NDJSON evidence and replay comparisons;
    retain the Python lane as a non-booted behavior lab until the Rust owner has
    attended physical parity evidence.
-4. Re-audit the current navigation graph, make live SLAM rate/backend/fallback
+3. Re-audit the current navigation graph, make live SLAM rate/backend/fallback
    observable, verify the manual/emergency-stop GUI and autonomous MPC share
    one authority path, and close every wheels-off gate before requesting wheel
    attachment. Only an attended wheels-on session can calibrate the
