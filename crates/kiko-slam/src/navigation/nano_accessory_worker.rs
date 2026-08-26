@@ -11,9 +11,12 @@
 //!
 //! A terminal accessory fault is a base-stop signal, not permission to alter
 //! the head. After publishing the first terminal fault, the worker stops
-//! accepting RGB work and retains the natural-hold actor while continuing
-//! bounded health checks. Only [`NanoAccessoryWorker::shutdown`] asks the eye
-//! actor to release control and the head actor to release serial ownership.
+//! accepting RGB work, latches every base-facing stop boundary, then attempts
+//! one bounded character-owned fault-eye transition. Its exact completion or
+//! secondary failure is retained without replacing the first fault. The
+//! worker retains the natural-hold actor while continuing bounded health
+//! checks. Only [`NanoAccessoryWorker::shutdown`] asks the eye actor to release
+//! control and the head actor to release serial ownership.
 //! Production head release performs no torque-switch write, preserving the
 //! last admitted hold without claiming the physical torque state. Dropping the
 //! worker is deliberately not an implicit physical shutdown.
@@ -2029,9 +2032,79 @@ pub enum NanoAccessoryTerminalFault {
     #[cfg(feature = "nano-agent")]
     PetEvidence(NanoPetEvidenceJournalRuntimeError),
     CharacterCoordination(TrackingEyeGazeReplacementError),
+    LifecyclePresentationFrameCountExhausted,
     RgbIngressDisconnected,
     RgbChannelPoisoned,
     ReadinessObserverDropped,
+}
+
+/// A failure encountered while presenting the character-owned fault reflex
+/// after the first accessory fault and all stop latches were already
+/// published.
+///
+/// This is deliberately not a [`NanoAccessoryTerminalFault`]: it is secondary
+/// shutdown evidence and must never replace the first fault that stopped the
+/// base.
+#[derive(Debug)]
+pub enum NanoFaultRecoveryPresentationFault {
+    MissingPresentationDuration,
+    FrameCountExhausted,
+    ExpressionBridge(RgbExpressionBridgeError),
+    #[cfg(feature = "nano-agent")]
+    FacePerception(NanoFacePerceptionRuntimeError),
+    EyeApply(EyeHandleRequestError),
+}
+
+impl fmt::Display for NanoFaultRecoveryPresentationFault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Nano fault-recovery presentation failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for NanoFaultRecoveryPresentationFault {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ExpressionBridge(source) => Some(source),
+            #[cfg(feature = "nano-agent")]
+            Self::FacePerception(source) => Some(source),
+            Self::EyeApply(source) => Some(source),
+            Self::MissingPresentationDuration | Self::FrameCountExhausted => None,
+        }
+    }
+}
+
+/// Exact terminal fault-reflex outcome retained with coordinated accessory
+/// shutdown evidence.
+#[derive(Debug)]
+pub enum NanoFaultRecoveryPresentationEvidence {
+    /// No terminal fault occurred after both accessory actors were admitted.
+    NotRequired,
+    /// At least one fresh eye frame was acknowledged after the stop latch and
+    /// the complete bounded transition reached its endpoint.
+    Presented { frames_applied: NonZeroU64 },
+    /// The primary stop remains authoritative. `frames_applied` records any
+    /// fresh frames acknowledged before this secondary failure.
+    Failed {
+        frames_applied: u64,
+        source: NanoFaultRecoveryPresentationFault,
+    },
+}
+
+impl NanoFaultRecoveryPresentationEvidence {
+    pub const fn frames_applied(&self) -> u64 {
+        match self {
+            Self::NotRequired => 0,
+            Self::Presented { frames_applied } => frames_applied.get(),
+            Self::Failed { frames_applied, .. } => *frames_applied,
+        }
+    }
+
+    pub const fn completed(&self) -> bool {
+        matches!(self, Self::Presented { .. })
+    }
 }
 
 impl fmt::Display for NanoAccessoryTerminalFault {
@@ -2055,6 +2128,7 @@ impl std::error::Error for NanoAccessoryTerminalFault {
             Self::CharacterCoordination(source) => Some(source),
             Self::HeadHealthStatusPoisoned
             | Self::RgbHealthStatusPoisoned
+            | Self::LifecyclePresentationFrameCountExhausted
             | Self::RgbIngressDisconnected
             | Self::RgbChannelPoisoned
             | Self::ReadinessObserverDropped => None,
@@ -2232,6 +2306,7 @@ impl NanoHeadShutdownEvidence {
 pub struct NanoAccessoryShutdownEvidence {
     eye: NanoEyeShutdownEvidence,
     head: NanoHeadShutdownEvidence,
+    fault_recovery_presentation: NanoFaultRecoveryPresentationEvidence,
     #[cfg(feature = "nano-agent")]
     pet_evidence: NanoPetEvidenceLifecycleShutdownEvidence,
     #[cfg(feature = "nano-agent")]
@@ -2245,6 +2320,10 @@ impl NanoAccessoryShutdownEvidence {
 
     pub const fn head(&self) -> &NanoHeadShutdownEvidence {
         &self.head
+    }
+
+    pub const fn fault_recovery_presentation(&self) -> &NanoFaultRecoveryPresentationEvidence {
+        &self.fault_recovery_presentation
     }
 
     #[cfg(feature = "nano-agent")]
@@ -2263,10 +2342,17 @@ impl NanoAccessoryShutdownEvidence {
     ) -> (
         NanoEyeShutdownEvidence,
         NanoHeadShutdownEvidence,
+        NanoFaultRecoveryPresentationEvidence,
         NanoPetEvidenceLifecycleShutdownEvidence,
         NanoFacePerceptionShutdownEvidence,
     ) {
-        (self.eye, self.head, self.pet_evidence, self.face_perception)
+        (
+            self.eye,
+            self.head,
+            self.fault_recovery_presentation,
+            self.pet_evidence,
+            self.face_perception,
+        )
     }
 }
 
@@ -4115,6 +4201,7 @@ enum CoreTerminalFault<H, G, B, E> {
     Bridge(B),
     EyeApply(E),
     CharacterCoordination(TrackingEyeGazeReplacementError),
+    LifecyclePresentationFrameCountExhausted,
     #[cfg(feature = "nano-agent")]
     PetEvidence(NanoPetEvidenceJournalRuntimeError),
     IngressDisconnected,
@@ -4130,6 +4217,7 @@ enum CoreExit<ES, HS, H, G, B, E, EyeShutdown, HeadShutdown> {
     },
     Shutdown {
         terminal_fault: Option<CoreTerminalFault<H, G, B, E>>,
+        fault_recovery_presentation: CoreFaultRecoveryPresentationEvidence<B, E>,
         eye_shutdown: EyeShutdown,
         head_shutdown: HeadShutdown,
     },
@@ -4142,16 +4230,26 @@ struct CoreObservers<Ready, RecordHealth, PublishFault, LatchFault> {
     latch_fault: LatchFault,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum LifecyclePresentationFault<B, E> {
-    Bridge(B),
-    EyeApply(E),
+    Bridge { frames_applied: u64, source: B },
+    EyeApply { frames_applied: u64, source: E },
+    FrameCountExhausted { frames_applied: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CoreFaultRecoveryPresentationEvidence<B, E> {
+    NotRequired,
+    Presented { frames_applied: NonZeroU64 },
+    MissingPresentationDuration,
+    Failed(LifecyclePresentationFault<B, E>),
 }
 
 async fn present_lifecycle_reflex<F, E, B>(
     bridge: &mut B,
     eye: &mut E,
     state: CharacterLifecycleState,
-) -> Result<(), LifecyclePresentationFault<B::Error, E::ApplyError>>
+) -> Result<u64, LifecyclePresentationFault<B::Error, E::ApplyError>>
 where
     E: Kep2EyePort<<B::Intent as AccessoryCharacterIntent>::EyeIntent>,
     B: RgbBridgePort<F>,
@@ -4160,24 +4258,57 @@ where
     let duration = bridge.lifecycle_reflex_duration(state);
     bridge.note_lifecycle_state(state);
     if duration.is_zero() {
-        return Ok(());
+        return Ok(0);
     }
 
     let started = Instant::now();
+    let mut frames_applied = 0_u64;
     loop {
-        let intent = bridge
-            .prepare_lifecycle_reflex(state)
-            .map_err(LifecyclePresentationFault::Bridge)?;
-        eye.apply(intent.into_eye())
-            .await
-            .map_err(LifecyclePresentationFault::EyeApply)?;
+        if frames_applied == u64::MAX {
+            return Err(LifecyclePresentationFault::FrameCountExhausted { frames_applied });
+        }
+        let intent = bridge.prepare_lifecycle_reflex(state).map_err(|source| {
+            LifecyclePresentationFault::Bridge {
+                frames_applied,
+                source,
+            }
+        })?;
+        eye.apply(intent.into_eye()).await.map_err(|source| {
+            LifecyclePresentationFault::EyeApply {
+                frames_applied,
+                source,
+            }
+        })?;
+        frames_applied += 1;
 
         let elapsed = started.elapsed();
         if elapsed >= duration {
-            return Ok(());
+            return Ok(frames_applied);
         }
         let remaining = duration.saturating_sub(elapsed);
         tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+    }
+}
+
+async fn present_fault_recovery_after_stop_latch<F, E, B>(
+    bridge: &mut B,
+    eye: &mut E,
+) -> CoreFaultRecoveryPresentationEvidence<B::Error, E::ApplyError>
+where
+    E: Kep2EyePort<<B::Intent as AccessoryCharacterIntent>::EyeIntent>,
+    B: RgbBridgePort<F>,
+    B::Intent: AccessoryCharacterIntent,
+{
+    match present_lifecycle_reflex::<F, _, _>(bridge, eye, CharacterLifecycleState::FaultRecovery)
+        .await
+    {
+        Ok(frames_applied) => match NonZeroU64::new(frames_applied) {
+            Some(frames_applied) => {
+                CoreFaultRecoveryPresentationEvidence::Presented { frames_applied }
+            }
+            None => CoreFaultRecoveryPresentationEvidence::MissingPresentationDuration,
+        },
+        Err(source) => CoreFaultRecoveryPresentationEvidence::Failed(source),
     }
 }
 
@@ -4242,16 +4373,24 @@ where
     .await
     {
         let fault = match source {
-            LifecyclePresentationFault::Bridge(source) => CoreTerminalFault::Bridge(source),
-            LifecyclePresentationFault::EyeApply(source) => CoreTerminalFault::EyeApply(source),
+            LifecyclePresentationFault::Bridge { source, .. } => CoreTerminalFault::Bridge(source),
+            LifecyclePresentationFault::EyeApply { source, .. } => {
+                CoreTerminalFault::EyeApply(source)
+            }
+            LifecyclePresentationFault::FrameCountExhausted { .. } => {
+                CoreTerminalFault::LifecyclePresentationFrameCountExhausted
+            }
         };
         publish_fault(fault.clone());
         latch_fault();
         channel.latch_terminal_fault();
+        let fault_recovery_presentation =
+            present_fault_recovery_after_stop_latch::<F, _, _>(&mut bridge, &mut eye).await;
         let eye_shutdown = eye.shutdown().await;
         let head_shutdown = head.shutdown().await;
         return CoreExit::Shutdown {
             terminal_fault: Some(fault),
+            fault_recovery_presentation,
             eye_shutdown,
             head_shutdown,
         };
@@ -4266,6 +4405,11 @@ where
         latch_fault();
         channel.latch_terminal_fault();
         Some(fault)
+    };
+    let mut fault_recovery_presentation = if terminal_fault.is_some() {
+        present_fault_recovery_after_stop_latch::<F, _, _>(&mut bridge, &mut eye).await
+    } else {
+        CoreFaultRecoveryPresentationEvidence::NotRequired
     };
     let period = health_period.get();
     let first_health = tokio::time::Instant::now() + period;
@@ -4391,11 +4535,12 @@ where
             }
         };
         if let Some(fault) = fault {
-            bridge.note_lifecycle_state(CharacterLifecycleState::FaultRecovery);
             publish_fault(fault.clone());
             latch_fault();
             channel.latch_terminal_fault();
             terminal_fault = Some(fault);
+            fault_recovery_presentation =
+                present_fault_recovery_after_stop_latch::<F, _, _>(&mut bridge, &mut eye).await;
         }
     }
 
@@ -4408,13 +4553,20 @@ where
         .await
     {
         let fault = match source {
-            LifecyclePresentationFault::Bridge(source) => CoreTerminalFault::Bridge(source),
-            LifecyclePresentationFault::EyeApply(source) => CoreTerminalFault::EyeApply(source),
+            LifecyclePresentationFault::Bridge { source, .. } => CoreTerminalFault::Bridge(source),
+            LifecyclePresentationFault::EyeApply { source, .. } => {
+                CoreTerminalFault::EyeApply(source)
+            }
+            LifecyclePresentationFault::FrameCountExhausted { .. } => {
+                CoreTerminalFault::LifecyclePresentationFrameCountExhausted
+            }
         };
         publish_fault(fault.clone());
         latch_fault();
         channel.latch_terminal_fault();
         terminal_fault = Some(fault);
+        fault_recovery_presentation =
+            present_fault_recovery_after_stop_latch::<F, _, _>(&mut bridge, &mut eye).await;
     }
 
     // Explicit coordinated shutdown releases eyes first, then preserves the
@@ -4423,6 +4575,7 @@ where
     let head_shutdown = head.shutdown().await;
     CoreExit::Shutdown {
         terminal_fault,
+        fault_recovery_presentation,
         eye_shutdown,
         head_shutdown,
     }
@@ -5464,16 +5617,20 @@ where
         },
         CoreExit::Shutdown {
             terminal_fault,
+            fault_recovery_presentation,
             eye_shutdown,
             head_shutdown,
         } => {
             let terminal_fault = terminal_fault
                 .map(|fault| map_production_core_fault(fault, face_perception_enabled));
+            let fault_recovery_presentation =
+                map_production_fault_recovery_presentation(fault_recovery_presentation);
             NanoAccessoryWorkerExit::Shutdown {
                 terminal_fault,
                 evidence: Box::new(NanoAccessoryShutdownEvidence {
                     eye: eye_shutdown,
                     head: head_shutdown,
+                    fault_recovery_presentation,
                     #[cfg(feature = "nano-agent")]
                     pet_evidence,
                     #[cfg(feature = "nano-agent")]
@@ -5481,6 +5638,56 @@ where
                 }),
             }
         }
+    }
+}
+
+fn map_production_fault_recovery_presentation(
+    evidence: CoreFaultRecoveryPresentationEvidence<
+        NanoAccessoryRgbProcessingError,
+        EyeHandleRequestError,
+    >,
+) -> NanoFaultRecoveryPresentationEvidence {
+    match evidence {
+        CoreFaultRecoveryPresentationEvidence::NotRequired => {
+            NanoFaultRecoveryPresentationEvidence::NotRequired
+        }
+        CoreFaultRecoveryPresentationEvidence::Presented { frames_applied } => {
+            NanoFaultRecoveryPresentationEvidence::Presented { frames_applied }
+        }
+        CoreFaultRecoveryPresentationEvidence::MissingPresentationDuration => {
+            NanoFaultRecoveryPresentationEvidence::Failed {
+                frames_applied: 0,
+                source: NanoFaultRecoveryPresentationFault::MissingPresentationDuration,
+            }
+        }
+        CoreFaultRecoveryPresentationEvidence::Failed(LifecyclePresentationFault::Bridge {
+            frames_applied,
+            source: NanoAccessoryRgbProcessingError::Bridge(source),
+        }) => NanoFaultRecoveryPresentationEvidence::Failed {
+            frames_applied,
+            source: NanoFaultRecoveryPresentationFault::ExpressionBridge(source),
+        },
+        #[cfg(feature = "nano-agent")]
+        CoreFaultRecoveryPresentationEvidence::Failed(LifecyclePresentationFault::Bridge {
+            frames_applied,
+            source: NanoAccessoryRgbProcessingError::FacePerception(source),
+        }) => NanoFaultRecoveryPresentationEvidence::Failed {
+            frames_applied,
+            source: NanoFaultRecoveryPresentationFault::FacePerception(source),
+        },
+        CoreFaultRecoveryPresentationEvidence::Failed(LifecyclePresentationFault::EyeApply {
+            frames_applied,
+            source,
+        }) => NanoFaultRecoveryPresentationEvidence::Failed {
+            frames_applied,
+            source: NanoFaultRecoveryPresentationFault::EyeApply(source),
+        },
+        CoreFaultRecoveryPresentationEvidence::Failed(
+            LifecyclePresentationFault::FrameCountExhausted { frames_applied },
+        ) => NanoFaultRecoveryPresentationEvidence::Failed {
+            frames_applied,
+            source: NanoFaultRecoveryPresentationFault::FrameCountExhausted,
+        },
     }
 }
 
@@ -5519,6 +5726,9 @@ fn map_production_core_fault(
         CoreTerminalFault::EyeApply(source) => NanoAccessoryTerminalFault::EyeApply(source),
         CoreTerminalFault::CharacterCoordination(source) => {
             NanoAccessoryTerminalFault::CharacterCoordination(source)
+        }
+        CoreTerminalFault::LifecyclePresentationFrameCountExhausted => {
+            NanoAccessoryTerminalFault::LifecyclePresentationFrameCountExhausted
         }
         #[cfg(feature = "nano-agent")]
         CoreTerminalFault::PetEvidence(source) => NanoAccessoryTerminalFault::PetEvidence(source),
@@ -6760,6 +6970,7 @@ mod tests {
         log: Arc<Mutex<Vec<&'static str>>>,
         fail_start: bool,
         fail_apply: bool,
+        require_terminal_latch_for_fault_reflex: Option<Arc<LatestFrameChannel<u64>>>,
     }
 
     impl Kep2EyePort<u64> for FakeEye {
@@ -6778,6 +6989,15 @@ mod tests {
         }
 
         async fn apply(&mut self, intent: u64) -> Result<(), Self::ApplyError> {
+            if intent == 92
+                && let Some(channel) = self.require_terminal_latch_for_fault_reflex.as_ref()
+            {
+                assert_eq!(
+                    channel.submit(u64::MAX),
+                    NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched,
+                    "the RGB stop latch must precede the first fault-reflex eye write"
+                );
+            }
             self.log.lock().unwrap().push(if intent == 1_777 {
                 "eye_apply_coordinated"
             } else {
@@ -6832,6 +7052,7 @@ mod tests {
 
     struct LifecycleBridge {
         states: Arc<Mutex<Vec<CharacterLifecycleState>>>,
+        fail_process: bool,
         fail_prepare_for: Option<CharacterLifecycleState>,
     }
 
@@ -6840,7 +7061,11 @@ mod tests {
         type Error = &'static str;
 
         fn process(&mut self, frame: &u64) -> Result<Self::Intent, Self::Error> {
-            Ok(*frame)
+            if self.fail_process {
+                Err("lifecycle_process")
+            } else {
+                Ok(*frame)
+            }
         }
 
         fn note_lifecycle_state(&mut self, state: CharacterLifecycleState) {
@@ -6854,7 +7079,12 @@ mod tests {
             if self.fail_prepare_for == Some(state) {
                 Err("lifecycle")
             } else {
-                Ok(99)
+                Ok(match state {
+                    CharacterLifecycleState::AdmissionRecovery => 91,
+                    CharacterLifecycleState::FaultRecovery => 92,
+                    CharacterLifecycleState::Parking => 93,
+                    _ => 99,
+                })
             }
         }
 
@@ -6863,6 +7093,7 @@ mod tests {
                 CharacterLifecycleState::AdmissionRecovery | CharacterLifecycleState::Parking => {
                     Duration::from_millis(2)
                 }
+                CharacterLifecycleState::FaultRecovery => Duration::from_nanos(1),
                 _ => Duration::ZERO,
             }
         }
@@ -6938,6 +7169,7 @@ mod tests {
                 log: Arc::clone(&log),
                 fail_start: fail_eye_start,
                 fail_apply: fail_eye_apply,
+                require_terminal_latch_for_fault_reflex: None,
             },
             FakeBridge {
                 log: Arc::clone(&log),
@@ -7003,6 +7235,7 @@ mod tests {
         let states = Arc::new(Mutex::new(Vec::new()));
         let bridge = LifecycleBridge {
             states: Arc::clone(&states),
+            fail_process: false,
             fail_prepare_for: None,
         };
         let channel = Arc::new(LatestFrameChannel::new());
@@ -7075,6 +7308,7 @@ mod tests {
         let states = Arc::new(Mutex::new(Vec::new()));
         let bridge = LifecycleBridge {
             states,
+            fail_process: false,
             fail_prepare_for: Some(CharacterLifecycleState::Parking),
         };
         let channel = Arc::new(LatestFrameChannel::new());
@@ -7108,8 +7342,10 @@ mod tests {
             exit,
             CoreExit::Shutdown {
                 terminal_fault: Some(CoreTerminalFault::Bridge("lifecycle")),
+                fault_recovery_presentation:
+                    CoreFaultRecoveryPresentationEvidence::Presented { frames_applied },
                 ..
-            }
+            } if frames_applied == NonZeroU64::MIN
         ));
         assert_eq!(
             &*published.lock().unwrap(),
@@ -7124,6 +7360,7 @@ mod tests {
         let states = Arc::new(Mutex::new(Vec::new()));
         let bridge = LifecycleBridge {
             states: Arc::clone(&states),
+            fail_process: false,
             fail_prepare_for: Some(CharacterLifecycleState::AdmissionRecovery),
         };
         let channel = Arc::new(LatestFrameChannel::new());
@@ -7155,14 +7392,17 @@ mod tests {
             exit,
             CoreExit::Shutdown {
                 terminal_fault: Some(CoreTerminalFault::Bridge("lifecycle")),
+                fault_recovery_presentation:
+                    CoreFaultRecoveryPresentationEvidence::Presented { frames_applied },
                 ..
-            }
+            } if frames_applied == NonZeroU64::MIN
         ));
         assert_eq!(
             &*states.lock().unwrap(),
             &[
                 CharacterLifecycleState::Booting,
                 CharacterLifecycleState::AdmissionRecovery,
+                CharacterLifecycleState::FaultRecovery,
             ]
         );
         assert_eq!(
@@ -7175,10 +7415,193 @@ mod tests {
                 "eye_start",
                 "head_start",
                 "head_return",
+                "eye_apply",
                 "eye_shutdown",
                 "head_shutdown",
             ]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_stop_latches_precede_the_first_fresh_fault_reflex_frame() {
+        let (head, mut eye, _, log, _) = fakes(false, false, false, false, None);
+        let states = Arc::new(Mutex::new(Vec::new()));
+        let bridge = LifecycleBridge {
+            states: Arc::clone(&states),
+            fail_process: true,
+            fail_prepare_for: None,
+        };
+        let channel = Arc::new(LatestFrameChannel::new());
+        eye.require_terminal_latch_for_fault_reflex = Some(Arc::clone(&channel));
+        let task_channel = Arc::clone(&channel);
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let published_for_task = Arc::clone(&published);
+        let task_log = Arc::clone(&log);
+        let latch_log = Arc::clone(&log);
+        let task = tokio::spawn(async move {
+            run_accessory_core(
+                head,
+                eye,
+                bridge,
+                task_channel,
+                health_period(50),
+                None,
+                CoreObservers {
+                    ready: |_, _| true,
+                    record_health: |_| true,
+                    publish_fault: move |fault| {
+                        published_for_task.lock().unwrap().push(fault);
+                        task_log.lock().unwrap().push("fault_published");
+                    },
+                    latch_fault: move || latch_log.lock().unwrap().push("base_latched"),
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !states
+                .lock()
+                .unwrap()
+                .contains(&CharacterLifecycleState::Operational)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accessory owner becomes operational");
+        log.lock().unwrap().clear();
+        assert_eq!(channel.submit(7), NanoAccessoryFrameSubmitOutcome::Enqueued);
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !log.lock().unwrap().contains(&"eye_apply") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fault reflex reaches the eye after both stop latches");
+        channel.request_shutdown();
+
+        let exit = task.await.unwrap();
+        assert!(matches!(
+            exit,
+            CoreExit::Shutdown {
+                terminal_fault: Some(CoreTerminalFault::Bridge("lifecycle_process")),
+                fault_recovery_presentation:
+                    CoreFaultRecoveryPresentationEvidence::Presented { frames_applied },
+                ..
+            } if frames_applied == NonZeroU64::MIN
+        ));
+        assert_eq!(
+            &*published.lock().unwrap(),
+            &[CoreTerminalFault::Bridge("lifecycle_process")]
+        );
+        assert_eq!(
+            &*states.lock().unwrap(),
+            &[
+                CharacterLifecycleState::Booting,
+                CharacterLifecycleState::AdmissionRecovery,
+                CharacterLifecycleState::Operational,
+                CharacterLifecycleState::FaultRecovery,
+            ]
+        );
+        assert_eq!(
+            &*log.lock().unwrap(),
+            &[
+                "fault_published",
+                "base_latched",
+                "eye_apply",
+                "eye_shutdown",
+                "head_shutdown",
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fault_reflex_failure_is_secondary_and_shutdown_retains_both_causes() {
+        let (head, eye, _, log, _) = fakes(false, false, false, false, None);
+        let states = Arc::new(Mutex::new(Vec::new()));
+        let bridge = LifecycleBridge {
+            states: Arc::clone(&states),
+            fail_process: true,
+            fail_prepare_for: Some(CharacterLifecycleState::FaultRecovery),
+        };
+        let channel = Arc::new(LatestFrameChannel::new());
+        let task_channel = Arc::clone(&channel);
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let published_for_task = Arc::clone(&published);
+        let latch_count = Arc::new(AtomicUsize::new(0));
+        let latch_count_for_task = Arc::clone(&latch_count);
+        let task = tokio::spawn(async move {
+            run_accessory_core(
+                head,
+                eye,
+                bridge,
+                task_channel,
+                health_period(50),
+                None,
+                CoreObservers {
+                    ready: |_, _| true,
+                    record_health: |_| true,
+                    publish_fault: move |fault| published_for_task.lock().unwrap().push(fault),
+                    latch_fault: move || {
+                        latch_count_for_task.fetch_add(1, Ordering::SeqCst);
+                    },
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !states
+                .lock()
+                .unwrap()
+                .contains(&CharacterLifecycleState::Operational)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accessory owner becomes operational");
+        log.lock().unwrap().clear();
+        assert_eq!(channel.submit(8), NanoAccessoryFrameSubmitOutcome::Enqueued);
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while channel.accepting_frames.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("primary fault latches the channel");
+        channel.request_shutdown();
+
+        let exit = task.await.unwrap();
+        assert!(matches!(
+            exit,
+            CoreExit::Shutdown {
+                terminal_fault: Some(CoreTerminalFault::Bridge("lifecycle_process")),
+                fault_recovery_presentation: CoreFaultRecoveryPresentationEvidence::Failed(
+                    LifecyclePresentationFault::Bridge {
+                        frames_applied: 0,
+                        source: "lifecycle",
+                    }
+                ),
+                ..
+            }
+        ));
+        assert_eq!(
+            &*published.lock().unwrap(),
+            &[CoreTerminalFault::Bridge("lifecycle_process")]
+        );
+        assert_eq!(latch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            &*states.lock().unwrap(),
+            &[
+                CharacterLifecycleState::Booting,
+                CharacterLifecycleState::AdmissionRecovery,
+                CharacterLifecycleState::Operational,
+                CharacterLifecycleState::FaultRecovery,
+            ]
+        );
+        assert_eq!(&*log.lock().unwrap(), &["eye_shutdown", "head_shutdown"]);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -170,6 +170,7 @@ use kiko_slam::navigation::{
     NanoDatasetReplayRequired, NanoFaceDiagnosticFrame, NanoFaceDiagnosticReceiver,
     NanoFaceDiagnosticStatsHandle, NanoFacePerceptionShutdownClass,
     NanoFacePerceptionShutdownEvidence, NanoFacePerceptionStageStatsHandle,
+    NanoFaultRecoveryPresentationEvidence, NanoFaultRecoveryPresentationFault,
     NanoFinalizedJournalMapIdentity, NanoHeadGazeActuationAvailability, NanoHeadGazeDiagnostic,
     NanoLaunchInference, NanoLaunchOccupancy, NanoLaunchRerun, NanoLaunchStorage,
     NanoMapPersistenceConfig, NanoMapPersistenceOwner, NanoMapPersistencePathError,
@@ -12205,6 +12206,7 @@ struct NanoAccessoryShutdownSummary {
     terminal_fault: Option<NanoAccessoryTerminalFault>,
     eye_release_verified: bool,
     head_hold_preserving_release_completed: bool,
+    fault_recovery_presentation: Box<NanoFaultRecoveryPresentationEvidence>,
     pet_evidence_clean: bool,
     face_perception: NanoFacePerceptionShutdownEvidence,
 }
@@ -12215,11 +12217,13 @@ impl NanoAccessoryShutdownSummary {
         terminal_fault: Option<NanoAccessoryTerminalFault>,
         evidence: NanoAccessoryShutdownEvidence,
     ) -> Self {
-        let (eye, head, pet_evidence, face_perception) = evidence.into_parts();
+        let (eye, head, fault_recovery_presentation, pet_evidence, face_perception) =
+            evidence.into_parts();
         Self {
             terminal_fault,
             eye_release_verified: eye.release_verified(),
             head_hold_preserving_release_completed: head.hold_preserving_release_completed(),
+            fault_recovery_presentation: Box::new(fault_recovery_presentation),
             pet_evidence_clean: pet_evidence.clean(),
             face_perception,
         }
@@ -12256,6 +12260,10 @@ impl NanoAccessoryShutdownSummary {
         self.terminal_fault.is_none()
             && self.eye_release_verified
             && self.head_hold_preserving_release_completed
+            && matches!(
+                self.fault_recovery_presentation.as_ref(),
+                NanoFaultRecoveryPresentationEvidence::NotRequired
+            )
             && self.pet_evidence_clean
             && self.face_classification().is_healthy()
     }
@@ -12274,6 +12282,12 @@ enum LiveAccessoryError {
     UnexpectedExit(Box<NanoAccessoryWorkerExit>),
     EyeReleaseUnverified,
     HeadHoldPreservingReleaseUnverified,
+    FaultRecoveryPresentationFailed {
+        frames_applied: u64,
+        source: Box<NanoFaultRecoveryPresentationFault>,
+    },
+    FaultRecoveryPresentationMissing,
+    FaultRecoveryPresentationUnexpected(Box<NanoFaultRecoveryPresentationEvidence>),
     PetEvidenceShutdownUnclean,
     FaceShutdown {
         kind: NanoFaceShutdownProblemKind,
@@ -12327,6 +12341,20 @@ impl std::fmt::Display for LiveAccessoryError {
             Self::HeadHoldPreservingReleaseUnverified => formatter.write_str(
                 "the head hold-preserving ownership release could not be verified during accessory shutdown",
             ),
+            Self::FaultRecoveryPresentationFailed {
+                frames_applied,
+                source,
+            } => write!(
+                formatter,
+                "fault recovery applied {frames_applied} fresh eye frames after the primary stop latch, then failed: {source}"
+            ),
+            Self::FaultRecoveryPresentationMissing => formatter.write_str(
+                "an accessory terminal fault was retained without a post-latch fault-recovery presentation attempt",
+            ),
+            Self::FaultRecoveryPresentationUnexpected(evidence) => write!(
+                formatter,
+                "fault-recovery presentation evidence existed without an accessory terminal fault: {evidence:?}"
+            ),
             Self::PetEvidenceShutdownUnclean => formatter.write_str(
                 "the pet-evidence writer did not complete a clean coordinated shutdown and join",
             ),
@@ -12346,15 +12374,45 @@ impl std::error::Error for LiveAccessoryError {
             #[cfg(feature = "nano-wheels-off-qualification")]
             Self::Start(source) => Some(source),
             Self::TerminalFault(source) => Some(source),
+            Self::FaultRecoveryPresentationFailed { source, .. } => Some(source.as_ref()),
             Self::FaultMonitor(source) => Some(source),
             Self::ShutdownJoin(source) => Some(source),
             Self::FrameIngress(_)
             | Self::UnexpectedExit(_)
             | Self::EyeReleaseUnverified
             | Self::HeadHoldPreservingReleaseUnverified
+            | Self::FaultRecoveryPresentationMissing
+            | Self::FaultRecoveryPresentationUnexpected(_)
             | Self::PetEvidenceShutdownUnclean
             | Self::FaceShutdown { .. } => None,
         }
+    }
+}
+
+#[cfg(all(feature = "nano-agent", unix))]
+fn classify_fault_recovery_presentation(
+    terminal_fault_present: bool,
+    evidence: NanoFaultRecoveryPresentationEvidence,
+) -> Option<LiveAccessoryError> {
+    match (terminal_fault_present, evidence) {
+        (false, NanoFaultRecoveryPresentationEvidence::NotRequired)
+        | (true, NanoFaultRecoveryPresentationEvidence::Presented { .. }) => None,
+        (
+            true,
+            NanoFaultRecoveryPresentationEvidence::Failed {
+                frames_applied,
+                source,
+            },
+        ) => Some(LiveAccessoryError::FaultRecoveryPresentationFailed {
+            frames_applied,
+            source: Box::new(source),
+        }),
+        (true, NanoFaultRecoveryPresentationEvidence::NotRequired) => {
+            Some(LiveAccessoryError::FaultRecoveryPresentationMissing)
+        }
+        (false, evidence) => Some(LiveAccessoryError::FaultRecoveryPresentationUnexpected(
+            Box::new(evidence),
+        )),
     }
 }
 
@@ -13250,18 +13308,20 @@ impl Drop for NanoLiveSetupGuard {
                 if !summary.is_fully_healthy() {
                     if self.accessory_terminal_fault_reported && summary.terminal_fault.is_some() {
                         eprintln!(
-                            "early live setup accessory shutdown was not fully healthy: terminal_fault=retained_for_consistency_and_already_reported_by_primary eye_release_verified={} head_hold_preserving_release_completed={} pet_evidence_clean={} face_perception={}",
+                            "early live setup accessory shutdown was not fully healthy: terminal_fault=retained_for_consistency_and_already_reported_by_primary eye_release_verified={} head_hold_preserving_release_completed={} fault_recovery_presentation={:?} pet_evidence_clean={} face_perception={}",
                             summary.eye_release_verified,
                             summary.head_hold_preserving_release_completed,
+                            summary.fault_recovery_presentation,
                             summary.pet_evidence_clean,
                             summary.face_classification(),
                         );
                     } else {
                         eprintln!(
-                            "early live setup accessory shutdown was not fully healthy: terminal_fault={:?} eye_release_verified={} head_hold_preserving_release_completed={} pet_evidence_clean={} face_perception={}",
+                            "early live setup accessory shutdown was not fully healthy: terminal_fault={:?} eye_release_verified={} head_hold_preserving_release_completed={} fault_recovery_presentation={:?} pet_evidence_clean={} face_perception={}",
                             summary.terminal_fault,
                             summary.eye_release_verified,
                             summary.head_hold_preserving_release_completed,
+                            summary.fault_recovery_presentation,
                             summary.pet_evidence_clean,
                             summary.face_classification(),
                         );
@@ -13346,10 +13406,11 @@ impl Drop for NanoPostNavigationSetupGuard {
                     NanoAccessoryShutdownSummary::from_evidence(terminal_fault, *evidence);
                 if !summary.is_fully_healthy() {
                     eprintln!(
-                        "post-navigation setup accessory shutdown was not fully healthy: terminal_fault={:?} eye_release_verified={} head_hold_preserving_release_completed={} pet_evidence_clean={} face_perception={}",
+                        "post-navigation setup accessory shutdown was not fully healthy: terminal_fault={:?} eye_release_verified={} head_hold_preserving_release_completed={} fault_recovery_presentation={:?} pet_evidence_clean={} face_perception={}",
                         summary.terminal_fault,
                         summary.eye_release_verified,
                         summary.head_hold_preserving_release_completed,
+                        summary.fault_recovery_presentation,
                         summary.pet_evidence_clean,
                         summary.face_classification(),
                     );
@@ -13403,19 +13464,21 @@ impl std::fmt::Display for NanoPreOwnerAccessoryShutdown {
                 if *terminal_fault_already_reported && summary.terminal_fault.is_some() {
                     write!(
                         formatter,
-                        "accessory shutdown evidence (terminal_fault=retained_for_consistency_and_already_reported_by_primary, eye_release_verified={}, head_hold_preserving_release_completed={}, pet_evidence_clean={}, face_perception={})",
+                        "accessory shutdown evidence (terminal_fault=retained_for_consistency_and_already_reported_by_primary, eye_release_verified={}, head_hold_preserving_release_completed={}, fault_recovery_presentation={:?}, pet_evidence_clean={}, face_perception={})",
                         summary.eye_release_verified,
                         summary.head_hold_preserving_release_completed,
+                        summary.fault_recovery_presentation,
                         summary.pet_evidence_clean,
                         summary.face_classification(),
                     )
                 } else {
                     write!(
                         formatter,
-                        "accessory shutdown evidence (terminal_fault={:?}, eye_release_verified={}, head_hold_preserving_release_completed={}, pet_evidence_clean={}, face_perception={})",
+                        "accessory shutdown evidence (terminal_fault={:?}, eye_release_verified={}, head_hold_preserving_release_completed={}, fault_recovery_presentation={:?}, pet_evidence_clean={}, face_perception={})",
                         summary.terminal_fault,
                         summary.eye_release_verified,
                         summary.head_hold_preserving_release_completed,
+                        summary.fault_recovery_presentation,
                         summary.pet_evidence_clean,
                         summary.face_classification(),
                     )
@@ -17845,9 +17908,11 @@ fn run_prepared_live_session(
                         terminal_fault,
                         eye_release_verified,
                         head_hold_preserving_release_completed,
+                        fault_recovery_presentation,
                         pet_evidence_clean,
                         face_perception,
                     } = summary;
+                    let terminal_fault_present = terminal_fault.is_some();
                     if let Some(fault) = terminal_fault
                         && !accessory_terminal_fault_recorded
                     {
@@ -17864,6 +17929,12 @@ fn run_prepared_live_session(
                         live_failures.push(LiveWorkerFailure::Accessory(
                             LiveAccessoryError::HeadHoldPreservingReleaseUnverified,
                         ));
+                    }
+                    if let Some(problem) = classify_fault_recovery_presentation(
+                        terminal_fault_present,
+                        *fault_recovery_presentation,
+                    ) {
+                        live_failures.push(LiveWorkerFailure::Accessory(problem));
                     }
                     if !pet_evidence_clean {
                         live_failures.push(LiveWorkerFailure::Accessory(
@@ -18931,6 +19002,11 @@ mod tests {
                 ),
                 eye_release_verified: true,
                 head_hold_preserving_release_completed: true,
+                fault_recovery_presentation: Box::new(
+                    kiko_slam::navigation::NanoFaultRecoveryPresentationEvidence::Presented {
+                        frames_applied: std::num::NonZeroU64::MIN,
+                    },
+                ),
                 pet_evidence_clean: true,
                 face_perception: super::NanoFacePerceptionShutdownEvidence::Disabled,
             },
@@ -18943,11 +19019,63 @@ mod tests {
 
     #[cfg(all(feature = "nano-agent", unix))]
     #[test]
+    fn fault_recovery_classification_never_replaces_the_primary_fault() {
+        let secondary = super::classify_fault_recovery_presentation(
+            true,
+            kiko_slam::navigation::NanoFaultRecoveryPresentationEvidence::Failed {
+                frames_applied: 3,
+                source: kiko_slam::navigation::NanoFaultRecoveryPresentationFault::MissingPresentationDuration,
+            },
+        )
+        .expect("secondary presentation failure remains reportable");
+        let super::LiveAccessoryError::FaultRecoveryPresentationFailed {
+            frames_applied,
+            source,
+        } = secondary
+        else {
+            panic!("secondary failure must retain its dedicated classification");
+        };
+        assert_eq!(frames_applied, 3);
+        assert!(matches!(
+            source.as_ref(),
+            kiko_slam::navigation::NanoFaultRecoveryPresentationFault::MissingPresentationDuration
+        ));
+
+        assert!(matches!(
+            super::classify_fault_recovery_presentation(
+                true,
+                kiko_slam::navigation::NanoFaultRecoveryPresentationEvidence::NotRequired,
+            ),
+            Some(super::LiveAccessoryError::FaultRecoveryPresentationMissing)
+        ));
+        assert!(matches!(
+            super::classify_fault_recovery_presentation(
+                false,
+                kiko_slam::navigation::NanoFaultRecoveryPresentationEvidence::Presented {
+                    frames_applied: std::num::NonZeroU64::MIN,
+                },
+            ),
+            Some(super::LiveAccessoryError::FaultRecoveryPresentationUnexpected(_))
+        ));
+        assert!(
+            super::classify_fault_recovery_presentation(
+                false,
+                kiko_slam::navigation::NanoFaultRecoveryPresentationEvidence::NotRequired,
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[test]
     fn live_face_stage_stats_are_final_only_after_disabled_or_joined_shutdown() {
         let disabled = super::NanoAccessoryShutdownSummary {
             terminal_fault: None,
             eye_release_verified: true,
             head_hold_preserving_release_completed: true,
+            fault_recovery_presentation: Box::new(
+                kiko_slam::navigation::NanoFaultRecoveryPresentationEvidence::NotRequired,
+            ),
             pet_evidence_clean: true,
             face_perception: super::NanoFacePerceptionShutdownEvidence::Disabled,
         };
@@ -18959,6 +19087,9 @@ mod tests {
             terminal_fault: None,
             eye_release_verified: true,
             head_hold_preserving_release_completed: true,
+            fault_recovery_presentation: Box::new(
+                kiko_slam::navigation::NanoFaultRecoveryPresentationEvidence::NotRequired,
+            ),
             pet_evidence_clean: true,
             face_perception: super::NanoFacePerceptionShutdownEvidence::Join(
                 kiko_slam::navigation::NanoFacePerceptionJoinEvidence::DetachedAfterTimeout {

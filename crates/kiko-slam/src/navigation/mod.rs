@@ -329,8 +329,9 @@ pub use nano_accessory_worker::{
     NanoAccessoryShutdownEvidence, NanoAccessoryTerminalFault, NanoAccessoryWorker,
     NanoAccessoryWorkerConfig, NanoAccessoryWorkerConfigError, NanoAccessoryWorkerExit,
     NanoAccessoryWorkerJoinError, NanoAccessoryWorkerStartError, NanoEyeActorStartupError,
-    NanoEyeReadyEvidence, NanoEyeShutdownEvidence, NanoHeadActorStartupError,
-    NanoHeadReadyEvidence, NanoHeadShutdownEvidence,
+    NanoEyeReadyEvidence, NanoEyeShutdownEvidence, NanoFaultRecoveryPresentationEvidence,
+    NanoFaultRecoveryPresentationFault, NanoHeadActorStartupError, NanoHeadReadyEvidence,
+    NanoHeadShutdownEvidence,
 };
 #[cfg(all(feature = "nano-agent", unix))]
 pub use nano_accessory_worker::{
