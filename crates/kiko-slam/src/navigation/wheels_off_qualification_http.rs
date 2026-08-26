@@ -36,9 +36,9 @@ use super::{
     ConsoleHostTimestampNs, ConsoleManualCommandEnvelope, ConsoleMapSnapshot,
     ConsoleNavigationSnapshot, ConsoleOccupancyGrid, ConsolePhysicalEmergencyStopState,
     ConsoleRequestedActuation, ConsoleRequestedCommand, ConsoleRequestedOwner,
-    ConsoleSafetySignalState, ConsoleSnapshotRevision, ConsoleSourceKind, ConsoleStopCertainty,
-    ConsoleSubsystemHealth, OperatorConsoleAccessCapability, OperatorConsoleBind,
-    OperatorConsoleBindError, OperatorConsoleCapabilityCleanupEvidence,
+    ConsoleSafetySignalState, ConsoleSlamSnapshot, ConsoleSnapshotRevision, ConsoleSourceKind,
+    ConsoleStopCertainty, ConsoleSubsystemHealth, OperatorConsoleAccessCapability,
+    OperatorConsoleBind, OperatorConsoleBindError, OperatorConsoleCapabilityCleanupEvidence,
     OperatorConsoleCapabilityPersistError, OperatorConsolePersistedAccessCapability,
     OperatorConsoleSnapshot, WheelsOffQualificationConsoleHandle,
     WheelsOffQualificationControlProfile, WheelsOffQualificationFrontendConnectError,
@@ -326,6 +326,7 @@ impl WheelsOffQualificationTelemetryStore {
             manual_command_envelope: None,
             map: &state.base.map,
             navigation: &state.base.navigation,
+            slam: &state.base.slam,
             last_requested: None,
             last_requested_actuation: &state.base.last_requested_actuation,
             last_applied: &state.base.last_applied,
@@ -362,7 +363,7 @@ fn bump_projection_revision(
 fn validate_observational_base(
     snapshot: &OperatorConsoleSnapshot,
 ) -> Result<(), WheelsOffQualificationTelemetryError> {
-    if snapshot.schema_version != super::OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V4 {
+    if snapshot.schema_version != super::OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V5 {
         return Err(WheelsOffQualificationTelemetryError::UnsupportedBaseSchema(
             snapshot.schema_version,
         ));
@@ -466,6 +467,7 @@ struct QualificationSnapshotProjection<'a> {
     manual_command_envelope: Option<ConsoleManualCommandEnvelope>,
     map: &'a Option<ConsoleMapSnapshot>,
     navigation: &'a Option<ConsoleNavigationSnapshot>,
+    slam: &'a Option<ConsoleSlamSnapshot>,
     last_requested: Option<ConsoleRequestedCommand>,
     last_requested_actuation: &'a Option<ConsoleRequestedActuation>,
     last_applied: &'a Option<ConsoleAppliedReceipt>,
@@ -2219,6 +2221,29 @@ mod tests {
             ConsoleSnapshotRevision::parse(1).unwrap(),
             super::super::ConsoleRuntimeAuthorityKind::WheelsOffQualification,
         );
+        base.health.slam = Some(super::super::ConsoleHealth::Ready);
+        base.slam = Some(super::super::ConsoleSlamSnapshot {
+            inference: super::super::ConsoleInferenceRuntime {
+                superpoint: super::super::ConsoleInferenceSelection {
+                    requested: super::super::ConsoleRequestedInferenceBackend::Auto,
+                    selected: super::super::ConsoleSelectedInferenceBackend::Cpu,
+                },
+                lightglue: super::super::ConsoleInferenceSelection {
+                    requested: super::super::ConsoleRequestedInferenceBackend::Cpu,
+                    selected: super::super::ConsoleSelectedInferenceBackend::Cpu,
+                },
+            },
+            started_pairs: 3,
+            successful_pairs: 2,
+            recoverable_failures: 1,
+            fatal_failures: 0,
+            last_successful_source_arrival_host_monotonic_ns: Some(100),
+            last_successful_completion_host_monotonic_ns: Some(200),
+            rate_window: Some(super::super::ConsoleSlamRateWindow {
+                successful_completions: 2,
+                span_ns: 100,
+            }),
+        });
         base.rerun_diagnostics_url = Some(
             super::super::ConsoleRerunDiagnosticsUrl::from_admitted_forwarded_port(
                 std::num::NonZeroU16::new(9_876).unwrap(),
@@ -2234,6 +2259,41 @@ mod tests {
         );
         assert!(projection["requested_owner"].is_null());
         assert!(projection["actual_authority"].is_null());
+        assert_eq!(projection["health"]["slam"], serde_json::json!("ready"));
+        assert_eq!(projection["slam"]["started_pairs"], serde_json::json!("3"));
+        assert_eq!(
+            projection["slam"]["inference"]["superpoint"],
+            serde_json::json!({"requested": "auto", "selected": "cpu"})
+        );
+        assert_eq!(
+            projection["slam"]["rate_window"],
+            serde_json::json!({"successful_completions": 2, "span_ns": "100"})
+        );
+    }
+
+    #[test]
+    fn telemetry_requires_the_exact_current_observational_base_schema() {
+        let profile = profile();
+        let (console, _receiver) = super::super::wheels_off_qualification_console(profile);
+        for schema_version in [
+            super::super::OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V4,
+            super::super::OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V5 + 1,
+        ] {
+            let mut base = OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+            );
+            base.schema_version = schema_version;
+            assert!(matches!(
+                WheelsOffQualificationTelemetryStore::parse(
+                    profile,
+                    base,
+                    console.snapshot(),
+                ),
+                Err(WheelsOffQualificationTelemetryError::UnsupportedBaseSchema(actual))
+                    if actual == schema_version
+            ));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
