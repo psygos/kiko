@@ -40,8 +40,10 @@ const FIRST_BLINK_MIN_NS: u64 = 3 * NS_PER_SECOND;
 const FIRST_BLINK_MAX_NS: u64 = 5 * NS_PER_SECOND;
 const BLINK_MIN_NS: u64 = 2 * NS_PER_SECOND;
 const BLINK_MAX_NS: u64 = 12 * NS_PER_SECOND;
-const SACCADE_MIN_NS: u64 = 180 * NS_PER_MS;
-const SACCADE_MAX_NS: u64 = 550 * NS_PER_MS;
+const SACCADE_MIN_NS: u64 = 900 * NS_PER_MS;
+const SACCADE_MAX_NS: u64 = 2_400 * NS_PER_MS;
+const SACCADE_HOLD_NS: u64 = 120 * NS_PER_MS;
+const SACCADE_DECAY_NS: u64 = 280 * NS_PER_MS;
 const HEAD_EYE_LEAD_NS: u64 = 120 * NS_PER_MS;
 const NEVER_RUN: u64 = u64::MAX;
 
@@ -537,6 +539,10 @@ pub struct AutonomicCharacterEngine {
     searching_until_ns: u64,
     next_blink_ns: u64,
     next_saccade_ns: u64,
+    saccade_peak_x: i32,
+    saccade_peak_y: i32,
+    saccade_hold_until_ns: u64,
+    saccade_decay_until_ns: u64,
     saccade_x: i32,
     saccade_y: i32,
     next_act_ns: u64,
@@ -563,6 +569,10 @@ impl AutonomicCharacterEngine {
             searching_until_ns: 0,
             next_blink_ns: 0,
             next_saccade_ns: 0,
+            saccade_peak_x: 0,
+            saccade_peak_y: 0,
+            saccade_hold_until_ns: 0,
+            saccade_decay_until_ns: 0,
             saccade_x: 0,
             saccade_y: 0,
             next_act_ns: 0,
@@ -713,13 +723,53 @@ impl AutonomicCharacterEngine {
     }
 
     fn update_saccade(&mut self, now_ns: u64) {
-        if now_ns < self.next_saccade_ns {
+        // Face tracking already carries authoritative gaze. Adding random
+        // offsets here made the eyes visibly ping-pong around a real person,
+        // so tracking explicitly suppresses and reschedules autonomic
+        // saccades instead of merely hiding the current sample.
+        if self.mode == CharacterMode::Tracking {
+            self.saccade_peak_x = 0;
+            self.saccade_peak_y = 0;
+            self.saccade_x = 0;
+            self.saccade_y = 0;
+            self.saccade_hold_until_ns = now_ns;
+            self.saccade_decay_until_ns = now_ns;
+            if now_ns >= self.next_saccade_ns {
+                self.next_saccade_ns =
+                    saturating_add(now_ns, self.random_range(SACCADE_MIN_NS, SACCADE_MAX_NS));
+            }
             return;
         }
-        self.saccade_x = self.random_signed(26);
-        self.saccade_y = self.random_signed(18);
-        self.next_saccade_ns =
-            saturating_add(now_ns, self.random_range(SACCADE_MIN_NS, SACCADE_MAX_NS));
+
+        if now_ns >= self.next_saccade_ns {
+            self.saccade_peak_x = self.random_signed(14);
+            self.saccade_peak_y = self.random_signed(9);
+            self.saccade_x = self.saccade_peak_x;
+            self.saccade_y = self.saccade_peak_y;
+            self.saccade_hold_until_ns = saturating_add(now_ns, SACCADE_HOLD_NS);
+            self.saccade_decay_until_ns =
+                saturating_add(self.saccade_hold_until_ns, SACCADE_DECAY_NS);
+            self.next_saccade_ns =
+                saturating_add(now_ns, self.random_range(SACCADE_MIN_NS, SACCADE_MAX_NS));
+            return;
+        }
+
+        if now_ns <= self.saccade_hold_until_ns {
+            self.saccade_x = self.saccade_peak_x;
+            self.saccade_y = self.saccade_peak_y;
+            return;
+        }
+        if now_ns >= self.saccade_decay_until_ns {
+            self.saccade_x = 0;
+            self.saccade_y = 0;
+            return;
+        }
+
+        let elapsed = now_ns.saturating_sub(self.saccade_hold_until_ns);
+        let progress = normalized_phase(elapsed, SACCADE_DECAY_NS);
+        let remaining = SCALE - minimum_jerk_ramp(progress);
+        self.saccade_x = self.saccade_peak_x * remaining / SCALE;
+        self.saccade_y = self.saccade_peak_y * remaining / SCALE;
     }
 
     fn update_act(&mut self, now_ns: u64) {
@@ -1581,6 +1631,60 @@ mod tests {
 
         assert!(first.intent().flags().requests_blink());
         assert!(!second.intent().flags().requests_blink());
+    }
+
+    #[test]
+    fn micro_saccade_holds_then_returns_to_center_with_a_smooth_decay() {
+        let start = 5 * NS_PER_SECOND;
+        let mut engine = AutonomicCharacterEngine::new(23);
+        engine.initialize_if_needed(start);
+        engine.mode = CharacterMode::Idle;
+        engine.next_saccade_ns = start;
+
+        engine.update_saccade(start);
+        let peak = (engine.saccade_x, engine.saccade_y);
+        assert!(peak.0.abs() <= 14);
+        assert!(peak.1.abs() <= 9);
+        assert_ne!(peak, (0, 0), "the retained seed produces a visible sample");
+        assert!(
+            (start + SACCADE_MIN_NS..=start + SACCADE_MAX_NS).contains(&engine.next_saccade_ns)
+        );
+
+        engine.update_saccade(start + SACCADE_HOLD_NS);
+        assert_eq!((engine.saccade_x, engine.saccade_y), peak);
+
+        engine.update_saccade(start + SACCADE_HOLD_NS + SACCADE_DECAY_NS / 2);
+        assert!(engine.saccade_x.abs() <= peak.0.abs());
+        assert!(engine.saccade_y.abs() <= peak.1.abs());
+
+        engine.update_saccade(start + SACCADE_HOLD_NS + SACCADE_DECAY_NS);
+        assert_eq!((engine.saccade_x, engine.saccade_y), (0, 0));
+    }
+
+    #[test]
+    fn face_tracking_suppresses_random_saccade_offsets() {
+        let start = 7 * NS_PER_SECOND;
+        let mut engine = AutonomicCharacterEngine::new(29);
+        engine.initialize_if_needed(start);
+        engine.mode = CharacterMode::Tracking;
+        engine.mode_started_ns = start;
+        engine.ever_saw_face = true;
+        engine.last_face_ns = start;
+        engine.next_act_ns = u64::MAX;
+        engine.saccade_peak_x = 14;
+        engine.saccade_peak_y = -9;
+        engine.saccade_x = 14;
+        engine.saccade_y = -9;
+        engine.next_saccade_ns = start + NS_PER_SECOND;
+
+        let output = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start),
+            true,
+            prepared(start),
+        );
+        assert_eq!(output.eye().intent().gaze_x().get(), 0);
+        assert_eq!(output.eye().intent().gaze_y().get(), 0);
+        assert_eq!((engine.saccade_x, engine.saccade_y), (0, 0));
     }
 
     #[test]
