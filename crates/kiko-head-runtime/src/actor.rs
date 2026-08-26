@@ -10613,17 +10613,22 @@ mod tests {
             assert_eq!(index, joint as usize);
             assert!(response.request_write().completed_at() <= response.received_at());
         }
-        assert!(evidence
-            .torque_switches()
-            .windows(2)
-            .all(|pair| pair[0].received_at() <= pair[1].request_write().completed_at()));
+        assert!(
+            evidence
+                .torque_switches()
+                .windows(2)
+                .all(|pair| pair[0].received_at() <= pair[1].request_write().completed_at())
+        );
         assert!(
             evidence
                 .torque_switches()
                 .last()
                 .expect("four torque switches")
                 .received_at()
-                <= evidence.joints()[0].response().request_write().completed_at()
+                <= evidence.joints()[0]
+                    .response()
+                    .request_write()
+                    .completed_at()
         );
         for (index, (joint, sample)) in HeadJoint::ALL
             .into_iter()
@@ -10707,10 +10712,12 @@ mod tests {
             .await
             .expect_err("a cleared torque switch is not a healthy hold");
         let observation = health_observation_error(error);
-        assert!(observation
-            .accepted_torque_switch_prefix()
-            .iter()
-            .all(Option::is_none));
+        assert!(
+            observation
+                .accepted_torque_switch_prefix()
+                .iter()
+                .all(Option::is_none)
+        );
         assert!(observation.accepted_prefix().iter().all(Option::is_none));
         assert!(matches!(
             observation.failure(),
@@ -10726,12 +10733,16 @@ mod tests {
             .expect("a later enabled observation remains distinguishable from the fault");
         {
             let shared = shared.lock().expect("fake state");
-            assert!(shared.writes[36..]
-                .iter()
-                .any(|write| write[4..=6] == [2, 40, 1]));
-            assert!(shared.writes[36..]
-                .iter()
-                .all(|write| write[4..=6] != [3, 40, 1]));
+            assert!(
+                shared.writes[36..]
+                    .iter()
+                    .any(|write| write[4..=6] == [2, 40, 1])
+            );
+            assert!(
+                shared.writes[36..]
+                    .iter()
+                    .all(|write| write[4..=6] != [3, 40, 1])
+            );
         }
 
         handle.shutdown().await.expect("shutdown");
