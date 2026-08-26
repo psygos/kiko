@@ -94,6 +94,12 @@ fixes only these currently declared facts:
   and reaches that share at `140` combined absolute pitch-demand ticks. These
   are behavior constants, not a claim that the illustrative mapping or
   resulting motion has been physically requalified;
+- the same specification supplies the gaze-neutral rapid-turn posture:
+  demand below `120 yaw ticks/s` is ignored, excess rate uses an `80 ms` gain,
+  equal negative bow/curl displacement is capped at `26` ticks, decay retains
+  `850` permille per `50 ms`, and a `500 ms` gap never creates a rate sample.
+  The parser requires opposing pitch signs and enough natural-to-minimum
+  travel; composed overflow is reported and withheld rather than clamped;
 - the compliant-hold declaration is cross-bound to the currently configured
   startup torque limits `[600,400,400,400]` permille. This records what the
   runtime would install; it does **not** claim those limits are the minimum

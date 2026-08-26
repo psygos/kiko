@@ -149,8 +149,16 @@ dynamic serial-pitch block. The checked-in source retains Fable's behavior
 constants: bow recruitment approaches `600` permille of combined bow/curl
 pitch demand and is complete at `140` total demand ticks. The renderer does
 not treat those constants, or this illustrative encoder mapping, as an
-attended physical review; the separately retained policy/review pair remains
-mandatory.
+attended physical review.
+
+Admission also requires Fable's typed rapid-turn posture. Yaw demand below
+`120 ticks/s` produces no posture. Excess rate recruits up to `26` equal
+negative bow/curl ticks with an `80 ms` gain, retains `850` permille per
+`50 ms`, and stops deriving rate after a `500 ms` sample gap. Equal physical
+bow/curl offsets are gaze-neutral only under the separately parsed opposing
+pitch signs; any composed envelope overflow is withheld rather than clamped.
+The separately retained policy/review pair remains mandatory, and these
+behavior constants still require attended physical observation.
 
 Do not expand these templates with shell substitution. Feed exact discovery
 and reviewed source paths to `kiko-nano-bundle-renderer`; it emits the agent

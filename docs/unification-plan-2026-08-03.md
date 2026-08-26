@@ -173,17 +173,31 @@ remaining work; a passing host test is never presented as physical evidence.
   production physical admission. Intent: make large pitch movements recruit
   the base joint without changing total gaze demand or corrupting residual eye
   coordination.
+- `6883a06`: Fable's rapid-turn weight shift is now a typed, production-required
+  posture in the evidence-bound Rust owner. Physical yaw demand below
+  `120 ticks/s` is deadbanded; excess rate uses an `80 ms` dimensioned gain,
+  saturates at `26` equal negative bow/curl ticks, retains `850` permille per
+  `50 ms`, and derives no fresh rate from intervals at or above `500 ms`.
+  Opposing pitch signs and natural-to-minimum travel are cross-checked during
+  parsing. Runtime rate and decay use deterministic checked integer/fixed-point
+  arithmetic anchored to monotonic time, so recovery is independent of frame
+  segmentation. The posture composes after face and character demand, remains
+  optically gaze-neutral under the admitted signed-total inverse, can finish
+  without a face instead of snapping upright, and reports envelope withholding
+  instead of clamping. Intent: preserve Fable's whole-neck lean into a turn
+  without feeding posture back into gaze, hiding scheduler gaps, or weakening
+  physical bounds.
 
 Host evidence at this checkpoint is 105/105 `kiko-expression-runtime` unit
 tests plus its compile-fail doctest, warning-free expression, head, and Nano
 compile-only Clippy, 177 `kiko-head-runtime` library tests plus 11 binary
-tests, 1,455/1,455 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
+tests, 1,460/1,460 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
 binary tests, 7/7 offline-qualifier tests, 36/36 immutable-renderer tests,
 all 6 deployment-gate tests, the 13 focused base-commissioning tests, and
 82/82 Python behavior tests. The complete Nano-agent library suite was run
 outside the filesystem sandbox because 23 otherwise-green local socket and
 loopback-listener tests are denied binding by that sandbox; the unrestricted
-run passed all 1,455 tests.
+run passed all 1,460 tests.
 The Linux-aarch64 standard-library abstract notify-socket API was compiled
 directly. A complete Linux-aarch64 dependency cross-check remains unclaimed
 because this Mac does not have `aarch64-linux-gnu-gcc`; native OAK linking,
@@ -193,12 +207,11 @@ claimed by these host results.
 ### Remaining before the single-owner handoff is complete
 
 1. Commanded-head feedback and residual-driven eyes are complete. Add metric
-   proximity only when depth has valid face-association evidence, then port
-   turn-dip weight shift and the remaining
-   interoceptive acts. Thermal/body state, base-motion exclusion, image-plane
-   face bearing, apparent-width proximity cue, continuous pet-state eye
-   choreography, and the formal bow greeting are complete; apparent width is
-   not relabeled as metric range.
+   proximity only when depth has valid face-association evidence, then port the
+   remaining interoceptive acts. Turn-dip weight shift, thermal/body state,
+   base-motion exclusion, image-plane face bearing, apparent-width proximity
+   cue, continuous pet-state eye choreography, and the formal bow greeting are
+   complete; apparent width is not relabeled as metric range.
 2. Pet NDJSON compatibility, durable production recording, and reaction replay
    are complete. Add the remaining general behavior-trace replay comparison;
    retain the Python lane as a non-booted behavior lab until the Rust owner has
