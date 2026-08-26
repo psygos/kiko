@@ -26,9 +26,10 @@ use serde::Deserialize;
 
 use super::{
     ConsoleRerunDiagnosticsUrl, MAX_HEAD_GAZE_POLICY_JSON_BYTES,
-    MAX_NANO_AGENT_POLICY_CONFIG_JSON_BYTES, MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES,
-    MAX_NANO_OCCUPANCY_CELLS, MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES,
-    MAX_NAVIGATION_INGRESS_RECORDS, MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
+    MAX_HEAD_GAZE_REVIEW_EVIDENCE_BYTES, MAX_NANO_AGENT_POLICY_CONFIG_JSON_BYTES,
+    MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES, MAX_NANO_OCCUPANCY_CELLS,
+    MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES, MAX_NAVIGATION_INGRESS_RECORDS,
+    MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
 };
 use crate::InferenceBackend;
 use crate::dense::occupancy::OccupancyGridGeometry;
@@ -82,10 +83,6 @@ pub const MAX_NANO_OCCUPANCY_KEYFRAMES: usize = 1_000_000;
 pub const MAX_NANO_OCCUPANCY_SNAPSHOT_CADENCE: usize = 1_000_000;
 /// Per-file ceiling for the XML cascade inputs retained by launch V3.
 pub const MAX_OPENCV_HAAR_CASCADE_BYTES: u64 = 4 * 1_024 * 1_024;
-/// Physical-review evidence is retained as an opaque, exact-byte artifact.
-/// Admission interprets only the digest claimed by the typed policy.
-pub const MAX_HEAD_GAZE_REVIEW_EVIDENCE_BYTES: u64 = 1_024 * 1_024;
-
 const SHA256_HEX_BYTES: usize = 64;
 const MAX_LAUNCH_ARTIFACT_ID_BYTES: usize = 64;
 const MIN_RERUN_MEMORY_BYTES: u64 = 1_048_576;

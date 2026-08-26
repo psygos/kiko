@@ -254,7 +254,8 @@ pub use head_gaze_policy::{
     HeadGazePolicyParseError, HeadGazePolicyV1, HeadGazeProposalClaimId, HeadGazeProposalOnlyClaim,
     HeadGazeReviewClaimId, HeadGazeReviewEvidenceId, HeadGazeTimingField, HeadTurnDipPosturePolicy,
     HeadTurnDipPosturePolicyParseError, MAX_HEAD_GAZE_POLICY_JSON_BYTES,
-    OperatorClaimedHeadGazePhysicalReview, REQUIRED_HEAD_GAZE_ACQUISITION_PROPOSALS,
+    MAX_HEAD_GAZE_REVIEW_EVIDENCE_BYTES, OperatorClaimedHeadGazePhysicalReview,
+    REQUIRED_HEAD_GAZE_ACQUISITION_PROPOSALS,
 };
 #[cfg(feature = "agent-runtime")]
 pub use head_gaze_proposal_adapter::{

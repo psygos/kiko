@@ -52,6 +52,13 @@ pub const HEAD_GAZE_POLICY_V1: u32 = 1;
 /// Bound checked before JSON deserialization can allocate caller-sized values.
 pub const MAX_HEAD_GAZE_POLICY_JSON_BYTES: usize = 16 * 1_024;
 
+/// Bound for the opaque physical-review record paired with a head-gaze policy.
+///
+/// This belongs to the policy contract rather than the hardware-bearing launch
+/// parser so offline bundle construction can enforce the same limit without
+/// enabling OAK recording support.
+pub const MAX_HEAD_GAZE_REVIEW_EVIDENCE_BYTES: u64 = 1_024 * 1_024;
+
 /// Tracking starts only after three distinct, ordered fresh proposals.
 pub const REQUIRED_HEAD_GAZE_ACQUISITION_PROPOSALS: u8 = 3;
 

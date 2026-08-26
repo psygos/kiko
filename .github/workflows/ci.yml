@@ -116,6 +116,15 @@ jobs:
           --all-targets
           -- -D warnings
 
+      - name: Check bundle renderer production dependency graph
+        # `--all-targets` above activates the renderer's qualification-only
+        # dev dependency and can hide missing exports in its smaller runtime
+        # graph. Keep this exact library-only boundary as a separate check.
+        run: >-
+          cargo check --locked
+          -p kiko-nano-bundle-renderer
+          --lib
+
       - name: Clippy exact production Kiko Nano graph
         env:
           OAK_SYS_CHECK_ONLY: "1"
