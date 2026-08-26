@@ -27,8 +27,9 @@ use kiko_head_protocol::{
     TorqueLimitPermille,
 };
 use kiko_head_runtime::compliant_hold::{
-    CompliantJointPolicy, CompliantJointPolicyError, HeadCompliantHoldConfig,
-    HeadCompliantHoldConfigError,
+    CompliantJointPolicy, CompliantJointPolicyError, CompliantPetJointPolicy,
+    CompliantPetJointPolicyError, CompliantPetProfile, CompliantPetProfileError,
+    HeadCompliantHoldConfig, HeadCompliantHoldConfigError,
 };
 use kiko_head_runtime::gaze_control::{
     HeadAcquisitionProposalCount, HeadAcquisitionProposalCountError, HeadControlPeriod,
@@ -713,7 +714,7 @@ fn parse_compliant_hold(
         torque(HeadJoint::Yaw, dto.holding_torque_limit_permille.yaw)?,
         torque(HeadJoint::Roll, dto.holding_torque_limit_permille.roll)?,
     );
-    HeadCompliantHoldConfig::try_new(
+    let config = HeadCompliantHoldConfig::try_new(
         bow,
         curl,
         yaw,
@@ -729,7 +730,48 @@ fn parse_compliant_hold(
         Duration::from_nanos(dto.recovery_duration_ns),
         dto.follow_permille,
     )
-    .map_err(HeadCompliantHoldDeclarationParseError::Config)
+    .map_err(HeadCompliantHoldDeclarationParseError::Config)?;
+    let Some(pet) = dto.pet_profile else {
+        return Ok(config);
+    };
+    let pet_joint = |joint, values: CompliantPetJointPolicyDto| {
+        CompliantPetJointPolicy::try_new(
+            values.maximum_baseline_error_ticks,
+            values.rest_offset_ticks,
+            values.directional_rest_offset_ticks,
+        )
+        .map_err(|source| HeadCompliantHoldDeclarationParseError::PetJoint { joint, source })
+    };
+    let yield_torque = |joint, value| {
+        TorqueLimitPermille::try_new(value)
+            .map_err(|source| HeadCompliantHoldDeclarationParseError::YieldTorque { joint, source })
+    };
+    let profile = CompliantPetProfile::try_new(
+        pet_joint(HeadJoint::Bow, pet.joints.bow)?,
+        pet_joint(HeadJoint::Curl, pet.joints.curl)?,
+        pet_joint(HeadJoint::Yaw, pet.joints.yaw)?,
+        pet_joint(HeadJoint::Roll, pet.joints.roll)?,
+        Duration::from_nanos(pet.rest_dwell_ns),
+        Duration::from_nanos(pet.rest_per_additional_joint_ns),
+        Duration::from_nanos(pet.maximum_rest_dwell_ns),
+        pet.recovery_per_additional_joint_permille,
+        Duration::from_nanos(pet.static_release_dwell_ns),
+        Duration::from_nanos(pet.maximum_yield_dwell_ns),
+        pet.residual_stillness_ticks,
+        pet.comfort_roll_tilt_ticks,
+        HeadTorqueLimits::new(
+            yield_torque(HeadJoint::Bow, pet.yield_torque_limit_permille.bow)?,
+            yield_torque(HeadJoint::Curl, pet.yield_torque_limit_permille.curl)?,
+            yield_torque(HeadJoint::Yaw, pet.yield_torque_limit_permille.yaw)?,
+            yield_torque(HeadJoint::Roll, pet.yield_torque_limit_permille.roll)?,
+        ),
+        Duration::from_nanos(pet.tap_maximum_contact_duration_ns),
+        Duration::from_nanos(pet.tap_recovery_duration_ns),
+    )
+    .map_err(HeadCompliantHoldDeclarationParseError::PetProfile)?;
+    config
+        .try_with_pet_profile(profile)
+        .map_err(HeadCompliantHoldDeclarationParseError::Config)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -742,6 +784,15 @@ pub enum HeadCompliantHoldDeclarationParseError {
         joint: HeadJoint,
         source: FrameBuildError,
     },
+    PetJoint {
+        joint: HeadJoint,
+        source: CompliantPetJointPolicyError,
+    },
+    YieldTorque {
+        joint: HeadJoint,
+        source: FrameBuildError,
+    },
+    PetProfile(CompliantPetProfileError),
     Config(HeadCompliantHoldConfigError),
 }
 
@@ -758,7 +809,9 @@ impl std::error::Error for HeadCompliantHoldDeclarationParseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Joint { source, .. } => Some(source),
-            Self::Torque { source, .. } => Some(source),
+            Self::Torque { source, .. } | Self::YieldTorque { source, .. } => Some(source),
+            Self::PetJoint { source, .. } => Some(source),
+            Self::PetProfile(source) => Some(source),
             Self::Config(source) => Some(source),
         }
     }
@@ -1192,6 +1245,7 @@ struct HeadCompliantHoldDeclarationDto {
     recovery_duration_ns: u64,
     follow_permille: u16,
     joints: NamedCompliantJointPoliciesDto,
+    pet_profile: Option<CompliantPetProfileDto>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -1220,6 +1274,40 @@ struct CompliantJointPolicyDto {
     maximum_yield_ticks: u16,
     maximum_command_step_ticks: u16,
     maximum_observed_step_ticks: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompliantPetProfileDto {
+    rest_dwell_ns: u64,
+    rest_per_additional_joint_ns: u64,
+    maximum_rest_dwell_ns: u64,
+    recovery_per_additional_joint_permille: u16,
+    static_release_dwell_ns: u64,
+    maximum_yield_dwell_ns: u64,
+    residual_stillness_ticks: u16,
+    comfort_roll_tilt_ticks: u16,
+    yield_torque_limit_permille: NamedHeadTorqueLimitsDto,
+    tap_maximum_contact_duration_ns: u64,
+    tap_recovery_duration_ns: u64,
+    joints: NamedCompliantPetJointPoliciesDto,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamedCompliantPetJointPoliciesDto {
+    bow: CompliantPetJointPolicyDto,
+    curl: CompliantPetJointPolicyDto,
+    yaw: CompliantPetJointPolicyDto,
+    roll: CompliantPetJointPolicyDto,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompliantPetJointPolicyDto {
+    maximum_baseline_error_ticks: u16,
+    rest_offset_ticks: i16,
+    directional_rest_offset_ticks: u16,
 }
 
 #[cfg(test)]
@@ -1369,6 +1457,46 @@ mod tests {
                     "maximum_yield_ticks": 90,
                     "maximum_command_step_ticks": 4,
                     "maximum_observed_step_ticks": 100
+                }
+            }
+        })
+    }
+
+    fn pet_profile_declaration() -> Value {
+        json!({
+            "rest_dwell_ns": 1_200_000_000_u64,
+            "rest_per_additional_joint_ns": 350_000_000_u64,
+            "maximum_rest_dwell_ns": 3_000_000_000_u64,
+            "recovery_per_additional_joint_permille": 150,
+            "static_release_dwell_ns": 1_800_000_000_u64,
+            "maximum_yield_dwell_ns": 30_000_000_000_u64,
+            "residual_stillness_ticks": 3,
+            "comfort_roll_tilt_ticks": 14,
+            "yield_torque_limit_permille": {
+                "bow": 450, "curl": 350, "yaw": 220, "roll": 250
+            },
+            "tap_maximum_contact_duration_ns": 1_200_000_000_u64,
+            "tap_recovery_duration_ns": 800_000_000_u64,
+            "joints": {
+                "bow": {
+                    "maximum_baseline_error_ticks": 32,
+                    "rest_offset_ticks": -24,
+                    "directional_rest_offset_ticks": 0
+                },
+                "curl": {
+                    "maximum_baseline_error_ticks": 40,
+                    "rest_offset_ticks": 30,
+                    "directional_rest_offset_ticks": 0
+                },
+                "yaw": {
+                    "maximum_baseline_error_ticks": 24,
+                    "rest_offset_ticks": 0,
+                    "directional_rest_offset_ticks": 20
+                },
+                "roll": {
+                    "maximum_baseline_error_ticks": 24,
+                    "rest_offset_ticks": 0,
+                    "directional_rest_offset_ticks": 16
                 }
             }
         })
@@ -1729,6 +1857,67 @@ mod tests {
                     ..
                 }
             ))
+        ));
+    }
+
+    #[test]
+    fn optional_pet_profile_parses_once_and_rejects_unsafe_field_relationships() {
+        let mut document = valid_value();
+        let mut compliant = compliant_declaration();
+        compliant["follow_permille"] = json!(650);
+        compliant["pet_profile"] = pet_profile_declaration();
+        document["compliant_hold_declaration"] = compliant;
+        let policy = parse(&document).expect("typed pet profile");
+        let profile = policy
+            .compliant_hold()
+            .expect("compliance")
+            .pet_profile()
+            .expect("pet profile");
+        assert_eq!(profile.rest_dwell(), Duration::from_millis(1_200));
+        assert_eq!(profile.static_release_dwell(), Duration::from_millis(1_800));
+        assert_eq!(profile.comfort_roll_tilt_ticks(), 14);
+        assert_eq!(profile.joint(HeadJoint::Bow).rest_offset_ticks(), -24);
+        assert_eq!(
+            HeadJoint::ALL.map(|joint| profile.yield_torque_limits().for_joint(joint).get()),
+            [450, 350, 220, 250]
+        );
+
+        let mut below_floor = document.clone();
+        below_floor["compliant_hold_declaration"]["pet_profile"]["yield_torque_limit_permille"]["bow"] =
+            json!(299);
+        assert!(matches!(
+            parse(&below_floor),
+            Err(HeadGazePolicyParseError::CompliantHold(
+                HeadCompliantHoldDeclarationParseError::Config(
+                    HeadCompliantHoldConfigError::YieldTorqueBelowMeasuredFloor {
+                        joint: HeadJoint::Bow,
+                        actual_permille: 299,
+                        minimum_permille: 300,
+                    }
+                )
+            ))
+        ));
+
+        let mut rest_outside_yield = document.clone();
+        rest_outside_yield["compliant_hold_declaration"]["pet_profile"]["joints"]["bow"]["rest_offset_ticks"] =
+            json!(-81);
+        assert!(matches!(
+            parse(&rest_outside_yield),
+            Err(HeadGazePolicyParseError::CompliantHold(
+                HeadCompliantHoldDeclarationParseError::Config(
+                    HeadCompliantHoldConfigError::PetRestExceedsMaximumYield {
+                        joint: HeadJoint::Bow,
+                        ..
+                    }
+                )
+            ))
+        ));
+
+        let mut unknown = document;
+        unknown["compliant_hold_declaration"]["pet_profile"]["script_name"] = json!("cute");
+        assert!(matches!(
+            parse(&unknown),
+            Err(HeadGazePolicyParseError::JsonDecode(_))
         ));
     }
 

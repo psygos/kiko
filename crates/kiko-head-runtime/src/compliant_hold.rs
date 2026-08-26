@@ -28,6 +28,7 @@ use crate::{HeadTelemetrySafetyLimits, HeadTelemetrySafetyViolation, MonotonicTi
 
 const JOINT_COUNT: usize = 4;
 const INTERPOLATION_SCALE: u128 = 1_000_000;
+const YIELD_TORQUE_FLOOR_PERMILLE: [u16; JOINT_COUNT] = [300, 200, 150, 150];
 static NEXT_COMPLIANT_CONTROLLER_ID: AtomicU64 = AtomicU64::new(1);
 
 const fn joint_index(joint: HeadJoint) -> usize {
@@ -225,6 +226,244 @@ impl fmt::Display for CompliantJointPolicyError {
 
 impl std::error::Error for CompliantJointPolicyError {}
 
+/// Pet-specific policy for one joint.
+///
+/// A stopped, bounded encoder bias is learned before contact is armed. This
+/// keeps pose-dependent gravity sag distinct from a person's displacement.
+/// Rest offsets are signed offsets from the expression target captured when
+/// the contact episode begins; directional offsets lean with the admitted
+/// contact direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompliantPetJointPolicy {
+    maximum_baseline_error_ticks: NonZeroU16,
+    rest_offset_ticks: i16,
+    directional_rest_offset_ticks: u16,
+}
+
+impl CompliantPetJointPolicy {
+    pub fn try_new(
+        maximum_baseline_error_ticks: u16,
+        rest_offset_ticks: i16,
+        directional_rest_offset_ticks: u16,
+    ) -> Result<Self, CompliantPetJointPolicyError> {
+        let maximum_baseline_error_ticks = NonZeroU16::new(maximum_baseline_error_ticks)
+            .ok_or(CompliantPetJointPolicyError::ZeroMaximumBaselineError)?;
+        if rest_offset_ticks.unsigned_abs() > PositionTicks::MAX.get() {
+            return Err(
+                CompliantPetJointPolicyError::RestOffsetOutsideEncoderDomain {
+                    ticks: rest_offset_ticks,
+                },
+            );
+        }
+        if directional_rest_offset_ticks > PositionTicks::MAX.get() {
+            return Err(
+                CompliantPetJointPolicyError::DirectionalRestOffsetOutsideEncoderDomain {
+                    ticks: directional_rest_offset_ticks,
+                },
+            );
+        }
+        Ok(Self {
+            maximum_baseline_error_ticks,
+            rest_offset_ticks,
+            directional_rest_offset_ticks,
+        })
+    }
+
+    pub const fn maximum_baseline_error_ticks(self) -> u16 {
+        self.maximum_baseline_error_ticks.get()
+    }
+
+    pub const fn rest_offset_ticks(self) -> i16 {
+        self.rest_offset_ticks
+    }
+
+    pub const fn directional_rest_offset_ticks(self) -> u16 {
+        self.directional_rest_offset_ticks
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompliantPetJointPolicyError {
+    ZeroMaximumBaselineError,
+    RestOffsetOutsideEncoderDomain { ticks: i16 },
+    DirectionalRestOffsetOutsideEncoderDomain { ticks: u16 },
+}
+
+impl fmt::Display for CompliantPetJointPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid compliant pet joint policy: {self:?}")
+    }
+}
+
+impl std::error::Error for CompliantPetJointPolicyError {}
+
+/// Field-qualified contact choreography layered on compliant hold.
+///
+/// Construction parses timing and torque relationships once. Binding the
+/// profile to [`HeadCompliantHoldConfig`] performs the remaining checks that
+/// depend on command envelopes, follow gain, control period, and holding
+/// torque. A controller therefore cannot observe a half-validated pet policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompliantPetProfile {
+    joints: [CompliantPetJointPolicy; JOINT_COUNT],
+    rest_dwell: Duration,
+    rest_per_additional_joint: Duration,
+    maximum_rest_dwell: Duration,
+    recovery_per_additional_joint_permille: u16,
+    static_release_dwell: Duration,
+    maximum_yield_dwell: Duration,
+    residual_stillness_ticks: NonZeroU16,
+    comfort_roll_tilt_ticks: u16,
+    yield_torque_limits: HeadTorqueLimits,
+    tap_maximum_contact_duration: Duration,
+    tap_recovery_duration: Duration,
+}
+
+impl CompliantPetProfile {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        bow: CompliantPetJointPolicy,
+        curl: CompliantPetJointPolicy,
+        yaw: CompliantPetJointPolicy,
+        roll: CompliantPetJointPolicy,
+        rest_dwell: Duration,
+        rest_per_additional_joint: Duration,
+        maximum_rest_dwell: Duration,
+        recovery_per_additional_joint_permille: u16,
+        static_release_dwell: Duration,
+        maximum_yield_dwell: Duration,
+        residual_stillness_ticks: u16,
+        comfort_roll_tilt_ticks: u16,
+        yield_torque_limits: HeadTorqueLimits,
+        tap_maximum_contact_duration: Duration,
+        tap_recovery_duration: Duration,
+    ) -> Result<Self, CompliantPetProfileError> {
+        if rest_dwell.is_zero() {
+            return Err(CompliantPetProfileError::ZeroRestDwell);
+        }
+        if maximum_rest_dwell < rest_dwell {
+            return Err(CompliantPetProfileError::MaximumRestDwellBelowBase {
+                base: rest_dwell,
+                maximum: maximum_rest_dwell,
+            });
+        }
+        if recovery_per_additional_joint_permille > 1_000 {
+            return Err(
+                CompliantPetProfileError::RecoveryAdditionalPermilleOutOfRange {
+                    value: recovery_per_additional_joint_permille,
+                },
+            );
+        }
+        if static_release_dwell.is_zero() {
+            return Err(CompliantPetProfileError::ZeroStaticReleaseDwell);
+        }
+        if maximum_yield_dwell <= static_release_dwell {
+            return Err(CompliantPetProfileError::MaximumYieldDwellNotAboveStatic {
+                static_release: static_release_dwell,
+                maximum_yield: maximum_yield_dwell,
+            });
+        }
+        let residual_stillness_ticks = NonZeroU16::new(residual_stillness_ticks)
+            .ok_or(CompliantPetProfileError::ZeroResidualStillness)?;
+        if tap_maximum_contact_duration.is_zero() {
+            return Err(CompliantPetProfileError::ZeroTapMaximumContactDuration);
+        }
+        if tap_recovery_duration.is_zero() {
+            return Err(CompliantPetProfileError::ZeroTapRecoveryDuration);
+        }
+        Ok(Self {
+            joints: [bow, curl, yaw, roll],
+            rest_dwell,
+            rest_per_additional_joint,
+            maximum_rest_dwell,
+            recovery_per_additional_joint_permille,
+            static_release_dwell,
+            maximum_yield_dwell,
+            residual_stillness_ticks,
+            comfort_roll_tilt_ticks,
+            yield_torque_limits,
+            tap_maximum_contact_duration,
+            tap_recovery_duration,
+        })
+    }
+
+    pub const fn joint(self, joint: HeadJoint) -> CompliantPetJointPolicy {
+        self.joints[joint_index(joint)]
+    }
+
+    pub const fn rest_dwell(self) -> Duration {
+        self.rest_dwell
+    }
+
+    pub const fn rest_per_additional_joint(self) -> Duration {
+        self.rest_per_additional_joint
+    }
+
+    pub const fn maximum_rest_dwell(self) -> Duration {
+        self.maximum_rest_dwell
+    }
+
+    pub const fn recovery_per_additional_joint_permille(self) -> u16 {
+        self.recovery_per_additional_joint_permille
+    }
+
+    pub const fn static_release_dwell(self) -> Duration {
+        self.static_release_dwell
+    }
+
+    pub const fn maximum_yield_dwell(self) -> Duration {
+        self.maximum_yield_dwell
+    }
+
+    pub const fn residual_stillness_ticks(self) -> u16 {
+        self.residual_stillness_ticks.get()
+    }
+
+    pub const fn comfort_roll_tilt_ticks(self) -> u16 {
+        self.comfort_roll_tilt_ticks
+    }
+
+    pub const fn yield_torque_limits(self) -> HeadTorqueLimits {
+        self.yield_torque_limits
+    }
+
+    pub const fn tap_maximum_contact_duration(self) -> Duration {
+        self.tap_maximum_contact_duration
+    }
+
+    pub const fn tap_recovery_duration(self) -> Duration {
+        self.tap_recovery_duration
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompliantPetProfileError {
+    ZeroRestDwell,
+    MaximumRestDwellBelowBase {
+        base: Duration,
+        maximum: Duration,
+    },
+    RecoveryAdditionalPermilleOutOfRange {
+        value: u16,
+    },
+    ZeroStaticReleaseDwell,
+    MaximumYieldDwellNotAboveStatic {
+        static_release: Duration,
+        maximum_yield: Duration,
+    },
+    ZeroResidualStillness,
+    ZeroTapMaximumContactDuration,
+    ZeroTapRecoveryDuration,
+}
+
+impl fmt::Display for CompliantPetProfileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid compliant pet profile: {self:?}")
+    }
+}
+
+impl std::error::Error for CompliantPetProfileError {}
+
 /// A complete four-axis compliant-hold policy.
 ///
 /// `holding_torque_limits` are evidence binding, not adaptive output. They
@@ -244,6 +483,7 @@ pub struct HeadCompliantHoldConfig {
     release_dwell: Duration,
     recovery_duration: Duration,
     follow_permille: NonZeroU16,
+    pet_profile: Option<CompliantPetProfile>,
 }
 
 impl HeadCompliantHoldConfig {
@@ -328,7 +568,121 @@ impl HeadCompliantHoldConfig {
             release_dwell,
             recovery_duration,
             follow_permille,
+            pet_profile: None,
         })
+    }
+
+    /// Bind field-qualified pet behavior to this complete hold policy.
+    ///
+    /// This consumes and returns the configuration so invalid combinations
+    /// never escape as a temporarily usable value.
+    pub fn try_with_pet_profile(
+        mut self,
+        profile: CompliantPetProfile,
+    ) -> Result<Self, HeadCompliantHoldConfigError> {
+        let minimum_static_evidence = self
+            .control_period
+            .checked_mul(3)
+            .ok_or(HeadCompliantHoldConfigError::PetTimingOverflow)?;
+        if profile.static_release_dwell() < minimum_static_evidence {
+            return Err(
+                HeadCompliantHoldConfigError::StaticReleaseBelowThreeControlPeriods {
+                    static_release: profile.static_release_dwell(),
+                    minimum: minimum_static_evidence,
+                },
+            );
+        }
+        if profile.tap_recovery_duration() > self.recovery_duration {
+            return Err(
+                HeadCompliantHoldConfigError::TapRecoveryExceedsFullRecovery {
+                    tap: profile.tap_recovery_duration(),
+                    full: self.recovery_duration,
+                },
+            );
+        }
+        let maximum_recovery_scale =
+            1_000_u32 + 3 * u32::from(profile.recovery_per_additional_joint_permille());
+        if scale_duration_permille(self.recovery_duration, maximum_recovery_scale).is_none() {
+            return Err(HeadCompliantHoldConfigError::PetTimingOverflow);
+        }
+        if profile
+            .maximum_rest_dwell()
+            .checked_add(self.maximum_rest_travel_duration())
+            .is_none()
+        {
+            return Err(HeadCompliantHoldConfigError::PetTimingOverflow);
+        }
+        for joint in HeadJoint::ALL {
+            let hold = self.joint(joint);
+            let pet = profile.joint(joint);
+            let rest = u32::from(pet.rest_offset_ticks().unsigned_abs());
+            let directional = u32::from(pet.directional_rest_offset_ticks());
+            if rest + directional > u32::from(hold.maximum_yield_ticks()) {
+                return Err(HeadCompliantHoldConfigError::PetRestExceedsMaximumYield {
+                    joint,
+                    rest_offset_ticks: pet.rest_offset_ticks(),
+                    directional_offset_ticks: pet.directional_rest_offset_ticks(),
+                    maximum_yield_ticks: hold.maximum_yield_ticks(),
+                });
+            }
+            if profile.residual_stillness_ticks() > hold.maximum_command_step_ticks() {
+                return Err(
+                    HeadCompliantHoldConfigError::StillnessExceedsMaximumCommandStep {
+                        joint,
+                        stillness_ticks: profile.residual_stillness_ticks(),
+                        maximum_command_step_ticks: hold.maximum_command_step_ticks(),
+                    },
+                );
+            }
+            let yielded_at_entry = div_round_nearest(
+                i64::from(hold.contact_entry_error_ticks()) * i64::from(self.follow_permille()),
+                1_000,
+            );
+            let retained_error = i64::from(hold.contact_entry_error_ticks()) - yielded_at_entry;
+            if retained_error <= i64::from(hold.contact_release_error_ticks()) {
+                return Err(HeadCompliantHoldConfigError::FollowCollapsesHysteresis {
+                    joint,
+                    retained_error_ticks: u16::try_from(retained_error)
+                        .expect("positive entry and admitted gain retain a nonnegative error"),
+                    release_error_ticks: hold.contact_release_error_ticks(),
+                });
+            }
+            let yield_torque = profile.yield_torque_limits().for_joint(joint).get();
+            let holding_torque = self.holding_torque_limits.for_joint(joint).get();
+            let floor = YIELD_TORQUE_FLOOR_PERMILLE[joint_index(joint)];
+            if yield_torque < floor {
+                return Err(
+                    HeadCompliantHoldConfigError::YieldTorqueBelowMeasuredFloor {
+                        joint,
+                        actual_permille: yield_torque,
+                        minimum_permille: floor,
+                    },
+                );
+            }
+            if yield_torque > holding_torque {
+                return Err(HeadCompliantHoldConfigError::YieldTorqueExceedsHolding {
+                    joint,
+                    yield_permille: yield_torque,
+                    holding_permille: holding_torque,
+                });
+            }
+        }
+        let roll_pet = profile.joint(HeadJoint::Roll);
+        let roll_total = u32::from(roll_pet.rest_offset_ticks().unsigned_abs())
+            + u32::from(roll_pet.directional_rest_offset_ticks())
+            + u32::from(profile.comfort_roll_tilt_ticks());
+        let roll_yield = u32::from(self.joint(HeadJoint::Roll).maximum_yield_ticks());
+        if roll_total > roll_yield {
+            return Err(
+                HeadCompliantHoldConfigError::ComfortRollExceedsMaximumYield {
+                    total_ticks: roll_total,
+                    maximum_yield_ticks: u16::try_from(roll_yield)
+                        .expect("joint policy yield is u16"),
+                },
+            );
+        }
+        self.pet_profile = Some(profile);
+        Ok(self)
     }
 
     pub const fn joint(self, joint: HeadJoint) -> CompliantJointPolicy {
@@ -375,6 +729,26 @@ impl HeadCompliantHoldConfig {
         self.follow_permille.get()
     }
 
+    pub const fn pet_profile(self) -> Option<CompliantPetProfile> {
+        self.pet_profile
+    }
+
+    fn maximum_rest_travel_duration(self) -> Duration {
+        let maximum_slots = HeadJoint::ALL
+            .into_iter()
+            .map(|joint| {
+                let policy = self.joint(joint);
+                let travel = u32::from(policy.maximum_yield_ticks()) * 2;
+                let step = u32::from(policy.maximum_command_step_ticks());
+                travel.div_ceil(step)
+            })
+            .max()
+            .expect("a Kiko head always has four joints");
+        self.control_period
+            .checked_mul(maximum_slots)
+            .unwrap_or(Duration::MAX)
+    }
+
     pub fn admit_runtime_torque_limits(
         self,
         actual: HeadTorqueLimits,
@@ -419,6 +793,45 @@ pub enum HeadCompliantHoldConfigError {
     ZeroFollowPermille,
     FollowPermilleOutOfRange {
         value: u16,
+    },
+    PetTimingOverflow,
+    StaticReleaseBelowThreeControlPeriods {
+        static_release: Duration,
+        minimum: Duration,
+    },
+    TapRecoveryExceedsFullRecovery {
+        tap: Duration,
+        full: Duration,
+    },
+    PetRestExceedsMaximumYield {
+        joint: HeadJoint,
+        rest_offset_ticks: i16,
+        directional_offset_ticks: u16,
+        maximum_yield_ticks: u16,
+    },
+    StillnessExceedsMaximumCommandStep {
+        joint: HeadJoint,
+        stillness_ticks: u16,
+        maximum_command_step_ticks: u16,
+    },
+    FollowCollapsesHysteresis {
+        joint: HeadJoint,
+        retained_error_ticks: u16,
+        release_error_ticks: u16,
+    },
+    YieldTorqueBelowMeasuredFloor {
+        joint: HeadJoint,
+        actual_permille: u16,
+        minimum_permille: u16,
+    },
+    YieldTorqueExceedsHolding {
+        joint: HeadJoint,
+        yield_permille: u16,
+        holding_permille: u16,
+    },
+    ComfortRollExceedsMaximumYield {
+        total_ticks: u32,
+        maximum_yield_ticks: u16,
     },
 }
 
@@ -722,6 +1135,7 @@ pub enum CompliantHoldState {
     ConfirmingContact,
     Yielding,
     ReleaseDwell,
+    Resting,
     Recovering,
     FaultHeld,
 }
@@ -770,11 +1184,98 @@ pub enum CompliantHoldDisposition {
         command_step_limited: [bool; JOINT_COUNT],
     },
     ReleaseDwell,
+    Resting {
+        command_step_limited: [bool; JOINT_COUNT],
+        at_rest_target: bool,
+    },
     Recovering {
         progress_millionths: u32,
         command_step_limited: [bool; JOINT_COUNT],
     },
     ReturnedToExpression,
+}
+
+/// One semantic edge emitted by the compliant planner.
+///
+/// This is factual state-machine evidence. The character layer may render an
+/// eye/head response from it; the compliant controller itself never chooses a
+/// social expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompliantPetEvent {
+    Ready,
+    Candidate,
+    Contact,
+    Tap,
+    ReleaseStatic,
+    YieldTimeout,
+    Resting,
+    Comfy,
+    Recontact,
+    Recovering,
+    Returned,
+}
+
+/// Exact integer evidence for one completed contact episode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompliantPetEpisodeSummary {
+    started_at: MonotonicTime,
+    completed_at: MonotonicTime,
+    yield_entries: u16,
+    samples: u64,
+    peak_residual_ticks: [u16; JOINT_COUNT],
+    accumulated_max_delta_ticks: u64,
+    delta_samples: u64,
+    reached_rest: bool,
+    reached_comfy: bool,
+    tap: bool,
+}
+
+impl CompliantPetEpisodeSummary {
+    pub const fn started_at(self) -> MonotonicTime {
+        self.started_at
+    }
+
+    pub const fn completed_at(self) -> MonotonicTime {
+        self.completed_at
+    }
+
+    pub fn duration(self) -> Duration {
+        self.completed_at
+            .checked_duration_since(self.started_at)
+            .expect("completed pet episode timestamps are monotonic")
+    }
+
+    pub const fn yield_entries(self) -> u16 {
+        self.yield_entries
+    }
+
+    pub const fn samples(self) -> u64 {
+        self.samples
+    }
+
+    pub const fn peak_residual_ticks(self) -> [u16; JOINT_COUNT] {
+        self.peak_residual_ticks
+    }
+
+    pub const fn accumulated_max_delta_ticks(self) -> u64 {
+        self.accumulated_max_delta_ticks
+    }
+
+    pub const fn delta_samples(self) -> u64 {
+        self.delta_samples
+    }
+
+    pub const fn reached_rest(self) -> bool {
+        self.reached_rest
+    }
+
+    pub const fn reached_comfy(self) -> bool {
+        self.reached_comfy
+    }
+
+    pub const fn was_tap(self) -> bool {
+        self.tap
+    }
 }
 
 impl CompliantHoldDisposition {
@@ -791,6 +1292,82 @@ struct ContactCandidate {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActiveContact {
+    return_target: ExactHeadTargetPose,
+    directions: [i8; JOINT_COUNT],
+    rest_offsets: [i16; JOINT_COUNT],
+    rest_duration: Duration,
+    recovery_duration: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompliantPetEpisodeAccumulator {
+    started_at: MonotonicTime,
+    yield_entries: u16,
+    samples: u64,
+    peak_residual_ticks: [u16; JOINT_COUNT],
+    accumulated_max_delta_ticks: u64,
+    delta_samples: u64,
+    previous_residual: Option<[i32; JOINT_COUNT]>,
+    reached_rest: bool,
+    reached_comfy: bool,
+    tap: bool,
+}
+
+impl CompliantPetEpisodeAccumulator {
+    const fn new(started_at: MonotonicTime) -> Self {
+        Self {
+            started_at,
+            yield_entries: 0,
+            samples: 0,
+            peak_residual_ticks: [0; JOINT_COUNT],
+            accumulated_max_delta_ticks: 0,
+            delta_samples: 0,
+            previous_residual: None,
+            reached_rest: false,
+            reached_comfy: false,
+            tap: false,
+        }
+    }
+
+    fn observe(&mut self, residual: [i32; JOINT_COUNT]) {
+        self.samples = self.samples.saturating_add(1);
+        for (peak, actual) in self.peak_residual_ticks.iter_mut().zip(residual) {
+            let magnitude = u16::try_from(actual.unsigned_abs()).unwrap_or(u16::MAX);
+            *peak = (*peak).max(magnitude);
+        }
+        if let Some(previous) = self.previous_residual {
+            let maximum_delta = previous
+                .into_iter()
+                .zip(residual)
+                .map(|(previous, actual)| previous.abs_diff(actual))
+                .max()
+                .unwrap_or(0);
+            self.accumulated_max_delta_ticks = self
+                .accumulated_max_delta_ticks
+                .saturating_add(u64::from(maximum_delta));
+            self.delta_samples = self.delta_samples.saturating_add(1);
+        }
+        self.previous_residual = Some(residual);
+    }
+
+    const fn complete(self, completed_at: MonotonicTime) -> CompliantPetEpisodeSummary {
+        CompliantPetEpisodeSummary {
+            started_at: self.started_at,
+            completed_at,
+            yield_entries: self.yield_entries,
+            samples: self.samples,
+            peak_residual_ticks: self.peak_residual_ticks,
+            accumulated_max_delta_ticks: self.accumulated_max_delta_ticks,
+            delta_samples: self.delta_samples,
+            reached_rest: self.reached_rest,
+            reached_comfy: self.reached_comfy,
+            tap: self.tap,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControllerPhase {
     FollowingExpression {
         quiescent_since: Option<MonotonicTime>,
@@ -798,13 +1375,25 @@ enum ControllerPhase {
     },
     Confirming(ContactCandidate),
     Yielding {
-        return_target: ExactHeadTargetPose,
+        contact: ActiveContact,
         quiet_since: Option<MonotonicTime>,
+        entered_at: MonotonicTime,
+        stable_since: MonotonicTime,
+        stable_reference: Option<[i32; JOINT_COUNT]>,
+    },
+    Resting {
+        contact: ActiveContact,
+        entered_at: MonotonicTime,
+        settled_at: Option<MonotonicTime>,
+        previous_residual: Option<[i32; JOINT_COUNT]>,
+        reacquisition: Option<ContactCandidate>,
     },
     Recovering {
-        return_target: ExactHeadTargetPose,
+        contact: ActiveContact,
         recovery_start: ExactHeadTargetPose,
         started_at: MonotonicTime,
+        duration: Duration,
+        previous_residual: Option<[i32; JOINT_COUNT]>,
         reacquisition: Option<ContactCandidate>,
     },
 }
@@ -823,6 +1412,10 @@ pub struct HeadCompliantHoldController {
     config: HeadCompliantHoldConfig,
     phase: ControllerPhase,
     committed_target: ExactHeadTargetPose,
+    baseline_error_ticks: [i32; JOINT_COUNT],
+    comfort_roll_side: Option<i8>,
+    episode: Option<CompliantPetEpisodeAccumulator>,
+    last_completed_episode: Option<CompliantPetEpisodeSummary>,
     previous_observation: Option<CompliantHeadObservation>,
     next_service_due: MonotonicTime,
     latest_boundary_at: MonotonicTime,
@@ -841,6 +1434,9 @@ pub struct PreparedCompliantHoldStep {
     state: CompliantHoldState,
     target: ExactHeadTargetPose,
     disposition: CompliantHoldDisposition,
+    desired_torque_limits: HeadTorqueLimits,
+    pet_event: Option<CompliantPetEvent>,
+    completed_episode: Option<CompliantPetEpisodeSummary>,
     observation: CompliantHeadObservation,
     candidate: HeadCompliantHoldController,
 }
@@ -862,6 +1458,18 @@ impl PreparedCompliantHoldStep {
         self.disposition
     }
 
+    pub const fn desired_torque_limits(&self) -> HeadTorqueLimits {
+        self.desired_torque_limits
+    }
+
+    pub const fn pet_event(&self) -> Option<CompliantPetEvent> {
+        self.pet_event
+    }
+
+    pub const fn completed_episode(&self) -> Option<CompliantPetEpisodeSummary> {
+        self.completed_episode
+    }
+
     pub const fn observation(&self) -> CompliantHeadObservation {
         self.observation
     }
@@ -873,6 +1481,9 @@ pub struct CompliantHoldCommitReceipt {
     state: CompliantHoldState,
     committed_target: ExactHeadTargetPose,
     disposition: CompliantHoldDisposition,
+    desired_torque_limits: HeadTorqueLimits,
+    pet_event: Option<CompliantPetEvent>,
+    completed_episode: Option<CompliantPetEpisodeSummary>,
     observation: CompliantHeadObservation,
 }
 
@@ -887,6 +1498,18 @@ impl CompliantHoldCommitReceipt {
 
     pub const fn disposition(self) -> CompliantHoldDisposition {
         self.disposition
+    }
+
+    pub const fn desired_torque_limits(self) -> HeadTorqueLimits {
+        self.desired_torque_limits
+    }
+
+    pub const fn pet_event(self) -> Option<CompliantPetEvent> {
+        self.pet_event
+    }
+
+    pub const fn completed_episode(self) -> Option<CompliantPetEpisodeSummary> {
+        self.completed_episode
     }
 
     pub const fn observation(self) -> CompliantHeadObservation {
@@ -964,6 +1587,10 @@ impl HeadCompliantHoldController {
                 contact_armed: false,
             },
             committed_target: initial_committed_target,
+            baseline_error_ticks: [0; JOINT_COUNT],
+            comfort_roll_side: None,
+            episode: None,
+            last_completed_episode: None,
             previous_observation: None,
             next_service_due: started_at,
             latest_boundary_at: started_at,
@@ -999,6 +1626,7 @@ impl HeadCompliantHoldController {
                     ..
                 },
             ) => CompliantHoldState::ReleaseDwell,
+            (None, ControllerPhase::Resting { .. }) => CompliantHoldState::Resting,
             (None, ControllerPhase::Recovering { .. }) => CompliantHoldState::Recovering,
         }
     }
@@ -1009,6 +1637,20 @@ impl HeadCompliantHoldController {
 
     pub const fn next_service_due(&self) -> MonotonicTime {
         self.next_service_due
+    }
+
+    pub const fn baseline_error_ticks(&self) -> [i32; JOINT_COUNT] {
+        self.baseline_error_ticks
+    }
+
+    pub const fn last_completed_episode(&self) -> Option<CompliantPetEpisodeSummary> {
+        self.last_completed_episode
+    }
+
+    /// Torque profile that must be installed for the currently committed
+    /// planner state.
+    pub fn desired_torque_limits(&self) -> HeadTorqueLimits {
+        desired_torque_limits(self.config, self.phase)
     }
 
     /// Prepare one observation-driven command.
@@ -1047,7 +1689,8 @@ impl HeadCompliantHoldController {
             generation: self.generation,
         };
         let mut candidate = self.clone();
-        let disposition = candidate.advance(
+        let previously_completed_episode = candidate.last_completed_episode;
+        let (disposition, pet_event) = candidate.advance(
             serviced_at,
             expression_target,
             expression_quiet,
@@ -1067,11 +1710,18 @@ impl HeadCompliantHoldController {
             })?;
         let target = candidate.committed_target;
         let state = candidate.state();
+        let desired_torque_limits = candidate.desired_torque_limits();
+        let completed_episode = (candidate.last_completed_episode != previously_completed_episode)
+            .then_some(candidate.last_completed_episode)
+            .flatten();
         Ok(PreparedCompliantHoldStep {
             token,
             state,
             target,
             disposition,
+            desired_torque_limits,
+            pet_event,
+            completed_episode,
             observation,
             candidate,
         })
@@ -1087,6 +1737,9 @@ impl HeadCompliantHoldController {
             state,
             target,
             disposition,
+            desired_torque_limits,
+            pet_event,
+            completed_episode,
             observation,
             candidate,
         } = prepared;
@@ -1096,6 +1749,9 @@ impl HeadCompliantHoldController {
             state,
             committed_target: target,
             disposition,
+            desired_torque_limits,
+            pet_event,
+            completed_episode,
             observation,
         })
     }
@@ -1199,7 +1855,8 @@ impl HeadCompliantHoldController {
         expression_target: ExactHeadTargetPose,
         expression_quiet: bool,
         observation: CompliantHeadObservation,
-    ) -> Result<CompliantHoldDisposition, CompliantHoldPrepareError> {
+    ) -> Result<(CompliantHoldDisposition, Option<CompliantPetEvent>), CompliantHoldPrepareError>
+    {
         match self.phase {
             ControllerPhase::FollowingExpression {
                 quiescent_since,
@@ -1208,19 +1865,43 @@ impl HeadCompliantHoldController {
                 let expression_target_changed = expression_target != self.committed_target;
                 self.committed_target = expression_target;
                 if !expression_quiet || expression_target_changed {
-                    self.phase = following_expression_unarmed();
-                    return Ok(CompliantHoldDisposition::FollowingExpression);
+                    self.reset_to_following();
+                    return Ok((CompliantHoldDisposition::FollowingExpression, None));
                 }
                 if !contact_armed {
-                    let settled =
-                        inside_release_band(self.config, self.committed_target, observation)
-                            && HeadJoint::ALL
-                                .into_iter()
-                                .all(|joint| !observation.is_moving(joint));
+                    let candidate_baseline = HeadJoint::ALL.map(|joint| {
+                        signed_error(
+                            observation.position(joint),
+                            self.committed_target.position(joint),
+                        )
+                    });
+                    let settled = if let Some(profile) = self.config.pet_profile() {
+                        HeadJoint::ALL.into_iter().all(|joint| {
+                            !observation.is_moving(joint)
+                                && candidate_baseline[joint_index(joint)].unsigned_abs()
+                                    <= u32::from(
+                                        profile.joint(joint).maximum_baseline_error_ticks(),
+                                    )
+                        })
+                    } else {
+                        inside_release_band(
+                            self.config,
+                            self.committed_target,
+                            observation,
+                            self.baseline_error_ticks,
+                        ) && HeadJoint::ALL
+                            .into_iter()
+                            .all(|joint| !observation.is_moving(joint))
+                    };
                     let quiescent_since = if settled {
                         quiescent_since.or(Some(now))
                     } else {
                         None
+                    };
+                    self.baseline_error_ticks = if settled && self.config.pet_profile().is_some() {
+                        candidate_baseline
+                    } else {
+                        [0; JOINT_COUNT]
                     };
                     let contact_armed = quiescent_since.is_some_and(|started| {
                         now.checked_duration_since(started)
@@ -1230,12 +1911,19 @@ impl HeadCompliantHoldController {
                         quiescent_since,
                         contact_armed,
                     };
-                    return Ok(CompliantHoldDisposition::FollowingExpression);
+                    let event = contact_armed
+                        .then_some(CompliantPetEvent::Ready)
+                        .filter(|_| self.config.pet_profile().is_some());
+                    return Ok((CompliantHoldDisposition::FollowingExpression, event));
                 }
-                let directions =
-                    contact_directions(self.config, self.committed_target, observation);
+                let directions = contact_directions(
+                    self.config,
+                    self.committed_target,
+                    observation,
+                    self.baseline_error_ticks,
+                );
                 if directions == [0; JOINT_COUNT] {
-                    return Ok(CompliantHoldDisposition::FollowingExpression);
+                    return Ok((CompliantHoldDisposition::FollowingExpression, None));
                 }
                 let candidate = ContactCandidate {
                     return_target: self.committed_target,
@@ -1243,162 +1931,538 @@ impl HeadCompliantHoldController {
                     consecutive_samples: 1,
                 };
                 if self.config.contact_acquisition_samples() == 1 {
-                    return self.enter_yield(candidate.return_target, observation);
+                    return self.enter_yield(now, candidate, observation, false);
                 }
                 self.phase = ControllerPhase::Confirming(candidate);
-                Ok(CompliantHoldDisposition::ContactCandidate {
-                    consecutive_samples: 1,
-                })
+                Ok((
+                    CompliantHoldDisposition::ContactCandidate {
+                        consecutive_samples: 1,
+                    },
+                    self.config
+                        .pet_profile()
+                        .map(|_| CompliantPetEvent::Candidate),
+                ))
             }
             ControllerPhase::Confirming(candidate) => {
                 if !expression_quiet || expression_target != candidate.return_target {
-                    self.phase = following_expression_unarmed();
                     self.committed_target = expression_target;
-                    return Ok(CompliantHoldDisposition::FollowingExpression);
+                    self.reset_to_following();
+                    return Ok((CompliantHoldDisposition::FollowingExpression, None));
                 }
-                let directions =
-                    contact_directions(self.config, self.committed_target, observation);
+                let directions = contact_directions(
+                    self.config,
+                    self.committed_target,
+                    observation,
+                    self.baseline_error_ticks,
+                );
                 if !directions_continue(candidate.directions, directions) {
-                    self.phase = following_expression_unarmed();
-                    return Ok(CompliantHoldDisposition::FollowingExpression);
+                    self.reset_to_following();
+                    return Ok((CompliantHoldDisposition::FollowingExpression, None));
                 }
                 let consecutive_samples = candidate.consecutive_samples.saturating_add(1);
+                let directions = merge_directions(candidate.directions, directions);
                 if consecutive_samples >= self.config.contact_acquisition_samples() {
-                    return self.enter_yield(candidate.return_target, observation);
+                    return self.enter_yield(
+                        now,
+                        ContactCandidate {
+                            directions,
+                            consecutive_samples,
+                            ..candidate
+                        },
+                        observation,
+                        false,
+                    );
                 }
                 self.phase = ControllerPhase::Confirming(ContactCandidate {
+                    directions,
                     consecutive_samples,
                     ..candidate
                 });
-                Ok(CompliantHoldDisposition::ContactCandidate {
-                    consecutive_samples,
-                })
+                Ok((
+                    CompliantHoldDisposition::ContactCandidate {
+                        consecutive_samples,
+                    },
+                    None,
+                ))
             }
             ControllerPhase::Yielding {
-                return_target,
+                contact,
                 quiet_since,
+                entered_at,
+                stable_since,
+                stable_reference,
             } => {
-                let released = inside_release_band(self.config, self.committed_target, observation)
-                    && HeadJoint::ALL
-                        .into_iter()
-                        .all(|joint| !observation.is_moving(joint));
+                let residual = residual_errors(
+                    self.committed_target,
+                    observation,
+                    self.baseline_error_ticks,
+                );
+                if let Some(episode) = self.episode.as_mut() {
+                    episode.observe(residual);
+                }
+                let released = inside_release_band(
+                    self.config,
+                    self.committed_target,
+                    observation,
+                    self.baseline_error_ticks,
+                ) && HeadJoint::ALL
+                    .into_iter()
+                    .all(|joint| !observation.is_moving(joint));
                 let quiet_since = if released {
                     quiet_since.or(Some(now))
                 } else {
                     None
                 };
-                if let Some(started) = quiet_since
-                    && now
-                        .checked_duration_since(started)
-                        .is_some_and(|elapsed| elapsed >= self.config.release_dwell())
-                {
-                    self.phase = ControllerPhase::Recovering {
-                        return_target,
-                        recovery_start: self.committed_target,
-                        started_at: now,
-                        reacquisition: None,
-                    };
-                    return Ok(CompliantHoldDisposition::Recovering {
-                        progress_millionths: 0,
-                        command_step_limited: [false; JOINT_COUNT],
-                    });
-                }
-                self.phase = ControllerPhase::Yielding {
-                    return_target,
-                    quiet_since,
-                };
                 if released {
-                    Ok(CompliantHoldDisposition::ReleaseDwell)
+                    if let Some(profile) = self.config.pet_profile()
+                        && self.episode.is_some_and(|episode| {
+                            episode.yield_entries == 1
+                                && !episode.reached_rest
+                                && now
+                                    .checked_duration_since(entered_at)
+                                    .is_some_and(|elapsed| {
+                                        elapsed <= profile.tap_maximum_contact_duration()
+                                    })
+                        })
+                    {
+                        if let Some(episode) = self.episode.as_mut() {
+                            episode.tap = true;
+                        }
+                        self.enter_recovery(contact, now, profile.tap_recovery_duration());
+                        return Ok((
+                            CompliantHoldDisposition::Recovering {
+                                progress_millionths: 0,
+                                command_step_limited: [false; JOINT_COUNT],
+                            },
+                            Some(CompliantPetEvent::Tap),
+                        ));
+                    }
+                    if quiet_since.is_some_and(|started| {
+                        now.checked_duration_since(started)
+                            .is_some_and(|elapsed| elapsed >= self.config.release_dwell())
+                    }) {
+                        if self.config.pet_profile().is_some() {
+                            self.enter_rest(contact, now);
+                            return Ok((
+                                CompliantHoldDisposition::Resting {
+                                    command_step_limited: [false; JOINT_COUNT],
+                                    at_rest_target: false,
+                                },
+                                Some(CompliantPetEvent::Resting),
+                            ));
+                        }
+                        self.enter_recovery(contact, now, self.config.recovery_duration());
+                        return Ok((
+                            CompliantHoldDisposition::Recovering {
+                                progress_millionths: 0,
+                                command_step_limited: [false; JOINT_COUNT],
+                            },
+                            None,
+                        ));
+                    }
+                    self.phase = ControllerPhase::Yielding {
+                        contact,
+                        quiet_since,
+                        entered_at,
+                        stable_since: now,
+                        stable_reference: None,
+                    };
+                    return Ok((CompliantHoldDisposition::ReleaseDwell, None));
+                }
+
+                if let Some(profile) = self.config.pet_profile() {
+                    let stable = stable_reference.is_some_and(|reference| {
+                        residual
+                            .into_iter()
+                            .zip(reference)
+                            .all(|(actual, reference)| {
+                                actual.abs_diff(reference)
+                                    <= u32::from(profile.residual_stillness_ticks())
+                            })
+                    });
+                    let (stable_since, stable_reference) = if stable {
+                        (stable_since, stable_reference)
+                    } else {
+                        (now, Some(residual))
+                    };
+                    let static_release = now
+                        .checked_duration_since(stable_since)
+                        .is_some_and(|elapsed| elapsed >= profile.static_release_dwell());
+                    let timed_out = now
+                        .checked_duration_since(entered_at)
+                        .is_some_and(|elapsed| elapsed >= profile.maximum_yield_dwell());
+                    if static_release || timed_out {
+                        self.enter_rest(contact, now);
+                        return Ok((
+                            CompliantHoldDisposition::Resting {
+                                command_step_limited: [false; JOINT_COUNT],
+                                at_rest_target: false,
+                            },
+                            Some(if static_release {
+                                CompliantPetEvent::ReleaseStatic
+                            } else {
+                                CompliantPetEvent::YieldTimeout
+                            }),
+                        ));
+                    }
+                    self.phase = ControllerPhase::Yielding {
+                        contact,
+                        quiet_since: None,
+                        entered_at,
+                        stable_since,
+                        stable_reference,
+                    };
                 } else {
-                    let (target, envelope_limited, command_step_limited) = yield_target(
-                        self.config,
-                        return_target,
-                        self.committed_target,
-                        observation,
-                    );
-                    self.committed_target = target;
-                    Ok(CompliantHoldDisposition::Yielding {
+                    self.phase = ControllerPhase::Yielding {
+                        contact,
+                        quiet_since: None,
+                        entered_at,
+                        stable_since,
+                        stable_reference,
+                    };
+                }
+                let (target, envelope_limited, command_step_limited) = yield_target(
+                    self.config,
+                    contact,
+                    self.committed_target,
+                    observation,
+                    self.baseline_error_ticks,
+                );
+                self.committed_target = target;
+                Ok((
+                    CompliantHoldDisposition::Yielding {
                         envelope_limited,
                         command_step_limited,
-                    })
-                }
+                    },
+                    None,
+                ))
             }
-            ControllerPhase::Recovering {
-                return_target,
-                recovery_start,
-                started_at,
+            ControllerPhase::Resting {
+                contact,
+                entered_at,
+                settled_at,
+                previous_residual,
                 reacquisition,
             } => {
-                let directions =
-                    contact_directions(self.config, self.committed_target, observation);
-                let reacquisition = match (reacquisition, directions == [0; JOINT_COUNT]) {
-                    (_, true) => None,
-                    (Some(candidate), false)
-                        if directions_continue(candidate.directions, directions) =>
-                    {
-                        Some(ContactCandidate {
-                            consecutive_samples: candidate.consecutive_samples.saturating_add(1),
-                            ..candidate
-                        })
-                    }
-                    _ => Some(ContactCandidate {
-                        return_target,
-                        directions,
-                        consecutive_samples: 1,
-                    }),
+                let (confirmed, previous_residual, reacquisition) =
+                    self.recontact(contact, observation, previous_residual, reacquisition);
+                if let Some(candidate) = confirmed {
+                    return self.enter_yield(now, candidate, observation, true);
+                }
+                let desired = rest_target(self.config, contact);
+                let (target, command_step_limited) =
+                    command_step_target(self.config, self.committed_target, desired);
+                self.committed_target = target;
+                let reached_now = settled_at.is_none() && target == desired;
+                let settled_at = if reached_now { Some(now) } else { settled_at };
+                if reached_now && let Some(episode) = self.episode.as_mut() {
+                    episode.reached_comfy = true;
+                }
+                let settled = settled_at.is_some_and(|settled_at| {
+                    now.checked_duration_since(settled_at)
+                        .is_some_and(|elapsed| elapsed >= contact.rest_duration)
+                });
+                let overdue = now
+                    .checked_duration_since(entered_at)
+                    .is_some_and(|elapsed| {
+                        elapsed
+                            >= self
+                                .config
+                                .pet_profile()
+                                .expect("Resting exists only with a pet profile")
+                                .maximum_rest_dwell()
+                                .checked_add(self.config.maximum_rest_travel_duration())
+                                .expect("pet profile binding rejects timing overflow")
+                    });
+                if settled || overdue {
+                    self.enter_recovery(contact, now, contact.recovery_duration);
+                    return Ok((
+                        CompliantHoldDisposition::Recovering {
+                            progress_millionths: 0,
+                            command_step_limited: [false; JOINT_COUNT],
+                        },
+                        Some(CompliantPetEvent::Recovering),
+                    ));
+                }
+                self.phase = ControllerPhase::Resting {
+                    contact,
+                    entered_at,
+                    settled_at,
+                    previous_residual,
+                    reacquisition,
                 };
-                if let Some(candidate) = reacquisition
-                    && candidate.consecutive_samples >= self.config.contact_acquisition_samples()
-                {
-                    return self.enter_yield(return_target, observation);
+                Ok((
+                    CompliantHoldDisposition::Resting {
+                        command_step_limited,
+                        at_rest_target: target == desired,
+                    },
+                    reached_now.then_some(CompliantPetEvent::Comfy),
+                ))
+            }
+            ControllerPhase::Recovering {
+                contact,
+                recovery_start,
+                started_at,
+                duration,
+                previous_residual,
+                reacquisition,
+            } => {
+                let (confirmed, previous_residual, reacquisition) =
+                    if self.config.pet_profile().is_some() {
+                        self.recontact(contact, observation, previous_residual, reacquisition)
+                    } else {
+                        let directions = contact_directions(
+                            self.config,
+                            self.committed_target,
+                            observation,
+                            self.baseline_error_ticks,
+                        );
+                        let reacquisition =
+                            advance_reacquisition(contact.return_target, reacquisition, directions);
+                        let confirmed = reacquisition.filter(|candidate| {
+                            candidate.consecutive_samples
+                                >= self.config.contact_acquisition_samples()
+                        });
+                        (confirmed, previous_residual, reacquisition)
+                    };
+                if let Some(candidate) = confirmed {
+                    return self.enter_yield(now, candidate, observation, true);
                 }
                 let elapsed = now
                     .checked_duration_since(started_at)
                     .expect("observation time admission prevents clock regression");
-                let progress = minimum_jerk_progress(elapsed, self.config.recovery_duration());
-                let desired = interpolate_pose(recovery_start, return_target, progress);
+                let progress = minimum_jerk_progress(elapsed, duration);
+                let desired = interpolate_pose(recovery_start, contact.return_target, progress);
                 let (target, command_step_limited) =
                     command_step_target(self.config, self.committed_target, desired);
                 self.committed_target = target;
-                if elapsed >= self.config.recovery_duration() && target == return_target {
+                if elapsed >= duration && target == contact.return_target {
                     self.phase = following_expression_unarmed();
-                    return Ok(CompliantHoldDisposition::ReturnedToExpression);
+                    self.baseline_error_ticks = [0; JOINT_COUNT];
+                    self.comfort_roll_side = None;
+                    if let Some(episode) = self.episode.take() {
+                        let summary = episode.complete(now);
+                        self.last_completed_episode = Some(summary);
+                    }
+                    return Ok((
+                        CompliantHoldDisposition::ReturnedToExpression,
+                        self.config
+                            .pet_profile()
+                            .map(|_| CompliantPetEvent::Returned),
+                    ));
                 }
                 self.phase = ControllerPhase::Recovering {
-                    return_target,
+                    contact,
                     recovery_start,
                     started_at,
+                    duration,
+                    previous_residual,
                     reacquisition,
                 };
-                Ok(CompliantHoldDisposition::Recovering {
-                    progress_millionths: u32::try_from(progress)
-                        .expect("fixed interpolation scale fits u32"),
-                    command_step_limited,
-                })
+                Ok((
+                    CompliantHoldDisposition::Recovering {
+                        progress_millionths: u32::try_from(progress)
+                            .expect("fixed interpolation scale fits u32"),
+                        command_step_limited,
+                    },
+                    None,
+                ))
             }
         }
     }
 
     fn enter_yield(
         &mut self,
-        return_target: ExactHeadTargetPose,
+        now: MonotonicTime,
+        candidate: ContactCandidate,
         observation: CompliantHeadObservation,
-    ) -> Result<CompliantHoldDisposition, CompliantHoldPrepareError> {
+        recontact: bool,
+    ) -> Result<(CompliantHoldDisposition, Option<CompliantPetEvent>), CompliantHoldPrepareError>
+    {
+        let contact =
+            self.active_contact(candidate.return_target, candidate.directions, observation);
         let (target, envelope_limited, command_step_limited) = yield_target(
             self.config,
-            return_target,
+            contact,
             self.committed_target,
             observation,
+            self.baseline_error_ticks,
         );
         self.committed_target = target;
         self.phase = ControllerPhase::Yielding {
-            return_target,
+            contact,
             quiet_since: None,
+            entered_at: now,
+            stable_since: now,
+            stable_reference: None,
         };
-        Ok(CompliantHoldDisposition::Yielding {
-            envelope_limited,
-            command_step_limited,
-        })
+        if self.config.pet_profile().is_some() {
+            let episode = self
+                .episode
+                .get_or_insert_with(|| CompliantPetEpisodeAccumulator::new(now));
+            episode.yield_entries = episode.yield_entries.saturating_add(1);
+            if recontact {
+                episode.tap = false;
+            }
+        }
+        Ok((
+            CompliantHoldDisposition::Yielding {
+                envelope_limited,
+                command_step_limited,
+            },
+            self.config.pet_profile().map(|_| {
+                if recontact {
+                    CompliantPetEvent::Recontact
+                } else {
+                    CompliantPetEvent::Contact
+                }
+            }),
+        ))
+    }
+
+    fn active_contact(
+        &mut self,
+        return_target: ExactHeadTargetPose,
+        directions: [i8; JOINT_COUNT],
+        observation: CompliantHeadObservation,
+    ) -> ActiveContact {
+        let Some(profile) = self.config.pet_profile() else {
+            return ActiveContact {
+                return_target,
+                directions,
+                rest_offsets: [0; JOINT_COUNT],
+                rest_duration: Duration::ZERO,
+                recovery_duration: self.config.recovery_duration(),
+            };
+        };
+        let active_joints = directions
+            .into_iter()
+            .filter(|direction| *direction != 0)
+            .count()
+            .max(1);
+        let additional_joints = u32::try_from(active_joints - 1).expect("four joints fit u32");
+        let mut rest_offsets = HeadJoint::ALL.map(|joint| {
+            let pet = profile.joint(joint);
+            let directional = i32::from(directions[joint_index(joint)])
+                * i32::from(pet.directional_rest_offset_ticks());
+            i16::try_from(i32::from(pet.rest_offset_ticks()) + directional)
+                .expect("bound pet rest offsets fit i16")
+        });
+        if directions[joint_index(HeadJoint::Roll)] == 0 && profile.comfort_roll_tilt_ticks() > 0 {
+            let residual = residual_errors(
+                self.committed_target,
+                observation,
+                self.baseline_error_ticks,
+            );
+            let roll = residual[joint_index(HeadJoint::Roll)];
+            let yaw = residual[joint_index(HeadJoint::Yaw)];
+            let hint = if roll.unsigned_abs() >= 3 { roll } else { yaw };
+            let side = *self
+                .comfort_roll_side
+                .get_or_insert(if hint < 0 { -1 } else { 1 });
+            let roll_index = joint_index(HeadJoint::Roll);
+            rest_offsets[roll_index] = i16::try_from(
+                i32::from(rest_offsets[roll_index])
+                    + i32::from(side) * i32::from(profile.comfort_roll_tilt_ticks()),
+            )
+            .expect("bound comfort roll offset fits i16");
+        }
+        let additional_rest = profile
+            .rest_per_additional_joint()
+            .checked_mul(additional_joints)
+            .expect("pet profile binding rejects timing overflow");
+        let rest_duration = profile
+            .rest_dwell()
+            .checked_add(additional_rest)
+            .expect("pet profile binding rejects timing overflow")
+            .min(profile.maximum_rest_dwell());
+        let recovery_scale =
+            1_000 + additional_joints * u32::from(profile.recovery_per_additional_joint_permille());
+        let recovery_duration =
+            scale_duration_permille(self.config.recovery_duration(), recovery_scale)
+                .expect("pet profile binding rejects timing overflow");
+        ActiveContact {
+            return_target,
+            directions,
+            rest_offsets,
+            rest_duration,
+            recovery_duration,
+        }
+    }
+
+    fn enter_rest(&mut self, contact: ActiveContact, now: MonotonicTime) {
+        if let Some(episode) = self.episode.as_mut() {
+            episode.reached_rest = true;
+        }
+        self.phase = ControllerPhase::Resting {
+            contact,
+            entered_at: now,
+            settled_at: None,
+            previous_residual: None,
+            reacquisition: None,
+        };
+    }
+
+    fn enter_recovery(&mut self, contact: ActiveContact, now: MonotonicTime, duration: Duration) {
+        self.phase = ControllerPhase::Recovering {
+            contact,
+            recovery_start: self.committed_target,
+            started_at: now,
+            duration,
+            previous_residual: None,
+            reacquisition: None,
+        };
+    }
+
+    fn recontact(
+        &self,
+        contact: ActiveContact,
+        observation: CompliantHeadObservation,
+        previous_residual: Option<[i32; JOINT_COUNT]>,
+        reacquisition: Option<ContactCandidate>,
+    ) -> (
+        Option<ContactCandidate>,
+        Option<[i32; JOINT_COUNT]>,
+        Option<ContactCandidate>,
+    ) {
+        let profile = self
+            .config
+            .pet_profile()
+            .expect("stillness-gated recontact requires a pet profile");
+        let directions = contact_directions(
+            self.config,
+            self.committed_target,
+            observation,
+            self.baseline_error_ticks,
+        );
+        let residual = residual_errors(
+            self.committed_target,
+            observation,
+            self.baseline_error_ticks,
+        );
+        let varying = previous_residual.is_some_and(|previous| {
+            residual
+                .into_iter()
+                .zip(previous)
+                .any(|(actual, previous)| {
+                    actual.abs_diff(previous) > u32::from(profile.residual_stillness_ticks())
+                })
+        });
+        if directions != [0; JOINT_COUNT] && !varying {
+            return (None, Some(residual), reacquisition);
+        }
+        let reacquisition = advance_reacquisition(contact.return_target, reacquisition, directions);
+        let confirmed = reacquisition.filter(|candidate| {
+            candidate.consecutive_samples >= self.config.contact_acquisition_samples()
+        });
+        (confirmed, Some(residual), reacquisition)
+    }
+
+    fn reset_to_following(&mut self) {
+        self.phase = following_expression_unarmed();
+        self.baseline_error_ticks = [0; JOINT_COUNT];
+        self.comfort_roll_side = None;
+        self.episode = None;
     }
 }
 
@@ -1421,6 +2485,32 @@ fn admit_target(
     Ok(())
 }
 
+fn desired_torque_limits(
+    config: HeadCompliantHoldConfig,
+    phase: ControllerPhase,
+) -> HeadTorqueLimits {
+    let Some(profile) = config.pet_profile() else {
+        return config.holding_torque_limits();
+    };
+    let ControllerPhase::Yielding { contact, .. } = phase else {
+        return config.holding_torque_limits();
+    };
+    let for_joint = |joint: HeadJoint| {
+        let touched = contact.directions[joint_index(joint)] != 0;
+        if touched || matches!(joint, HeadJoint::Yaw | HeadJoint::Roll) {
+            profile.yield_torque_limits().for_joint(joint)
+        } else {
+            config.holding_torque_limits().for_joint(joint)
+        }
+    };
+    HeadTorqueLimits::new(
+        for_joint(HeadJoint::Bow),
+        for_joint(HeadJoint::Curl),
+        for_joint(HeadJoint::Yaw),
+        for_joint(HeadJoint::Roll),
+    )
+}
+
 fn signed_error(actual: PositionTicks, reference: PositionTicks) -> i32 {
     i32::from(actual.get()) - i32::from(reference.get())
 }
@@ -1429,14 +2519,27 @@ fn contact_directions(
     config: HeadCompliantHoldConfig,
     reference: ExactHeadTargetPose,
     observation: CompliantHeadObservation,
+    baseline_error_ticks: [i32; JOINT_COUNT],
 ) -> [i8; JOINT_COUNT] {
     HeadJoint::ALL.map(|joint| {
-        let error = signed_error(observation.position(joint), reference.position(joint));
+        let error = signed_error(observation.position(joint), reference.position(joint))
+            - baseline_error_ticks[joint_index(joint)];
         if error.unsigned_abs() >= u32::from(config.joint(joint).contact_entry_error_ticks()) {
             error.signum() as i8
         } else {
             0
         }
+    })
+}
+
+fn residual_errors(
+    command: ExactHeadTargetPose,
+    observation: CompliantHeadObservation,
+    baseline_error_ticks: [i32; JOINT_COUNT],
+) -> [i32; JOINT_COUNT] {
+    HeadJoint::ALL.map(|joint| {
+        signed_error(observation.position(joint), command.position(joint))
+            - baseline_error_ticks[joint_index(joint)]
     })
 }
 
@@ -1451,44 +2554,85 @@ fn directions_continue(previous: [i8; JOINT_COUNT], actual: [i8; JOINT_COUNT]) -
             .all(|(previous, actual)| previous == 0 || actual == 0 || previous == actual)
 }
 
+fn merge_directions(previous: [i8; JOINT_COUNT], actual: [i8; JOINT_COUNT]) -> [i8; JOINT_COUNT] {
+    std::array::from_fn(|index| {
+        if previous[index] == 0 {
+            actual[index]
+        } else {
+            previous[index]
+        }
+    })
+}
+
+fn advance_reacquisition(
+    return_target: ExactHeadTargetPose,
+    previous: Option<ContactCandidate>,
+    directions: [i8; JOINT_COUNT],
+) -> Option<ContactCandidate> {
+    if directions == [0; JOINT_COUNT] {
+        return None;
+    }
+    match previous {
+        Some(candidate) if directions_continue(candidate.directions, directions) => {
+            Some(ContactCandidate {
+                directions: merge_directions(candidate.directions, directions),
+                consecutive_samples: candidate.consecutive_samples.saturating_add(1),
+                ..candidate
+            })
+        }
+        _ => Some(ContactCandidate {
+            return_target,
+            directions,
+            consecutive_samples: 1,
+        }),
+    }
+}
+
 fn inside_release_band(
     config: HeadCompliantHoldConfig,
     command: ExactHeadTargetPose,
     observation: CompliantHeadObservation,
+    baseline_error_ticks: [i32; JOINT_COUNT],
 ) -> bool {
-    HeadJoint::ALL.into_iter().all(|joint| {
-        observation
-            .position(joint)
-            .get()
-            .abs_diff(command.position(joint).get())
-            <= config.joint(joint).contact_release_error_ticks()
-    })
+    residual_errors(command, observation, baseline_error_ticks)
+        .into_iter()
+        .zip(HeadJoint::ALL)
+        .all(|(error, joint)| {
+            error.unsigned_abs() <= u32::from(config.joint(joint).contact_release_error_ticks())
+        })
 }
 
 fn yield_target(
     config: HeadCompliantHoldConfig,
-    return_target: ExactHeadTargetPose,
+    contact: ActiveContact,
     current_target: ExactHeadTargetPose,
     observation: CompliantHeadObservation,
+    baseline_error_ticks: [i32; JOINT_COUNT],
 ) -> (
     ExactHeadTargetPose,
     [bool; JOINT_COUNT],
     [bool; JOINT_COUNT],
 ) {
-    let mut positions = return_target.positions();
+    let mut positions = contact.return_target.positions();
     let mut limited = [false; JOINT_COUNT];
     for joint in HeadJoint::ALL {
         let index = joint_index(joint);
         let policy = config.joint(joint);
-        let displacement = signed_error(observation.position(joint), return_target.position(joint));
+        let rest = i64::from(contact.rest_offsets[index]);
+        let displacement_from_rest = i64::from(signed_error(
+            observation.position(joint),
+            contact.return_target.position(joint),
+        )) - i64::from(baseline_error_ticks[index])
+            - rest;
         let scaled = div_round_nearest(
-            i64::from(displacement) * i64::from(config.follow_permille()),
+            displacement_from_rest * i64::from(config.follow_permille()),
             1_000,
         );
         let maximum_yield = i64::from(policy.maximum_yield_ticks());
-        let yield_limited = scaled.clamp(-maximum_yield, maximum_yield);
-        limited[index] |= yield_limited != scaled;
-        let raw = i64::from(return_target.position(joint).get()) + yield_limited;
+        let requested_offset = rest + scaled;
+        let yield_limited = requested_offset.clamp(-maximum_yield, maximum_yield);
+        limited[index] |= yield_limited != requested_offset;
+        let raw = i64::from(contact.return_target.position(joint).get()) + yield_limited;
         let envelope_limited = raw.clamp(
             i64::from(policy.minimum().get()),
             i64::from(policy.maximum().get()),
@@ -1503,6 +2647,22 @@ fn yield_target(
         ExactHeadTargetPose::from_positions(positions[0], positions[1], positions[2], positions[3]);
     let (target, command_step_limited) = command_step_target(config, current_target, desired);
     (target, limited, command_step_limited)
+}
+
+fn rest_target(config: HeadCompliantHoldConfig, contact: ActiveContact) -> ExactHeadTargetPose {
+    let positions = HeadJoint::ALL.map(|joint| {
+        let index = joint_index(joint);
+        let policy = config.joint(joint);
+        let raw = i32::from(contact.return_target.position(joint).get())
+            + i32::from(contact.rest_offsets[index]);
+        let admitted = raw.clamp(
+            i32::from(policy.minimum().get()),
+            i32::from(policy.maximum().get()),
+        );
+        PositionTicks::try_new(u16::try_from(admitted).expect("admitted rest target fits u16"))
+            .expect("admitted rest target is inside encoder domain")
+    });
+    ExactHeadTargetPose::from_positions(positions[0], positions[1], positions[2], positions[3])
 }
 
 fn command_step_target(
@@ -1545,6 +2705,20 @@ fn checked_time_add(time: MonotonicTime, duration: Duration) -> Option<Monotonic
     time.duration_since_origin()
         .checked_add(duration)
         .map(MonotonicTime::from_duration_since_origin)
+}
+
+fn scale_duration_permille(duration: Duration, permille: u32) -> Option<Duration> {
+    let nanoseconds = duration
+        .as_nanos()
+        .checked_mul(u128::from(permille))?
+        .checked_add(500)?
+        / 1_000;
+    let seconds = nanoseconds / 1_000_000_000;
+    let subsecond_nanoseconds = nanoseconds % 1_000_000_000;
+    Some(Duration::new(
+        u64::try_from(seconds).ok()?,
+        u32::try_from(subsecond_nanoseconds).ok()?,
+    ))
 }
 
 /// Quintic minimum-jerk progress in fixed millionths.
@@ -1635,6 +2809,88 @@ mod tests {
         .unwrap()
     }
 
+    fn deployed_pet_joint(
+        minimum: u16,
+        maximum: u16,
+        entry: u16,
+        release: u16,
+        maximum_yield: u16,
+        command_step: u16,
+        observed_step: u16,
+    ) -> CompliantJointPolicy {
+        CompliantJointPolicy::try_new(
+            PositionTicks::try_new(minimum).unwrap(),
+            PositionTicks::try_new(maximum).unwrap(),
+            entry,
+            release,
+            maximum_yield,
+            command_step,
+            observed_step,
+        )
+        .unwrap()
+    }
+
+    fn pet_joint(maximum_baseline: u16, rest: i16, directional: u16) -> CompliantPetJointPolicy {
+        CompliantPetJointPolicy::try_new(maximum_baseline, rest, directional).unwrap()
+    }
+
+    fn deployed_pet_profile() -> CompliantPetProfile {
+        CompliantPetProfile::try_new(
+            pet_joint(32, -24, 0),
+            pet_joint(40, 30, 0),
+            pet_joint(24, 0, 20),
+            pet_joint(24, 0, 16),
+            Duration::from_millis(1_200),
+            Duration::from_millis(350),
+            Duration::from_secs(3),
+            150,
+            Duration::from_millis(1_800),
+            Duration::from_secs(30),
+            3,
+            14,
+            HeadTorqueLimits::new(
+                TorqueLimitPermille::try_new(450).unwrap(),
+                TorqueLimitPermille::try_new(350).unwrap(),
+                TorqueLimitPermille::try_new(220).unwrap(),
+                TorqueLimitPermille::try_new(250).unwrap(),
+            ),
+            Duration::from_millis(1_200),
+            Duration::from_millis(800),
+        )
+        .unwrap()
+    }
+
+    fn pet_base_config(acquisition: u8) -> HeadCompliantHoldConfig {
+        HeadCompliantHoldConfig::try_new(
+            deployed_pet_joint(2_064, 2_284, 18, 5, 40, 3, 64),
+            deployed_pet_joint(2_390, 2_750, 24, 7, 48, 4, 80),
+            deployed_pet_joint(1_157, 2_117, 32, 4, 80, 8, 160),
+            deployed_pet_joint(2_887, 3_207, 18, 4, 36, 3, 64),
+            HeadTorqueLimits::new(
+                TorqueLimitPermille::try_new(650).unwrap(),
+                TorqueLimitPermille::try_new(550).unwrap(),
+                TorqueLimitPermille::try_new(400).unwrap(),
+                TorqueLimitPermille::try_new(400).unwrap(),
+            ),
+            Duration::from_millis(100),
+            Duration::from_millis(80),
+            Duration::from_millis(60),
+            Duration::from_millis(150),
+            Duration::from_secs(1),
+            acquisition,
+            Duration::from_millis(600),
+            Duration::from_secs(3),
+            650,
+        )
+        .unwrap()
+    }
+
+    fn pet_config(acquisition: u8) -> HeadCompliantHoldConfig {
+        pet_base_config(acquisition)
+            .try_with_pet_profile(deployed_pet_profile())
+            .unwrap()
+    }
+
     fn observation(at_ms: u64, values: [u16; 4], moving: bool) -> CompliantHeadObservation {
         CompliantHeadObservation::from_parts(at(at_ms), values, [moving; 4])
     }
@@ -1664,6 +2920,431 @@ mod tests {
         assert_eq!(first.state(), CompliantHoldState::FollowingExpression);
         let armed = prepare_commit(controller, 10, natural, true, positions, false);
         assert_eq!(armed.state(), CompliantHoldState::FollowingExpression);
+    }
+
+    fn arm_pet_with_baseline(
+        controller: &mut HeadCompliantHoldController,
+        natural: ExactHeadTargetPose,
+        positions: [u16; 4],
+    ) {
+        for time in (0..=1_000).step_by(100) {
+            let receipt = prepare_commit(controller, time, natural, true, positions, false);
+            assert_eq!(receipt.state(), CompliantHoldState::FollowingExpression);
+            if time == 1_000 {
+                assert_eq!(receipt.pet_event(), Some(CompliantPetEvent::Ready));
+            }
+        }
+    }
+
+    #[test]
+    fn field_pet_profile_preserves_all_measured_constants() {
+        let config = pet_config(2);
+        let profile = config.pet_profile().expect("pet profile");
+        assert_eq!(config.follow_permille(), 650);
+        assert_eq!(profile.static_release_dwell(), Duration::from_millis(1_800));
+        assert_eq!(profile.maximum_yield_dwell(), Duration::from_secs(30));
+        assert_eq!(profile.rest_dwell(), Duration::from_millis(1_200));
+        assert_eq!(
+            profile.rest_per_additional_joint(),
+            Duration::from_millis(350)
+        );
+        assert_eq!(profile.maximum_rest_dwell(), Duration::from_secs(3));
+        assert_eq!(profile.recovery_per_additional_joint_permille(), 150);
+        assert_eq!(profile.comfort_roll_tilt_ticks(), 14);
+        assert_eq!(
+            profile.tap_maximum_contact_duration(),
+            Duration::from_millis(1_200)
+        );
+        assert_eq!(profile.tap_recovery_duration(), Duration::from_millis(800));
+        assert_eq!(profile.joint(HeadJoint::Bow).rest_offset_ticks(), -24);
+        assert_eq!(profile.joint(HeadJoint::Curl).rest_offset_ticks(), 30);
+        assert_eq!(
+            profile
+                .joint(HeadJoint::Yaw)
+                .directional_rest_offset_ticks(),
+            20
+        );
+        assert_eq!(
+            profile
+                .joint(HeadJoint::Roll)
+                .directional_rest_offset_ticks(),
+            16
+        );
+        assert_eq!(
+            HeadJoint::ALL.map(|joint| profile.yield_torque_limits().for_joint(joint).get()),
+            [450, 350, 220, 250]
+        );
+    }
+
+    #[test]
+    fn pet_profile_binding_rejects_unsafe_cross_field_combinations() {
+        let below_floor = CompliantPetProfile {
+            yield_torque_limits: HeadTorqueLimits::new(
+                TorqueLimitPermille::try_new(299).unwrap(),
+                TorqueLimitPermille::try_new(350).unwrap(),
+                TorqueLimitPermille::try_new(220).unwrap(),
+                TorqueLimitPermille::try_new(250).unwrap(),
+            ),
+            ..deployed_pet_profile()
+        };
+        assert!(matches!(
+            pet_base_config(1).try_with_pet_profile(below_floor),
+            Err(
+                HeadCompliantHoldConfigError::YieldTorqueBelowMeasuredFloor {
+                    joint: HeadJoint::Bow,
+                    actual_permille: 299,
+                    minimum_permille: 300,
+                }
+            )
+        ));
+
+        let too_much_roll = CompliantPetProfile {
+            comfort_roll_tilt_ticks: 21,
+            ..deployed_pet_profile()
+        };
+        assert!(matches!(
+            pet_base_config(1).try_with_pet_profile(too_much_roll),
+            Err(
+                HeadCompliantHoldConfigError::ComfortRollExceedsMaximumYield {
+                    total_ticks: 37,
+                    maximum_yield_ticks: 36,
+                }
+            )
+        ));
+
+        let too_short_static = CompliantPetProfile {
+            static_release_dwell: Duration::from_millis(200),
+            ..deployed_pet_profile()
+        };
+        assert!(matches!(
+            pet_base_config(1).try_with_pet_profile(too_short_static),
+            Err(
+                HeadCompliantHoldConfigError::StaticReleaseBelowThreeControlPeriods {
+                    static_release,
+                    minimum,
+                }
+            ) if static_release == Duration::from_millis(200)
+                && minimum == Duration::from_millis(300)
+        ));
+
+        let mut collapsed_hysteresis = pet_base_config(1);
+        collapsed_hysteresis.follow_permille = NonZeroU16::new(800).unwrap();
+        assert!(matches!(
+            collapsed_hysteresis.try_with_pet_profile(deployed_pet_profile()),
+            Err(HeadCompliantHoldConfigError::FollowCollapsesHysteresis {
+                joint: HeadJoint::Bow,
+                retained_error_ticks: 4,
+                release_error_ticks: 5,
+            })
+        ));
+    }
+
+    #[test]
+    fn bounded_stopped_bias_is_learned_before_contact_arms() {
+        let natural = pose([2_174, 2_570, 1_637, 3_047]);
+        let mut controller =
+            HeadCompliantHoldController::try_new(pet_config(1), natural, at(0)).unwrap();
+        arm_pet_with_baseline(&mut controller, natural, [2_191, 2_585, 1_637, 3_047]);
+        assert_eq!(controller.baseline_error_ticks(), [17, 15, 0, 0]);
+
+        let contact = prepare_commit(
+            &mut controller,
+            1_100,
+            natural,
+            true,
+            [2_210, 2_585, 1_637, 3_047],
+            true,
+        );
+        assert_eq!(contact.state(), CompliantHoldState::Yielding);
+        assert_eq!(contact.pet_event(), Some(CompliantPetEvent::Contact));
+        assert_eq!(
+            HeadJoint::ALL.map(|joint| contact.desired_torque_limits().for_joint(joint).get()),
+            [450, 550, 220, 250]
+        );
+    }
+
+    #[test]
+    fn bias_outside_its_own_envelope_never_arms_or_becomes_touch() {
+        let natural = pose([2_174, 2_570, 1_637, 3_047]);
+        let mut controller =
+            HeadCompliantHoldController::try_new(pet_config(1), natural, at(0)).unwrap();
+        for time in (0..=1_500).step_by(100) {
+            let receipt = prepare_commit(
+                &mut controller,
+                time,
+                natural,
+                true,
+                [2_207, 2_570, 1_637, 3_047],
+                false,
+            );
+            assert_eq!(receipt.state(), CompliantHoldState::FollowingExpression);
+            assert_eq!(receipt.pet_event(), None);
+        }
+        assert_eq!(controller.baseline_error_ticks(), [0; JOINT_COUNT]);
+    }
+
+    #[test]
+    fn quick_single_touch_skips_rest_and_emits_exact_episode_evidence() {
+        let natural = pose([2_174, 2_570, 1_637, 3_047]);
+        let mut controller =
+            HeadCompliantHoldController::try_new(pet_config(1), natural, at(0)).unwrap();
+        arm_pet_with_baseline(
+            &mut controller,
+            natural,
+            natural.positions().map(PositionTicks::get),
+        );
+        let contact = prepare_commit(
+            &mut controller,
+            1_100,
+            natural,
+            true,
+            [2_204, 2_570, 1_637, 3_047],
+            true,
+        );
+        assert_eq!(contact.pet_event(), Some(CompliantPetEvent::Contact));
+        let yielded = contact.committed_target();
+        let tap = prepare_commit(
+            &mut controller,
+            1_200,
+            natural,
+            true,
+            yielded.positions().map(PositionTicks::get),
+            false,
+        );
+        assert_eq!(tap.state(), CompliantHoldState::Recovering);
+        assert_eq!(tap.pet_event(), Some(CompliantPetEvent::Tap));
+
+        let mut completed = None;
+        for time in (1_300..=2_100).step_by(100) {
+            let positions = controller
+                .committed_target()
+                .positions()
+                .map(PositionTicks::get);
+            let receipt = prepare_commit(&mut controller, time, natural, true, positions, false);
+            assert_ne!(receipt.state(), CompliantHoldState::Resting);
+            if let Some(summary) = receipt.completed_episode() {
+                assert_eq!(receipt.pet_event(), Some(CompliantPetEvent::Returned));
+                completed = Some(summary);
+                break;
+            }
+        }
+        let summary = completed.expect("tap returns after its 800 ms recovery");
+        assert!(summary.was_tap());
+        assert_eq!(summary.yield_entries(), 1);
+        assert!(!summary.reached_rest());
+        assert!(!summary.reached_comfy());
+        assert_eq!(controller.last_completed_episode(), Some(summary));
+    }
+
+    fn drive_static_pet_to_rest(
+        controller: &mut HeadCompliantHoldController,
+        natural: ExactHeadTargetPose,
+    ) -> (u64, CompliantHoldCommitReceipt) {
+        let mut contact = prepare_commit(
+            controller,
+            1_100,
+            natural,
+            true,
+            [2_214, 2_570, 1_637, 3_047],
+            true,
+        );
+        let first_yield_time = if contact.state() == CompliantHoldState::ConfirmingContact {
+            contact = prepare_commit(
+                controller,
+                1_200,
+                natural,
+                true,
+                [2_214, 2_570, 1_637, 3_047],
+                true,
+            );
+            1_200
+        } else {
+            1_100
+        };
+        assert_eq!(contact.state(), CompliantHoldState::Yielding);
+        for time in ((first_yield_time + 100)..=5_000).step_by(100) {
+            let receipt = prepare_commit(
+                controller,
+                time,
+                natural,
+                true,
+                [2_214, 2_570, 1_637, 3_047],
+                false,
+            );
+            if receipt.state() == CompliantHoldState::Resting {
+                assert_eq!(receipt.pet_event(), Some(CompliantPetEvent::ReleaseStatic));
+                return (time, receipt);
+            }
+        }
+        panic!("static contact did not enter rest");
+    }
+
+    #[test]
+    fn static_contact_releases_then_pauses_from_actual_rest_arrival() {
+        let natural = pose([2_174, 2_570, 1_637, 3_047]);
+        let mut controller =
+            HeadCompliantHoldController::try_new(pet_config(1), natural, at(0)).unwrap();
+        arm_pet_with_baseline(
+            &mut controller,
+            natural,
+            natural.positions().map(PositionTicks::get),
+        );
+        let (rest_entered_at, _) = drive_static_pet_to_rest(&mut controller, natural);
+
+        let mut comfy_at = None;
+        for time in ((rest_entered_at + 100)..=(rest_entered_at + 3_000)).step_by(100) {
+            let positions = controller
+                .committed_target()
+                .positions()
+                .map(PositionTicks::get);
+            let receipt = prepare_commit(&mut controller, time, natural, true, positions, false);
+            if receipt.pet_event() == Some(CompliantPetEvent::Comfy) {
+                assert_eq!(receipt.state(), CompliantHoldState::Resting);
+                assert_eq!(
+                    receipt.committed_target().position(HeadJoint::Bow).get(),
+                    2_150
+                );
+                assert_eq!(
+                    receipt.committed_target().position(HeadJoint::Curl).get(),
+                    2_600
+                );
+                assert_eq!(
+                    receipt.committed_target().position(HeadJoint::Roll).get(),
+                    3_061
+                );
+                comfy_at = Some(time);
+                break;
+            }
+        }
+        let comfy_at = comfy_at.expect("rest target is reached through bounded steps");
+        assert!(comfy_at > rest_entered_at);
+
+        for time in ((comfy_at + 100)..(comfy_at + 1_200)).step_by(100) {
+            let positions = controller
+                .committed_target()
+                .positions()
+                .map(PositionTicks::get);
+            let receipt = prepare_commit(&mut controller, time, natural, true, positions, false);
+            assert_eq!(receipt.state(), CompliantHoldState::Resting);
+        }
+        let positions = controller
+            .committed_target()
+            .positions()
+            .map(PositionTicks::get);
+        let recovery = prepare_commit(
+            &mut controller,
+            comfy_at + 1_200,
+            natural,
+            true,
+            positions,
+            false,
+        );
+        assert_eq!(recovery.state(), CompliantHoldState::Recovering);
+        assert_eq!(recovery.pet_event(), Some(CompliantPetEvent::Recovering));
+    }
+
+    #[test]
+    fn static_residual_during_rest_does_not_knead_cycle_back_into_yield() {
+        let natural = pose([2_174, 2_570, 1_637, 3_047]);
+        let mut controller =
+            HeadCompliantHoldController::try_new(pet_config(2), natural, at(0)).unwrap();
+        arm_pet_with_baseline(
+            &mut controller,
+            natural,
+            natural.positions().map(PositionTicks::get),
+        );
+        let (rest_entered_at, _) = drive_static_pet_to_rest(&mut controller, natural);
+        for time in ((rest_entered_at + 100)..=(rest_entered_at + 2_500)).step_by(100) {
+            let mut positions = controller
+                .committed_target()
+                .positions()
+                .map(PositionTicks::get);
+            positions[joint_index(HeadJoint::Bow)] += 23;
+            let receipt = prepare_commit(&mut controller, time, natural, true, positions, false);
+            assert_ne!(receipt.pet_event(), Some(CompliantPetEvent::Recontact));
+            assert_ne!(receipt.state(), CompliantHoldState::Yielding);
+        }
+    }
+
+    #[test]
+    fn only_varying_contact_can_reacquire_during_rest() {
+        let natural = pose([2_174, 2_570, 1_637, 3_047]);
+        let mut controller =
+            HeadCompliantHoldController::try_new(pet_config(2), natural, at(0)).unwrap();
+        arm_pet_with_baseline(
+            &mut controller,
+            natural,
+            natural.positions().map(PositionTicks::get),
+        );
+        let (rest_entered_at, _) = drive_static_pet_to_rest(&mut controller, natural);
+        let base = controller.committed_target().position(HeadJoint::Bow).get();
+        let first = prepare_commit(
+            &mut controller,
+            rest_entered_at + 100,
+            natural,
+            true,
+            [base + 30, 2_570, 1_637, 3_047],
+            true,
+        );
+        assert_eq!(first.state(), CompliantHoldState::Resting);
+        let second_base = controller.committed_target().position(HeadJoint::Bow).get();
+        let second = prepare_commit(
+            &mut controller,
+            rest_entered_at + 200,
+            natural,
+            true,
+            [second_base + 40, 2_570, 1_637, 3_047],
+            true,
+        );
+        assert_eq!(second.state(), CompliantHoldState::Resting);
+        let third_base = controller.committed_target().position(HeadJoint::Bow).get();
+        let third = prepare_commit(
+            &mut controller,
+            rest_entered_at + 300,
+            natural,
+            true,
+            [third_base + 50, 2_570, 1_637, 3_047],
+            true,
+        );
+        assert_eq!(third.state(), CompliantHoldState::Yielding);
+        assert_eq!(third.pet_event(), Some(CompliantPetEvent::Recontact));
+    }
+
+    #[test]
+    fn continuously_varying_contact_hits_the_declared_yield_timeout() {
+        let natural = pose([2_174, 2_570, 1_637, 3_047]);
+        let mut controller =
+            HeadCompliantHoldController::try_new(pet_config(1), natural, at(0)).unwrap();
+        arm_pet_with_baseline(
+            &mut controller,
+            natural,
+            natural.positions().map(PositionTicks::get),
+        );
+        prepare_commit(
+            &mut controller,
+            1_100,
+            natural,
+            true,
+            [2_214, 2_570, 1_637, 3_047],
+            true,
+        );
+        let mut timed_out = None;
+        for time in (1_200..=31_200).step_by(100) {
+            let displacement = if (time / 100) % 2 == 0 { 40 } else { 50 };
+            let receipt = prepare_commit(
+                &mut controller,
+                time,
+                natural,
+                true,
+                [2_174 + displacement, 2_570, 1_637, 3_047],
+                true,
+            );
+            if receipt.pet_event() == Some(CompliantPetEvent::YieldTimeout) {
+                timed_out = Some((time, receipt.state()));
+                break;
+            }
+        }
+        assert_eq!(timed_out, Some((31_100, CompliantHoldState::Resting)));
     }
 
     #[test]
