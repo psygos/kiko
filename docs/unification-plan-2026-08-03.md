@@ -221,6 +221,18 @@ remaining work; a passing host test is never presented as physical evidence.
   normalized character offsets, encoder ticks, and physical motion remain
   explicitly non-equivalent domains. Intent: make general software parity a
   reproducible gate without manufacturing a physical-parity claim.
+- `29ec63d`: console snapshot schema V5 now separates OAK stream health from
+  sparse-SLAM completion health. One fixed-size telemetry owner retains exact
+  started, successful, recoverable, and fatal outcomes; successful source and
+  completion clocks; requested and actually selected SuperPoint/LightGlue
+  providers; and a 64-completion rate window. Rerun receives the same
+  diagnostic evidence, while the browser rejects impossible counters, clocks,
+  providers, and windows and requires both OAK and SLAM readiness for manual
+  control. The provider is runtime session-selection evidence and the rate is
+  successful-completion evidence, not an accelerator-placement, utilization,
+  camera-FPS, or performance claim. Intent: make a stalled or silently
+  CPU-fallback tracker visible instead of inheriting a green state from fresh
+  OAK traffic.
 
 Host evidence at this checkpoint is 112/112 `kiko-expression-runtime` unit
 tests plus its compile-fail doctest, warning-free expression, head, and Nano
@@ -256,11 +268,13 @@ claimed by these host results.
    Retain the Python lane as a non-booted behavior lab until the Rust owner has
    attended physical parity evidence; do not reinterpret the host semantic
    trace as actuator, optical, timing-load, or physical-feel evidence.
-3. Re-audit the current navigation graph, make live SLAM rate/backend/fallback
-   observable, verify the manual/emergency-stop GUI and autonomous MPC share
-   one authority path, and close every wheels-off gate before requesting wheel
-   attachment. Only an attended wheels-on session can calibrate the
-   encoderless plant and prove mapping/navigation on the robot.
+3. The navigation graph re-audit and host observability portion are complete:
+   live SLAM rate, requested/selected backend, fallback, outcomes, and
+   freshness are exposed by `29ec63d`; the manual GUI, agent ingress, software
+   stop, mapping, frontier, point-goal, and MPC paths retain the one typed
+   arbitrator. The attended wheels-off gates remain open. Only an attended
+   wheels-on session can calibrate the encoderless plant and prove
+   mapping/navigation on the robot.
 4. Materialize launch V4's policy/review pair from a fresh attended Nano
    session, run the exact offline gate, and then prove detector, head, eye,
    compliance, watchdog, and shutdown behavior under PID 1. The software path
@@ -463,8 +477,19 @@ S3. Cherry-pick the projected tracker + 2048-keypoint models from the
     the revoked claims).
 S4. First live SLAM run remains gated behind the Phase 5 handoff (one
     owner per device — no coexistence evidence is possible before it);
-    schedule it as the first post-switchover session, with tegrastats
-    thermal/CPU capture alongside.
+    schedule it as the first post-switchover session. Any Jetson GPU,
+    thermal, power-mode, or utilization work belongs to the separate Nano
+    hardware lane and is not authorized by this host-side plan.
+
+Current status at `29ec63d` (2026-08-27): S1's minimum truthful live instrument
+is implemented. S2's fallback is now loud because the request and actual
+session selection are separate typed values in logs, console V5, and Rerun;
+the production feature graph has not been changed to claim CUDA or TensorRT.
+S3 remains intentionally unported because its historical placement claim was
+revoked and no fresh evidence justifies changing Kiko's SLAM architecture.
+S4 remains a physical Nano gate. No Jetson GPU benchmark, power-mode change,
+thermal diagnosis, or runtime performance claim was made in this host-side
+work.
 
 ## 9. Ordering constraints
 

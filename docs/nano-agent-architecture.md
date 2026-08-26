@@ -302,6 +302,16 @@ rectangles, and the selected face target. RGB is copied only after strict BGR8
 layout admission into a capacity-one, drop-oldest diagnostic queue; that copy
 cannot feed SLAM, expression, control, or safety.
 
+The live SLAM view publishes the requested and actually selected SuperPoint
+and LightGlue session providers, exact started/successful/recoverable/fatal
+pair counts, the latest successful source-arrival and completion clocks, and a
+window containing at most 64 successful completion timestamps. Its displayed
+rate is `(count - 1) * 1e9 / span_ns`. It is measured successful-completion
+evidence, not configured camera FPS, accelerator utilization, a latency
+distribution, or a performance claim. The exact counters and clocks remain in
+the text/status record and console decimal strings; Rerun scalar projections
+are diagnostic plots and may not preserve every bit of a large `u64`.
+
 When the admitted launch graph configures `serve_loopback`, the console
 snapshot includes the corresponding operator-side same-port SSH-forward URI,
 for example `rerun+http://127.0.0.1:9876/proxy`. The browser displays the exact
@@ -351,16 +361,22 @@ The console renders only typed map metadata/cells, composed map-frame pose,
 goal, global path, MPC rollout, requested actuation, exact STM32 applied
 receipt, stop certainty, health, and timing that the live owners publish. Head
 health is refreshed from complete four-joint transactions, eye health requires
-at least one acknowledged RGB-derived expression after startup, and OAK health
-does not become ready until visual, depth, and IMU inputs have each been
-admitted. Ready is not an ever-seen latch: the projection requires recent
-activity from all three streams and the coordinator's at-now odometry and
-depth-aligned local-costmap freshness gates. A closed stream faults it. The
-same typed coordinator readiness check rejects new manual, frontier, and point
-authority from both the browser and agent API before any authority is granted;
-periodic control retains its independent stricter stop-on-stale checks. The
-console never opens the OAK or STM32 and never labels an accepted request as
-applied.
+at least one acknowledged RGB-derived expression after startup, and OAK stream
+health does not become ready until visual, depth, and IMU inputs have each been
+admitted recently. Sparse-SLAM health is separate in console snapshot schema
+V5: it is ready only while its worker is running and both the latest successful
+source arrival and tracker completion are no more than one second old. A
+faulted worker is faulted; a normally closed worker is unavailable; startup or
+stale success evidence is degraded. This prevents fresh camera traffic from
+being presented as proof that inference or tracking is completing.
+
+New browser manual authority additionally requires both OAK-stream and
+sparse-SLAM health to be ready. The same typed coordinator readiness check
+independently enforces current localization, odometry, depth-aligned local
+costmap, and other motion prerequisites for manual, frontier, and point
+authority from both browser and agent ingress. Periodic control retains its
+stricter stop-on-stale checks. The console never opens the OAK or STM32 and
+never labels an accepted request as applied.
 The configured `100 mm/s` and `500 mrad/s` browser steps are requested
 body-frame magnitudes inside the admitted manual envelope, not physical speed
 measurements.

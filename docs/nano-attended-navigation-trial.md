@@ -113,10 +113,19 @@ authority, not as production and not as raw-PWM qualification. It provides:
 - a live occupancy grid with pose, planned path, MPC prediction, and applied
   command evidence;
 - a map click that is accepted only on a currently free cell of the exact
-  displayed revision while localization and OAK motion evidence are current;
+  displayed revision while localization, OAK streams, sparse SLAM, and local
+  collision evidence are current;
   and
 - a one-way software safety-stop latch. The physical emergency cut remains an
   independent mechanism and is never represented as a browser substitute.
+
+Console snapshot schema V5 presents OAK streams and sparse SLAM separately.
+The SLAM row carries requested-to-selected SuperPoint and LightGlue providers,
+exact attempt outcome counters, and a successful-completion rate derived from
+at most the latest 64 completion timestamps. That number proves neither camera
+FPS nor real-time MPC capacity; those remain attended measurements on the exact
+Nano build. A stale or stopped tracker cannot inherit a green state from a
+camera that is still delivering frames.
 
 The HTTP service remains loopback-only. Access it through an explicit SSH
 forward to the configured console port and read the per-boot capability from
@@ -149,7 +158,8 @@ OAK_SYS_CHECK_ONLY=1 cargo clippy --locked -p kiko-slam \
   --all-targets --no-default-features \
   --features nano-attended-navigation-trial -- -D warnings
 
-node crates/kiko-slam/src/operator-console/view-model.test.js
+node --test crates/kiko-slam/src/operator-console/view-model.test.js \
+  crates/kiko-slam/src/operator-console/drive-safety.test.js
 node --check crates/kiko-slam/src/operator-console/app.js
 ```
 
@@ -161,14 +171,17 @@ the canonical handoff is ready:
 2. the exact Nano aarch64 binary and native OAK bridge start successfully;
 3. the OAK reports SuperSpeed and all RGB/stereo/depth/IMU streams remain
    healthy;
-4. the neck is actively held at the reviewed neutral pose and the current eye
+4. sparse SLAM reports the actual selected providers, advancing successful
+   source/completion evidence, a nonempty measured rate window, current
+   localization, and continuing occupancy revisions without fatal outcomes;
+5. the neck is actively held at the reviewed neutral pose and the current eye
    expression and RGB tracking are visibly present;
-5. the motion-capable STM32 firmware returns the expected V2 identity, exact
+6. the motion-capable STM32 firmware returns the expected V2 identity, exact
    applied-zero, disarm, watchdog, restart, disconnect, and fault evidence with
    motor power disconnected;
-6. the private console can observe the grid and exercise Stop/Disarm without
+7. the private console can observe the grid and exercise Stop/Disarm without
    granting nonzero motion; and
-7. the independent physical power cut is reachable and ready for the attended
+8. the independent physical power cut is reachable and ready for the attended
    wheel-on ceremony.
 
 Only after those checks pass is the truthful next instruction: attach the
