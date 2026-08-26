@@ -141,6 +141,47 @@ impl CompliantJointPolicy {
     const fn contains(self, value: PositionTicks) -> bool {
         value.get() >= self.minimum.get() && value.get() <= self.maximum.get()
     }
+
+    /// Lowest physically observable position admitted while a safe command
+    /// remains at the command envelope edge.
+    ///
+    /// Commands never use this wider range. A person can backdrive a joint by
+    /// at most the separately reviewed yield distance beyond an edge, so
+    /// rejecting that observation would turn the compliant controller's own
+    /// permitted interaction into an absorbing fault.
+    pub const fn observation_minimum(self) -> PositionTicks {
+        let value = self
+            .minimum
+            .get()
+            .saturating_sub(self.maximum_yield_ticks.get());
+        match PositionTicks::try_new(value) {
+            Ok(position) => position,
+            Err(_) => panic!("a saturating subtraction stays inside the encoder domain"),
+        }
+    }
+
+    /// Highest physically observable position admitted while a safe command
+    /// remains at the command envelope edge.
+    pub const fn observation_maximum(self) -> PositionTicks {
+        let candidate = self
+            .maximum
+            .get()
+            .saturating_add(self.maximum_yield_ticks.get());
+        let value = if candidate > PositionTicks::MAX.get() {
+            PositionTicks::MAX.get()
+        } else {
+            candidate
+        };
+        match PositionTicks::try_new(value) {
+            Ok(position) => position,
+            Err(_) => panic!("the observation maximum is capped to the encoder domain"),
+        }
+    }
+
+    const fn contains_observation(self, value: PositionTicks) -> bool {
+        value.get() >= self.observation_minimum().get()
+            && value.get() <= self.observation_maximum().get()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1058,12 +1099,12 @@ impl HeadCompliantHoldController {
         for joint in HeadJoint::ALL {
             let policy = self.config.joint(joint);
             let observed = observation.position(joint);
-            if !policy.contains(observed) {
+            if !policy.contains_observation(observed) {
                 let fault = CompliantHoldFault::ObservationOutsideEnvelope {
                     joint,
                     observed,
-                    minimum: policy.minimum(),
-                    maximum: policy.maximum(),
+                    minimum: policy.observation_minimum(),
+                    maximum: policy.observation_maximum(),
                 };
                 self.fault = Some(fault);
                 return Err(CompliantHoldPrepareError::FaultLatched(fault));
@@ -1576,6 +1617,69 @@ mod tests {
                 release_ticks: 20,
                 entry_ticks: 20,
             })
+        );
+    }
+
+    #[test]
+    fn touch_observation_may_cross_a_command_edge_only_by_reviewed_yield() {
+        let natural = pose([2_174, 2_570, 1_637, 3_047]);
+        let policy = config(1).joint(HeadJoint::Bow);
+        assert_eq!(policy.minimum().get(), 2_064);
+        assert_eq!(policy.observation_minimum().get(), 1_984);
+
+        let mut exact_edge =
+            HeadCompliantHoldController::try_new(config(1), natural, at(0)).unwrap();
+        exact_edge
+            .prepare(
+                at(0),
+                natural,
+                true,
+                observation(0, [1_984, 2_570, 1_637, 3_047], false),
+            )
+            .expect("the exact command edge plus reviewed yield is observable");
+
+        let mut beyond = HeadCompliantHoldController::try_new(config(1), natural, at(0)).unwrap();
+        assert_eq!(
+            beyond
+                .prepare(
+                    at(0),
+                    natural,
+                    true,
+                    observation(0, [1_983, 2_570, 1_637, 3_047], false),
+                )
+                .expect_err("one tick beyond reviewed yield must fault"),
+            CompliantHoldPrepareError::FaultLatched(
+                CompliantHoldFault::ObservationOutsideEnvelope {
+                    joint: HeadJoint::Bow,
+                    observed: PositionTicks::try_new(1_983).unwrap(),
+                    minimum: PositionTicks::try_new(1_984).unwrap(),
+                    maximum: PositionTicks::try_new(2_364).unwrap(),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn expression_command_cannot_use_the_observation_excursion() {
+        let natural = pose([2_174, 2_570, 1_637, 3_047]);
+        let unsafe_expression = pose([2_063, 2_570, 1_637, 3_047]);
+        let mut controller =
+            HeadCompliantHoldController::try_new(config(1), natural, at(0)).unwrap();
+        assert_eq!(
+            controller
+                .prepare(
+                    at(0),
+                    unsafe_expression,
+                    true,
+                    observation(0, [2_063, 2_570, 1_637, 3_047], false),
+                )
+                .expect_err("physical observation latitude must never widen commands"),
+            CompliantHoldPrepareError::ExpressionTargetOutsideEnvelope {
+                joint: HeadJoint::Bow,
+                target: PositionTicks::try_new(2_063).unwrap(),
+                minimum: PositionTicks::try_new(2_064).unwrap(),
+                maximum: PositionTicks::try_new(2_284).unwrap(),
+            }
         );
     }
 
