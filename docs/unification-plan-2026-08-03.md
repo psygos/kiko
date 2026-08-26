@@ -209,14 +209,26 @@ remaining work; a passing host test is never presented as physical evidence.
   samples, because secondary presentation failure still needs durable evidence
   without replacing the primary fault. Intent: make startup and park observable
   consequences of lifecycle facts without weakening fault ordering.
+- `8704e50`: the retained Python lab now generates a strict, source-hashed
+  schema-V1 semantic behavior trace. Rust rejects unknown and duplicate fields,
+  checks all 24 distinct acts against Fable's exact duration, cooldown, and
+  mode-eligibility contract, proves every recorded Fable eye/head channel is
+  retained by the richer four-axis act, replays the seven-step attention-mode
+  sequence, replays all three pet classifications, and requires exact natural
+  at unattended rest. The comparison exposed and corrected three genuine
+  drifts: re-greeting `10 s -> 6 s`, nod cooldown `11 s -> 10 s`, and soft-nod
+  cooldown `12 s -> 11 s`. Python float paths, independent RNG samples,
+  normalized character offsets, encoder ticks, and physical motion remain
+  explicitly non-equivalent domains. Intent: make general software parity a
+  reproducible gate without manufacturing a physical-parity claim.
 
-Host evidence at this checkpoint is 108/108 `kiko-expression-runtime` unit
+Host evidence at this checkpoint is 112/112 `kiko-expression-runtime` unit
 tests plus its compile-fail doctest, warning-free expression, head, and Nano
 compile-only Clippy, 177 `kiko-head-runtime` library tests plus 11 binary
 tests, 1,464/1,464 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
 binary tests, 7/7 offline-qualifier tests, 36/36 immutable-renderer tests,
 all 6 deployment-gate tests, the 13 focused base-commissioning tests, and
-82/82 Python behavior tests. The standalone KEP2 firmware passed all 8
+85/85 Python behavior tests. The standalone KEP2 firmware passed all 8
 renderer tests, including literal Matrix dynamics and maximum-time totality.
 The complete Nano-agent library suite was run
 outside the filesystem sandbox because 23 otherwise-green local socket and
@@ -239,10 +251,11 @@ claimed by these host results.
    coordinator exists, and add durable secondary-fault evidence before the
    terminal branch streams fault-recovery eyes; do not replace the primary
    stop fault or call apparent width metric range.
-2. Pet NDJSON compatibility, durable production recording, and reaction replay
-   are complete. Add the remaining general behavior-trace replay comparison;
-   retain the Python lane as a non-booted behavior lab until the Rust owner has
-   attended physical parity evidence.
+2. Pet NDJSON compatibility, durable production recording, reaction replay,
+   and general source-hashed semantic behavior-trace replay are complete.
+   Retain the Python lane as a non-booted behavior lab until the Rust owner has
+   attended physical parity evidence; do not reinterpret the host semantic
+   trace as actuator, optical, timing-load, or physical-feel evidence.
 3. Re-audit the current navigation graph, make live SLAM rate/backend/fallback
    observable, verify the manual/emergency-stop GUI and autonomous MPC share
    one authority path, and close every wheels-off gate before requesting wheel

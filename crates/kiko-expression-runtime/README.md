@@ -169,6 +169,16 @@ a head offset is still rejected: this crate owns no head actor. The production
 default remains `ReactionMixer::default()` → `HeadIntention::NaturalHold`;
 the separate typed character overlay cannot grant actuation authority.
 
+The preserved Fable laboratory exports a source-hashed schema-V1 semantic
+trace. Tests in this crate parse it with unknown- and duplicate-field
+rejection, compare all 24 act identities, duration bounds, cooldowns, eligible
+modes, and source channels, and replay its attention and pet sequences through
+`AutonomicCharacterEngine`. The comparison is deliberately semantic: Python
+float trajectories, Python and Rust RNG samples, normalized character offsets,
+encoder ticks, and observed physical motion are different domains. The trace
+therefore proves that behavior was not silently dropped; only an attended Nano
+run can prove physical parity.
+
 When the evidence-bound physical head path is active, face tracking is no
 longer an open-loop eye command. The proposal seam retains the desired
 neutral-head yaw/pitch in radians, and the sole head actor returns its exact
