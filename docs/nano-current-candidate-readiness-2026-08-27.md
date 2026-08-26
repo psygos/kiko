@@ -5,42 +5,132 @@ available for the next attended wheels-off qualification. It prevents the live
 Fable worktree, an old Nano binary, retained native libraries, or historical
 calibration records from being mistaken for a qualified deployment.
 
-No source was transferred to the Orin while preparing this record. No live
-process was stopped or signalled, no endpoint was opened, and no firmware,
-bundle, service, configuration, or hardware state was changed. This document
-does not claim installation, Linux-aarch64 linkage, camera delivery, physical
-head behavior, PID-1 supervision, SLAM accuracy, MPC tracking, or performance.
+The approved `60983f0` archive was transferred to the Orin, extracted, and
+built in an isolated private directory. That build exposed one release-binary
+provenance defect: generic development model defaults embedded the build
+machine's absolute source directory. Commit `9deda40` removes that fallback,
+adds regression coverage, and is now the hardened candidate. Its exact source
+archive and executable are staged only below
+`/home/makerspace/kiko-candidate-9deda40`; neither is installed or deployed.
 
-## Exact source candidate
+No live process was stopped or signalled, no hardware endpoint was opened, and
+no firmware, bundle, service, configuration, or hardware state was changed.
+Fable remained live throughout. This document does not claim camera delivery,
+physical head behavior, PID-1 supervision, SLAM accuracy, MPC tracking, or
+performance.
+
+## Superseded approved transfer
 
 | Field | Value |
 | --- | --- |
 | branch | `codex/nano-expression-integration-stage` |
 | commit | `60983f0b60fa28f4da9dc61af96e0d883cd7c9d9` |
 | Git tree | `4a6ba7f0ddaaed2e0f9b63f540391131b9e8099c` |
-| source tar | `/tmp/kiko-60983f0-source.tar` |
-| source tar bytes | `191631360` |
-| source tar SHA-256 | `f0a099bf1ef4be91b1ce5a2298b2359269afed938569a308a844b16a1bfb4e05` |
 | compressed source tar | `/tmp/kiko-60983f0-source.tar.gz` |
 | compressed bytes | `164836698` |
 | compressed SHA-256 | `1d8cf717840e32c8cde696c51e48990b894e87689d09de76b801dda72b6b4e06` |
+| isolated Orin root | `/home/makerspace/kiko-candidate-60983f0` |
 
-The archive size includes the Git-tracked ONNX model assets. The archive is an
-ephemeral local preparation artifact, not a checked-in or qualified release.
-The private Orin directory `/home/makerspace/kiko-candidate-60983f0` exists and
-was empty at `2026-08-27T02:37:48+05:30`; the archive has **not** been copied
-there. Transferring this private repository source requires explicit approval
-of that exact payload and destination.
+The local and transferred archives matched byte-for-byte. The archive includes
+the Git-tracked ONNX model assets. The locked native AArch64 release build
+completed in that isolated root without modifying `/home/makerspace/kiko`.
+The first executable was invalidated after inspection found the absolute source
+path described above; it is not the staged qualification candidate.
+
+## Hardened exact candidate
+
+| Field | Value |
+| --- | --- |
+| branch | `codex/nano-expression-integration-stage` |
+| commit | `9deda40ec0638b7e84dbcd90fa09cc574e831d85` |
+| Git tree | `2c41e5e1adce68c8c0d6a8788caceaf57e13d803` |
+| source tar | `/tmp/kiko-9deda40-source.tar` |
+| source tar bytes | `191641600` |
+| source tar SHA-256 | `8c2432cd1991ac181e27f4b1c6a36e679dbe373a4ba964ae673f6a9584a3b68c` |
+| compressed source tar | `/tmp/kiko-9deda40-source.tar.gz` |
+| compressed bytes | `164892982` |
+| compressed SHA-256 | `e6d5a5ed1990692721c020c59c7d99dd07cb041fa7ac9fd0a55e099e740979db` |
+| isolated Orin root | `/home/makerspace/kiko-candidate-9deda40` |
+
+The remote compressed archive matched that SHA-256 after transfer. The staged
+executable was built from the `60983f0` archive plus a SHA-verified patch whose
+resulting five source files matched `9deda40` byte-for-byte. The exact
+`9deda40` archive was then transferred and extracted beside it. This is exact
+source identity evidence, but not a claim that a second cold build was made
+from the later directory.
+
+## Isolated Linux AArch64 build evidence
+
+The build used Cargo's locked release graph and exactly the production
+qualification feature:
+
+```text
+cargo build --locked --release -p kiko-slam \
+  --no-default-features \
+  --features nano-wheels-off-qualification \
+  --bin kiko-slam
+```
+
+The build host and toolchain were:
+
+| Field | Observed value |
+| --- | --- |
+| kernel | `Linux 5.15.148-tegra aarch64` |
+| rustc | `1.88.0 (6b00bc388 2025-06-23)`, host `aarch64-unknown-linux-gnu`, LLVM `20.1.5` |
+| cargo | `1.88.0 (873a06493 2025-05-10)`, host `aarch64-unknown-linux-gnu` |
+| C compiler | Ubuntu GCC `11.4.0` |
+| DepthAI headers | SDK `3.4.0`, commit `ba7a920a2568ea6eaaaebf3f92bbdb40924187ae`, device artifact `86cc8f6aa527b7c1f4b62129decd68e12bcf7d8a`, bootloader `0.0.28` |
+| DepthAI version header SHA-256 | `91eded0aa1468a5e8ca7ee13b51f2e2f8475c616922a59c684ecb59fc61e6e80` |
+
+The current executable is retained, not installed:
+
+| Field | Value |
+| --- | --- |
+| path | `/home/makerspace/kiko-candidate-9deda40/bin/kiko-nano-wheels-off-qualification` |
+| bytes | `31221720` |
+| SHA-256 | `9d746650c3d86cea4292fecc5bb9098c1cfc8a0ccb9d29ab018ede821ffc82f9` |
+| GNU build ID | `84f56531c586d2963fdfd08fd6cf7a8c820c5c96` |
+| format | ELF64 AArch64 PIE, GNU/Linux 3.7, interpreter `/lib/ld-linux-aarch64.so.1` |
+| mode and owner | `0755`, `makerspace:makerspace` |
+
+`readelf` found direct dependencies on DepthAI, the three required OpenCV
+libraries, and the expected C/C++ runtime libraries. With the retained native
+directory on `LD_LIBRARY_PATH`, `ldd` resolved DepthAI, dynamic calibration,
+OpenCV, and the pinned libusb leaf. A system libusb also remains in the
+transitive closure, so this is not described as a wholly hermetic OS closure.
+The exact old candidate source path is absent from the hardened executable.
+`--help` ran successfully and exposed the qualification command without
+opening a hardware endpoint. Runtime `/proc/self/maps` admission remains a
+bundle-launch gate.
+
+Host verification for the exact wheels-off feature graph passed:
+
+- `cargo clippy --locked ... --all-targets -- -D warnings`;
+- 1,538 library unit tests;
+- 7 deployment-qualifier tests;
+- 103 CLI/runtime unit tests;
+- 7 qualification-template integration tests; and
+- doctests, with one intentionally ignored backend example.
+
+The first in-sandbox test pass produced 27 local-socket `EPERM` failures; the
+identical command was rerun with local socket permission and all tests passed.
+`OAK_SYS_CHECK_ONLY=1` intentionally makes these host checks compile-only for
+the native OAK bridge. The native bridge is instead evidenced by the Orin
+release build above.
 
 ## Live Orin state retained during preparation
 
-The read-only refresh at `2026-08-27T02:37:48+05:30` observed an NVIDIA Jetson
-Orin Nano running Linux `aarch64`. `/home/makerspace/kiko` remained at
+The final read-only refresh at `2026-08-27T04:02:24+05:30` observed an NVIDIA
+Jetson Orin Nano running Linux `aarch64`. `/home/makerspace/kiko` remained at
 `e53d7cb084a9b56f49df484f6d8bc7f46f0b39e6`; it is the intentionally preserved
 dirty field worktree and must not be reset, overwritten, or used as a clean
 candidate build source.
 
 Fable's guardian and `kiko_face_follow.py` remained the sole live owner family.
+The face-follow process was still PID `1073`, its heartbeat advanced at the
+final observation, and no `kiko-slam` or staged qualification process was
+running. The source transfer, cold build, incremental hardened rebuild, and
+artifact staging therefore did not replace the live owner.
 The current stable serial paths were:
 
 ```text
@@ -76,10 +166,11 @@ The following retained Orin closure is available as a build input candidate:
 | `libopencv_imgproc.so.4.5d` | `2906064` | `15b2448af215493a79f4638cad8eefcb9b43f15926724caffbdbd06a9c018261` |
 | `libopencv_objdetect.so.4.5d` | `366632` | `94d3ddfb2111e72658d4bd005d22fd0ce402f8ae45ff8a79e9f7bdbd9b194b0b` |
 
-That closure was retained for commit `3f262f1`. It may supply the seven exact
-native leaves, but it is not current-candidate linkage evidence. The new
-qualification executable still requires fresh `readelf`, `ldd`, byte-identity,
-and `/proc/self/maps` admission against the rendered V4 bundle.
+That closure was originally retained for commit `3f262f1`. The current
+candidate was compiled and link-inspected against it, so its seven leaf hashes
+are current build inputs rather than merely located candidates. Bundle
+rendering must copy and re-hash those exact leaves, and the launched process
+must still prove the admitted mappings through `/proc/self/maps`.
 
 The Orin's installed OpenCV cascades are available at:
 
@@ -114,25 +205,22 @@ shadow-only synthetic plant, MPC shadow bounds, current four-servo natural
 return policy, and expression head origin `[0,-0.25,-0.20] m`. Gate A omits
 expressive physical head gaze while retaining the reviewed natural hold.
 
-The following must still be produced or freshly observed:
+The source, AArch64 build, compiled DepthAI identities, executable inspection,
+and host feature-graph verification are complete. The following must still be
+produced or freshly observed:
 
-1. a release `aarch64-unknown-linux-gnu` qualification executable built from
-   the exact candidate commit with `--locked` and the
-   `nano-wheels-off-qualification` feature;
-2. the compiled DepthAI header SDK, commit, device-artifact, and bootloader
-   identities from that exact build;
-3. fresh exact OAK, STM32 protocol/build/profile/capability, head-adapter, and
+1. fresh exact OAK, STM32 protocol/build/profile/capability, head-adapter, and
    KEP2 session/build/capability admission;
-4. a fresh finalized candidate-recorder capture at the V4 stream geometry;
-5. a measurement record naming the drive-axle midpoint base frame and the OAK
+2. a fresh finalized candidate-recorder capture at the V4 stream geometry;
+3. a measurement record naming the drive-axle midpoint base frame and the OAK
    rectified-left optical centre, with their translation and proper rotation;
-6. a sourced proper rotation from native OAK IMU axes to the same base frame;
-7. the seven frame-specific navigation leaves: world-to-occupancy rotation and
+4. a sourced proper rotation from native OAK IMU axes to the same base frame;
+5. the seven frame-specific navigation leaves: world-to-occupancy rotation and
    translation, inflated footprint radius, global floor-relative obstacle
    minimum/maximum, and axle-centred base-frame obstacle-z minimum/maximum;
-8. a canonical calibration-artifact V1 and navigation-shadow V2 generated
+6. a canonical calibration-artifact V1 and navigation-shadow V2 generated
    transactionally by `kiko-nano-calibration-prepare`; and
-9. a completely materialized bundle-render-input V4 followed by an immutable
+7. a completely materialized bundle-render-input V4 followed by an immutable
    wheels-off qualification launch V4.
 
 The operator declarations retained so far are useful but insufficient:
@@ -150,31 +238,21 @@ those declarations.
 
 ## Exact next transaction
 
-1. Obtain explicit approval to transfer the exact compressed candidate above
-   to `/home/makerspace/kiko-candidate-60983f0`.
-2. Extract into that isolated private directory and prove the Git tree/source
-   identity before building; never build from `/home/makerspace/kiko`.
-3. Record the Orin toolchain and run:
+Transfer, isolated build, executable inspection, hardened source staging, and
+host verification are complete. The next transaction begins only after the
+operator explicitly supersedes the current **do not stop Fable or deploy yet**
+constraint:
 
-   ```text
-   cargo build --locked --release -p kiko-slam \
-     --no-default-features \
-     --features nano-wheels-off-qualification \
-     --bin kiko-slam
-   ```
-
-4. Retain the executable hash, byte count, `file`, `readelf`, `ldd`, model,
-   cascade, native-leaf, and compiled-DepthAI evidence without installing it.
-5. During the attended single-owner window, stop the Fable owner exactly once,
+1. During an attended single-owner window, stop the Fable owner exactly once,
    acquire the OAK with the exact candidate recorder, and either finish the
    capture and calibration inputs or restore Fable before leaving the window.
-6. Prepare calibration and navigation with the fail-closed assembler; render
+2. Prepare calibration and navigation with the fail-closed assembler; render
    and inspect the immutable V4 bundle before any installation.
-7. With wheels removed, head supported, motor power physically disconnected,
+3. With wheels removed, head supported, motor power physically disconnected,
    and the power cut reachable, launch the qualification binary once in the
    foreground and complete the challenge-gated procedure in
    `docs/nano-wheels-off-qualification.md`.
-8. Prove the sole-owner OAK/head/eye/STM32 graph, natural hold and pet response,
+4. Prove the sole-owner OAK/head/eye/STM32 graph, natural hold and pet response,
    live RGB/stereo/depth/IMU, sparse-SLAM completions, occupancy, Rerun, GUI
    deadman and emergency stop, MPC shadow stream, watchdog, and every terminal
    stop/shutdown path. Restore Fable on failure; never run both owners.

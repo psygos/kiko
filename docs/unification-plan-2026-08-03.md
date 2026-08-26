@@ -319,10 +319,12 @@ The read-only 2026-08-27 Orin checkpoint is retained in
 Python owner remains active on OAK/head/eyes at USB3 while STM32 is idle, but
 no canonical service, current bundle, online SLAM, occupancy, GUI, MPC, or
 navigation owner is running. This is the safe pre-handoff state, not completion.
-The exact source archive, reusable native/model/cascade leaves, unresolved V4
-calibration inputs, and ordered next transaction are consolidated in
-`docs/nano-current-candidate-readiness-2026-08-27.md`; the archive has not been
-transferred to the Orin.
+The exact source archives, isolated native AArch64 build evidence, reusable
+native/model/cascade leaves, unresolved V4 calibration inputs, and ordered next
+transaction are consolidated in
+`docs/nano-current-candidate-readiness-2026-08-27.md`. The hardened candidate
+is staged privately on the Orin but is neither installed nor running; Fable
+remains the live owner.
 
 ## 1. Original situation recorded 2026-08-03
 
