@@ -15,7 +15,7 @@
       ${HEAD_YAW_SERVO_ID},
       ${HEAD_ROLL_SERVO_ID}
     ],
-    "natural_encoder_position_ticks_bow_curl_yaw_roll": [2174, 2570, 1637, 3047],
+    "natural_encoder_position_ticks_bow_curl_yaw_roll": [1505, 3937, 1551, 3018],
     "head_origin_in_oak_camera_m_x_right_y_down_z_forward": [0.0, -0.25, -0.20],
     "neutral_head_parallel_to_oak_optical_axis": true
   },

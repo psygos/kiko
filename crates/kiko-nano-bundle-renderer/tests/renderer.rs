@@ -12,6 +12,9 @@ use kiko_nano_bundle_renderer::{
     QualificationFaceCascadeRole, RenderError, RenderMode, render_bundle,
 };
 use kiko_slam::navigation::{
+    KIKO_REVIEWED_NATURAL_HEAD_MAXIMUM_TRAVEL_TICKS,
+    KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS, KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS,
+    KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS, KIKO_REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE,
     NanoAgentLaunchV4, NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1,
     NanoCalibrationBindingError, NanoWheelsOffNativeRuntimeV1, NanoWheelsOffQualificationLaunchV4,
     OfflineNavigationGraphParseError, ProductionNavigationControllerBindingError,
@@ -631,16 +634,16 @@ fn source_fixture() -> (TempDir, Value) {
             "write_attempts": 2,
             "noise_budget_bytes": 32,
             "redundant_read_tolerance_ticks": 10,
-            "readback_tolerance_ticks": 20,
-            "final_target_tolerance_ticks": 20,
-            "path_corridor_tolerance_ticks": 20,
-            "direction_regression_tolerance_ticks": 20,
+            "readback_tolerance_ticks": 24,
+            "final_target_tolerance_ticks": 24,
+            "path_corridor_tolerance_ticks": 24,
+            "direction_regression_tolerance_ticks": 24,
             "goal_speed_ticks_per_second": 50,
-            "torque_limit_permille": [600, 400, 400, 400],
-            "minimum_start_ticks": [2133, 2550, 1617, 3023],
-            "maximum_start_ticks": [2194, 2660, 1852, 3067],
-            "reviewed_natural_target_ticks": [2174, 2570, 1637, 3047],
-            "maximum_travel_ticks": [48, 96, 224, 32]
+            "torque_limit_permille": KIKO_REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE,
+            "minimum_start_ticks": KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS,
+            "maximum_start_ticks": KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS,
+            "reviewed_natural_target_ticks": KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS,
+            "maximum_travel_ticks": KIKO_REVIEWED_NATURAL_HEAD_MAXIMUM_TRAVEL_TICKS
         },
         "rgb_expression_policy": {
             "sampling_columns": 16,
@@ -2131,7 +2134,7 @@ fn renderer_requires_and_checks_navigation_dataset_storage_limits() {
 fn renderer_rejects_policy_values_the_agent_would_reject() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
-    input["head_policy"]["reviewed_natural_target_ticks"][0] = json!(2175);
+    input["head_policy"]["reviewed_natural_target_ticks"][0] = json!(1506);
     let input_path = write_input(&root, &input);
     let error = render_bundle(&input_path, RenderMode::DryRun).expect_err("unreviewed head target");
     assert!(
@@ -2140,14 +2143,14 @@ fn renderer_rejects_policy_values_the_agent_would_reject() {
             .contains("operator-confirmed natural target")
     );
 
-    input["head_policy"]["reviewed_natural_target_ticks"][0] = json!(2174);
-    input["head_policy"]["maximum_travel_ticks"][0] = json!(49);
+    input["head_policy"]["reviewed_natural_target_ticks"][0] = json!(1505);
+    input["head_policy"]["maximum_travel_ticks"][0] = json!(129);
     let input_path = write_input(&root, &input);
     let error = render_bundle(&input_path, RenderMode::DryRun)
         .expect_err("widened head travel must not be admitted");
     assert!(error.to_string().contains("reviewed startup, travel"));
 
-    input["head_policy"]["maximum_travel_ticks"][0] = json!(48);
+    input["head_policy"]["maximum_travel_ticks"][0] = json!(128);
     input["rgb_expression_policy"]["sampling_columns"] = json!(65);
     input["rgb_expression_policy"]["sampling_rows"] = json!(65);
     let input_path = write_input(&root, &input);
@@ -2416,7 +2419,7 @@ fn qualification_v4_template_renders_exact_policy_and_leaves_only_evidence_bound
     );
     assert_eq!(
         shape["head_policy"]["reviewed_natural_target_ticks"],
-        json!([2174, 2570, 1637, 3047])
+        json!(KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS)
     );
     assert_eq!(
         shape["rgb_expression_policy"]["head_origin_in_camera_m"],
@@ -2479,16 +2482,16 @@ fn qualification_v4_template_renders_exact_policy_and_leaves_only_evidence_bound
             "write_attempts": 2,
             "noise_budget_bytes": 32,
             "redundant_read_tolerance_ticks": 10,
-            "readback_tolerance_ticks": 20,
-            "final_target_tolerance_ticks": 20,
-            "path_corridor_tolerance_ticks": 20,
-            "direction_regression_tolerance_ticks": 20,
+            "readback_tolerance_ticks": 24,
+            "final_target_tolerance_ticks": 24,
+            "path_corridor_tolerance_ticks": 24,
+            "direction_regression_tolerance_ticks": 24,
             "goal_speed_ticks_per_second": 50,
-            "torque_limit_permille": [600, 400, 400, 400],
-            "minimum_start_ticks": [2133, 2550, 1617, 3023],
-            "maximum_start_ticks": [2194, 2660, 1852, 3067],
-            "reviewed_natural_target_ticks": [2174, 2570, 1637, 3047],
-            "maximum_travel_ticks": [48, 96, 224, 32],
+            "torque_limit_permille": KIKO_REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE,
+            "minimum_start_ticks": KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS,
+            "maximum_start_ticks": KIKO_REVIEWED_NATURAL_HEAD_START_MAXIMUM_TICKS,
+            "reviewed_natural_target_ticks": KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS,
+            "maximum_travel_ticks": KIKO_REVIEWED_NATURAL_HEAD_MAXIMUM_TRAVEL_TICKS,
             "physical_torque_consent": "enable_for_reviewed_natural_return_and_hold",
             "physical_motion_consent": "return_to_reviewed_natural_target"
         })

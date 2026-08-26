@@ -8,7 +8,7 @@
   },
   "mapping_declaration": {
     "assembly_id": "${HEAD_ASSEMBLY_DECLARATION_ID}",
-    "calibration_provenance_id": "kiko-follow-config-0d98af8c-2026-07-31",
+    "calibration_provenance_id": "fable-config-sha256-46d69519425caba5ace1920d39ff8a07101bf86b79eacb1cdeb53f1dd8957a56",
     "gaze_only_focus_plane": {
       "camera_forward_depth_m": 1.5
     },
@@ -26,33 +26,33 @@
       }
     },
     "natural_encoder_position_ticks": {
-      "bow_ticks": 2174,
-      "curl_ticks": 2570,
-      "yaw_ticks": 1637,
-      "roll_ticks": 3047
+      "bow_ticks": 1505,
+      "curl_ticks": 3937,
+      "yaw_ticks": 1551,
+      "roll_ticks": 3018
     },
     "hard_encoder_envelopes_ticks": {
       "bow": {
-        "minimum_ticks": 2064,
-        "maximum_ticks": 2284
+        "minimum_ticks": 1395,
+        "maximum_ticks": 1615
       },
       "curl": {
-        "minimum_ticks": 2390,
-        "maximum_ticks": 2750
+        "minimum_ticks": 3787,
+        "maximum_ticks": 4087
       },
       "yaw": {
-        "minimum_ticks": 1157,
-        "maximum_ticks": 2117
+        "minimum_ticks": 1071,
+        "maximum_ticks": 2031
       },
       "roll": {
-        "minimum_ticks": 2887,
-        "maximum_ticks": 3207
+        "minimum_ticks": 2858,
+        "maximum_ticks": 3178
       }
     },
     "encoder_tick_offsets_per_radian": {
       "pitch_down_rad": {
-        "bow_ticks_per_radian": -93.0,
-        "curl_ticks_per_radian": 465.0,
+        "bow_ticks_per_radian": -217.0,
+        "curl_ticks_per_radian": 403.0,
         "yaw_ticks_per_radian": 0.0,
         "roll_ticks_per_radian": 0.0
       },
@@ -77,7 +77,7 @@
     },
     "character_positive_full_scale_encoder_offsets_ticks": {
       "bow_ticks": 110,
-      "curl_ticks": -180,
+      "curl_ticks": -150,
       "yaw_ticks": 480,
       "roll_ticks": 160
     }
@@ -148,8 +148,8 @@
   },
   "compliant_hold_declaration": {
     "holding_torque_limit_permille": {
-      "bow": 600,
-      "curl": 400,
+      "bow": 650,
+      "curl": 550,
       "yaw": 400,
       "roll": 400
     },
