@@ -25,10 +25,10 @@ use oak_sys::{
 use serde::Deserialize;
 
 use super::{
-    ConsoleRerunDiagnosticsUrl, MAX_NANO_AGENT_POLICY_CONFIG_JSON_BYTES,
-    MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES, MAX_NANO_OCCUPANCY_CELLS,
-    MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES, MAX_NAVIGATION_INGRESS_RECORDS,
-    MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
+    ConsoleRerunDiagnosticsUrl, MAX_HEAD_GAZE_POLICY_JSON_BYTES,
+    MAX_NANO_AGENT_POLICY_CONFIG_JSON_BYTES, MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES,
+    MAX_NANO_OCCUPANCY_CELLS, MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES,
+    MAX_NAVIGATION_INGRESS_RECORDS, MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
 };
 use crate::InferenceBackend;
 use crate::dense::occupancy::OccupancyGridGeometry;
@@ -43,6 +43,13 @@ pub const NANO_AGENT_LAUNCH_V2: u32 = 2;
 /// V2 remains a separate parser and type so adding face perception does not
 /// silently weaken or reinterpret an already deployed V2 document.
 pub const NANO_AGENT_LAUNCH_V3: u32 = 3;
+
+/// Production launch schema that makes physically reviewed head gaze part of
+/// the exact deployment graph.
+///
+/// V3 remains separately parseable, but production startup uses V4 so a
+/// natural-hold-only bundle cannot silently claim expressive head control.
+pub const NANO_AGENT_LAUNCH_V4: u32 = 4;
 
 /// Hard bound applied before JSON decoding can allocate caller-sized values.
 pub const MAX_NANO_AGENT_LAUNCH_JSON_BYTES: usize = 64 * 1_024;
@@ -75,6 +82,9 @@ pub const MAX_NANO_OCCUPANCY_KEYFRAMES: usize = 1_000_000;
 pub const MAX_NANO_OCCUPANCY_SNAPSHOT_CADENCE: usize = 1_000_000;
 /// Per-file ceiling for the XML cascade inputs retained by launch V3.
 pub const MAX_OPENCV_HAAR_CASCADE_BYTES: u64 = 4 * 1_024 * 1_024;
+/// Physical-review evidence is retained as an opaque, exact-byte artifact.
+/// Admission interprets only the digest claimed by the typed policy.
+pub const MAX_HEAD_GAZE_REVIEW_EVIDENCE_BYTES: u64 = 1_024 * 1_024;
 
 const SHA256_HEX_BYTES: usize = 64;
 const MAX_LAUNCH_ARTIFACT_ID_BYTES: usize = 64;
@@ -106,6 +116,24 @@ pub enum NanoFaceCascadeAssetRole {
 
 impl NanoFaceCascadeAssetRole {
     pub const ALL: [Self; 2] = [Self::FrontalFace, Self::ProfileFace];
+}
+
+/// The two distinct inputs needed to activate physical head gaze in launch V4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NanoHeadGazeAssetRole {
+    Policy,
+    PhysicalReviewEvidence,
+}
+
+impl NanoHeadGazeAssetRole {
+    pub const ALL: [Self; 2] = [Self::Policy, Self::PhysicalReviewEvidence];
+
+    const fn maximum_bytes(self) -> u64 {
+        match self {
+            Self::Policy => MAX_HEAD_GAZE_POLICY_JSON_BYTES as u64,
+            Self::PhysicalReviewEvidence => MAX_HEAD_GAZE_REVIEW_EVIDENCE_BYTES,
+        }
+    }
 }
 
 impl NanoLaunchAssetRole {
@@ -280,6 +308,34 @@ impl NanoLaunchFacePerception {
         match role {
             NanoFaceCascadeAssetRole::FrontalFace => &self.frontal_face_cascade,
             NanoFaceCascadeAssetRole::ProfileFace => &self.profile_face_cascade,
+        }
+    }
+}
+
+/// Exact launch-V4 inputs for physically reviewed gaze and character motion.
+///
+/// The policy is parsed later into domain types. The review evidence remains
+/// opaque: only its retained content identity is cross-bound to the policy's
+/// operator-claimed review before motion types can be constructed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NanoLaunchPhysicalHeadGaze {
+    policy: NanoLaunchAssetBinding,
+    review_evidence: NanoLaunchAssetBinding,
+}
+
+impl NanoLaunchPhysicalHeadGaze {
+    pub const fn policy(&self) -> &NanoLaunchAssetBinding {
+        &self.policy
+    }
+
+    pub const fn review_evidence(&self) -> &NanoLaunchAssetBinding {
+        &self.review_evidence
+    }
+
+    pub const fn asset(&self, role: NanoHeadGazeAssetRole) -> &NanoLaunchAssetBinding {
+        match role {
+            NanoHeadGazeAssetRole::Policy => &self.policy,
+            NanoHeadGazeAssetRole::PhysicalReviewEvidence => &self.review_evidence,
         }
     }
 }
@@ -671,8 +727,9 @@ impl NanoLaunchStorage {
 
 /// Fully parsed legacy V2 launch document.
 ///
-/// Canonical production and attended commissioning use `NanoAgentLaunchV3`;
-/// this type never invents or implies face-perception assets.
+/// Canonical production and attended commissioning use `NanoAgentLaunchV4`;
+/// this type never invents or implies face-perception or physical-head-gaze
+/// assets.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NanoAgentLaunchV2 {
     agent_policy: NanoLaunchAssetBinding,
@@ -830,6 +887,10 @@ impl NanoAgentLaunchV3 {
         deserializer
             .end()
             .map_err(NanoAgentLaunchParseError::JsonTrailingData)?;
+        Self::from_dto(dto)
+    }
+
+    fn from_dto(dto: NanoAgentLaunchV3Dto) -> Result<Self, NanoAgentLaunchParseError> {
         if dto.schema_version != NANO_AGENT_LAUNCH_V3 {
             return Err(NanoAgentLaunchParseError::UnsupportedSchema {
                 actual: dto.schema_version,
@@ -903,6 +964,104 @@ impl NanoAgentLaunchV3 {
     }
 }
 
+/// Canonical production launch: the established V3 graph plus mandatory,
+/// exact-byte physical head-gaze inputs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NanoAgentLaunchV4 {
+    common: NanoAgentLaunchV3,
+    physical_head_gaze: NanoLaunchPhysicalHeadGaze,
+}
+
+impl NanoAgentLaunchV4 {
+    /// Parse one exact bounded V4 JSON byte sequence exactly once.
+    pub fn parse_json(json: &[u8]) -> Result<Self, NanoAgentLaunchParseError> {
+        if json.len() > MAX_NANO_AGENT_LAUNCH_JSON_BYTES {
+            return Err(NanoAgentLaunchParseError::InputTooLarge {
+                actual_bytes: json.len(),
+                maximum_bytes: MAX_NANO_AGENT_LAUNCH_JSON_BYTES,
+            });
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(json);
+        let dto = NanoAgentLaunchV4Dto::deserialize(&mut deserializer)
+            .map_err(NanoAgentLaunchParseError::JsonDecode)?;
+        deserializer
+            .end()
+            .map_err(NanoAgentLaunchParseError::JsonTrailingData)?;
+        if dto.schema_version != NANO_AGENT_LAUNCH_V4 {
+            return Err(NanoAgentLaunchParseError::UnsupportedSchema {
+                actual: dto.schema_version,
+                supported: NANO_AGENT_LAUNCH_V4,
+            });
+        }
+
+        let (common_dto, physical_head_gaze_dto) = dto.into_parts();
+        let common = NanoAgentLaunchV3::from_dto(common_dto)?;
+        let physical_head_gaze = parse_physical_head_gaze(physical_head_gaze_dto)?;
+        let launch = Self {
+            common,
+            physical_head_gaze,
+        };
+        ensure_distinct_v4_input_assets(&launch)?;
+        Ok(launch)
+    }
+
+    pub const fn agent_policy(&self) -> &NanoLaunchAssetBinding {
+        self.common.agent_policy()
+    }
+
+    pub const fn navigation_shadow_config(&self) -> &NanoLaunchAssetBinding {
+        self.common.navigation_shadow_config()
+    }
+
+    pub const fn physical_actuation_config(&self) -> &NanoLaunchAssetBinding {
+        self.common.physical_actuation_config()
+    }
+
+    pub const fn controller_server(&self) -> &NanoLaunchControllerServer {
+        self.common.controller_server()
+    }
+
+    pub const fn plant_artifact(&self) -> &NanoLaunchPlantArtifact {
+        self.common.plant_artifact()
+    }
+
+    pub const fn calibration_artifact(&self) -> &NanoLaunchCalibrationArtifact {
+        self.common.calibration_artifact()
+    }
+
+    pub const fn oak(&self) -> &NanoOakStreamGraph {
+        self.common.oak()
+    }
+
+    pub const fn occupancy(&self) -> &NanoLaunchOccupancy {
+        self.common.occupancy()
+    }
+
+    pub const fn inference(&self) -> &NanoLaunchInference {
+        self.common.inference()
+    }
+
+    pub const fn rerun(&self) -> NanoLaunchRerun {
+        self.common.rerun()
+    }
+
+    pub const fn storage(&self) -> &NanoLaunchStorage {
+        self.common.storage()
+    }
+
+    pub fn asset(&self, role: NanoLaunchAssetRole) -> &NanoLaunchAssetBinding {
+        self.common.asset(role)
+    }
+
+    pub const fn face_perception(&self) -> &NanoLaunchFacePerception {
+        self.common.face_perception()
+    }
+
+    pub const fn physical_head_gaze(&self) -> &NanoLaunchPhysicalHeadGaze {
+        &self.physical_head_gaze
+    }
+}
+
 /// Loaded launch document retaining the exact no-follow source bytes and
 /// digest used by the parser.
 #[derive(Debug)]
@@ -950,6 +1109,31 @@ impl LoadedNanoAgentLaunchV3 {
     }
 
     pub fn into_parts(self) -> (NanoAgentLaunchV3, LoadedDeploymentAsset) {
+        (self.launch, self.source)
+    }
+}
+
+/// Loaded V4 launch retaining the exact no-follow source bytes and digest.
+#[derive(Debug)]
+pub struct LoadedNanoAgentLaunchV4 {
+    launch: NanoAgentLaunchV4,
+    source: LoadedDeploymentAsset,
+}
+
+impl LoadedNanoAgentLaunchV4 {
+    pub const fn launch(&self) -> &NanoAgentLaunchV4 {
+        &self.launch
+    }
+
+    pub const fn source(&self) -> &LoadedDeploymentAsset {
+        &self.source
+    }
+
+    pub const fn content_sha256(&self) -> DeploymentAssetContentSha256 {
+        self.source.content_sha256()
+    }
+
+    pub fn into_parts(self) -> (NanoAgentLaunchV4, LoadedDeploymentAsset) {
         (self.launch, self.source)
     }
 }
@@ -1020,6 +1204,50 @@ pub fn load_nano_agent_launch_v3(
     Ok(LoadedNanoAgentLaunchV3 { launch, source })
 }
 
+/// Load the canonical production V4 launch document beneath one deployment
+/// root. Every referenced input remains separately exact-loaded by bootstrap.
+pub fn load_nano_agent_launch_v4(
+    deployment_root: &Path,
+    launch_relative_path: ArtifactRelativePath,
+) -> Result<LoadedNanoAgentLaunchV4, NanoAgentLaunchLoadError> {
+    let byte_limit = DeploymentAssetByteLimit::try_new(
+        u64::try_from(MAX_NANO_AGENT_LAUNCH_JSON_BYTES)
+            .expect("launch JSON bound fits every supported host"),
+    )
+    .expect("launch JSON bound is nonzero and below the global asset limit");
+    let source = load_deployment_asset(deployment_root, launch_relative_path, byte_limit)
+        .map_err(NanoAgentLaunchLoadError::Load)?;
+    let launch =
+        NanoAgentLaunchV4::parse_json(source.bytes()).map_err(NanoAgentLaunchLoadError::Parse)?;
+    for role in NanoLaunchAssetRole::ALL {
+        if launch.asset(role).relative_path() == source.relative_path() {
+            return Err(NanoAgentLaunchLoadError::InputAliasesLaunchDocument {
+                role,
+                relative_path: source.relative_path().clone(),
+            });
+        }
+    }
+    for role in NanoFaceCascadeAssetRole::ALL {
+        if launch.face_perception().asset(role).relative_path() == source.relative_path() {
+            return Err(NanoAgentLaunchLoadError::FaceInputAliasesLaunchDocument {
+                role,
+                relative_path: source.relative_path().clone(),
+            });
+        }
+    }
+    for role in NanoHeadGazeAssetRole::ALL {
+        if launch.physical_head_gaze().asset(role).relative_path() == source.relative_path() {
+            return Err(
+                NanoAgentLaunchLoadError::HeadGazeInputAliasesLaunchDocument {
+                    role,
+                    relative_path: source.relative_path().clone(),
+                },
+            );
+        }
+    }
+    Ok(LoadedNanoAgentLaunchV4 { launch, source })
+}
+
 #[derive(Debug)]
 pub enum NanoAgentLaunchLoadError {
     Load(DeploymentAssetLoadError),
@@ -1030,6 +1258,10 @@ pub enum NanoAgentLaunchLoadError {
     },
     FaceInputAliasesLaunchDocument {
         role: NanoFaceCascadeAssetRole,
+        relative_path: ArtifactRelativePath,
+    },
+    HeadGazeInputAliasesLaunchDocument {
+        role: NanoHeadGazeAssetRole,
         relative_path: ArtifactRelativePath,
     },
 }
@@ -1055,6 +1287,14 @@ impl fmt::Display for NanoAgentLaunchLoadError {
                 "{role:?} face-cascade asset aliases launch document {}",
                 relative_path.as_str()
             ),
+            Self::HeadGazeInputAliasesLaunchDocument {
+                role,
+                relative_path,
+            } => write!(
+                formatter,
+                "{role:?} head-gaze asset aliases launch document {}",
+                relative_path.as_str()
+            ),
         }
     }
 }
@@ -1065,7 +1305,8 @@ impl std::error::Error for NanoAgentLaunchLoadError {
             Self::Load(source) => Some(source),
             Self::Parse(source) => Some(source),
             Self::InputAliasesLaunchDocument { .. }
-            | Self::FaceInputAliasesLaunchDocument { .. } => None,
+            | Self::FaceInputAliasesLaunchDocument { .. }
+            | Self::HeadGazeInputAliasesLaunchDocument { .. } => None,
         }
     }
 }
@@ -1116,6 +1357,23 @@ pub enum NanoAgentLaunchParseError {
         role: NanoFaceCascadeAssetRole,
         source: NanoLaunchSha256Error,
     },
+    InvalidHeadGazeAssetPath {
+        role: NanoHeadGazeAssetRole,
+        source: ArtifactRelativePathError,
+    },
+    InvalidHeadGazeAssetByteLimit {
+        role: NanoHeadGazeAssetRole,
+        source: DeploymentAssetByteLimitError,
+    },
+    HeadGazeAssetByteLimitAboveMaximum {
+        role: NanoHeadGazeAssetRole,
+        actual_bytes: u64,
+        maximum_bytes: u64,
+    },
+    InvalidHeadGazeAssetSha256 {
+        role: NanoHeadGazeAssetRole,
+        source: NanoLaunchSha256Error,
+    },
     MissingFacePerception,
     DuplicateInputAssetPath {
         first: NanoLaunchAssetRole,
@@ -1132,6 +1390,32 @@ pub enum NanoAgentLaunchParseError {
         face: NanoFaceCascadeAssetRole,
         input: NanoLaunchAssetRole,
         relative_path: ArtifactRelativePath,
+    },
+    DuplicateHeadGazeAssetPath {
+        relative_path: ArtifactRelativePath,
+    },
+    DuplicateHeadGazeAssetContent {
+        expected_sha256: [u8; 32],
+    },
+    HeadGazeAssetAliasesInputAsset {
+        head_gaze: NanoHeadGazeAssetRole,
+        input: NanoLaunchAssetRole,
+        relative_path: ArtifactRelativePath,
+    },
+    HeadGazeAssetAliasesInputContent {
+        head_gaze: NanoHeadGazeAssetRole,
+        input: NanoLaunchAssetRole,
+        expected_sha256: [u8; 32],
+    },
+    HeadGazeAssetAliasesFaceAsset {
+        head_gaze: NanoHeadGazeAssetRole,
+        face: NanoFaceCascadeAssetRole,
+        relative_path: ArtifactRelativePath,
+    },
+    HeadGazeAssetAliasesFaceContent {
+        head_gaze: NanoHeadGazeAssetRole,
+        face: NanoFaceCascadeAssetRole,
+        expected_sha256: [u8; 32],
     },
     InvalidPlantArtifactId,
     InvalidCalibrationArtifactId,
@@ -1226,11 +1510,14 @@ impl std::error::Error for NanoAgentLaunchParseError {
             Self::InvalidAssetPath { source, .. } | Self::InvalidStoragePath { source, .. } => {
                 Some(source)
             }
-            Self::InvalidFaceAssetPath { source, .. } => Some(source),
+            Self::InvalidFaceAssetPath { source, .. }
+            | Self::InvalidHeadGazeAssetPath { source, .. } => Some(source),
             Self::InvalidAssetByteLimit { source, .. }
-            | Self::InvalidFaceAssetByteLimit { source, .. } => Some(source),
+            | Self::InvalidFaceAssetByteLimit { source, .. }
+            | Self::InvalidHeadGazeAssetByteLimit { source, .. } => Some(source),
             Self::InvalidAssetSha256 { source, .. }
-            | Self::InvalidFaceAssetSha256 { source, .. } => Some(source),
+            | Self::InvalidFaceAssetSha256 { source, .. }
+            | Self::InvalidHeadGazeAssetSha256 { source, .. } => Some(source),
             Self::InvalidSocket { source, .. } => Some(source),
             Self::OakDeviceConfig(source) => Some(source),
             Self::OccupancyHostPolicy(source) => Some(source),
@@ -1294,6 +1581,48 @@ struct NanoAgentLaunchV3Dto {
     storage: NanoLaunchStorageDto,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NanoAgentLaunchV4Dto {
+    schema_version: u32,
+    agent_policy_asset: NanoLaunchAssetBindingDto,
+    navigation_shadow_config_asset: NanoLaunchAssetBindingDto,
+    physical_actuation_config_asset: NanoLaunchAssetBindingDto,
+    controller_server: NanoLaunchControllerServerDto,
+    calibration_artifact: NanoLaunchCalibrationArtifactDto,
+    plant_artifact: NanoLaunchPlantArtifactDto,
+    oak: NanoOakStreamGraphDto,
+    occupancy: NanoLaunchOccupancyDto,
+    inference: NanoLaunchInferenceDto,
+    face_perception: Option<NanoLaunchFacePerceptionDto>,
+    physical_head_gaze: NanoLaunchPhysicalHeadGazeDto,
+    rerun: NanoLaunchRerunDto,
+    storage: NanoLaunchStorageDto,
+}
+
+impl NanoAgentLaunchV4Dto {
+    fn into_parts(self) -> (NanoAgentLaunchV3Dto, NanoLaunchPhysicalHeadGazeDto) {
+        (
+            NanoAgentLaunchV3Dto {
+                schema_version: NANO_AGENT_LAUNCH_V3,
+                agent_policy_asset: self.agent_policy_asset,
+                navigation_shadow_config_asset: self.navigation_shadow_config_asset,
+                physical_actuation_config_asset: self.physical_actuation_config_asset,
+                controller_server: self.controller_server,
+                calibration_artifact: self.calibration_artifact,
+                plant_artifact: self.plant_artifact,
+                oak: self.oak,
+                occupancy: self.occupancy,
+                inference: self.inference,
+                face_perception: self.face_perception,
+                rerun: self.rerun,
+                storage: self.storage,
+            },
+            self.physical_head_gaze,
+        )
+    }
+}
+
 impl NanoAgentLaunchV3Dto {
     fn into_parts(self) -> (NanoAgentLaunchV2Dto, Option<NanoLaunchFacePerceptionDto>) {
         (
@@ -1329,6 +1658,13 @@ pub(crate) struct NanoLaunchAssetBindingDto {
 struct NanoLaunchFacePerceptionDto {
     frontal_face_cascade_asset: NanoLaunchAssetBindingDto,
     profile_face_cascade_asset: NanoLaunchAssetBindingDto,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NanoLaunchPhysicalHeadGazeDto {
+    policy_asset: NanoLaunchAssetBindingDto,
+    physical_review_evidence_asset: NanoLaunchAssetBindingDto,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1517,6 +1853,46 @@ fn parse_face_asset(
     }
     let expected_sha256 = parse_sha256(&dto.sha256_hex)
         .map_err(|source| NanoAgentLaunchParseError::InvalidFaceAssetSha256 { role, source })?;
+    Ok(NanoLaunchAssetBinding {
+        relative_path,
+        byte_limit,
+        expected_sha256,
+    })
+}
+
+fn parse_physical_head_gaze(
+    dto: NanoLaunchPhysicalHeadGazeDto,
+) -> Result<NanoLaunchPhysicalHeadGaze, NanoAgentLaunchParseError> {
+    Ok(NanoLaunchPhysicalHeadGaze {
+        policy: parse_head_gaze_asset(NanoHeadGazeAssetRole::Policy, dto.policy_asset)?,
+        review_evidence: parse_head_gaze_asset(
+            NanoHeadGazeAssetRole::PhysicalReviewEvidence,
+            dto.physical_review_evidence_asset,
+        )?,
+    })
+}
+
+fn parse_head_gaze_asset(
+    role: NanoHeadGazeAssetRole,
+    dto: NanoLaunchAssetBindingDto,
+) -> Result<NanoLaunchAssetBinding, NanoAgentLaunchParseError> {
+    let relative_path = ArtifactRelativePath::parse(dto.relative_path)
+        .map_err(|source| NanoAgentLaunchParseError::InvalidHeadGazeAssetPath { role, source })?;
+    let byte_limit = DeploymentAssetByteLimit::try_new(dto.maximum_bytes).map_err(|source| {
+        NanoAgentLaunchParseError::InvalidHeadGazeAssetByteLimit { role, source }
+    })?;
+    let role_maximum = role.maximum_bytes();
+    if byte_limit.get() > role_maximum {
+        return Err(
+            NanoAgentLaunchParseError::HeadGazeAssetByteLimitAboveMaximum {
+                role,
+                actual_bytes: byte_limit.get(),
+                maximum_bytes: role_maximum,
+            },
+        );
+    }
+    let expected_sha256 = parse_sha256(&dto.sha256_hex)
+        .map_err(|source| NanoAgentLaunchParseError::InvalidHeadGazeAssetSha256 { role, source })?;
     Ok(NanoLaunchAssetBinding {
         relative_path,
         byte_limit,
@@ -2077,6 +2453,69 @@ fn ensure_distinct_v3_input_assets(
     Ok(())
 }
 
+fn ensure_distinct_v4_input_assets(
+    launch: &NanoAgentLaunchV4,
+) -> Result<(), NanoAgentLaunchParseError> {
+    let policy = launch
+        .physical_head_gaze()
+        .asset(NanoHeadGazeAssetRole::Policy);
+    let review = launch
+        .physical_head_gaze()
+        .asset(NanoHeadGazeAssetRole::PhysicalReviewEvidence);
+    if policy.relative_path() == review.relative_path() {
+        return Err(NanoAgentLaunchParseError::DuplicateHeadGazeAssetPath {
+            relative_path: policy.relative_path().clone(),
+        });
+    }
+    if policy.expected_sha256() == review.expected_sha256() {
+        return Err(NanoAgentLaunchParseError::DuplicateHeadGazeAssetContent {
+            expected_sha256: *policy.expected_sha256(),
+        });
+    }
+    for head_gaze in NanoHeadGazeAssetRole::ALL {
+        let head_gaze_asset = launch.physical_head_gaze().asset(head_gaze);
+        for input in NanoLaunchAssetRole::ALL {
+            if head_gaze_asset.relative_path() == launch.asset(input).relative_path() {
+                return Err(NanoAgentLaunchParseError::HeadGazeAssetAliasesInputAsset {
+                    head_gaze,
+                    input,
+                    relative_path: head_gaze_asset.relative_path().clone(),
+                });
+            }
+            if head_gaze_asset.expected_sha256() == launch.asset(input).expected_sha256() {
+                return Err(
+                    NanoAgentLaunchParseError::HeadGazeAssetAliasesInputContent {
+                        head_gaze,
+                        input,
+                        expected_sha256: *head_gaze_asset.expected_sha256(),
+                    },
+                );
+            }
+        }
+        for face in NanoFaceCascadeAssetRole::ALL {
+            if head_gaze_asset.relative_path()
+                == launch.face_perception().asset(face).relative_path()
+            {
+                return Err(NanoAgentLaunchParseError::HeadGazeAssetAliasesFaceAsset {
+                    head_gaze,
+                    face,
+                    relative_path: head_gaze_asset.relative_path().clone(),
+                });
+            }
+            if head_gaze_asset.expected_sha256()
+                == launch.face_perception().asset(face).expected_sha256()
+            {
+                return Err(NanoAgentLaunchParseError::HeadGazeAssetAliasesFaceContent {
+                    head_gaze,
+                    face,
+                    expected_sha256: *head_gaze_asset.expected_sha256(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_rerun_diagnostics_url(
     value: String,
 ) -> Result<ConsoleRerunDiagnosticsUrl, NanoAgentLaunchParseError> {
@@ -2314,12 +2753,30 @@ mod tests {
         value
     }
 
+    fn valid_v4_value() -> Value {
+        let mut value = valid_v3_value();
+        value["schema_version"] = json!(NANO_AGENT_LAUNCH_V4);
+        value["physical_head_gaze"] = json!({
+            "policy_asset": asset("head-gaze-policy-v1.json", 16_384, 12),
+            "physical_review_evidence_asset": asset(
+                "evidence/head-gaze-physical-review-v1.json",
+                65_536,
+                13
+            )
+        });
+        value
+    }
+
     fn parse(value: &Value) -> Result<NanoAgentLaunchV2, NanoAgentLaunchParseError> {
         NanoAgentLaunchV2::parse_json(&serde_json::to_vec(value).expect("fixture serializes"))
     }
 
     fn parse_v3(value: &Value) -> Result<NanoAgentLaunchV3, NanoAgentLaunchParseError> {
         NanoAgentLaunchV3::parse_json(&serde_json::to_vec(value).expect("fixture serializes"))
+    }
+
+    fn parse_v4(value: &Value) -> Result<NanoAgentLaunchV4, NanoAgentLaunchParseError> {
+        NanoAgentLaunchV4::parse_json(&serde_json::to_vec(value).expect("fixture serializes"))
     }
 
     #[test]
@@ -2476,6 +2933,105 @@ mod tests {
             Err(NanoAgentLaunchParseError::FaceAssetAliasesInputAsset {
                 face: NanoFaceCascadeAssetRole::FrontalFace,
                 input: NanoLaunchAssetRole::SuperpointModel,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn v4_requires_distinct_bounded_head_gaze_policy_and_review_evidence() {
+        let launch = parse_v4(&valid_v4_value()).expect("valid V4 launch");
+        assert_eq!(
+            launch
+                .physical_head_gaze()
+                .policy()
+                .relative_path()
+                .as_str(),
+            "head-gaze-policy-v1.json"
+        );
+        assert_eq!(
+            launch
+                .physical_head_gaze()
+                .review_evidence()
+                .relative_path()
+                .as_str(),
+            "evidence/head-gaze-physical-review-v1.json"
+        );
+
+        let mut missing = valid_v4_value();
+        missing
+            .as_object_mut()
+            .expect("top-level fixture")
+            .remove("physical_head_gaze");
+        assert!(matches!(
+            parse_v4(&missing),
+            Err(NanoAgentLaunchParseError::JsonDecode(_))
+        ));
+
+        let mut oversized = valid_v4_value();
+        oversized["physical_head_gaze"]["policy_asset"]["maximum_bytes"] =
+            json!(MAX_HEAD_GAZE_POLICY_JSON_BYTES as u64 + 1);
+        assert!(matches!(
+            parse_v4(&oversized),
+            Err(
+                NanoAgentLaunchParseError::HeadGazeAssetByteLimitAboveMaximum {
+                    role: NanoHeadGazeAssetRole::Policy,
+                    ..
+                }
+            )
+        ));
+
+        let mut same_path = valid_v4_value();
+        same_path["physical_head_gaze"]["physical_review_evidence_asset"]["relative_path"] =
+            same_path["physical_head_gaze"]["policy_asset"]["relative_path"].clone();
+        assert!(matches!(
+            parse_v4(&same_path),
+            Err(NanoAgentLaunchParseError::DuplicateHeadGazeAssetPath { .. })
+        ));
+
+        let mut same_content = valid_v4_value();
+        same_content["physical_head_gaze"]["physical_review_evidence_asset"]["sha256_hex"] =
+            same_content["physical_head_gaze"]["policy_asset"]["sha256_hex"].clone();
+        assert!(matches!(
+            parse_v4(&same_content),
+            Err(NanoAgentLaunchParseError::DuplicateHeadGazeAssetContent { .. })
+        ));
+
+        let mut aliases_face = valid_v4_value();
+        aliases_face["physical_head_gaze"]["policy_asset"]["relative_path"] =
+            aliases_face["face_perception"]["frontal_face_cascade_asset"]["relative_path"].clone();
+        assert!(matches!(
+            parse_v4(&aliases_face),
+            Err(NanoAgentLaunchParseError::HeadGazeAssetAliasesFaceAsset {
+                head_gaze: NanoHeadGazeAssetRole::Policy,
+                face: NanoFaceCascadeAssetRole::FrontalFace,
+                ..
+            })
+        ));
+
+        let mut aliases_input_content = valid_v4_value();
+        aliases_input_content["physical_head_gaze"]["policy_asset"]["sha256_hex"] =
+            aliases_input_content["agent_policy_asset"]["sha256_hex"].clone();
+        assert!(matches!(
+            parse_v4(&aliases_input_content),
+            Err(
+                NanoAgentLaunchParseError::HeadGazeAssetAliasesInputContent {
+                    head_gaze: NanoHeadGazeAssetRole::Policy,
+                    input: NanoLaunchAssetRole::AgentPolicy,
+                    ..
+                }
+            )
+        ));
+
+        let mut aliases_face_content = valid_v4_value();
+        aliases_face_content["physical_head_gaze"]["policy_asset"]["sha256_hex"] =
+            aliases_face_content["face_perception"]["frontal_face_cascade_asset"]["sha256_hex"]
+                .clone();
+        assert!(matches!(
+            parse_v4(&aliases_face_content),
+            Err(NanoAgentLaunchParseError::HeadGazeAssetAliasesFaceContent {
+                head_gaze: NanoHeadGazeAssetRole::Policy,
+                face: NanoFaceCascadeAssetRole::FrontalFace,
                 ..
             })
         ));

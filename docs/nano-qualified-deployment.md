@@ -20,8 +20,10 @@ The production layout is intentionally fixed:
 ```text
 /opt/kiko/bin/kiko-slam
 /opt/kiko/bin/kiko-nano-deployment-gate
-/opt/kiko/deployment/nano-agent-launch-v3.json
+/opt/kiko/deployment/nano-agent-launch-v4.json
 /opt/kiko/deployment/native-runtime-v1.json
+/opt/kiko/deployment/head-gaze-policy-v1.json
+/opt/kiko/deployment/evidence/head-gaze-physical-review-v1.json
 /opt/kiko/deployment/lib/...
 /opt/kiko/deployment/models/opencv/haarcascade_frontalface_default.xml
 /opt/kiko/deployment/models/opencv/haarcascade_profileface.xml

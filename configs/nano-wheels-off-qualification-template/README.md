@@ -241,7 +241,9 @@ contracts. They must not be relabelled: V2 incorrectly selected the system ABI
 name `libusb-1.0.so.0` for the pinned DepthAI libusb role, while V3 had no
 face-cascade or head-gaze-policy bindings. The current renderer therefore
 rejects qualification render-input V1 through V3 and emits launch V4.
-Production render-input schema V1 and production launch V3 remain unchanged.
+Production uses its separate render-input schema V2 and production launch V4,
+with mandatory physical-policy/review-evidence bindings; those production
+claims are not accepted or implied by qualification V4.
 
 The pinned DepthAI v3.4.0 `libdepthai-core.so` directly needs
 `libusb-1.0.so`, so that exact file is the qualification role retained and

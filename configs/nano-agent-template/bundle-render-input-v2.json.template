@@ -1,0 +1,173 @@
+{
+  "schema_version": 2,
+  "bundle": ${BUNDLE_SELECTION_JSON},
+  "robot_id": "${ROBOT_ID}",
+  "discovery": {
+    "oak": {
+      "mxid": "${OAK_MXID}",
+      "compiled_depthai_header_sdk_version": "${DEPTHAI_HEADER_SDK_VERSION}",
+      "compiled_depthai_header_sdk_commit": "${DEPTHAI_HEADER_SDK_COMMIT}",
+      "compiled_depthai_header_embedded_device_artifact_version": "${DEPTHAI_HEADER_DEVICE_ARTIFACT_VERSION}",
+      "compiled_depthai_header_embedded_bootloader_artifact_version": "${DEPTHAI_HEADER_BOOTLOADER_ARTIFACT_VERSION}"
+    },
+    "stm32": {
+      "serial_by_id_path": "${STM32_SERIAL_BY_ID_PATH}",
+      "controller_uid_hex": "${CONTROLLER_UID_HEX}",
+      "firmware_abi": ${FIRMWARE_ABI},
+      "firmware_build_id": ${FIRMWARE_BUILD_ID},
+      "hardware_profile_fingerprint_hex": "${ACTUATOR_CONFIG_FINGERPRINT_HEX}",
+      "capabilities_bits": ${CONTROLLER_CAPABILITIES_BITS}
+    },
+    "head": {
+      "adapter_serial_by_id_path": "${HEAD_SERIAL_BY_ID_PATH}",
+      "bow_servo_id": ${HEAD_BOW_SERVO_ID},
+      "curl_servo_id": ${HEAD_CURL_SERVO_ID},
+      "yaw_servo_id": ${HEAD_YAW_SERVO_ID},
+      "roll_servo_id": ${HEAD_ROLL_SERVO_ID},
+      "baud_rate_bps": ${HEAD_BAUD_RATE_BPS},
+      "dtr_asserted": ${HEAD_DTR_ASSERTED},
+      "rts_asserted": ${HEAD_RTS_ASSERTED}
+    },
+    "eye": {
+      "serial_by_id_path": "${EYE_SERIAL_BY_ID_PATH}",
+      "kep_protocol_version": ${EYE_KEP_PROTOCOL_VERSION},
+      "device_uid_hex": "${EYE_DEVICE_UID_HEX}",
+      "firmware_build_id_hex": "${EYE_FIRMWARE_BUILD_ID_HEX}",
+      "capabilities_bits": ${EYE_CAPABILITIES_BITS}
+    }
+  },
+  "assets": {
+    "calibration": {
+      "artifact_id": "${CALIBRATION_ARTIFACT_ID}",
+      "source_path": "${CALIBRATION_SOURCE_ABSOLUTE_PATH}",
+      "destination_relative_path": "artifacts/${CALIBRATION_ARTIFACT_RELATIVE_PATH}"
+    },
+    "plant": {
+      "artifact_id": "${PLANT_ARTIFACT_ID}",
+      "source_path": "${PLANT_SOURCE_ABSOLUTE_PATH}",
+      "destination_relative_path": "artifacts/${PLANT_ARTIFACT_RELATIVE_PATH}"
+    },
+    "navigation_shadow_source_path": "${NAVIGATION_SHADOW_SOURCE_ABSOLUTE_PATH}",
+    "superpoint_model": {
+      "source_path": "${SUPERPOINT_MODEL_SOURCE_ABSOLUTE_PATH}",
+      "destination_relative_path": "${SUPERPOINT_MODEL_RELATIVE_PATH}"
+    },
+    "lightglue_model": {
+      "source_path": "${LIGHTGLUE_MODEL_SOURCE_ABSOLUTE_PATH}",
+      "destination_relative_path": "${LIGHTGLUE_MODEL_RELATIVE_PATH}"
+    },
+    "face_perception": ${FACE_PERCEPTION_ASSETS_JSON},
+    "head_gaze_policy_source_path": "${HEAD_GAZE_POLICY_SOURCE_ABSOLUTE_PATH}",
+    "head_gaze_review_evidence_source_path": "${HEAD_GAZE_REVIEW_EVIDENCE_SOURCE_ABSOLUTE_PATH}"
+  },
+  "native_libraries": [
+    {
+      "role": "depthai_core",
+      "soname": "${DEPTHAI_CORE_SONAME}",
+      "source_path": "${DEPTHAI_CORE_SOURCE_ABSOLUTE_PATH}"
+    },
+    {
+      "role": "dynamic_calibration",
+      "soname": "${DYNAMIC_CALIBRATION_SONAME}",
+      "source_path": "${DYNAMIC_CALIBRATION_SOURCE_ABSOLUTE_PATH}"
+    },
+    {
+      "role": "libusb1_0",
+      "soname": "${LIBUSB_1_0_SONAME}",
+      "source_path": "${LIBUSB_1_0_SOURCE_ABSOLUTE_PATH}"
+    },
+    {
+      "role": "onnxruntime",
+      "soname": "${ONNXRUNTIME_SONAME}",
+      "source_path": "${ONNXRUNTIME_SOURCE_ABSOLUTE_PATH}"
+    },
+    {
+      "role": "opencv_core",
+      "soname": "libopencv_core.so.4.5d",
+      "source_path": "${OPENCV_CORE_SOURCE_ABSOLUTE_PATH}"
+    },
+    {
+      "role": "opencv_imgproc",
+      "soname": "libopencv_imgproc.so.4.5d",
+      "source_path": "${OPENCV_IMGPROC_SOURCE_ABSOLUTE_PATH}"
+    },
+    {
+      "role": "opencv_objdetect",
+      "soname": "libopencv_objdetect.so.4.5d",
+      "source_path": "${OPENCV_OBJDETECT_SOURCE_ABSOLUTE_PATH}"
+    }
+  ],
+  "runtime": {
+    "oak": {
+      "rgb_width_px": ${OAK_RGB_WIDTH_PX},
+      "rgb_height_px": ${OAK_RGB_HEIGHT_PX},
+      "rgb_fps": ${OAK_RGB_FPS},
+      "stereo_width_px": ${OAK_STEREO_WIDTH_PX},
+      "stereo_height_px": ${OAK_STEREO_HEIGHT_PX},
+      "stereo_fps": ${OAK_STEREO_FPS},
+      "imu_rate_hz": ${OAK_IMU_RATE_HZ},
+      "queue_size": ${OAK_QUEUE_SIZE}
+    },
+    "occupancy": {
+      "resolution_m": ${OCCUPANCY_RESOLUTION_M},
+      "lower_x_m": ${OCCUPANCY_LOWER_X_M},
+      "lower_y_m": ${OCCUPANCY_LOWER_Y_M},
+      "width_cells": ${OCCUPANCY_WIDTH_CELLS},
+      "height_cells": ${OCCUPANCY_HEIGHT_CELLS},
+      "maximum_cells": ${OCCUPANCY_MAXIMUM_CELLS},
+      "maximum_keyframes": ${OCCUPANCY_MAXIMUM_KEYFRAMES},
+      "snapshot_every_keyframes": ${OCCUPANCY_SNAPSHOT_EVERY_KEYFRAMES}
+    },
+    "inference": {
+      "superpoint_backend": "${SUPERPOINT_BACKEND}",
+      "lightglue_backend": "${LIGHTGLUE_BACKEND}",
+      "downscale_factor": ${INFERENCE_DOWNSCALE_FACTOR},
+      "maximum_keypoints": ${INFERENCE_MAXIMUM_KEYPOINTS}
+    },
+    "rerun": {
+      "decimation": ${RERUN_DECIMATION},
+      "memory_limit_bytes": ${RERUN_MEMORY_LIMIT_BYTES},
+      "flush_timeout_ms": ${RERUN_FLUSH_TIMEOUT_MS}
+    },
+    "storage": {
+      "maximum_map_snapshot_bytes": ${MAXIMUM_MAP_SNAPSHOT_BYTES},
+      "minimum_free_bytes_after_map_save": ${MINIMUM_FREE_BYTES_AFTER_MAP_SAVE},
+      "maximum_navigation_dataset_bytes": ${MAXIMUM_NAVIGATION_DATASET_BYTES},
+      "maximum_navigation_dataset_files": ${MAXIMUM_NAVIGATION_DATASET_FILES},
+      "maximum_navigation_ingress_records": ${MAXIMUM_NAVIGATION_INGRESS_RECORDS},
+      "minimum_free_bytes_after_navigation_dataset_write": ${MINIMUM_FREE_BYTES_AFTER_NAVIGATION_DATASET_WRITE},
+      "navigation_dataset_terminal_reserve_bytes": ${NAVIGATION_DATASET_TERMINAL_RESERVE_BYTES},
+      "warm_start": ${MAP_WARM_START_JSON}
+    }
+  },
+  "head_policy": {
+    "response_timeout_ms": ${HEAD_RESPONSE_TIMEOUT_MS},
+    "write_timeout_ms": ${HEAD_WRITE_TIMEOUT_MS},
+    "arming_freshness_ms": ${HEAD_ARMING_FRESHNESS_MS},
+    "write_attempts": ${HEAD_WRITE_ATTEMPTS},
+    "noise_budget_bytes": ${HEAD_NOISE_BUDGET_BYTES},
+    "redundant_read_tolerance_ticks": ${HEAD_REDUNDANT_READ_TOLERANCE_TICKS},
+    "readback_tolerance_ticks": ${HEAD_READBACK_TOLERANCE_TICKS},
+    "final_target_tolerance_ticks": ${HEAD_FINAL_TARGET_TOLERANCE_TICKS},
+    "path_corridor_tolerance_ticks": ${HEAD_PATH_CORRIDOR_TOLERANCE_TICKS},
+    "direction_regression_tolerance_ticks": ${HEAD_DIRECTION_REGRESSION_TOLERANCE_TICKS},
+    "goal_speed_ticks_per_second": ${HEAD_GOAL_SPEED_TICKS_PER_SECOND},
+    "torque_limit_permille": [${HEAD_TORQUE_LIMIT_PERMILLE_U16_ARRAY}],
+    "minimum_start_ticks": [${HEAD_MINIMUM_START_TICKS_U16_ARRAY}],
+    "maximum_start_ticks": [${HEAD_MAXIMUM_START_TICKS_U16_ARRAY}],
+    "reviewed_natural_target_ticks": [${HEAD_REVIEWED_NATURAL_TARGET_TICKS_U16_ARRAY}],
+    "maximum_travel_ticks": [${HEAD_MAXIMUM_TRAVEL_TICKS_U16_ARRAY}]
+  },
+  "rgb_expression_policy": {
+    "sampling_columns": ${RGB_SAMPLING_COLUMNS},
+    "sampling_rows": ${RGB_SAMPLING_ROWS},
+    "minimum_residual_luma": ${RGB_MINIMUM_RESIDUAL_LUMA},
+    "minimum_active_fraction_basis_points": ${RGB_MINIMUM_ACTIVE_FRACTION_BASIS_POINTS},
+    "frame_freshness_ms": ${RGB_FRAME_FRESHNESS_MS},
+    "brightness_basis_points": ${RGB_BRIGHTNESS_BASIS_POINTS},
+    "color_rgb": [${RGB_COLOR_U8_ARRAY}],
+    "blink": ${RGB_BLINK},
+    "head_origin_in_camera_m": [${HEAD_ORIGIN_IN_CAMERA_M_F64_ARRAY}],
+    "neutral_head_from_camera_quaternion_xyzw": [${NEUTRAL_HEAD_FROM_CAMERA_QUATERNION_XYZW_F64_ARRAY}]
+  }
+}

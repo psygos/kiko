@@ -26,14 +26,16 @@ binds every input by deployment-relative path, size ceiling, and SHA-256:
 - a controller-server V3 contract;
 - a device-inventory V3 manifest;
 - the exact calibration artifact;
-- canonical Nano-agent launch V3 and its policy, ORT models, SuperPoint model,
-  frontal/profile face cascades, live graph, and calibration bindings.
+- canonical Nano-agent launch V4 and its policy, ORT models, SuperPoint model,
+  frontal/profile face cascades, physical head-gaze policy/review evidence,
+  live graph, and calibration bindings.
 
-Commissioning content-binds the nested launch-V3 cascade assets so it cannot
-accept a different production graph, but it deliberately does not construct or
-run the face detector. Its expression readiness is the scene-motion base lane
-only. Face detection and gaze attention are production-V3 readiness evidence,
-not commissioning evidence.
+Commissioning exact-loads the nested launch-V4 cascade and physical head-gaze
+leaves so it cannot accept a different production graph, but it deliberately
+does not construct the face detector or activate the production physical-gaze
+policy. Its expression readiness is the scene-motion base lane only. Face
+detection and gaze attention are production-V4 readiness evidence, not
+commissioning evidence.
 
 The V3 server contract and V3 inventory must independently identify build
 `139265`, fingerprint `KIKO-WHEELON-CM1`, a 20% cap,

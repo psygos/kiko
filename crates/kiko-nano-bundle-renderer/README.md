@@ -20,9 +20,12 @@ Qualification bundles reject persisted warm start.
 Qualification render-input V4 additionally requires distinct exact frontal
 and profile cascades. Its qualification-only head-gaze policy is optional:
 absence emits no policy claim, while supplied exact bytes are retained,
-size/hash bound into launch V4, and rejected on path/content aliasing.
-Bootstrap admits a supplied policy only as proposal-only. Production
-render-input V1 and launch V3 remain unchanged.
+size/hash bound into qualification launch V4, and rejected on path/content
+aliasing. Bootstrap admits a supplied qualification policy only as
+proposal-only. Production render-input V2 emits production launch V4 and
+requires two separate exact inputs: the physically reviewed head-gaze policy
+and its attended review-evidence record. Offline qualification and runtime
+bootstrap cross-bind that evidence digest before physical head gaze can start.
 
 The storage input requires independent nonzero ceilings for cumulative dataset
 logical bytes, regular files, and navigation-ingress records, plus a

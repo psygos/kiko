@@ -20,22 +20,24 @@ use kiko_device_inventory::{
     MAX_MANIFEST_JSON_BYTES, hash_manifest_artifacts, load_deployment_asset,
     load_expected_manifest_v1_file,
 };
+use kiko_expression_core::StreamEpochId;
 use kiko_nano_deployment_gate::{
     DEFAULT_QUALIFICATION_MARKER, OfflineInstallQualificationV1, QUALIFICATION_ACKNOWLEDGEMENT,
     QualifiedFileBindingV1, QualifiedFileV1, ROOT_GID, ROOT_UID, verify_qualification_marker,
     write_qualification_marker,
 };
 use kiko_slam::navigation::{
+    HeadGazePolicyV1, NanoAccessoryHealthPeriod, NanoAccessoryWorkerConfig, NanoAgentLaunchV4,
     NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1, NanoFaceCascadeAssetRole,
-    NanoLaunchAssetRole, OfflineProductionNavigationGraphV1,
-    ProductionNavigationControllerContractV1, load_nano_agent_launch_v3,
+    NanoHeadGazeAssetRole, NanoLaunchAssetRole, OfflineProductionNavigationGraphV1,
+    ProductionNavigationControllerContractV1, load_nano_agent_launch_v4,
 };
 use robot_server::config::ControllerServerConfigV1;
 use serde::Deserialize;
 
 const DEPLOYMENT_ROOT: &str = "/opt/kiko/deployment";
 const STATE_ROOT: &str = "/var/lib/kiko-nano-agent";
-const LAUNCH_RELATIVE_PATH: &str = "nano-agent-launch-v3.json";
+const LAUNCH_RELATIVE_PATH: &str = "nano-agent-launch-v4.json";
 const NATIVE_MANIFEST_RELATIVE_PATH: &str = "native-runtime-v1.json";
 const NATIVE_LIBRARY_SEARCH_RELATIVE_PATH: &str = "lib";
 const AGENT_BINARY: &str = "/opt/kiko/bin/kiko-slam";
@@ -239,7 +241,7 @@ fn run(cli: Cli) -> Result<(), QualifyError> {
     let state_root = PathBuf::from(STATE_ROOT);
     let launch_relative_path = ArtifactRelativePath::parse(LAUNCH_RELATIVE_PATH.to_owned())
         .map_err(|source| QualifyError::context("parse fixed launch relative path", source))?;
-    let loaded_launch = load_nano_agent_launch_v3(&deployment_root, launch_relative_path)
+    let loaded_launch = load_nano_agent_launch_v4(&deployment_root, launch_relative_path)
         .map_err(|source| QualifyError::context("load typed Nano launch graph", source))?;
     reject_template_sentinel("launch document", loaded_launch.source().bytes())?;
 
@@ -274,6 +276,27 @@ fn run(cli: Cli) -> Result<(), QualifyError> {
             .map_err(|source| QualifyError::context(format!("load exact {marker_role}"), source))?;
         loaded_face_assets.push((marker_role, loaded));
     }
+    let load_head_gaze_asset = |role, marker_role: &'static str| {
+        loaded_launch
+            .launch()
+            .physical_head_gaze()
+            .asset(role)
+            .load_exact(&deployment_root)
+            .map_err(|source| QualifyError::context(format!("load exact {marker_role}"), source))
+    };
+    let head_gaze_policy_asset = load_head_gaze_asset(
+        NanoHeadGazeAssetRole::Policy,
+        "launch_asset:head_gaze_policy",
+    )?;
+    reject_template_sentinel("head-gaze policy", head_gaze_policy_asset.bytes())?;
+    let head_gaze_review_evidence = load_head_gaze_asset(
+        NanoHeadGazeAssetRole::PhysicalReviewEvidence,
+        "launch_asset:head_gaze_physical_review_evidence",
+    )?;
+    reject_template_sentinel(
+        "head-gaze physical review evidence",
+        head_gaze_review_evidence.bytes(),
+    )?;
 
     let agent_policy_asset = loaded_asset(&loaded_assets, NanoLaunchAssetRole::AgentPolicy);
     let policy = NanoAgentPolicyConfigV3::parse_json(agent_policy_asset.bytes())
@@ -312,12 +335,27 @@ fn run(cli: Cli) -> Result<(), QualifyError> {
     {
         return Err(QualifyError::ManifestReadMismatch);
     }
-    policy
+    let bound_policy = policy
         .clone()
         .bind_accessories_to_manifest(loaded_manifest.manifest())
         .map_err(|source| {
             QualifyError::context("bind required head and eye policy to manifest", source)
         })?;
+    let head_gaze_policy = HeadGazePolicyV1::parse_json(head_gaze_policy_asset.bytes())
+        .map_err(|source| QualifyError::context("parse typed physical head-gaze policy", source))?;
+    let accessory_health_period =
+        NanoAccessoryHealthPeriod::try_from_duration(std::time::Duration::from_secs(1))
+            .expect("one second is inside the fixed Nano health bound");
+    NanoAccessoryWorkerConfig::from_manifest_bound_policy(
+        &bound_policy,
+        StreamEpochId::try_new(1).expect("fixed nonzero qualification epoch"),
+        accessory_health_period,
+    )
+    .map_err(|source| QualifyError::context("construct manifest-bound accessory policy", source))?
+    .with_evidence_bound_physical_head_gaze(head_gaze_policy, &head_gaze_review_evidence)
+    .map_err(|source| {
+        QualifyError::context("bind physical head gaze to exact review evidence", source)
+    })?;
 
     let artifact_hashes = hash_manifest_artifacts(
         loaded_manifest.manifest(),
@@ -489,6 +527,22 @@ fn run(cli: Cli) -> Result<(), QualifyError> {
             asset,
         )?;
     }
+    for (marker_role, asset) in [
+        ("launch_asset:head_gaze_policy", &head_gaze_policy_asset),
+        (
+            "launch_asset:head_gaze_physical_review_evidence",
+            &head_gaze_review_evidence,
+        ),
+    ] {
+        add_retained_file(
+            &mut files,
+            &mut bindings,
+            &mut roles,
+            marker_role,
+            &deployment_root,
+            asset,
+        )?;
+    }
     add_retained_file(
         &mut files,
         &mut bindings,
@@ -649,7 +703,7 @@ fn require_policy_path_beneath(
 }
 
 fn bind_controller_to_manifest(
-    launch: &kiko_slam::navigation::NanoAgentLaunchV3,
+    launch: &NanoAgentLaunchV4,
     controller: &ControllerServerConfigV1,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
 ) -> Result<(), QualifyError> {
@@ -693,7 +747,7 @@ fn bind_controller_to_manifest(
 
 fn bind_plant_to_manifest(
     deployment_root: &Path,
-    launch: &kiko_slam::navigation::NanoAgentLaunchV3,
+    launch: &NanoAgentLaunchV4,
     launch_plant: &LoadedDeploymentAsset,
     policy: &NanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -767,7 +821,7 @@ fn bind_plant_to_manifest(
 
 fn bind_calibration_to_manifest(
     deployment_root: &Path,
-    launch: &kiko_slam::navigation::NanoAgentLaunchV3,
+    launch: &NanoAgentLaunchV4,
     launch_calibration: &LoadedDeploymentAsset,
     policy: &NanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -988,7 +1042,7 @@ fn hex_nibble(byte: u8) -> u8 {
 }
 
 fn bind_onnx_runtime_to_launch(
-    launch: &kiko_slam::navigation::NanoAgentLaunchV3,
+    launch: &NanoAgentLaunchV4,
     native: &ParsedNativeRuntimeManifest,
 ) -> Result<(), QualifyError> {
     let runtime = native

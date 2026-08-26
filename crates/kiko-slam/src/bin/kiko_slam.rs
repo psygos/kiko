@@ -20021,7 +20021,7 @@ mod tests {
             "--deployment-root",
             "/opt/kiko/deployment",
             "--launch-config",
-            "nano-agent-launch-v3.json",
+            "nano-agent-launch-v4.json",
             "--state-root",
             "/var/lib/kiko-nano-agent",
         ])
@@ -20030,7 +20030,7 @@ mod tests {
             panic!("expected Nano agent command");
         };
         assert_eq!(args.deployment_root, Path::new("/opt/kiko/deployment"));
-        assert_eq!(args.launch_config, "nano-agent-launch-v3.json");
+        assert_eq!(args.launch_config, "nano-agent-launch-v4.json");
         assert_eq!(args.state_root, Path::new("/var/lib/kiko-nano-agent"));
     }
 
@@ -20219,7 +20219,7 @@ mod tests {
                 "--deployment-root",
                 "/opt/kiko/deployment",
                 "--launch-config",
-                "nano-agent-launch-v3.json",
+                "nano-agent-launch-v4.json",
                 "--state-root",
                 "/var/lib/kiko-nano-agent",
                 "--fault-injection",

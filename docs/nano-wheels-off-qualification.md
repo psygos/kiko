@@ -94,7 +94,9 @@ not relabel an old document: V2 incorrectly selected the system ABI name
 `libusb-1.0.so.0` for the pinned DepthAI libusb role, and V3 had no exact
 face-cascade or optional head-gaze-policy binding. The current renderer
 requires qualification input V4 and emits qualification launch V4. Production
-input V1 and launch V3 are unchanged.
+now uses its separate input V2 and launch V4, which mandate an attended-review
+bound physical head-gaze policy; that does not change this proposal-only
+qualification lane.
 
 Gate A omits `assets.head_gaze_policy_source_path`. Consequently its bundle
 contains no head-gaze policy file or hash, bootstrap returns no policy, and no

@@ -4,7 +4,7 @@ This directory is a source template, not a qualified deployment and not
 evidence that any device or motion contract is satisfied. The canonical
 offline renderer and its strict input/evidence contract are documented in
 [`docs/nano-bundle-renderer.md`](../../docs/nano-bundle-renderer.md). The
-`nano-agent-launch-v3.json.template` file deliberately contains `${...}`
+`nano-agent-launch-v4.json.template` file deliberately contains `${...}`
 tokens, so it is not JSON and cannot be admitted until a deployment tool has
 replaced every token with measured or independently reviewed values.
 `native-runtime-v1.json.template` is likewise a non-deployable source
@@ -14,12 +14,17 @@ native closure, exclusive-endpoint acquisition, and qualified-only boot
 procedure is in
 `docs/nano-qualified-deployment.md`.
 
-Launch schema V3 retains V2's separate map and navigation-dataset contracts
-and adds mandatory, distinct, exact frontal/profile face-cascade bindings.
+Launch schema V4 retains V3's separate map and navigation-dataset contracts
+and mandatory, distinct, exact frontal/profile face-cascade bindings. It adds
+mandatory, distinct exact-byte bindings for a physically reviewed head-gaze
+policy and its attended review-evidence record. The policy embeds the exact
+SHA-256 of that evidence; offline qualification and runtime admission verify
+the cross-binding before any head hardware is opened.
 V2 replaced V1's aggregate navigation-record,
 startup-evidence, and total-state fields with separate enforceable map and
-navigation-dataset contracts. Do not relabel an older document as V3: render
-and review the complete V3 storage and `face_perception` sections explicitly.
+navigation-dataset contracts. Do not relabel an older document as V4: render
+and review the complete storage, `face_perception`, and
+`physical_head_gaze` sections explicitly.
 
 A qualified deployment must:
 
@@ -98,12 +103,23 @@ A qualified deployment must:
     launch-bound paths. Production bootstrap retains and verifies both files
     before hardware acquisition; this binding is not by itself a claim that
     detector execution has succeeded;
-14. install the rendered document as
-   `/opt/kiko/deployment/nano-agent-launch-v3.json`; and
-15. mint and verify the exact offline-install marker, then start
+14. stage the exact physically reviewed `head-gaze-policy-v1.json` and its
+    separate attended review record. Materialize the review record first,
+    hash its exact bytes, and place that digest in the policy lifecycle. The
+    production policy must include both four-axis character mapping and the
+    compliant-hold declaration; proposal-only policy is rejected;
+15. install the rendered document as
+   `/opt/kiko/deployment/nano-agent-launch-v4.json`; and
+16. mint and verify the exact offline-install marker, then start
     `kiko-nano-agent.service` manually for qualification. The supplied service
     has no `[Install]` section and therefore is not automatically enabled at
     boot.
+
+The review JSON is an exact, digest-bound operator claim, not authentication
+and not proof that the attended observations happened. The offline gate proves
+that one immutable policy names those exact bytes and that the policy is
+structurally admissible. Physical truth still requires the named operator's
+attended review and retained external evidence.
 
 Parsing the rendered document proves only structural validity and equality
 with its content bindings. Runtime admission must still verify exact
@@ -135,11 +151,13 @@ native-runtime, and launch documents from domain types. Digest arrays and
 hexadecimal digests are derived from the same retained bytes, and the launch
 document is written last.
 
-The illustrative `bundle-render-input-v1.json.template` is the production
-render-input schema-V1 source. Replace its whole-value
+The illustrative `bundle-render-input-v2.json.template` is the production
+render-input schema-V2 source. Materialize the two separate
+`head-gaze-*.json.template` files from attended evidence, then provide their
+canonical absolute source paths. Replace the render input's whole-value
 `${FACE_PERCEPTION_ASSETS_JSON}` token with the complete object below, using
 canonical absolute source paths. The strict renderer rejects production
-without both distinct assets.
+without both distinct cascades, the physical policy, or its review record.
 
 The wheels-off renderer uses the separate exact schema-V4 source at
 `configs/nano-wheels-off-qualification-template/bundle-render-input-v4.json.template`.

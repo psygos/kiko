@@ -24,7 +24,7 @@ ExecStartPre=+/opt/kiko/bin/kiko-nano-deployment-gate verify --marker /etc/kiko/
 # Keep the native search path on the production executable only. Applying it
 # service-wide would load unverified deployment libraries into ExecStartPre
 # before the root-owned gate could verify their exact bytes.
-ExecStart=/usr/bin/env LD_LIBRARY_PATH=/opt/kiko/deployment/lib /opt/kiko/bin/kiko-slam nano-agent --deployment-root /opt/kiko/deployment --launch-config nano-agent-launch-v3.json --state-root /var/lib/kiko-nano-agent
+ExecStart=/usr/bin/env LD_LIBRARY_PATH=/opt/kiko/deployment/lib /opt/kiko/bin/kiko-slam nano-agent --deployment-root /opt/kiko/deployment --launch-config nano-agent-launch-v4.json --state-root /var/lib/kiko-nano-agent
 # The OAK capture loop sends watchdog datagrams only after observing a new
 # completed four-servo health transaction from the sole accessory owner.
 # Frozen capture, expression, eye, gaze/compliance, or head-bus work therefore

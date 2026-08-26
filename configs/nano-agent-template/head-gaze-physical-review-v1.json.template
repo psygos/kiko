@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "evidence_scope": "attended_physical_head_gaze_and_compliance_review_v1",
+  "robot_id": "${ROBOT_ID}",
+  "review_id": "${HEAD_GAZE_PHYSICAL_REVIEW_ID}",
+  "operator_id": "${HEAD_GAZE_PHYSICAL_REVIEW_OPERATOR_ID}",
+  "evidence_id": "${HEAD_GAZE_PHYSICAL_REVIEW_EVIDENCE_ID}",
+  "observed_at_rfc3339": "${HEAD_GAZE_PHYSICAL_REVIEW_OBSERVED_AT_RFC3339}",
+  "software_commit": "${HEAD_GAZE_PHYSICAL_REVIEW_SOFTWARE_COMMIT}",
+  "assembly": {
+    "assembly_id": "${HEAD_ASSEMBLY_DECLARATION_ID}",
+    "servo_ids_bow_curl_yaw_roll": [
+      ${HEAD_BOW_SERVO_ID},
+      ${HEAD_CURL_SERVO_ID},
+      ${HEAD_YAW_SERVO_ID},
+      ${HEAD_ROLL_SERVO_ID}
+    ],
+    "natural_encoder_position_ticks_bow_curl_yaw_roll": [2174, 2570, 1637, 3047],
+    "head_origin_in_oak_camera_m_x_right_y_down_z_forward": [0.0, -0.25, -0.20],
+    "neutral_head_parallel_to_oak_optical_axis": true
+  },
+  "attended_observations": {
+    "wheels_removed": true,
+    "axis_sign_and_joint_identity_verified": ${HEAD_GAZE_REVIEW_AXIS_SIGN_AND_IDENTITY_VERIFIED},
+    "natural_return_verified": ${HEAD_GAZE_REVIEW_NATURAL_RETURN_VERIFIED},
+    "hard_envelopes_exercised_without_contact": ${HEAD_GAZE_REVIEW_HARD_ENVELOPES_VERIFIED},
+    "face_follow_direction_and_settling_verified": ${HEAD_GAZE_REVIEW_FACE_FOLLOW_VERIFIED},
+    "four_axis_character_motion_verified": ${HEAD_GAZE_REVIEW_FOUR_AXIS_CHARACTER_VERIFIED},
+    "holding_and_yield_torque_profiles_verified": ${HEAD_GAZE_REVIEW_TORQUE_PROFILES_VERIFIED},
+    "touch_yield_rest_recontact_recovery_verified": ${HEAD_GAZE_REVIEW_PET_SEQUENCE_VERIFIED},
+    "thermal_and_torque_health_fail_closed_verified": ${HEAD_GAZE_REVIEW_HEALTH_FAIL_CLOSED_VERIFIED}
+  },
+  "operator_notes": "${HEAD_GAZE_PHYSICAL_REVIEW_NOTES}"
+}

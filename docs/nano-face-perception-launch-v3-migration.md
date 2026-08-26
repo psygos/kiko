@@ -1,7 +1,13 @@
 # Nano face-perception launch V3 migration boundary
 
-Status: canonical production rendering, offline qualification, systemd
-startup, and bootstrap use V3. Production bootstrap verifies and retains both
+Historical migration record. Canonical production now uses launch V4, which
+retains this complete V3 face-perception graph and adds mandatory exact
+physical-head-gaze policy/review bindings. V3 remains an explicit compatibility
+parser/loader and must not be selected by current production bootstrap.
+
+Status at completion of this historical migration: production rendering,
+offline qualification, systemd startup, and bootstrap used V3. Production
+bootstrap verified and retained both
 face-cascade assets before hardware acquisition. The production accessory
 startup then moves those exact retained buffers into a named perception
 thread, constructs the detector there, and requires typed detector readiness
@@ -88,7 +94,7 @@ The canonical deployment migration moves these coupled consumers together:
 7. the dedicated face-perception worker that consumes the exact typed assets
    without opening a second OAK owner.
 
-Items 1–7 now require `nano-agent-launch-v3.json`. V2 remains available only
+Items 1–7 then required `nano-agent-launch-v3.json`. V2 remains available only
 through its explicit parser/loader compatibility API and tests; production
 bootstrap never chooses it or invents face bindings. A successful production
 accessory start now proves that the exact two retained assets were accepted by

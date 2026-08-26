@@ -72,10 +72,10 @@ use super::{AgentAuthoritySupervisor, NavigationClockEpoch};
 use super::{
     MAX_NANO_AGENT_LAUNCH_JSON_BYTES, MAX_NANO_CALIBRATION_ARTIFACT_JSON_BYTES,
     ManifestBoundNanoAgentPolicyConfigV3, NanoAccessoryManifestBindingError,
-    NanoAgentLaunchParseError, NanoAgentLaunchV3, NanoAgentPolicyConfigParseError,
+    NanoAgentLaunchParseError, NanoAgentLaunchV4, NanoAgentPolicyConfigParseError,
     NanoAgentPolicyConfigV3, NanoCalibrationArtifactParseError, NanoCalibrationArtifactV1,
-    NanoCalibrationBindingError, NanoFaceCascadeAssetRole, NanoLaunchAssetRole,
-    NanoLaunchBoundAssetLoadError,
+    NanoCalibrationBindingError, NanoFaceCascadeAssetRole, NanoHeadGazeAssetRole,
+    NanoLaunchAssetRole, NanoLaunchBoundAssetLoadError,
 };
 #[cfg(feature = "nano-attended-navigation-trial")]
 use crate::HostMonotonicTimestamp;
@@ -838,6 +838,8 @@ pub struct LoadedNanoBaseCommissioningInputs {
     pub onnx_runtime_library: LoadedDeploymentAsset,
     pub superpoint_model: LoadedDeploymentAsset,
     pub lightglue_model: LoadedDeploymentAsset,
+    pub head_gaze_policy: LoadedDeploymentAsset,
+    pub head_gaze_review_evidence: LoadedDeploymentAsset,
     #[cfg(not(feature = "nano-attended-navigation-trial"))]
     pub frontal_face_cascade: LoadedDeploymentAsset,
     #[cfg(not(feature = "nano-attended-navigation-trial"))]
@@ -854,7 +856,7 @@ pub struct PreparedNanoBaseCommissioning {
     profile: NanoBaseCommissioningControllerProfileV1,
     server: ControllerServerConfigV3,
     calibration: NanoCalibrationArtifactV1,
-    live_graph: NanoAgentLaunchV3,
+    live_graph: NanoAgentLaunchV4,
     accessory_policy: ManifestBoundNanoAgentPolicyConfigV3,
     inputs: LoadedNanoBaseCommissioningInputs,
     #[cfg(feature = "nano-attended-navigation-trial")]
@@ -1136,7 +1138,7 @@ impl PreparedNanoBaseCommissioning {
         &self.calibration
     }
 
-    pub const fn live_graph(&self) -> &NanoAgentLaunchV3 {
+    pub const fn live_graph(&self) -> &NanoAgentLaunchV4 {
         &self.live_graph
     }
 
@@ -2786,7 +2788,7 @@ pub fn prepare_nano_base_commissioning(
     let manifest = loaded_manifest.into_manifest();
     let calibration = NanoCalibrationArtifactV1::parse_json(calibration_source.bytes())
         .map_err(NanoBaseCommissioningPreparationError::Calibration)?;
-    let live_graph = NanoAgentLaunchV3::parse_json(live_graph_launch_source.bytes())
+    let live_graph = NanoAgentLaunchV4::parse_json(live_graph_launch_source.bytes())
         .map_err(NanoBaseCommissioningPreparationError::LiveGraphLaunch)?;
     bind_prepared_inputs(
         &launch,
@@ -2833,6 +2835,20 @@ pub fn prepare_nano_base_commissioning(
     };
     let frontal_face_cascade = load_face_asset(NanoFaceCascadeAssetRole::FrontalFace)?;
     let profile_face_cascade = load_face_asset(NanoFaceCascadeAssetRole::ProfileFace)?;
+    let load_head_gaze_asset = |role| {
+        let binding = live_graph.physical_head_gaze().asset(role);
+        if binding.relative_path() == live_graph_launch_source.relative_path() {
+            return Err(
+                NanoBaseCommissioningPreparationError::LiveGraphHeadGazeAssetAliasesLaunch { role },
+            );
+        }
+        binding.load_exact(deployment_root).map_err(|source| {
+            NanoBaseCommissioningPreparationError::LiveGraphHeadGazeAssetLoad { role, source }
+        })
+    };
+    let head_gaze_policy = load_head_gaze_asset(NanoHeadGazeAssetRole::Policy)?;
+    let head_gaze_review_evidence =
+        load_head_gaze_asset(NanoHeadGazeAssetRole::PhysicalReviewEvidence)?;
 
     Ok(PreparedNanoBaseCommissioning {
         state_root,
@@ -2857,6 +2873,8 @@ pub fn prepare_nano_base_commissioning(
             onnx_runtime_library,
             superpoint_model,
             lightglue_model,
+            head_gaze_policy,
+            head_gaze_review_evidence,
             #[cfg(not(feature = "nano-attended-navigation-trial"))]
             frontal_face_cascade,
             #[cfg(not(feature = "nano-attended-navigation-trial"))]
@@ -2874,7 +2892,7 @@ fn bind_prepared_inputs(
     server: &ControllerServerConfigV3,
     manifest: &DeviceInventoryManifestV3,
     calibration: &NanoCalibrationArtifactV1,
-    live_graph: &NanoAgentLaunchV3,
+    live_graph: &NanoAgentLaunchV4,
 ) -> Result<(), NanoBaseCommissioningPreparationError> {
     if launch.session_id() != profile.session_id() {
         return Err(NanoBaseCommissioningPreparationError::SessionIdMismatch);
@@ -3047,6 +3065,13 @@ pub enum NanoBaseCommissioningPreparationError {
         role: NanoFaceCascadeAssetRole,
         source: NanoLaunchBoundAssetLoadError,
     },
+    LiveGraphHeadGazeAssetAliasesLaunch {
+        role: NanoHeadGazeAssetRole,
+    },
+    LiveGraphHeadGazeAssetLoad {
+        role: NanoHeadGazeAssetRole,
+        source: NanoLaunchBoundAssetLoadError,
+    },
     AccessoryPolicy(NanoAgentPolicyConfigParseError),
     AccessoryManifestBinding(NanoAccessoryManifestBindingError),
     SessionIdMismatch,
@@ -3118,7 +3143,8 @@ impl std::error::Error for NanoBaseCommissioningPreparationError {
             Self::Calibration(source) => Some(source),
             Self::LiveGraphLaunch(source) => Some(source),
             Self::LiveGraphAssetLoad { source, .. }
-            | Self::LiveGraphFaceAssetLoad { source, .. } => Some(source),
+            | Self::LiveGraphFaceAssetLoad { source, .. }
+            | Self::LiveGraphHeadGazeAssetLoad { source, .. } => Some(source),
             Self::AccessoryPolicy(source) => Some(source),
             Self::AccessoryManifestBinding(source) => Some(source),
             Self::CalibrationBinding(source) => Some(source),
@@ -3590,7 +3616,7 @@ mod tests {
             "controller_server_contract_asset": asset("commissioning/controller-v3.json"),
             "device_manifest_asset": asset("commissioning/inventory-v3.json"),
             "calibration_artifact_asset": asset("calibration/oak-base-v1.json"),
-            "live_graph_launch_asset": asset("nano-agent-launch-v3.json")
+            "live_graph_launch_asset": asset("nano-agent-launch-v4.json")
         })
     }
 

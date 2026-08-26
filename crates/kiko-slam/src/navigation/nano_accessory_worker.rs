@@ -503,6 +503,12 @@ impl NanoAccessoryWorkerConfig {
         if self.head_gaze_diagnostics.is_some() || self.physical_head_gaze.is_some() {
             return Err(NanoPhysicalHeadGazeConfigError::AlreadyConfigured);
         }
+        if policy.character_mapping().is_none() {
+            return Err(NanoPhysicalHeadGazeConfigError::CharacterMappingRequired);
+        }
+        if policy.compliant_hold().is_none() {
+            return Err(NanoPhysicalHeadGazeConfigError::CompliantHoldRequired);
+        }
         let policy =
             EvidenceBoundPhysicalHeadGazePolicy::admit(policy, review_evidence, &self.head_return)
                 .map_err(NanoPhysicalHeadGazeConfigError::Admission)?;
@@ -525,6 +531,8 @@ struct NanoPhysicalHeadGazeConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NanoPhysicalHeadGazeConfigError {
     AlreadyConfigured,
+    CharacterMappingRequired,
+    CompliantHoldRequired,
     Admission(EvidenceBoundPhysicalHeadGazePolicyError),
 }
 
@@ -543,7 +551,9 @@ impl std::error::Error for NanoPhysicalHeadGazeConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Admission(source) => Some(source),
-            Self::AlreadyConfigured => None,
+            Self::AlreadyConfigured
+            | Self::CharacterMappingRequired
+            | Self::CompliantHoldRequired => None,
         }
     }
 }

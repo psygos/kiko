@@ -32,16 +32,17 @@ rendered assets by lower-case SHA-256 and byte limit:
 3. `commissioning/controller-server-v3.json`
 4. `commissioning/device-inventory-v3.json`
 5. the exact calibration artifact
-6. canonical `nano-agent-launch-v3.json`
+6. canonical `nano-agent-launch-v4.json`
 
 The nested canonical launch binds the exact agent-policy V3, OAK ORT models,
-SuperPoint model, live graph, and calibration. Commissioning admits its
+SuperPoint model, face cascades, physical head-gaze policy/review evidence,
+live graph, and calibration. Commissioning admits its
 accessory policy only after binding it to the commissioning inventory; it
 opens the exact OAK MXID and graph in the same process. External camera,
 velocity, or IMU injection is not supported.
 
 Render leaf assets first, compute their exact sizes and SHA-256 digests, render
-the canonical `nano-agent-launch-v3.json`, then render the outer commissioning
+the canonical `nano-agent-launch-v4.json`, then render the outer commissioning
 launch last. Use a new commissioning session ID for each attempt. The state
 writer uses create-new semantics and will not overwrite a prior session.
 
@@ -114,10 +115,12 @@ clock epoch; its host timestamp is captured by the ceremony and the same
 prepared session must consume it within five seconds. It then starts the
 in-process V3 STM32 owner at exact zero.
 
-Commissioning parses and content-binds the nested launch-V3 face cascades but
-does not load or execute them. Its `scene_motion` expression mode proves only
-the base RGB-expression lane. Production launch V3 adds the separate mandatory
-face-perception lane and must qualify detector readiness and latency itself.
+Commissioning parses and exact-loads the nested launch-V4 face cascades and
+physical head-gaze policy/review leaves, but does not execute the detector or
+activate the production physical-gaze policy. Its `scene_motion` expression
+mode proves only the base RGB-expression lane. Production launch V4 adds the
+separate mandatory face-perception and evidence-gated physical-gaze lanes and
+must qualify their readiness, motion, and latency itself.
 
 Do not install this command as an unattended systemd service or boot task.
 

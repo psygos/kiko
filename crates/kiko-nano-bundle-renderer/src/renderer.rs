@@ -6,6 +6,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use kiko_slam::navigation::{
+    MAX_HEAD_GAZE_POLICY_JSON_BYTES, MAX_HEAD_GAZE_REVIEW_EVIDENCE_BYTES,
     NanoCalibrationArtifactParseError, NanoCalibrationArtifactV1, NanoCalibrationBindingError,
     OfflineNavigationGraphParseError, OfflineProductionNavigationGraphV1,
     OfflineShadowNavigationGraphV1, ProductionNavigationControllerContractV1,
@@ -25,10 +26,9 @@ const MAX_PRODUCTION_PROFILE_BYTES: u64 = 262_144;
 const MAX_SOURCE_ASSET_BYTES: u64 = 512 * 1_024 * 1_024;
 const MAX_QUALIFICATION_EXECUTABLE_BYTES: u64 = 128 * 1_024 * 1_024;
 const MAX_OPENCV_HAAR_CASCADE_BYTES: u64 = 4 * 1_024 * 1_024;
-const MAX_HEAD_GAZE_POLICY_JSON_BYTES: u64 = 256 * 1_024;
-// Both current bundle variants emit at most 24 deterministic leaves including
+// Both current bundle variants emit at most 26 deterministic leaves including
 // source evidence, the render manifest, and launch.
-const STAGED_BUNDLE_FILE_CAPACITY: usize = 24;
+const STAGED_BUNDLE_FILE_CAPACITY: usize = 26;
 const EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const PLAN_SCHEMA_VERSION: u32 = 1;
 const EVIDENCE_SCOPE: &str = "offline_staging_only_not_installation_or_hardware_qualification_v1";
@@ -36,6 +36,7 @@ const PRODUCTION_PROFILE_EVIDENCE_PATH: &str = "evidence/production-controller-p
 const RENDER_EVIDENCE_PATH: &str = "evidence/render-evidence-v1.json";
 const QUALIFICATION_EXECUTABLE_RELATIVE_PATH: &str = "bin/kiko-nano-wheels-off-qualification";
 const HEAD_GAZE_POLICY_RELATIVE_PATH: &str = "head-gaze-policy-v1.json";
+const HEAD_GAZE_REVIEW_EVIDENCE_RELATIVE_PATH: &str = "evidence/head-gaze-physical-review-v1.json";
 const QUALIFICATION_GATE_A_PLANT_ARTIFACT_ID: &str =
     "qualification-shadow-only-synthetic-unvalidated-v2";
 const QUALIFICATION_GATE_A_PLANT_RELATIVE_PATH: &str =
@@ -298,6 +299,7 @@ impl StagedFile {
 struct LoadedAssets {
     qualification_executable: Option<LoadedSource>,
     head_gaze_policy: Option<LoadedSource>,
+    head_gaze_review_evidence: Option<LoadedSource>,
     calibration: LoadedSource,
     plant: LoadedSource,
     navigation_shadow: LoadedSource,
@@ -438,9 +440,23 @@ fn load_assets(input: &RenderInput) -> Result<LoadedAssets, RenderError> {
             let source = LoadedSource::read(
                 "head_gaze_policy",
                 path.as_path(),
-                MAX_HEAD_GAZE_POLICY_JSON_BYTES,
+                MAX_HEAD_GAZE_POLICY_JSON_BYTES as u64,
             )?;
             reject_unresolved_tokens("head gaze policy", &source.bytes)?;
+            ensure_json_value(&source)?;
+            Ok(source)
+        })
+        .transpose()?;
+    let head_gaze_review_evidence = input
+        .bundle
+        .head_gaze_review_evidence_source_path()
+        .map(|path| {
+            let source = LoadedSource::read(
+                "head_gaze_physical_review_evidence",
+                path.as_path(),
+                MAX_HEAD_GAZE_REVIEW_EVIDENCE_BYTES,
+            )?;
+            reject_unresolved_tokens("head gaze physical review evidence", &source.bytes)?;
             ensure_json_value(&source)?;
             Ok(source)
         })
@@ -511,6 +527,7 @@ fn load_assets(input: &RenderInput) -> Result<LoadedAssets, RenderError> {
     Ok(LoadedAssets {
         qualification_executable,
         head_gaze_policy,
+        head_gaze_review_evidence,
         calibration,
         plant,
         navigation_shadow,
@@ -568,6 +585,13 @@ fn render_non_launch_files(
             "head_gaze_policy",
             HEAD_GAZE_POLICY_RELATIVE_PATH,
             head_gaze_policy,
+        ));
+    }
+    if let Some(head_gaze_review_evidence) = loaded.head_gaze_review_evidence.take() {
+        staged.push(StagedFile::retained(
+            "head_gaze_physical_review_evidence",
+            HEAD_GAZE_REVIEW_EVIDENCE_RELATIVE_PATH,
+            head_gaze_review_evidence,
         ));
     }
     staged.push(StagedFile::retained(
@@ -650,7 +674,7 @@ fn render_non_launch_files(
     }
     staged.push(render_agent_policy(input, production)?);
     ensure_qualification_face_contents_are_unique(input, &staged)?;
-    ensure_qualification_head_gaze_content_is_unique(input, &staged)?;
+    ensure_head_gaze_contents_are_unique(input, &staged)?;
     Ok(staged)
 }
 
@@ -688,21 +712,37 @@ fn ensure_qualification_face_contents_are_unique(
     Ok(())
 }
 
-fn ensure_qualification_head_gaze_content_is_unique(
+fn ensure_head_gaze_contents_are_unique(
     input: &RenderInput,
     staged: &[StagedFile],
 ) -> Result<(), RenderError> {
     if input.bundle.head_gaze_policy_source_path().is_none() {
         return Ok(());
     }
-    let policy = find_staged(staged, HEAD_GAZE_POLICY_RELATIVE_PATH)?;
-    if let Some(alias) = staged
-        .iter()
-        .find(|file| file.relative_path != policy.relative_path && file.sha256 == policy.sha256)
-    {
-        return Err(RenderError::QualificationHeadGazeAssetContentAlias {
-            aliased_role: alias.role.clone(),
-        });
+    for (head_gaze_role, relative_path) in [
+        ("policy", HEAD_GAZE_POLICY_RELATIVE_PATH),
+        (
+            "physical_review_evidence",
+            HEAD_GAZE_REVIEW_EVIDENCE_RELATIVE_PATH,
+        ),
+    ] {
+        if head_gaze_role == "physical_review_evidence"
+            && input
+                .bundle
+                .head_gaze_review_evidence_source_path()
+                .is_none()
+        {
+            continue;
+        }
+        let head_gaze = find_staged(staged, relative_path)?;
+        if let Some(alias) = staged.iter().find(|file| {
+            file.relative_path != head_gaze.relative_path && file.sha256 == head_gaze.sha256
+        }) {
+            return Err(RenderError::HeadGazeAssetContentAlias {
+                head_gaze_role,
+                aliased_role: alias.role.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -1310,13 +1350,22 @@ fn render_launch(
             insert_face_perception_launch_binding(input, staged, &mut object)?;
         }
         BundleSelection::Production { .. } => {
-            object.insert("schema_version".to_owned(), json!(3));
+            object.insert("schema_version".to_owned(), json!(4));
             let actuation = find_staged(staged, "navigation-actuation-v2.json")?;
             object.insert(
                 "physical_actuation_config_asset".to_owned(),
                 binding(actuation),
             );
             insert_face_perception_launch_binding(input, staged, &mut object)?;
+            let head_gaze_policy = find_staged(staged, HEAD_GAZE_POLICY_RELATIVE_PATH)?;
+            let head_gaze_review = find_staged(staged, HEAD_GAZE_REVIEW_EVIDENCE_RELATIVE_PATH)?;
+            object.insert(
+                "physical_head_gaze".to_owned(),
+                json!({
+                    "policy_asset": binding(head_gaze_policy),
+                    "physical_review_evidence_asset": binding(head_gaze_review),
+                }),
+            );
         }
     }
     StagedFile::rendered_json(
@@ -1430,6 +1479,25 @@ fn render_evidence_manifest(
                 staged,
             )?);
         }
+    }
+    if let BundleSelection::Production {
+        head_gaze_policy_source_path,
+        head_gaze_review_evidence_source_path,
+        ..
+    } = &input.bundle
+    {
+        sources.push(SourceEvidence::from_staged_source(
+            "head_gaze_policy",
+            head_gaze_policy_source_path.as_path(),
+            HEAD_GAZE_POLICY_RELATIVE_PATH,
+            staged,
+        )?);
+        sources.push(SourceEvidence::from_staged_source(
+            "head_gaze_physical_review_evidence",
+            head_gaze_review_evidence_source_path.as_path(),
+            HEAD_GAZE_REVIEW_EVIDENCE_RELATIVE_PATH,
+            staged,
+        )?);
     }
     if let Some(face) = input.bundle.face_perception() {
         sources.push(SourceEvidence::from_staged_source(
@@ -1651,11 +1719,6 @@ fn validate_rendered_tree(
     Ok(())
 }
 
-fn ensure_json_value(source: &LoadedSource) -> Result<(), RenderError> {
-    let _: Value = parse_exact_json(&source.bytes, source.path.as_path())?;
-    Ok(())
-}
-
 fn parse_exact_json<T>(bytes: &[u8], path: &Path) -> Result<T, RenderError>
 where
     T: serde::de::DeserializeOwned,
@@ -1672,6 +1735,11 @@ where
             source,
         })?;
     Ok(value)
+}
+
+fn ensure_json_value(source: &LoadedSource) -> Result<(), RenderError> {
+    let _: Value = parse_exact_json(&source.bytes, source.path.as_path())?;
+    Ok(())
 }
 
 fn reject_unresolved_tokens(label: &str, bytes: &[u8]) -> Result<(), RenderError> {
@@ -2035,7 +2103,8 @@ pub enum RenderError {
         face: QualificationFaceCascadeRole,
         aliased_role: String,
     },
-    QualificationHeadGazeAssetContentAlias {
+    HeadGazeAssetContentAlias {
+        head_gaze_role: &'static str,
         aliased_role: String,
     },
     QualificationPlantBindingMismatch {
@@ -2190,9 +2259,12 @@ impl fmt::Display for RenderError {
                 "wheels-off qualification {} content aliases staged role {aliased_role}",
                 face.as_str()
             ),
-            Self::QualificationHeadGazeAssetContentAlias { aliased_role } => write!(
+            Self::HeadGazeAssetContentAlias {
+                head_gaze_role,
+                aliased_role,
+            } => write!(
                 formatter,
-                "wheels-off qualification head-gaze policy content aliases staged role {aliased_role}"
+                "head-gaze {head_gaze_role} content aliases staged role {aliased_role}"
             ),
             Self::QualificationPlantBindingMismatch { field } => write!(
                 formatter,

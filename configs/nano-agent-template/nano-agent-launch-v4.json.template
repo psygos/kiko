@@ -1,0 +1,144 @@
+{
+  "schema_version": 4,
+  "agent_policy_asset": {
+    "relative_path": "agent-policy-v3.json",
+    "maximum_bytes": ${AGENT_POLICY_MAXIMUM_BYTES},
+    "sha256_hex": "${AGENT_POLICY_SHA256}"
+  },
+  "navigation_shadow_config_asset": {
+    "relative_path": "navigation-shadow-v2.json",
+    "maximum_bytes": ${NAVIGATION_SHADOW_MAXIMUM_BYTES},
+    "sha256_hex": "${NAVIGATION_SHADOW_SHA256}"
+  },
+  "physical_actuation_config_asset": {
+    "relative_path": "navigation-actuation-v2.json",
+    "maximum_bytes": ${PHYSICAL_ACTUATION_MAXIMUM_BYTES},
+    "sha256_hex": "${PHYSICAL_ACTUATION_SHA256}"
+  },
+  "controller_server": {
+    "contract_asset": {
+      "relative_path": "controller-server-v1.json",
+      "maximum_bytes": ${CONTROLLER_SERVER_MAXIMUM_BYTES},
+      "sha256_hex": "${CONTROLLER_SERVER_SHA256}"
+    },
+    "command_udp_endpoint": "127.0.0.1:${CONTROLLER_OWNER_LOOPBACK_PORT}"
+  },
+  "calibration_artifact": {
+    "artifact_id": "${CALIBRATION_ARTIFACT_ID}",
+    "asset": {
+      "relative_path": "artifacts/${CALIBRATION_ARTIFACT_RELATIVE_PATH}",
+      "maximum_bytes": ${CALIBRATION_ARTIFACT_MAXIMUM_BYTES},
+      "sha256_hex": "${CALIBRATION_ARTIFACT_SHA256}"
+    }
+  },
+  "plant_artifact": {
+    "artifact_id": "${QUALIFIED_PLANT_ARTIFACT_ID}",
+    "asset": {
+      "relative_path": "${QUALIFIED_PLANT_RELATIVE_PATH}",
+      "maximum_bytes": ${QUALIFIED_PLANT_MAXIMUM_BYTES},
+      "sha256_hex": "${QUALIFIED_PLANT_SHA256}"
+    }
+  },
+  "oak": {
+    "selector_source": "exact_inventory_oak_mxid",
+    "maximum_usb_speed": "SUPER",
+    "minimum_usb_speed": "SUPER",
+    "rgb": {
+      "width_px": ${OAK_RGB_WIDTH_PX},
+      "height_px": ${OAK_RGB_HEIGHT_PX},
+      "fps": ${OAK_RGB_FPS}
+    },
+    "rectified_stereo": {
+      "width_px": ${OAK_STEREO_WIDTH_PX},
+      "height_px": ${OAK_STEREO_HEIGHT_PX},
+      "fps": ${OAK_STEREO_FPS},
+      "rectified": true
+    },
+    "depth": {
+      "width_px": ${OAK_STEREO_WIDTH_PX},
+      "height_px": ${OAK_STEREO_HEIGHT_PX},
+      "fps": ${OAK_STEREO_FPS},
+      "alignment": "rectified_left"
+    },
+    "imu": {
+      "rate_hz": ${OAK_IMU_RATE_HZ}
+    },
+    "queue": {
+      "size": ${OAK_QUEUE_SIZE},
+      "blocking": false
+    }
+  },
+  "occupancy": {
+    "resolution_m": ${OCCUPANCY_RESOLUTION_M},
+    "lower_x_m": ${OCCUPANCY_LOWER_X_M},
+    "lower_y_m": ${OCCUPANCY_LOWER_Y_M},
+    "width_cells": ${OCCUPANCY_WIDTH_CELLS},
+    "height_cells": ${OCCUPANCY_HEIGHT_CELLS},
+    "maximum_cells": ${OCCUPANCY_MAXIMUM_CELLS},
+    "maximum_keyframes": ${OCCUPANCY_MAXIMUM_KEYFRAMES},
+    "snapshot_every_keyframes": ${OCCUPANCY_SNAPSHOT_EVERY_KEYFRAMES}
+  },
+  "inference": {
+    "onnx_runtime_library_asset": {
+      "relative_path": "${ONNX_RUNTIME_LIBRARY_RELATIVE_PATH}",
+      "maximum_bytes": ${ONNX_RUNTIME_LIBRARY_MAXIMUM_BYTES},
+      "sha256_hex": "${ONNX_RUNTIME_LIBRARY_SHA256}"
+    },
+    "superpoint_model_asset": {
+      "relative_path": "${SUPERPOINT_MODEL_RELATIVE_PATH}",
+      "maximum_bytes": ${SUPERPOINT_MODEL_MAXIMUM_BYTES},
+      "sha256_hex": "${SUPERPOINT_MODEL_SHA256}"
+    },
+    "lightglue_model_asset": {
+      "relative_path": "${LIGHTGLUE_MODEL_RELATIVE_PATH}",
+      "maximum_bytes": ${LIGHTGLUE_MODEL_MAXIMUM_BYTES},
+      "sha256_hex": "${LIGHTGLUE_MODEL_SHA256}"
+    },
+    "superpoint_backend": "${SUPERPOINT_BACKEND}",
+    "lightglue_backend": "${LIGHTGLUE_BACKEND}",
+    "downscale_factor": ${INFERENCE_DOWNSCALE_FACTOR},
+    "maximum_keypoints": ${INFERENCE_MAXIMUM_KEYPOINTS}
+  },
+  "face_perception": {
+    "frontal_face_cascade_asset": {
+      "relative_path": "models/opencv/haarcascade_frontalface_default.xml",
+      "maximum_bytes": ${FRONTAL_FACE_CASCADE_MAXIMUM_BYTES},
+      "sha256_hex": "${FRONTAL_FACE_CASCADE_SHA256}"
+    },
+    "profile_face_cascade_asset": {
+      "relative_path": "models/opencv/haarcascade_profileface.xml",
+      "maximum_bytes": ${PROFILE_FACE_CASCADE_MAXIMUM_BYTES},
+      "sha256_hex": "${PROFILE_FACE_CASCADE_SHA256}"
+    }
+  },
+  "physical_head_gaze": {
+    "policy_asset": {
+      "relative_path": "head-gaze-policy-v1.json",
+      "maximum_bytes": ${HEAD_GAZE_POLICY_MAXIMUM_BYTES},
+      "sha256_hex": "${HEAD_GAZE_POLICY_SHA256}"
+    },
+    "physical_review_evidence_asset": {
+      "relative_path": "evidence/head-gaze-physical-review-v1.json",
+      "maximum_bytes": ${HEAD_GAZE_REVIEW_EVIDENCE_MAXIMUM_BYTES},
+      "sha256_hex": "${HEAD_GAZE_REVIEW_EVIDENCE_SHA256}"
+    }
+  },
+  "rerun": {
+    "kind": "serve_loopback",
+    "bind": "127.0.0.1:${RERUN_PORT}",
+    "decimation": ${RERUN_DECIMATION},
+    "memory_limit_bytes": ${RERUN_MEMORY_LIMIT_BYTES},
+    "flush_timeout_ms": ${RERUN_FLUSH_TIMEOUT_MS}
+  },
+  "storage": {
+    "map_snapshot_relative_path": "${MAP_SNAPSHOT_RELATIVE_PATH}",
+    "navigation_dataset_directory_relative_path": "${NAVIGATION_DATASET_DIRECTORY_RELATIVE_PATH}",
+    "maximum_map_snapshot_bytes": ${MAXIMUM_MAP_SNAPSHOT_BYTES},
+    "minimum_free_bytes_after_map_save": ${MINIMUM_FREE_BYTES_AFTER_MAP_SAVE},
+    "maximum_navigation_dataset_bytes": ${MAXIMUM_NAVIGATION_DATASET_BYTES},
+    "maximum_navigation_dataset_files": ${MAXIMUM_NAVIGATION_DATASET_FILES},
+    "maximum_navigation_ingress_records": ${MAXIMUM_NAVIGATION_INGRESS_RECORDS},
+    "minimum_free_bytes_after_navigation_dataset_write": ${MINIMUM_FREE_BYTES_AFTER_NAVIGATION_DATASET_WRITE},
+    "navigation_dataset_terminal_reserve_bytes": ${NAVIGATION_DATASET_TERMINAL_RESERVE_BYTES}
+  }
+}

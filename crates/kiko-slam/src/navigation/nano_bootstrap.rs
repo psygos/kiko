@@ -63,23 +63,25 @@ use super::actuation::LiveActuationError;
 use super::mpc::{MpcConfigV1, PlantModelJsonParseError, PlantModelV1, WheelSide};
 use super::nano_accessory_worker::NanoFacePerceptionAssets;
 use super::{
-    AdmittedOakSuperSpeedEvidence, ControlPeriodNs, ManifestBoundNanoAgentPolicyConfigV3,
-    NanoAccessoryFaultWaitError, NanoAccessoryHealthPeriod, NanoAccessoryHealthPeriodError,
-    NanoAccessoryManifestBindingError, NanoAccessoryPerceptionReadyEvidence,
-    NanoAccessoryShutdownEvidence, NanoAccessoryTerminalFault, NanoAccessoryWorker,
-    NanoAccessoryWorkerConfig, NanoAccessoryWorkerConfigError, NanoAccessoryWorkerExit,
-    NanoAccessoryWorkerJoinError, NanoAccessoryWorkerStartError, NanoAgentLaunchLoadError,
-    NanoAgentLaunchV3, NanoAgentPolicyConfigParseError, NanoAgentPolicyConfigV3,
-    NanoCalibrationArtifactParseError, NanoCalibrationArtifactV1, NanoCalibrationBindingError,
-    NanoFaceCascadeAssetRole, NanoFacePerceptionShutdownClass, NanoFacePerceptionShutdownEvidence,
+    AdmittedOakSuperSpeedEvidence, ControlPeriodNs, HeadGazePolicyParseError, HeadGazePolicyV1,
+    ManifestBoundNanoAgentPolicyConfigV3, NanoAccessoryFaultWaitError, NanoAccessoryHealthPeriod,
+    NanoAccessoryHealthPeriodError, NanoAccessoryManifestBindingError,
+    NanoAccessoryPerceptionReadyEvidence, NanoAccessoryShutdownEvidence,
+    NanoAccessoryTerminalFault, NanoAccessoryWorker, NanoAccessoryWorkerConfig,
+    NanoAccessoryWorkerConfigError, NanoAccessoryWorkerExit, NanoAccessoryWorkerJoinError,
+    NanoAccessoryWorkerStartError, NanoAgentLaunchLoadError, NanoAgentLaunchV4,
+    NanoAgentPolicyConfigParseError, NanoAgentPolicyConfigV3, NanoCalibrationArtifactParseError,
+    NanoCalibrationArtifactV1, NanoCalibrationBindingError, NanoFaceCascadeAssetRole,
+    NanoFacePerceptionShutdownClass, NanoFacePerceptionShutdownEvidence, NanoHeadGazeAssetRole,
     NanoLaunchAssetRole, NanoLaunchBoundAssetLoadError, NanoLaunchFacePerception,
     NanoObservedInventoryBuildError, NanoObservedInventoryBuilder,
-    NanoObservedInventoryEvidenceError, NanoProductionAdmissionError,
-    NanoProductionAdmissionTimeline, NanoProductionAdmissionTimelineError,
-    NavigationActuationConfigV1, NavigationClockEpoch, PendingLiveMpcControlDriver,
-    PreparedNanoProductionRuntime, ProductionNavigationControllerBindingError,
-    ProductionNavigationControllerBindingV1, ProductionNavigationControllerContractV1,
-    ShadowNavigationConfigParseError, ShadowNavigationConfigV2, load_nano_agent_launch_v3,
+    NanoObservedInventoryEvidenceError, NanoPhysicalHeadGazeConfigError,
+    NanoProductionAdmissionError, NanoProductionAdmissionTimeline,
+    NanoProductionAdmissionTimelineError, NavigationActuationConfigV1, NavigationClockEpoch,
+    PendingLiveMpcControlDriver, PreparedNanoProductionRuntime,
+    ProductionNavigationControllerBindingError, ProductionNavigationControllerBindingV1,
+    ProductionNavigationControllerContractV1, ShadowNavigationConfigParseError,
+    ShadowNavigationConfigV2, load_nano_agent_launch_v4,
 };
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
@@ -687,12 +689,14 @@ pub struct LoadedNanoBootstrapAssets {
     pub onnx_runtime_library: LoadedDeploymentAsset,
     pub superpoint_model: LoadedDeploymentAsset,
     pub lightglue_model: LoadedDeploymentAsset,
+    pub head_gaze_policy: LoadedDeploymentAsset,
+    pub head_gaze_review_evidence: LoadedDeploymentAsset,
 }
 
 impl LoadedNanoBootstrapAssets {
     fn load(
         deployment_root: &Path,
-        launch: &NanoAgentLaunchV3,
+        launch: &NanoAgentLaunchV4,
     ) -> Result<(Self, LoadedNanoBootstrapFacePerceptionAssets), NanoBootstrapPrimaryError> {
         let load = |role| {
             launch
@@ -705,6 +709,13 @@ impl LoadedNanoBootstrapAssets {
             launch.face_perception(),
         )
         .map_err(NanoBootstrapPrimaryError::FacePerceptionAssetLoad)?;
+        let load_head_gaze = |role| {
+            launch
+                .physical_head_gaze()
+                .asset(role)
+                .load_exact(deployment_root)
+                .map_err(|source| NanoBootstrapPrimaryError::HeadGazeAssetLoad { role, source })
+        };
         Ok((
             Self {
                 agent_policy: load(NanoLaunchAssetRole::AgentPolicy)?,
@@ -716,6 +727,10 @@ impl LoadedNanoBootstrapAssets {
                 onnx_runtime_library: load(NanoLaunchAssetRole::OnnxRuntimeLibrary)?,
                 superpoint_model: load(NanoLaunchAssetRole::SuperpointModel)?,
                 lightglue_model: load(NanoLaunchAssetRole::LightglueModel)?,
+                head_gaze_policy: load_head_gaze(NanoHeadGazeAssetRole::Policy)?,
+                head_gaze_review_evidence: load_head_gaze(
+                    NanoHeadGazeAssetRole::PhysicalReviewEvidence,
+                )?,
             },
             face_perception,
         ))
@@ -820,7 +835,7 @@ pub struct ParsedNanoLiveConfiguration {
 #[must_use = "the returned OAK and controller owners require explicit lifecycle handling"]
 pub struct PreparedNanoBootstrap {
     pub roots: NanoBootstrapRoots,
-    pub launch: super::LoadedNanoAgentLaunchV3,
+    pub launch: super::LoadedNanoAgentLaunchV4,
     pub assets: LoadedNanoBootstrapAssets,
     pub accessory_evidence: NanoBootstrapAccessoryEvidence,
     pub oak_connected_identity: ConnectedDeviceIdentity,
@@ -878,12 +893,16 @@ pub async fn bootstrap_nano_production(
     } = request;
 
     require_running(running).map_err(NanoBootstrapError::before_hardware)?;
-    let launch = load_nano_agent_launch_v3(roots.deployment_root(), launch_relative_path).map_err(
+    let launch = load_nano_agent_launch_v4(roots.deployment_root(), launch_relative_path).map_err(
         |source| NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::LaunchLoad(source)),
     )?;
     let (assets, face_perception_assets) =
         LoadedNanoBootstrapAssets::load(roots.deployment_root(), launch.launch())
             .map_err(NanoBootstrapError::before_hardware)?;
+
+    let head_gaze_policy = HeadGazePolicyV1::parse_json(assets.head_gaze_policy.bytes())
+        .map_err(NanoBootstrapPrimaryError::HeadGazePolicy)
+        .map_err(NanoBootstrapError::before_hardware)?;
 
     let policy =
         NanoAgentPolicyConfigV3::parse_json(assets.agent_policy.bytes()).map_err(|source| {
@@ -1020,6 +1039,12 @@ pub async fn bootstrap_nano_production(
     )
     .map_err(|source| {
         NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::AccessoryConfig(source))
+    })?
+    .with_evidence_bound_physical_head_gaze(head_gaze_policy, &assets.head_gaze_review_evidence)
+    .map_err(|source| {
+        NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::PhysicalHeadGazeConfig(
+            source,
+        ))
     })?;
     let (frontal_face_cascade, profile_face_cascade) = face_perception_assets.into_parts();
     let face_perception_assets =
@@ -1376,7 +1401,7 @@ struct ConnectedOakPreparation {
 }
 
 struct ConnectedOakRequest<'a> {
-    launch: &'a NanoAgentLaunchV3,
+    launch: &'a NanoAgentLaunchV4,
     navigation_bytes: &'a [u8],
     actuation_bytes: &'a [u8],
     calibration: &'a NanoCalibrationArtifactV1,
@@ -1692,7 +1717,7 @@ struct SelectedPlantArtifact {
 
 fn bind_calibration_artifact(
     roots: &NanoBootstrapRoots,
-    launch: &NanoAgentLaunchV3,
+    launch: &NanoAgentLaunchV4,
     loaded: &LoadedDeploymentAsset,
     policy: &NanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -1849,7 +1874,7 @@ impl std::error::Error for NanoCalibrationArtifactSelectionError {
 
 fn select_plant_artifact(
     roots: &NanoBootstrapRoots,
-    launch: &NanoAgentLaunchV3,
+    launch: &NanoAgentLaunchV4,
     launch_plant: &LoadedDeploymentAsset,
     policy: &NanoAgentPolicyConfigV3,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
@@ -1946,7 +1971,7 @@ fn deployment_relative_artifact_path(
 }
 
 fn bind_controller_contract_to_manifest(
-    launch: &NanoAgentLaunchV3,
+    launch: &NanoAgentLaunchV4,
     server: &ControllerServerConfigV1,
     manifest: &kiko_device_inventory::DeviceInventoryManifestV1,
 ) -> Result<(), NanoBootstrapPrimaryError> {
@@ -1989,7 +2014,7 @@ fn bind_controller_contract_to_manifest(
 }
 
 fn bind_controller_contract_to_actuation(
-    launch: &NanoAgentLaunchV3,
+    launch: &NanoAgentLaunchV4,
     server: &ControllerServerConfigV1,
     actuation: &NavigationActuationConfigV1,
     mpc: MpcConfigV1,
@@ -2657,7 +2682,12 @@ pub enum NanoBootstrapPrimaryError {
         role: NanoLaunchAssetRole,
         source: NanoLaunchBoundAssetLoadError,
     },
+    HeadGazeAssetLoad {
+        role: NanoHeadGazeAssetRole,
+        source: NanoLaunchBoundAssetLoadError,
+    },
     FacePerceptionAssetLoad(NanoBootstrapFacePerceptionAssetLoadError),
+    HeadGazePolicy(HeadGazePolicyParseError),
     AgentPolicy(NanoAgentPolicyConfigParseError),
     PolicyPathOutsideDeployment {
         kind: NanoBootstrapDeploymentPathKind,
@@ -2729,6 +2759,7 @@ pub enum NanoBootstrapPrimaryError {
     EyeProbe(IdentityProbeError),
     AccessoryHealthPeriod(NanoAccessoryHealthPeriodError),
     AccessoryConfig(NanoAccessoryWorkerConfigError),
+    PhysicalHeadGazeConfig(NanoPhysicalHeadGazeConfigError),
     AccessoryStart(NanoAccessoryWorkerStartError),
     AccessoryFacePerceptionReadinessMissing,
     AccessoryTerminalFault(NanoAccessoryTerminalFault),
@@ -2815,7 +2846,9 @@ impl std::error::Error for NanoBootstrapPrimaryError {
         match self {
             Self::LaunchLoad(source) => Some(source),
             Self::BoundAssetLoad { source, .. } => Some(source),
+            Self::HeadGazeAssetLoad { source, .. } => Some(source),
             Self::FacePerceptionAssetLoad(source) => Some(source),
+            Self::HeadGazePolicy(source) => Some(source),
             Self::AgentPolicy(source) => Some(source),
             Self::Manifest(source) => Some(source),
             Self::AccessoryManifestBinding(source) => Some(source),
@@ -2831,6 +2864,7 @@ impl std::error::Error for NanoBootstrapPrimaryError {
             Self::EyeProbe(source) => Some(source),
             Self::AccessoryHealthPeriod(source) => Some(source),
             Self::AccessoryConfig(source) => Some(source),
+            Self::PhysicalHeadGazeConfig(source) => Some(source),
             Self::AccessoryStart(source) => Some(source),
             Self::AccessoryFaultMonitor(source) => Some(source),
             Self::OakConnect(source) => Some(source),

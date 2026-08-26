@@ -12,7 +12,7 @@ use kiko_nano_bundle_renderer::{
     QualificationFaceCascadeRole, RenderError, RenderMode, render_bundle,
 };
 use kiko_slam::navigation::{
-    NanoAgentLaunchV3, NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1,
+    NanoAgentLaunchV4, NanoAgentPolicyConfigV3, NanoCalibrationArtifactV1,
     NanoCalibrationBindingError, NanoWheelsOffNativeRuntimeV1, NanoWheelsOffQualificationLaunchV4,
     OfflineNavigationGraphParseError, ProductionNavigationControllerBindingError,
     WheelsOffCandidateControllerBinding,
@@ -361,12 +361,14 @@ fn reviewed_production_plant() -> Value {
 }
 
 fn prepare_production_assets(root: &Path, input: &mut Value) {
-    input["schema_version"] = json!(1);
+    input["schema_version"] = json!(2);
     add_face_assets(root, input);
-    input["assets"]
-        .as_object_mut()
-        .expect("assets object")
-        .remove("head_gaze_policy_source_path");
+    let review = write_source(
+        root,
+        "head-gaze-physical-review.json",
+        br#"{"schema_version":1,"evidence":"exact attended head-gaze review fixture"}"#,
+    );
+    input["assets"]["head_gaze_review_evidence_source_path"] = json!(review);
 
     let plant = reviewed_production_plant();
     let plant_path = write_source(
@@ -1073,21 +1075,21 @@ fn render_input_versions_are_bundle_specific_and_fail_closed() {
         "production_controller_profile_path": null
     });
     let error = render_bundle(&write_input(&root, &production), RenderMode::DryRun)
-        .expect_err("production V1 reaches the independent profile gate");
+        .expect_err("production V2 reaches the independent profile gate");
     assert!(
         error
             .to_string()
             .contains("fail-closed without a separate admitted"),
-        "production render-input schema V1 remains admitted"
+        "production render-input schema V2 is admitted"
     );
 
-    production["schema_version"] = json!(2);
+    production["schema_version"] = json!(1);
     let error = render_bundle(&write_input(&root, &production), RenderMode::DryRun)
-        .expect_err("production must not silently adopt qualification schema V2");
+        .expect_err("retired production V1 must not be reinterpreted as V2");
     assert!(
         error
             .to_string()
-            .contains("unsupported production render-input schema 2; expected 1")
+            .contains("unsupported production render-input schema 1; expected 2")
     );
 }
 
@@ -1393,14 +1395,13 @@ fn production_without_separate_profile_is_fail_closed() {
 fn production_without_exact_face_assets_is_fail_closed() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
+    prepare_production_assets(&root, &mut input);
     let assets = input["assets"].as_object_mut().expect("fixture assets");
     assets.remove("face_perception");
-    assets.remove("head_gaze_policy_source_path");
     input["bundle"] = json!({
         "kind": "production",
         "production_controller_profile_path": null
     });
-    input["schema_version"] = json!(1);
     let input_path = write_input(&root, &input);
     let error =
         render_bundle(&input_path, RenderMode::DryRun).expect_err("face assets are mandatory");
@@ -1412,27 +1413,29 @@ fn production_without_exact_face_assets_is_fail_closed() {
 }
 
 #[test]
-fn production_v1_rejects_the_qualification_only_head_gaze_input() {
+fn production_v2_requires_a_physical_head_gaze_policy_input() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
-    let head_gaze_policy = input["assets"]["head_gaze_policy_source_path"].clone();
     prepare_production_assets(&root, &mut input);
-    input["assets"]["head_gaze_policy_source_path"] = head_gaze_policy;
+    input["assets"]
+        .as_object_mut()
+        .expect("assets")
+        .remove("head_gaze_policy_source_path");
     input["bundle"] = json!({
         "kind": "production",
         "production_controller_profile_path": null
     });
     let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
-        .expect_err("production must reject the qualification-only policy input");
+        .expect_err("production must require its physical policy input");
     assert!(
         error
             .to_string()
-            .contains("qualification-only head-gaze policy input is forbidden")
+            .contains("requires an exact physical head-gaze policy source")
     );
 }
 
 #[test]
-fn production_v1_rejects_explicit_null_head_gaze_input() {
+fn production_v2_rejects_explicit_null_head_gaze_input() {
     let (temporary, mut input) = source_fixture();
     let root = canonical_root(&temporary);
     prepare_production_assets(&root, &mut input);
@@ -1443,11 +1446,74 @@ fn production_v1_rejects_explicit_null_head_gaze_input() {
     });
 
     let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
-        .expect_err("production must reject presence even when the field is null");
+        .expect_err("production must reject null physical policy");
     assert!(
         error
             .to_string()
-            .contains("qualification-only head-gaze policy input is forbidden")
+            .contains("requires an exact physical head-gaze policy source")
+    );
+}
+
+#[test]
+fn production_v2_requires_physical_head_gaze_review_evidence() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    prepare_production_assets(&root, &mut input);
+    input["assets"]
+        .as_object_mut()
+        .expect("assets")
+        .remove("head_gaze_review_evidence_source_path");
+    input["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": null
+    });
+
+    let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
+        .expect_err("production must require exact physical review evidence");
+    assert!(
+        error
+            .to_string()
+            .contains("requires exact attended head-gaze review evidence")
+    );
+}
+
+#[test]
+fn production_v2_rejects_unmaterialized_head_gaze_review_evidence() {
+    let (temporary, mut input) = source_fixture();
+    let root = canonical_root(&temporary);
+    prepare_production_assets(&root, &mut input);
+    input["discovery"]["stm32"]["firmware_build_id"] = json!(196609);
+    input["discovery"]["stm32"]["hardware_profile_fingerprint_hex"] =
+        json!("4b494b4f2d3450574d2d50524f443121");
+    input["discovery"]["stm32"]["capabilities_bits"] = json!(255);
+    let profile_path = root.join("production-profile.json");
+    fs::write(
+        &profile_path,
+        serde_json::to_vec_pretty(&valid_production_profile()).unwrap(),
+    )
+    .unwrap();
+    input["bundle"] = json!({
+        "kind": "production",
+        "production_controller_profile_path": profile_path
+    });
+    let review_path = PathBuf::from(
+        input["assets"]["head_gaze_review_evidence_source_path"]
+            .as_str()
+            .expect("review evidence source path"),
+    );
+    fs::write(
+        review_path,
+        br#"{"schema_version":1,"review_id":"${UNRESOLVED_REVIEW_ID}"}"#,
+    )
+    .expect("replace fixture with an unmaterialized review template");
+
+    let error = render_bundle(&write_input(&root, &input), RenderMode::DryRun)
+        .expect_err("production must reject unresolved attended review evidence");
+    assert!(
+        error
+            .to_string()
+            .contains("unresolved ${...} token remains in head gaze physical review evidence"),
+        "unexpected error: {error}"
     );
 }
 
@@ -1505,10 +1571,10 @@ fn production_derives_navigation_digest_and_loopback_port() {
     )
     .expect("production render");
     assert_eq!(plan.bundle_kind, "production");
-    assert!(destination.join("evidence/render-input-v1.json").exists());
+    assert!(destination.join("evidence/render-input-v2.json").exists());
     assert!(!destination.join("evidence/render-input-v4.json").exists());
     let production_input_permissions =
-        fs::metadata(destination.join("evidence/render-input-v1.json"))
+        fs::metadata(destination.join("evidence/render-input-v2.json"))
             .expect("production render-input evidence metadata")
             .permissions();
     assert!(production_input_permissions.readonly());
@@ -1519,7 +1585,7 @@ fn production_derives_navigation_digest_and_loopback_port() {
     );
     assert_eq!(
         plan.files.last().unwrap().relative_path,
-        "nano-agent-launch-v3.json"
+        "nano-agent-launch-v4.json"
     );
     let navigation = fs::read(destination.join("navigation-shadow-v2.json")).unwrap();
     let actuation: Value = serde_json::from_slice(
@@ -1556,9 +1622,9 @@ fn production_derives_navigation_digest_and_loopback_port() {
         "udp://127.0.0.1:8081"
     );
     let launch_bytes =
-        fs::read(destination.join("nano-agent-launch-v3.json")).expect("production launch");
+        fs::read(destination.join("nano-agent-launch-v4.json")).expect("production launch");
     let typed_launch =
-        NanoAgentLaunchV3::parse_json(&launch_bytes).expect("typed production launch");
+        NanoAgentLaunchV4::parse_json(&launch_bytes).expect("typed production launch");
     let limits = typed_launch.storage().navigation_dataset_limits();
     assert_eq!(limits.maximum_bytes(), 8_589_934_592);
     assert_eq!(limits.maximum_files(), 65_536);
@@ -1568,6 +1634,16 @@ fn production_derives_navigation_digest_and_loopback_port() {
     let launch: Value = serde_json::from_slice(&launch_bytes).expect("production launch JSON");
     assert_eq!(launch["oak"]["maximum_usb_speed"], "SUPER");
     assert_eq!(launch["oak"]["minimum_usb_speed"], "SUPER");
+    assert_eq!(
+        launch["physical_head_gaze"]["policy_asset"]["sha256_hex"],
+        sha256_hex(&fs::read(destination.join("head-gaze-policy-v1.json")).unwrap())
+    );
+    assert_eq!(
+        launch["physical_head_gaze"]["physical_review_evidence_asset"]["sha256_hex"],
+        sha256_hex(
+            &fs::read(destination.join("evidence/head-gaze-physical-review-v1.json")).unwrap()
+        )
+    );
     assert_eq!(
         launch["calibration_artifact"]["asset"]["sha256_hex"],
         sha256_hex(
@@ -2159,6 +2235,82 @@ fn symlinked_source_is_rejected() {
     let input_path = write_input(&root, &input);
     let error = render_bundle(&input_path, RenderMode::DryRun).expect_err("symlink");
     assert!(error.to_string().contains("symlink component rejected"));
+}
+
+#[test]
+fn production_v2_templates_expose_one_review_bound_physical_head_contract() {
+    let render_input = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/nano-agent-template/bundle-render-input-v2.json.template"
+    ));
+    let input_shape = template_shape_with_unquoted_tokens_replaced_by_null(render_input);
+    assert_eq!(input_shape["schema_version"], 2);
+    assert_eq!(
+        input_shape["assets"]["head_gaze_policy_source_path"],
+        "${HEAD_GAZE_POLICY_SOURCE_ABSOLUTE_PATH}"
+    );
+    assert_eq!(
+        input_shape["assets"]["head_gaze_review_evidence_source_path"],
+        "${HEAD_GAZE_REVIEW_EVIDENCE_SOURCE_ABSOLUTE_PATH}"
+    );
+
+    let launch = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/nano-agent-template/nano-agent-launch-v4.json.template"
+    ));
+    let launch_shape = template_shape_with_unquoted_tokens_replaced_by_null(launch);
+    assert_eq!(launch_shape["schema_version"], 4);
+    assert_eq!(
+        launch_shape["physical_head_gaze"]["policy_asset"]["relative_path"],
+        "head-gaze-policy-v1.json"
+    );
+    assert_eq!(
+        launch_shape["physical_head_gaze"]["physical_review_evidence_asset"]["relative_path"],
+        "evidence/head-gaze-physical-review-v1.json"
+    );
+
+    let policy = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/nano-agent-template/head-gaze-policy-v1.json.template"
+    ));
+    let policy_shape = template_shape_with_unquoted_tokens_replaced_by_null(policy);
+    assert_eq!(
+        policy_shape["lifecycle"]["kind"],
+        "operator_claimed_physical_review"
+    );
+    assert_eq!(
+        policy_shape["mapping_declaration"]["camera_to_neutral_head"]["head_origin_in_oak_camera_m"]
+            ["y_down_m"],
+        -0.25
+    );
+    assert!(
+        policy_shape["mapping_declaration"]
+            .get("character_positive_full_scale_encoder_offsets_ticks")
+            .is_some()
+    );
+    assert!(policy_shape.get("compliant_hold_declaration").is_some());
+
+    let review = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/nano-agent-template/head-gaze-physical-review-v1.json.template"
+    ));
+    let review_shape = template_shape_with_unquoted_tokens_replaced_by_null(review);
+    assert_eq!(
+        review_shape["evidence_scope"],
+        "attended_physical_head_gaze_and_compliance_review_v1"
+    );
+    assert_eq!(
+        review_shape["evidence_id"],
+        "${HEAD_GAZE_PHYSICAL_REVIEW_EVIDENCE_ID}"
+    );
+    assert_eq!(
+        review_shape["assembly"]["head_origin_in_oak_camera_m_x_right_y_down_z_forward"],
+        json!([0.0, -0.25, -0.20])
+    );
+    assert_eq!(
+        review_shape["attended_observations"]["wheels_removed"],
+        true
+    );
 }
 
 #[test]

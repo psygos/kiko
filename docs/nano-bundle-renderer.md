@@ -20,16 +20,17 @@ anything.
 
 ## Boundary contract
 
-The schema version is selected with the bundle kind. Production remains
-render-input schema V1 and its illustrative source template is
-`configs/nano-agent-template/bundle-render-input-v1.json.template`.
+The schema version is selected with the bundle kind. Production requires
+render-input schema V2 and its illustrative source template is
+`configs/nano-agent-template/bundle-render-input-v2.json.template`.
 Wheels-off qualification requires render-input schema V4. Its field layout
 is the exact
 `configs/nano-wheels-off-qualification-template/bundle-render-input-v4.json.template`;
 it fixes the qualification bundle kind, cold-start selection, cascade
 destinations, disabled-by-absence optional head-gaze input, and reviewed
 SONAMEs while requiring canonical absolute source paths. Production keeps its
-complete two-cascade object and forbids the qualification-only head-gaze field.
+complete two-cascade object and requires separate canonical source paths for a
+physically reviewed head-gaze policy and its attended review evidence.
 Unresolved `${...}` fields make either prepared file non-deployable. The
 strict renderer rejects cross-version and bundle/asset mismatches.
 
@@ -39,7 +40,8 @@ DepthAI libusb role, so it is retired rather than silently reinterpreted.
 V3 did not bind face cascades or a head-gaze policy. Qualification
 render-input V4 emits `nano-wheels-off-qualification-launch-v4.json`.
 Production render-input schema V1 and launch schema V3 retain their published
-versions and document shapes.
+compatibility parsers and document shapes, but the renderer no longer emits or
+production bootstrap selects them. Current production is input V2 / launch V4.
 
 Current rendered launches request and require DepthAI `SUPER`, the qualified
 5 Gbit/s USB-3 transport. The exact maximum and minimum are parsed into the
@@ -88,15 +90,20 @@ resolves a by-id path to a transient `ttyACM*` name.
 
 The qualification executable, navigation-shadow document, canonical
 calibration artifact, plant artifact, models, frontal/profile face cascades,
-optional qualification head-gaze policy, and native libraries are exact leaf
-sources. The renderer retains their exact bytes. Both bundle variants require
+head-gaze inputs, and native libraries are exact leaf sources. The renderer
+retains their exact bytes. Both bundle variants require
 the two cascade sources as one typed set. Qualification represents disabled
 head gaze by omitting the source field, producing no leaf, binding, or evidence
 claim. When the field is supplied, the renderer caps the JSON at 256 KiB,
 fixes its retained path to `head-gaze-policy-v1.json`, and rejects path or
-content aliasing; bootstrap separately requires `proposal_only` before opening
-hardware. Each cascade is independently capped at 4 MiB and the two exact
-contents must differ.
+content aliasing; qualification bootstrap separately requires `proposal_only`
+before opening hardware. Production requires both the policy and distinct
+attended-review bytes. Its qualifier and bootstrap parse the policy once and
+require its lifecycle evidence digest to equal the retained review bytes
+before physical gaze is admitted. Each cascade is independently capped at
+4 MiB and the two exact contents must differ.
+The review document remains an operator-claimed evidence record, not a
+cryptographic attestation or hardware test performed by the renderer.
 The calibration input key is deliberately
 `assets.calibration`, not `camera_calibration`: the one artifact owns the
 exact OAK MXID, rectified stereo intrinsics/dimensions/baseline, raw IMU
@@ -132,7 +139,7 @@ The renderer constructs and writes:
 2. the native-runtime manifest, inventory, controller contract, motion
    contract when applicable, candidate policy when applicable, and agent
    policy;
-3. the exact render-input evidence copy—V4 for qualification and V1 for
+3. the exact render-input evidence copy—V4 for qualification and V2 for
    production—and the production-profile evidence copy when applicable;
 4. `evidence/render-evidence-v1.json`; and
 5. the bundle launch document, always last.
@@ -168,8 +175,11 @@ match the discovery record at every controller identity field.
 If the profile path is absent, production rendering fails before loading any
 deployment leaf. The renderer does not silently manufacture a map-only
 actuation contract or downgrade production to the raw candidate profile.
-Production rendering likewise fails if either exact face-cascade source is
-absent; both are copied, hashed, and bound into launch V3.
+Production rendering likewise fails if either exact face-cascade source, the
+physical head-gaze policy, or its attended review evidence is absent. All four
+are copied, hashed, and bound into launch V4. Rendering does not claim the
+attended observations are true; offline qualification and runtime admission
+cross-bind the exact review digest and reject proposal-only policy.
 It also fails unless all three directly linked OpenCV shared-library sources
 are supplied under their pinned SONAMEs. The renderer copies the regular
 source bytes into `lib/<SONAME>` and hashes them; do not supply or install
@@ -277,7 +287,9 @@ contract:
 - `device-inventory-v1.json.template`;
 - `navigation-actuation-v2.json.template`;
 - `native-runtime-v1.json.template`; and
-- `nano-agent-launch-v3.json.template`.
+- `head-gaze-policy-v1.json.template`;
+- `head-gaze-physical-review-v1.json.template`; and
+- `nano-agent-launch-v4.json.template`.
 
 These files document the on-disk shapes and remain intentionally invalid
 until expanded. Do not expand them with shell substitution or manually

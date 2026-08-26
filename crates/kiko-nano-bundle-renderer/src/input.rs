@@ -9,7 +9,7 @@ use kiko_expression_runtime::{
 use robot_protocol::v2::ControllerCapabilities;
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub const PRODUCTION_RENDER_INPUT_SCHEMA_VERSION: u32 = 1;
+pub const PRODUCTION_RENDER_INPUT_SCHEMA_VERSION: u32 = 2;
 pub const WHEELS_OFF_QUALIFICATION_RENDER_INPUT_SCHEMA_VERSION: u32 = 4;
 pub const PRODUCTION_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const PRODUCTION_ADMISSION_SCOPE: &str =
@@ -145,6 +145,8 @@ struct AssetSetDto {
     face_perception: Option<FacePerceptionAssetsDto>,
     #[serde(default)]
     head_gaze_policy_source_path: JsonFieldPresence<PathBuf>,
+    #[serde(default)]
+    head_gaze_review_evidence_source_path: JsonFieldPresence<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -411,6 +413,8 @@ pub(crate) enum BundleSelection {
     Production {
         production_controller_profile_path: Option<AbsoluteSourcePath>,
         face_perception: FacePerceptionAssets,
+        head_gaze_policy_source_path: AbsoluteSourcePath,
+        head_gaze_review_evidence_source_path: AbsoluteSourcePath,
     },
 }
 
@@ -425,14 +429,14 @@ impl BundleSelection {
     pub(crate) const fn launch_relative_path(&self) -> &'static str {
         match self {
             Self::WheelsOffQualification { .. } => "nano-wheels-off-qualification-launch-v4.json",
-            Self::Production { .. } => "nano-agent-launch-v3.json",
+            Self::Production { .. } => "nano-agent-launch-v4.json",
         }
     }
 
     pub(crate) const fn render_input_evidence_path(&self) -> &'static str {
         match self {
             Self::WheelsOffQualification { .. } => "evidence/render-input-v4.json",
-            Self::Production { .. } => "evidence/render-input-v1.json",
+            Self::Production { .. } => "evidence/render-input-v2.json",
         }
     }
 
@@ -453,7 +457,22 @@ impl BundleSelection {
                 head_gaze_policy_source_path,
                 ..
             } => head_gaze_policy_source_path.as_ref(),
-            Self::Production { .. } => None,
+            Self::Production {
+                head_gaze_policy_source_path,
+                ..
+            } => Some(head_gaze_policy_source_path),
+        }
+    }
+
+    pub(crate) const fn head_gaze_review_evidence_source_path(
+        &self,
+    ) -> Option<&AbsoluteSourcePath> {
+        match self {
+            Self::WheelsOffQualification { .. } => None,
+            Self::Production {
+                head_gaze_review_evidence_source_path,
+                ..
+            } => Some(head_gaze_review_evidence_source_path),
         }
     }
 }
@@ -669,11 +688,22 @@ impl RenderInput {
         }
 
         let robot_id = parse_text("robot_id", dto.robot_id)?;
-        let (assets, face_perception, head_gaze_policy_source_path) = AssetSet::parse(dto.assets)?;
+        let ParsedAssetSet {
+            assets,
+            face_perception,
+            head_gaze_policy_source_path,
+            head_gaze_review_evidence_source_path,
+        } = AssetSet::parse(dto.assets)?;
         let bundle = match dto.bundle {
             BundleSelectionDto::WheelsOffQualification {
                 qualification_executable_path,
             } => {
+                if !matches!(
+                    head_gaze_review_evidence_source_path,
+                    JsonFieldPresence::Absent
+                ) {
+                    return Err(InputError::QualificationHeadGazeReviewEvidenceForbidden);
+                }
                 let head_gaze_policy_source_path = match head_gaze_policy_source_path {
                     JsonFieldPresence::Absent => None,
                     JsonFieldPresence::Null => {
@@ -698,9 +728,16 @@ impl RenderInput {
             BundleSelectionDto::Production {
                 production_controller_profile_path,
             } => {
-                if !matches!(head_gaze_policy_source_path, JsonFieldPresence::Absent) {
-                    return Err(InputError::QualificationHeadGazePolicyForbiddenInProduction);
-                }
+                let head_gaze_policy_source_path = parse_required_production_asset_path(
+                    "assets.head_gaze_policy_source_path",
+                    head_gaze_policy_source_path,
+                    InputError::ProductionHeadGazePolicyRequired,
+                )?;
+                let head_gaze_review_evidence_source_path = parse_required_production_asset_path(
+                    "assets.head_gaze_review_evidence_source_path",
+                    head_gaze_review_evidence_source_path,
+                    InputError::ProductionHeadGazeReviewEvidenceRequired,
+                )?;
                 BundleSelection::Production {
                     production_controller_profile_path: production_controller_profile_path
                         .map(|path| {
@@ -709,6 +746,8 @@ impl RenderInput {
                         .transpose()?,
                     face_perception: face_perception
                         .ok_or(InputError::ProductionFacePerceptionAssetsRequired)?,
+                    head_gaze_policy_source_path,
+                    head_gaze_review_evidence_source_path,
                 }
             }
         };
@@ -860,17 +899,15 @@ impl Stm32Discovery {
     }
 }
 
+struct ParsedAssetSet {
+    assets: AssetSet,
+    face_perception: Option<FacePerceptionAssets>,
+    head_gaze_policy_source_path: JsonFieldPresence<PathBuf>,
+    head_gaze_review_evidence_source_path: JsonFieldPresence<PathBuf>,
+}
+
 impl AssetSet {
-    fn parse(
-        dto: AssetSetDto,
-    ) -> Result<
-        (
-            Self,
-            Option<FacePerceptionAssets>,
-            JsonFieldPresence<PathBuf>,
-        ),
-        InputError,
-    > {
+    fn parse(dto: AssetSetDto) -> Result<ParsedAssetSet, InputError> {
         let face_perception = dto
             .face_perception
             .map(|face| {
@@ -886,8 +923,8 @@ impl AssetSet {
                 })
             })
             .transpose()?;
-        Ok((
-            Self {
+        Ok(ParsedAssetSet {
+            assets: Self {
                 calibration: parse_artifact_source("assets.calibration", dto.calibration)?,
                 plant: parse_artifact_source("assets.plant", dto.plant)?,
                 navigation_shadow_source_path: parse_absolute_source_path(
@@ -901,8 +938,20 @@ impl AssetSet {
                 lightglue_model: parse_file_source("assets.lightglue_model", dto.lightglue_model)?,
             },
             face_perception,
-            dto.head_gaze_policy_source_path,
-        ))
+            head_gaze_policy_source_path: dto.head_gaze_policy_source_path,
+            head_gaze_review_evidence_source_path: dto.head_gaze_review_evidence_source_path,
+        })
+    }
+}
+
+fn parse_required_production_asset_path(
+    field: &'static str,
+    presence: JsonFieldPresence<PathBuf>,
+    missing: InputError,
+) -> Result<AbsoluteSourcePath, InputError> {
+    match presence {
+        JsonFieldPresence::Value(path) => parse_absolute_source_path(field, path),
+        JsonFieldPresence::Absent | JsonFieldPresence::Null => Err(missing),
     }
 }
 
@@ -2073,7 +2122,9 @@ pub enum InputError {
     ProductionFacePerceptionAssetsRequired,
     QualificationFacePerceptionAssetsRequired,
     QualificationHeadGazePolicyNullForbidden,
-    QualificationHeadGazePolicyForbiddenInProduction,
+    QualificationHeadGazeReviewEvidenceForbidden,
+    ProductionHeadGazePolicyRequired,
+    ProductionHeadGazeReviewEvidenceRequired,
     QualificationExecutablePathRequired,
 }
 
@@ -2213,8 +2264,14 @@ impl fmt::Display for InputError {
             Self::QualificationHeadGazePolicyNullForbidden => formatter.write_str(
                 "wheels-off qualification head-gaze policy must be omitted to disable it; explicit null is forbidden",
             ),
-            Self::QualificationHeadGazePolicyForbiddenInProduction => formatter.write_str(
-                "qualification-only head-gaze policy input is forbidden in production render-input V1",
+            Self::QualificationHeadGazeReviewEvidenceForbidden => formatter.write_str(
+                "wheels-off qualification cannot carry physical head-gaze review evidence",
+            ),
+            Self::ProductionHeadGazePolicyRequired => formatter.write_str(
+                "production render-input V2 requires an exact physical head-gaze policy source",
+            ),
+            Self::ProductionHeadGazeReviewEvidenceRequired => formatter.write_str(
+                "production render-input V2 requires exact attended head-gaze review evidence",
             ),
             Self::QualificationExecutablePathRequired => formatter.write_str(
                 "wheels-off qualification requires bundle.qualification_executable_path",
