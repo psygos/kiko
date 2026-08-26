@@ -144,6 +144,14 @@ their deliberately narrow claim boundary are recorded in
 `docs/nano-head-neutral-policy-2026-07-29.md`. They do not replace the
 attended wheels-off return-and-hold test.
 
+Production physical-expression admission additionally requires the typed
+dynamic serial-pitch block. The checked-in source retains Fable's behavior
+constants: bow recruitment approaches `600` permille of combined bow/curl
+pitch demand and is complete at `140` total demand ticks. The renderer does
+not treat those constants, or this illustrative encoder mapping, as an
+attended physical review; the separately retained policy/review pair remains
+mandatory.
+
 Do not expand these templates with shell substitution. Feed exact discovery
 and reviewed source paths to `kiko-nano-bundle-renderer`; it emits the agent
 policy, production controller, inventory, navigation-actuation,

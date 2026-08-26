@@ -150,7 +150,7 @@ remaining work; a passing host test is never presented as physical evidence.
 - `e561c97`: the current face proposal now retains its desired neutral-head
   angles, while the sole servo actor returns the exact target it actually
   committed. The reviewed sparse mapping reconstructs commanded optical gaze
-  through a scale-stable bow/curl least-squares inverse; desired minus
+  through a scale-stable signed-total-demand inverse; desired minus
   commanded gaze replaces only the original face contribution before KEP2
   application. Character saccades, act offsets, lids, colour, blink, and
   freshness remain intact. Bounded tracker coasting retains the last typed
@@ -160,17 +160,30 @@ remaining work; a passing host test is never presented as physical evidence.
   typed terminal faults. Intent: close Fable's eye/head feedback loop in the
   canonical owner without reconstructing radians from normalized image
   coordinates or weakening head authority.
+- `07d64e8`: Fable's dynamic serial-pitch recruitment is now a typed optional
+  mapping policy and a production requirement. Bow begins at the
+  coefficient-derived baseline share, recruits monotonically toward `600`
+  permille, and reaches it at `140` combined absolute pitch-demand ticks;
+  curl receives the exact complementary share. The inverse sums signed joint
+  demand rather than treating the two shares as independent measurements, so
+  redistribution preserves gaze within the two-joint one-tick quantization
+  bound. Zero, closed-unit, non-recruiting, and numerically collapsed policies
+  fail during parsing, while recruited envelope overflow rejects rather than
+  clamps. Legacy documents that omit the block remain linear but cannot cross
+  production physical admission. Intent: make large pitch movements recruit
+  the base joint without changing total gaze demand or corrupting residual eye
+  coordination.
 
-Host evidence at this checkpoint is 101/101 `kiko-expression-runtime` unit
+Host evidence at this checkpoint is 105/105 `kiko-expression-runtime` unit
 tests plus its compile-fail doctest, warning-free expression, head, and Nano
 compile-only Clippy, 177 `kiko-head-runtime` library tests plus 11 binary
-tests, 1,454/1,454 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
+tests, 1,455/1,455 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
 binary tests, 7/7 offline-qualifier tests, 36/36 immutable-renderer tests,
 all 6 deployment-gate tests, the 13 focused base-commissioning tests, and
 82/82 Python behavior tests. The complete Nano-agent library suite was run
 outside the filesystem sandbox because 23 otherwise-green local socket and
 loopback-listener tests are denied binding by that sandbox; the unrestricted
-run passed all 1,454 tests.
+run passed all 1,455 tests.
 The Linux-aarch64 standard-library abstract notify-socket API was compiled
 directly. A complete Linux-aarch64 dependency cross-check remains unclaimed
 because this Mac does not have `aarch64-linux-gnu-gcc`; native OAK linking,
@@ -181,7 +194,7 @@ claimed by these host results.
 
 1. Commanded-head feedback and residual-driven eyes are complete. Add metric
    proximity only when depth has valid face-association evidence, then port
-   dynamic bow/curl recruitment, turn-dip weight shift, and the remaining
+   turn-dip weight shift and the remaining
    interoceptive acts. Thermal/body state, base-motion exclusion, image-plane
    face bearing, apparent-width proximity cue, continuous pet-state eye
    choreography, and the formal bow greeting are complete; apparent width is

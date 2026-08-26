@@ -89,6 +89,11 @@ fixes only these currently declared facts:
   supplies the exact coordinate conversion: pitch-down maps to bow/curl
   `[-93,+465]` ticks/radian, yaw-right maps to yaw `-1050` ticks/radian,
   and character-positive full scale maps to `[+110,-180,+480,+160]` ticks;
+- the Fable behavior specification supplies dynamic serial-pitch recruitment:
+  bow grows from the coefficient-derived baseline share toward `600` permille
+  and reaches that share at `140` combined absolute pitch-demand ticks. These
+  are behavior constants, not a claim that the illustrative mapping or
+  resulting motion has been physically requalified;
 - the compliant-hold declaration is cross-bound to the currently configured
   startup torque limits `[600,400,400,400]` permille. This records what the
   runtime would install; it does **not** claim those limits are the minimum
