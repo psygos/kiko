@@ -25,10 +25,11 @@ use kiko_expression_core::{
 };
 use kiko_expression_runtime::{
     AdaptError, AutonomicCharacterEngine, CameraForwardDepthMeters, CameraToHeadGazeExtrinsics,
-    EyeRenderStyle, FaceTargetState, FaceTrackingUpdate, HeadGazeProjectionError, HeadRelativeGaze,
-    MonotonicLatestAdmission, MonotonicLatestGap, OakCameraTargetPoint, OakCameraTargetRay,
-    PreparedCharacterFrame, PreparedEyeIntent, RayHeadGazeProjectionError, SceneAnalysis,
-    SceneMotionConfig, SceneMotionError, SceneMotionExtractor, adapt_reaction_output,
+    CharacterPetEpisode, CharacterPetReaction, EyeRenderStyle, FaceTargetState, FaceTrackingUpdate,
+    HeadGazeProjectionError, HeadRelativeGaze, MonotonicLatestAdmission, MonotonicLatestGap,
+    OakCameraTargetPoint, OakCameraTargetRay, PreparedCharacterFrame, PreparedEyeIntent,
+    RayHeadGazeProjectionError, SceneAnalysis, SceneMotionConfig, SceneMotionError,
+    SceneMotionExtractor, adapt_reaction_output,
 };
 use kiko_eye_runtime::{ClockError, MonotonicClock};
 use oak_sys::{ImageFrame, StreamId};
@@ -332,6 +333,19 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         self.clock.clone()
     }
 
+    /// Feed one completed, already-typed compliant-contact episode back into
+    /// the character director. It preempts the next scheduled act but does not
+    /// mutate or replay the RGB frame that has already been rendered.
+    pub fn note_pet_episode(
+        &mut self,
+        completed_at: MonotonicTimestamp,
+        episode: CharacterPetEpisode,
+    ) -> Option<CharacterPetReaction> {
+        self.character
+            .as_mut()
+            .map(|character| character.note_pet_episode(completed_at, episode))
+    }
+
     /// Project one already-parsed positive-depth OAK point into neutral-head
     /// yaw-right/pitch-down radians. No head intention or actuator command is
     /// constructed by this seam.
@@ -627,8 +641,8 @@ mod tests {
 
     use kiko_expression_core::{MonotonicTimestamp, PositiveUnitAmount, UnitAmount};
     use kiko_expression_runtime::{
-        DetectorResultSequence, FaceDetection, FaceDetectionBatch, FaceDetectorSource, FaceTracker,
-        FaceTrackingConfig, MotionThresholds, SamplingGeometry,
+        CharacterAct, DetectorResultSequence, FaceDetection, FaceDetectionBatch,
+        FaceDetectorSource, FaceTracker, FaceTrackingConfig, MotionThresholds, SamplingGeometry,
     };
     use kiko_eye_protocol::Expression;
 
@@ -870,6 +884,30 @@ mod tests {
         }
 
         assert_eq!(moved, [true; 4]);
+    }
+
+    #[test]
+    fn completed_pet_episode_preempts_the_next_coherent_character_frame() {
+        let clock = TestClock::new(10);
+        let mut decorated = bridge(clock.clone());
+        decorated.character = Some(AutonomicCharacterEngine::new(stream_epoch().get()));
+        decorated
+            .process_borrowed(rgb(1, 1, &[0; 12]))
+            .expect("prime character frame");
+        let boop =
+            CharacterPetEpisode::try_new(std::time::Duration::from_millis(600), 0, 0, false, true)
+                .expect("valid tap episode");
+        assert_eq!(
+            decorated.note_pet_episode(MonotonicTimestamp::from_nanos_since_epoch(20), boop),
+            Some(CharacterPetReaction::Boop)
+        );
+
+        clock.set(30);
+        let reaction = decorated
+            .process_borrowed(rgb(2, 2, &[0; 12]))
+            .expect("next coherent character frame")
+            .into_character();
+        assert_eq!(reaction.act(), Some(CharacterAct::StartleBoop));
     }
 
     #[test]

@@ -13,6 +13,8 @@
 //! convert it into a physical target.
 
 use core::fmt;
+use core::num::NonZeroU64;
+use core::time::Duration;
 use kiko_expression_core::MonotonicTimestamp;
 use kiko_eye_protocol::{
     Expression, EyeFlags, EyeIntent, NORMALIZED_SCALE, SignedUnit, UnitAmount,
@@ -315,10 +317,15 @@ pub enum CharacterAct {
     HeadBob,
     Sneeze,
     Dance,
+    Sigh,
+    BowBob,
+    PlayBow,
+    StartleBoop,
+    AffectionMelt,
 }
 
 impl CharacterAct {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 24] = [
         Self::CuriousTilt,
         Self::DoubleTake,
         Self::ExcitedWiggle,
@@ -338,6 +345,11 @@ impl CharacterAct {
         Self::HeadBob,
         Self::Sneeze,
         Self::Dance,
+        Self::Sigh,
+        Self::BowBob,
+        Self::PlayBow,
+        Self::StartleBoop,
+        Self::AffectionMelt,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -361,6 +373,11 @@ impl CharacterAct {
             Self::HeadBob => "head_bob",
             Self::Sneeze => "sneeze",
             Self::Dance => "dance",
+            Self::Sigh => "sigh",
+            Self::BowBob => "bow_bob",
+            Self::PlayBow => "play_bow",
+            Self::StartleBoop => "startle_boop",
+            Self::AffectionMelt => "affection_melt",
         }
     }
 
@@ -385,6 +402,11 @@ impl CharacterAct {
             Self::HeadBob => 16,
             Self::Sneeze => 17,
             Self::Dance => 18,
+            Self::Sigh => 19,
+            Self::BowBob => 20,
+            Self::PlayBow => 21,
+            Self::StartleBoop => 22,
+            Self::AffectionMelt => 23,
         }
     }
 
@@ -393,7 +415,12 @@ impl CharacterAct {
             Self::LookAround | Self::PerkUp | Self::Daydream | Self::Stretch => {
                 matches!(mode, CharacterMode::Idle)
             }
-            Self::Sparkle | Self::BlinkFlourish | Self::SweepScan | Self::Sneeze | Self::Dance => {
+            Self::Sparkle
+            | Self::BlinkFlourish
+            | Self::SweepScan
+            | Self::Sneeze
+            | Self::Dance
+            | Self::Sigh => {
                 matches!(mode, CharacterMode::Idle | CharacterMode::Tracking)
             }
             Self::CuriousTilt
@@ -405,7 +432,10 @@ impl CharacterAct {
             | Self::HappySquint
             | Self::PuppyEyes
             | Self::ShyDip
-            | Self::HeadBob => matches!(mode, CharacterMode::Tracking),
+            | Self::HeadBob
+            | Self::BowBob
+            | Self::PlayBow => matches!(mode, CharacterMode::Tracking),
+            Self::StartleBoop | Self::AffectionMelt => false,
         }
     }
 
@@ -430,6 +460,10 @@ impl CharacterAct {
             Self::HeadBob => 13,
             Self::Sneeze => 45,
             Self::Dance => 30,
+            Self::Sigh => 22,
+            Self::BowBob => 9,
+            Self::PlayBow => 20,
+            Self::StartleBoop | Self::AffectionMelt => 0,
         }) * NS_PER_SECOND
     }
 
@@ -454,9 +488,113 @@ impl CharacterAct {
             Self::HeadBob => (1_800, 2_800),
             Self::Sneeze => (2_400, 3_200),
             Self::Dance => (4_200, 6_800),
+            Self::Sigh => (2_600, 3_400),
+            Self::BowBob => (1_000, 1_400),
+            Self::PlayBow => (2_400, 3_200),
+            Self::StartleBoop => (1_600, 2_100),
+            Self::AffectionMelt => (2_800, 3_600),
         };
         (milliseconds.0 * NS_PER_MS, milliseconds.1 * NS_PER_MS)
     }
+}
+
+/// Exact, transport-free facts from one completed compliant contact episode.
+///
+/// The character layer receives no raw servo registers and makes no claim
+/// about why contact occurred. It classifies only the head controller's
+/// completed episode evidence. A zero-duration episode or a non-zero delta
+/// sum without samples is rejected at this boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CharacterPetEpisode {
+    duration_ns: NonZeroU64,
+    accumulated_max_delta_ticks: u64,
+    delta_samples: u64,
+    reached_comfy: bool,
+    tap: bool,
+}
+
+impl CharacterPetEpisode {
+    pub fn try_new(
+        duration: Duration,
+        accumulated_max_delta_ticks: u64,
+        delta_samples: u64,
+        reached_comfy: bool,
+        tap: bool,
+    ) -> Result<Self, CharacterPetEpisodeError> {
+        let duration_ns = duration.as_nanos();
+        let duration_ns = u64::try_from(duration_ns)
+            .ok()
+            .and_then(NonZeroU64::new)
+            .ok_or(CharacterPetEpisodeError::InvalidDuration { duration_ns })?;
+        if delta_samples == 0 && accumulated_max_delta_ticks != 0 {
+            return Err(CharacterPetEpisodeError::DeltaWithoutSamples {
+                accumulated_max_delta_ticks,
+            });
+        }
+        Ok(Self {
+            duration_ns,
+            accumulated_max_delta_ticks,
+            delta_samples,
+            reached_comfy,
+            tap,
+        })
+    }
+
+    pub const fn duration_ns(self) -> NonZeroU64 {
+        self.duration_ns
+    }
+
+    pub const fn accumulated_max_delta_ticks(self) -> u64 {
+        self.accumulated_max_delta_ticks
+    }
+
+    pub const fn delta_samples(self) -> u64 {
+        self.delta_samples
+    }
+
+    pub const fn reached_comfy(self) -> bool {
+        self.reached_comfy
+    }
+
+    pub const fn was_tap(self) -> bool {
+        self.tap
+    }
+
+    pub const fn reaction(self) -> CharacterPetReaction {
+        if self.tap {
+            return CharacterPetReaction::Boop;
+        }
+        let playful = match self.delta_samples.checked_mul(6) {
+            Some(threshold) => self.accumulated_max_delta_ticks >= threshold,
+            None => false,
+        };
+        if playful && !self.reached_comfy {
+            CharacterPetReaction::Play
+        } else {
+            CharacterPetReaction::Affection
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterPetEpisodeError {
+    InvalidDuration { duration_ns: u128 },
+    DeltaWithoutSamples { accumulated_max_delta_ticks: u64 },
+}
+
+impl fmt::Display for CharacterPetEpisodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid character pet episode: {self:?}")
+    }
+}
+
+impl core::error::Error for CharacterPetEpisodeError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterPetReaction {
+    Boop,
+    Play,
+    Affection,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -466,6 +604,7 @@ struct RunningAct {
     duration_ns: u64,
     side: i32,
     style: u8,
+    energy_milli: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -548,6 +687,9 @@ pub struct AutonomicCharacterEngine {
     next_act_ns: u64,
     active_act: Option<RunningAct>,
     last_run_ns: [u64; CharacterAct::ALL.len()],
+    playfulness_milli: u16,
+    playfulness_updated_ns: u64,
+    playfulness_decay_remainder: u64,
 }
 
 impl AutonomicCharacterEngine {
@@ -578,6 +720,9 @@ impl AutonomicCharacterEngine {
             next_act_ns: 0,
             active_act: None,
             last_run_ns: [NEVER_RUN; CharacterAct::ALL.len()],
+            playfulness_milli: 0,
+            playfulness_updated_ns: 0,
+            playfulness_decay_remainder: 0,
         }
     }
 
@@ -590,6 +735,49 @@ impl AutonomicCharacterEngine {
             Some(running) => Some(running.act),
             None => None,
         }
+    }
+
+    pub const fn playfulness_milli(&self) -> u16 {
+        self.playfulness_milli
+    }
+
+    /// Preempt the scheduled act with the social response to one completed
+    /// compliant-contact episode. The head controller decides contact facts;
+    /// this character layer decides only their presentation.
+    pub fn note_pet_episode(
+        &mut self,
+        now: MonotonicTimestamp,
+        episode: CharacterPetEpisode,
+    ) -> CharacterPetReaction {
+        let now_ns = now.nanos_since_epoch();
+        self.initialize_if_needed(now_ns);
+        self.decay_playfulness(now_ns);
+        let reaction = episode.reaction();
+        if matches!(
+            reaction,
+            CharacterPetReaction::Boop | CharacterPetReaction::Play
+        ) {
+            self.playfulness_milli = self.playfulness_milli.saturating_add(450).min(1_000);
+        }
+        let act = match reaction {
+            CharacterPetReaction::Boop => CharacterAct::StartleBoop,
+            CharacterPetReaction::Play => CharacterAct::PlayBow,
+            CharacterPetReaction::Affection => CharacterAct::AffectionMelt,
+        };
+        let (minimum, maximum) = act.duration_bounds_ns();
+        let duration_ns = self.random_range(minimum, maximum);
+        let side = if self.next_u64() & 1 == 0 { -1 } else { 1 };
+        let style = (self.next_u64() % 3) as u8;
+        self.last_run_ns[act.index()] = now_ns;
+        self.active_act = Some(RunningAct {
+            act,
+            started_ns: now_ns,
+            duration_ns,
+            side,
+            style,
+            energy_milli: self.playfulness_milli,
+        });
+        reaction
     }
 
     /// Apply one autonomic sample without changing the reaction's freshness.
@@ -615,6 +803,7 @@ impl AutonomicCharacterEngine {
     ) -> PreparedCharacterFrame {
         let now_ns = now.nanos_since_epoch();
         self.initialize_if_needed(now_ns);
+        self.decay_playfulness(now_ns);
         self.update_mode(face_present, now_ns);
         self.update_saccade(now_ns);
         self.update_act(now_ns);
@@ -655,6 +844,26 @@ impl AutonomicCharacterEngine {
             now_ns,
             self.random_range(FIRST_ACT_MIN_NS, FIRST_ACT_MAX_NS),
         );
+        self.playfulness_updated_ns = now_ns;
+    }
+
+    fn decay_playfulness(&mut self, now_ns: u64) {
+        if self.playfulness_milli == 0 {
+            self.playfulness_decay_remainder = 0;
+            self.playfulness_updated_ns = now_ns;
+            return;
+        }
+        let elapsed_ns = now_ns.saturating_sub(self.playfulness_updated_ns);
+        let denominator = u128::from(45 * NS_PER_SECOND);
+        let numerator =
+            u128::from(elapsed_ns) * 1_000 + u128::from(self.playfulness_decay_remainder);
+        let decrease = numerator / denominator;
+        self.playfulness_decay_remainder = u64::try_from(numerator % denominator)
+            .expect("decay remainder is below a u64 denominator");
+        let decrease = u16::try_from(decrease.min(u128::from(u16::MAX)))
+            .expect("bounded playfulness decay fits u16");
+        self.playfulness_milli = self.playfulness_milli.saturating_sub(decrease);
+        self.playfulness_updated_ns = now_ns;
     }
 
     fn update_mode(&mut self, face_present: bool, now_ns: u64) {
@@ -830,6 +1039,7 @@ impl AutonomicCharacterEngine {
             duration_ns,
             side,
             style,
+            energy_milli: self.playfulness_milli,
         });
     }
 
@@ -1022,6 +1232,42 @@ impl AutonomicCharacterEngine {
                 fields.gaze_y += scale_wave(elapsed, 430 * NS_PER_MS, 120) * pulse / SCALE;
                 fields.brightness += pulse * 300 / SCALE;
                 fields.color_rgb = dance_palette(phase, running.style);
+            }
+            CharacterAct::Sigh => {
+                fields.lid += keyed_minimum_jerk(phase, &[(0, 0), (300, 90), (600, 70), (1000, 0)]);
+                fields.brightness += keyed_minimum_jerk(phase, &[(0, 0), (350, -250), (1000, 0)]);
+            }
+            CharacterAct::BowBob => {
+                fields.expression = Expression::Greet;
+                fields.pupil += pulse * 170 / SCALE;
+                fields.brightness += pulse * 300 / SCALE;
+            }
+            CharacterAct::StartleBoop => {
+                fields.expression = Expression::Greet;
+                fields.lid += keyed_minimum_jerk(phase, &[(0, 0), (80, -60), (500, 20), (1000, 0)]);
+                fields.pupil +=
+                    keyed_minimum_jerk(phase, &[(0, 0), (80, 260), (600, 120), (1000, 0)]);
+                fields.brightness += pulse * 500 / SCALE;
+                fields.color_rgb = [255, 190, 25];
+                fields.blink |= (35..=80).contains(&phase) || (875..=930).contains(&phase);
+            }
+            CharacterAct::PlayBow => {
+                fields.expression = Expression::Greet;
+                fields.gaze_y +=
+                    keyed_minimum_jerk(phase, &[(0, 0), (200, 500), (700, 300), (1000, 0)]);
+                fields.pupil += pulse * 260 / SCALE;
+                fields.brightness += pulse * 450 / SCALE;
+                fields.color_rgb = [70, 255, 105];
+                fields.blink |= (135..=185).contains(&phase);
+            }
+            CharacterAct::AffectionMelt => {
+                fields.expression = Expression::Greet;
+                fields.lid +=
+                    keyed_minimum_jerk(phase, &[(0, 0), (350, 240), (550, 240), (1000, 0)]);
+                fields.pupil += pulse * 170 / SCALE;
+                fields.brightness += keyed_minimum_jerk(phase, &[(0, 0), (400, -200), (1000, 0)]);
+                fields.color_rgb = [255, 150, 90];
+                fields.blink |= (280..=340).contains(&phase);
             }
         }
     }
@@ -1220,6 +1466,87 @@ impl AutonomicCharacterEngine {
                 fields.yaw += wave(650, 175);
                 fields.roll -= wave(650, 190);
             }
+            CharacterAct::Sigh => {
+                let posture = keyed_minimum_jerk(phase, &[(0, 0), (300, 70), (550, 64), (1000, 0)]);
+                fields.bow += posture;
+                fields.curl += posture;
+                fields.yaw += side * pulse * 12 / SCALE;
+                fields.roll += side * pulse * 16 / SCALE;
+            }
+            CharacterAct::BowBob => {
+                let bob = keyed_minimum_jerk(
+                    phase,
+                    &[
+                        (0, 0),
+                        (100, 0),
+                        (200, 105),
+                        (310, -26),
+                        (500, 105),
+                        (610, -26),
+                        (1000, 0),
+                    ],
+                );
+                fields.bow += bob;
+                fields.curl += bob;
+                fields.yaw += side * pulse * 18 / SCALE;
+                fields.roll += side * pulse * 26 / SCALE;
+            }
+            CharacterAct::StartleBoop => {
+                let energy = i32::from(running.energy_milli);
+                let recoil = 42 + 25 * energy / SCALE;
+                let dip = 52 + 31 * energy / SCALE;
+                let posture = keyed_minimum_jerk(
+                    phase,
+                    &[
+                        (0, 0),
+                        (100, -recoil),
+                        (300, -recoil * 3 / 5),
+                        (480, dip),
+                        (620, -dip * 3 / 10),
+                        (780, dip * 9 / 20),
+                        (1000, 0),
+                    ],
+                );
+                fields.bow += posture;
+                fields.curl += posture;
+                fields.yaw += side * pulse * 22 / SCALE;
+                fields.roll += side * pulse * 52 / SCALE;
+            }
+            CharacterAct::PlayBow => {
+                let energy = i32::from(running.energy_milli);
+                let depth = 110 + 55 * energy / SCALE;
+                let posture = keyed_minimum_jerk(
+                    phase,
+                    &[
+                        (0, 0),
+                        (180, depth),
+                        (550, depth * 92 / 100),
+                        (720, -depth * 22 / 100),
+                        (850, depth * 8 / 100),
+                        (1000, 0),
+                    ],
+                );
+                let wiggle = if (220..=540).contains(&phase) {
+                    scale_wave(
+                        elapsed.saturating_sub(running.duration_ns * 22 / 100),
+                        190 * NS_PER_MS,
+                        78,
+                    )
+                } else {
+                    0
+                };
+                fields.bow += posture;
+                fields.curl += posture;
+                fields.yaw += side * pulse * 52 / SCALE;
+                fields.roll += wiggle * pulse / SCALE;
+            }
+            CharacterAct::AffectionMelt => {
+                let nod = keyed_minimum_jerk(phase, &[(0, 0), (400, 68), (1000, 0)]);
+                fields.bow += nod * 2 / 5;
+                fields.curl += nod * 3 / 5;
+                fields.yaw += side * pulse * 12 / SCALE;
+                fields.roll += side * pulse * 34 / SCALE;
+            }
         }
     }
 
@@ -1318,6 +1645,32 @@ fn minimum_jerk_pulse(phase: i32) -> i32 {
     } else {
         minimum_jerk_ramp((SCALE - phase) * 2)
     }
+}
+
+/// Interpolate a small, ordered keyframe curve with a minimum-jerk segment
+/// between every pair. Values may be signed; phases are normalized to
+/// `0..=SCALE`. Exact key values and endpoints are retained.
+fn keyed_minimum_jerk(phase: i32, keys: &[(i32, i32)]) -> i32 {
+    debug_assert!(keys.len() >= 2);
+    debug_assert!(keys.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    let phase = phase.clamp(0, SCALE);
+    if phase <= keys[0].0 {
+        return keys[0].1;
+    }
+    for pair in keys.windows(2) {
+        let (start_phase, start_value) = pair[0];
+        let (end_phase, end_value) = pair[1];
+        if phase <= end_phase {
+            let span = end_phase - start_phase;
+            let local = (phase - start_phase) * SCALE / span;
+            let progress = minimum_jerk_ramp(local);
+            let delta = i64::from(end_value) - i64::from(start_value);
+            let interpolated =
+                i64::from(start_value) + delta * i64::from(progress) / i64::from(SCALE);
+            return i32::try_from(interpolated).expect("small keyframe values fit i32");
+        }
+    }
+    keys[keys.len() - 1].1
 }
 
 fn delayed_symmetric_pulse(elapsed_ns: u64, duration_ns: u64, delay_ns: u64) -> i32 {
@@ -1481,6 +1834,7 @@ mod tests {
                 duration_ns: 5 * NS_PER_SECOND,
                 side: if index % 2 == 0 { -1 } else { 1 },
                 style: (index % 3) as u8,
+                energy_milli: 500,
             });
             let mut joint_moved = [false; 4];
             for step in 0..=100_u64 {
@@ -1523,6 +1877,7 @@ mod tests {
             duration_ns: duration,
             side: 1,
             style: 0,
+            energy_milli: 0,
         });
 
         let at_start = engine.render_character(
@@ -1685,6 +2040,65 @@ mod tests {
         assert_eq!(output.eye().intent().gaze_x().get(), 0);
         assert_eq!(output.eye().intent().gaze_y().get(), 0);
         assert_eq!((engine.saccade_x, engine.saccade_y), (0, 0));
+    }
+
+    #[test]
+    fn pet_episode_boundary_rejects_impossible_facts_and_classifies_exactly() {
+        assert_eq!(
+            CharacterPetEpisode::try_new(Duration::ZERO, 0, 0, false, true),
+            Err(CharacterPetEpisodeError::InvalidDuration { duration_ns: 0 })
+        );
+        assert_eq!(
+            CharacterPetEpisode::try_new(Duration::from_secs(1), 1, 0, false, false),
+            Err(CharacterPetEpisodeError::DeltaWithoutSamples {
+                accumulated_max_delta_ticks: 1,
+            })
+        );
+
+        let boop = CharacterPetEpisode::try_new(Duration::from_millis(600), 2, 1, false, true)
+            .expect("valid tap episode");
+        let just_below_play =
+            CharacterPetEpisode::try_new(Duration::from_secs(2), 17, 3, false, false)
+                .expect("valid delta evidence");
+        let play = CharacterPetEpisode::try_new(Duration::from_secs(2), 18, 3, false, false)
+            .expect("valid delta evidence");
+        let comfy = CharacterPetEpisode::try_new(Duration::from_secs(6), 18, 3, true, false)
+            .expect("valid comfy evidence");
+
+        assert_eq!(boop.reaction(), CharacterPetReaction::Boop);
+        assert_eq!(just_below_play.reaction(), CharacterPetReaction::Affection);
+        assert_eq!(play.reaction(), CharacterPetReaction::Play);
+        assert_eq!(comfy.reaction(), CharacterPetReaction::Affection);
+    }
+
+    #[test]
+    fn pet_reaction_preempts_scheduled_act_and_playfulness_decays_without_tick_loss() {
+        let start = 11 * NS_PER_SECOND;
+        let mut engine = AutonomicCharacterEngine::new(31);
+        engine.initialize_if_needed(start);
+        engine.active_act = Some(RunningAct {
+            act: CharacterAct::Daydream,
+            started_ns: start,
+            duration_ns: 5 * NS_PER_SECOND,
+            side: -1,
+            style: 0,
+            energy_milli: 0,
+        });
+        let boop = CharacterPetEpisode::try_new(Duration::from_millis(600), 0, 0, false, true)
+            .expect("valid tap episode");
+        assert_eq!(
+            engine.note_pet_episode(MonotonicTimestamp::from_nanos_since_epoch(start), boop,),
+            CharacterPetReaction::Boop
+        );
+        assert_eq!(engine.active_act(), Some(CharacterAct::StartleBoop));
+        assert_eq!(engine.playfulness_milli(), 450);
+
+        for tick in 1..=900_u64 {
+            let now = start + tick * 50 * NS_PER_MS;
+            engine.decay_playfulness(now);
+        }
+        assert_eq!(engine.playfulness_milli(), 0);
+        assert_eq!(engine.playfulness_decay_remainder, 0);
     }
 
     #[test]

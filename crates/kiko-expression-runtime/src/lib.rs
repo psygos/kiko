@@ -33,7 +33,8 @@ pub use adapter::{
 pub use autonomic::{
     AutonomicCharacterEngine, CHARACTER_HEAD_SCALE, CharacterAct, CharacterHeadAmount,
     CharacterHeadAmountError, CharacterHeadAxis, CharacterHeadOverlay,
-    CharacterHeadOverlayParseError, CharacterMode, PreparedCharacterFrame,
+    CharacterHeadOverlayParseError, CharacterMode, CharacterPetEpisode, CharacterPetEpisodeError,
+    CharacterPetReaction, PreparedCharacterFrame,
 };
 pub use face_tracking::{
     AcquiringFaceTarget, CloserFaceWidthRatio, CoastingFaceTarget, ConsecutiveFaceResults,

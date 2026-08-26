@@ -45,9 +45,11 @@ use kiko_device_inventory::{
 #[cfg(feature = "nano-agent")]
 use kiko_expression_core::{Deadline, NonZeroDuration};
 use kiko_expression_core::{MonotonicTimestamp, StreamEpochId};
-use kiko_expression_runtime::{CharacterHeadOverlay, PreparedCharacterFrame, PreparedEyeIntent};
+use kiko_expression_runtime::{
+    CharacterHeadOverlay, CharacterPetEpisode, PreparedCharacterFrame, PreparedEyeIntent,
+};
 #[cfg(feature = "nano-agent")]
-use kiko_expression_runtime::{FaceTrackingConfig, MAX_FACE_DETECTIONS};
+use kiko_expression_runtime::{CharacterPetEpisodeError, FaceTrackingConfig, MAX_FACE_DETECTIONS};
 use kiko_eye_runtime::{
     ActorExit as EyeActorExit, ActorTermination as EyeActorTermination, ClockError, EyeActorHandle,
     EyeActorStartError, EyeActorTask, EyeRuntimeConfig, EyeRuntimeFault,
@@ -56,6 +58,8 @@ use kiko_eye_runtime::{
     StartupEvidence as EyeStartupEvidence, StartupReceiptError as EyeStartupReceiptError,
     StaticEyeRuntimeConfig,
 };
+#[cfg(feature = "nano-agent")]
+use kiko_head_runtime::compliant_hold::CompliantPetEpisodeSummary;
 #[cfg(feature = "nano-agent")]
 use kiko_head_runtime::gaze_control::{
     HeadGazeProposal, HeadGazeProposalId, HeadGazeProposalIdError,
@@ -75,7 +79,8 @@ use kiko_head_runtime::{
 #[cfg(feature = "nano-agent")]
 use kiko_head_runtime::{
     HeadGazeBaseInterlockError, HeadGazeBaseZeroExclusiveLeaseIssuer, HeadGazeProposalCommandError,
-    HeadGazeServiceError, TensionPreservingHeadGazeActorHandle as HeadGazeActorHandle,
+    HeadGazeServiceError, HeadGazeServiceOutcome,
+    TensionPreservingHeadGazeActorHandle as HeadGazeActorHandle,
 };
 use oak_sys::ImageFrame;
 #[cfg(feature = "nano-agent")]
@@ -1879,6 +1884,10 @@ pub enum NanoPhysicalHeadGazeRuntimeError {
     BaseInterlock(HeadGazeBaseInterlockError),
     ServiceCommand(HeadCommandError),
     Service(Box<HeadGazeServiceError>),
+    PetEpisode(CharacterPetEpisodeError),
+    PetEpisodeTimestampOutOfRange {
+        completed_at_ns: u128,
+    },
 }
 
 #[cfg(feature = "nano-agent")]
@@ -1900,7 +1909,10 @@ impl std::error::Error for NanoPhysicalHeadGazeRuntimeError {
             Self::BaseInterlock(source) => Some(source),
             Self::ServiceCommand(source) => Some(source),
             Self::Service(source) => Some(source.as_ref()),
-            Self::ProjectionGridMismatch { .. } | Self::ProposalSequenceExhausted { .. } => None,
+            Self::PetEpisode(source) => Some(source),
+            Self::ProjectionGridMismatch { .. }
+            | Self::ProposalSequenceExhausted { .. }
+            | Self::PetEpisodeTimestampOutOfRange { .. } => None,
         }
     }
 }
@@ -3635,6 +3647,34 @@ fn publish_face_diagnostic_if_active(
 // support and call `shutdown`; an accidental handle drop may not silently
 // remove neck torque.
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccessoryPetEpisode {
+    completed_at: MonotonicTimestamp,
+    episode: CharacterPetEpisode,
+}
+
+#[cfg(feature = "nano-agent")]
+fn adapt_pet_episode(
+    summary: CompliantPetEpisodeSummary,
+) -> Result<AccessoryPetEpisode, NanoPhysicalHeadGazeRuntimeError> {
+    let completed_at_ns = summary.completed_at().duration_since_origin().as_nanos();
+    let completed_at_ns = u64::try_from(completed_at_ns).map_err(|_| {
+        NanoPhysicalHeadGazeRuntimeError::PetEpisodeTimestampOutOfRange { completed_at_ns }
+    })?;
+    let episode = CharacterPetEpisode::try_new(
+        summary.duration(),
+        summary.accumulated_max_delta_ticks(),
+        summary.delta_samples(),
+        summary.reached_comfy(),
+        summary.was_tap(),
+    )
+    .map_err(NanoPhysicalHeadGazeRuntimeError::PetEpisode)?;
+    Ok(AccessoryPetEpisode {
+        completed_at: MonotonicTimestamp::from_nanos_since_epoch(completed_at_ns),
+        episode,
+    })
+}
+
 trait ReviewedNaturalHeadPort<F> {
     type Ready;
     type StartError;
@@ -3649,8 +3689,8 @@ trait ReviewedNaturalHeadPort<F> {
         &mut self,
         _frame: &F,
         _character_head: CharacterHeadOverlay,
-    ) -> Result<(), Self::GazeError> {
-        Ok(())
+    ) -> Result<Option<AccessoryPetEpisode>, Self::GazeError> {
+        Ok(None)
     }
     async fn shutdown(&mut self) -> Self::Shutdown;
 }
@@ -3671,6 +3711,8 @@ trait RgbBridgePort<F> {
     type Error: Clone;
 
     fn process(&mut self, frame: &F) -> Result<Self::Intent, Self::Error>;
+
+    fn note_pet_episode(&mut self, _episode: AccessoryPetEpisode) {}
 }
 
 trait AccessoryCharacterIntent: Copy {
@@ -3844,7 +3886,11 @@ where
                                 .await
                             {
                                 Err(source) => Some(CoreTerminalFault::HeadGaze(source)),
-                                Ok(()) => match eye.apply(intent.into_eye()).await {
+                                Ok(pet_episode) => {
+                                    if let Some(pet_episode) = pet_episode {
+                                        bridge.note_pet_episode(pet_episode);
+                                    }
+                                    match eye.apply(intent.into_eye()).await {
                                     Ok(()) => match channel.counters.record_processed_successfully() {
                                         Ok(()) => None,
                                         Err(
@@ -3855,7 +3901,8 @@ where
                                         ) => Some(CoreTerminalFault::RgbHealthStatusPoisoned),
                                     },
                                     Err(source) => Some(CoreTerminalFault::EyeApply(source)),
-                                },
+                                    }
+                                }
                             },
                         }
                     }
@@ -4111,16 +4158,16 @@ impl SerialReviewedNaturalHeadPort {
         &self,
         frame: &NanoFaceTrackedRgbFrame,
         character_head: CharacterHeadOverlay,
-    ) -> Result<(), NanoPhysicalHeadGazeRuntimeError> {
+    ) -> Result<Option<AccessoryPetEpisode>, NanoPhysicalHeadGazeRuntimeError> {
         let active = self
             .active
             .as_ref()
             .expect("gaze frames are processed only after head readiness");
         let Some(physical) = active.physical_gaze.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(issuer) = physical.lease_issuer.get() else {
-            return Ok(());
+            return Ok(None);
         };
         let lease = match issuer.try_acquire() {
             Ok(lease) => lease,
@@ -4128,7 +4175,7 @@ impl SerialReviewedNaturalHeadPort {
                 HeadGazeBaseInterlockError::BaseTransactionAlreadyActive
                 | HeadGazeBaseInterlockError::BaseMayMove
                 | HeadGazeBaseInterlockError::HeadGazeLeaseActive,
-            ) => return Ok(()),
+            ) => return Ok(None),
             Err(source) => {
                 return Err(NanoPhysicalHeadGazeRuntimeError::BaseInterlock(source));
             }
@@ -4170,12 +4217,21 @@ impl SerialReviewedNaturalHeadPort {
                 .map_err(NanoPhysicalHeadGazeRuntimeError::ProposalCommand)?
                 .map_err(NanoPhysicalHeadGazeRuntimeError::ProposalRejected)?;
         }
-        handle
+        let outcome = handle
             .service_gaze(lease)
             .await
             .map_err(NanoPhysicalHeadGazeRuntimeError::ServiceCommand)?
             .map_err(|source| NanoPhysicalHeadGazeRuntimeError::Service(Box::new(source)))?;
-        Ok(())
+        match outcome {
+            HeadGazeServiceOutcome::Compliant(evidence) => evidence
+                .controller()
+                .completed_episode()
+                .map(adapt_pet_episode)
+                .transpose(),
+            HeadGazeServiceOutcome::BeforeScheduledTick { .. }
+            | HeadGazeServiceOutcome::CompliantTemperatureDeferred(_)
+            | HeadGazeServiceOutcome::Applied(_) => Ok(None),
+        }
     }
 }
 
@@ -4349,11 +4405,11 @@ impl<F: NanoHeadGazeFrame> ReviewedNaturalHeadPort<F> for SerialReviewedNaturalH
         &mut self,
         frame: &F,
         character_head: CharacterHeadOverlay,
-    ) -> Result<(), Self::GazeError> {
+    ) -> Result<Option<AccessoryPetEpisode>, Self::GazeError> {
         #[cfg(feature = "nano-agent")]
         {
             let Some(frame) = frame.tracked_face_frame() else {
-                return Ok(());
+                return Ok(None);
             };
             self.process_physical_gaze_frame(frame, character_head)
                 .await
@@ -4362,7 +4418,7 @@ impl<F: NanoHeadGazeFrame> ReviewedNaturalHeadPort<F> for SerialReviewedNaturalH
         #[cfg(not(feature = "nano-agent"))]
         {
             let _ = (frame, character_head);
-            Ok(())
+            Ok(None)
         }
     }
 
@@ -4395,6 +4451,11 @@ impl RgbBridgePort<IngressObservedRgbFrame<ImageFrame>>
         self.process_queued_oak_frame_borrowed(frame)
             .map(|outcome| outcome.into_character())
     }
+
+    fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
+        let _reaction =
+            RgbExpressionBridge::note_pet_episode(self, feedback.completed_at, feedback.episode);
+    }
 }
 
 fn process_rgb_work<F, B>(
@@ -4416,6 +4477,11 @@ impl RgbBridgePort<NanoAccessoryRgbWork> for RgbExpressionBridge<NanoAccessoryCl
 
     fn process(&mut self, work: &NanoAccessoryRgbWork) -> Result<Self::Intent, Self::Error> {
         process_rgb_work(self, work)
+    }
+
+    fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
+        let _reaction =
+            RgbExpressionBridge::note_pet_episode(self, feedback.completed_at, feedback.episode);
     }
 }
 
@@ -4440,6 +4506,12 @@ impl RgbBridgePort<NanoAccessoryRgbWork> for ProductionSceneRgbBridge {
             .process(work)
             .map_err(NanoAccessoryRgbProcessingError::Bridge)
     }
+
+    fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
+        let _reaction = self
+            .0
+            .note_pet_episode(feedback.completed_at, feedback.episode);
+    }
 }
 
 #[cfg(feature = "nano-agent")]
@@ -4458,6 +4530,12 @@ impl RgbBridgePort<NanoFacePerceptionWork> for ProductionFaceRgbBridge {
             .process_queued_oak_frame_with_face(&frame.frame, frame.output.tracking())
             .map(|outcome| outcome.into_character())
             .map_err(NanoAccessoryRgbProcessingError::Bridge)
+    }
+
+    fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
+        let _reaction = self
+            .0
+            .note_pet_episode(feedback.completed_at, feedback.episode);
     }
 }
 
@@ -5698,6 +5776,7 @@ mod tests {
         fail_start: bool,
         fail_return: bool,
         fail_gaze: bool,
+        emit_pet_episode: bool,
         fail_health_at: Option<usize>,
     }
 
@@ -5737,12 +5816,24 @@ mod tests {
             &mut self,
             _frame: &F,
             _character_head: CharacterHeadOverlay,
-        ) -> Result<(), Self::GazeError> {
+        ) -> Result<Option<AccessoryPetEpisode>, Self::GazeError> {
             if self.fail_gaze {
                 self.log.lock().unwrap().push("head_gaze");
                 Err("head_gaze")
+            } else if self.emit_pet_episode {
+                Ok(Some(AccessoryPetEpisode {
+                    completed_at: MonotonicTimestamp::from_nanos_since_epoch(10),
+                    episode: CharacterPetEpisode::try_new(
+                        Duration::from_millis(600),
+                        0,
+                        0,
+                        false,
+                        true,
+                    )
+                    .expect("valid fake tap"),
+                }))
             } else {
-                Ok(())
+                Ok(None)
             }
         }
 
@@ -5801,6 +5892,10 @@ mod tests {
             self.log.lock().unwrap().push("bridge");
             if self.fail { Err("bridge") } else { Ok(*frame) }
         }
+
+        fn note_pet_episode(&mut self, _episode: AccessoryPetEpisode) {
+            self.log.lock().unwrap().push("pet_episode");
+        }
     }
 
     struct ClockWorkBridge {
@@ -5850,6 +5945,7 @@ mod tests {
                 fail_start: fail_head_start,
                 fail_return: false,
                 fail_gaze: false,
+                emit_pet_episode: false,
                 fail_health_at,
             },
             FakeEye {
@@ -5982,6 +6078,54 @@ mod tests {
         .expect("failed eye acknowledgement latches terminal fault");
         assert_eq!(failed_channel.counters.snapshot().processed_successfully, 0);
         failed_channel.request_shutdown();
+        assert!(matches!(task.await.unwrap(), CoreExit::Shutdown { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_pet_episode_reaches_character_before_the_current_eye_ack() {
+        let (mut head, eye, bridge, log, _) = fakes(false, false, false, false, None);
+        head.emit_pet_episode = true;
+        let channel = Arc::new(LatestFrameChannel::new());
+        let task_channel = Arc::clone(&channel);
+        let task = tokio::spawn(async move {
+            run_accessory_core(
+                head,
+                eye,
+                bridge,
+                task_channel,
+                health_period(50),
+                CoreObservers {
+                    ready: |_, _| true,
+                    record_health: |_| true,
+                    publish_fault: |_| {},
+                    latch_fault: || {},
+                },
+            )
+            .await
+        });
+        assert_eq!(
+            channel.submit(9_u64),
+            NanoAccessoryFrameSubmitOutcome::Enqueued
+        );
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while channel.counters.snapshot().processed_successfully == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pet feedback and eye acknowledgement finish in bounded time");
+        assert_eq!(
+            &*log.lock().unwrap(),
+            &[
+                "eye_start",
+                "head_start",
+                "head_return",
+                "bridge",
+                "pet_episode",
+                "eye_apply",
+            ]
+        );
+        channel.request_shutdown();
         assert!(matches!(task.await.unwrap(), CoreExit::Shutdown { .. }));
     }
 
