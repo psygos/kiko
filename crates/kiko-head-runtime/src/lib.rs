@@ -13,6 +13,7 @@ mod organic_motion;
 mod probe;
 #[cfg(test)]
 mod servo_plant;
+mod thermal_derate;
 mod transport;
 
 pub use actor::{
@@ -75,6 +76,11 @@ pub use organic_motion::{
 pub use probe::{
     HeadProbeError, HeadProbeReport, ProbeRequest, ProbeResponseEvidence, SerialHeadProbeError,
     ServoProbeReport, probe_serial_head,
+};
+pub use thermal_derate::{
+    HeadThermalDerateBindingError, HeadThermalDerateObservation, HeadThermalDeratePolicy,
+    HeadThermalDeratePolicyError, HeadThermalDerateState, HeadThermalDerateStep,
+    HeadThermalDerateTransition,
 };
 pub use transport::{
     AsyncByteTransport, MonotonicClock, MonotonicTime, SerialConfigurationEvidence,

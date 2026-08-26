@@ -57,6 +57,8 @@ const REST_AFTER_IDLE_NS: u64 = 20 * NS_PER_SECOND;
 const REST_EASE_NS: u64 = 6 * NS_PER_SECOND;
 const PET_VISUAL_ATTACK_NS: u64 = 350 * NS_PER_MS;
 const PET_VISUAL_RELEASE_NS: u64 = 900 * NS_PER_MS;
+const THERMAL_VISUAL_ATTACK_NS: u64 = 1_400 * NS_PER_MS;
+const THERMAL_VISUAL_RELEASE_NS: u64 = 2_600 * NS_PER_MS;
 const NEVER_RUN: u64 = u64::MAX;
 
 /// Dimensionless signed character displacement scale.
@@ -474,6 +476,74 @@ pub enum CharacterPetState {
     Recovering { progress: CoreUnitAmount },
 }
 
+/// Authoritative pitch-workload state published by the sole head owner.
+///
+/// `Unavailable` is deliberately distinct from `Nominal`: before the first
+/// admitted telemetry step, the character engine has no thermal fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterThermalState {
+    Unavailable,
+    Nominal,
+    PitchDerated,
+}
+
+/// Exact base/head exclusion fact published by the physical owner boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterBaseMotionState {
+    /// No physical head/base composition exists for this character renderer.
+    NotApplicable,
+    /// A physical composition exists but has not published usable authority.
+    Unavailable,
+    ConfirmedStationary,
+    CommandTransaction,
+    MayMove,
+    Faulted,
+}
+
+impl CharacterBaseMotionState {
+    pub const fn permits_character_head_motion(self) -> bool {
+        matches!(self, Self::NotApplicable | Self::ConfirmedStationary)
+    }
+}
+
+impl CharacterThermalState {
+    pub const fn pitch_derated(self) -> bool {
+        matches!(self, Self::PitchDerated)
+    }
+}
+
+/// Body facts that are time-coherent with one character sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CharacterBodyState {
+    thermal: CharacterThermalState,
+    base_motion: CharacterBaseMotionState,
+}
+
+impl CharacterBodyState {
+    pub const UNAVAILABLE: Self = Self {
+        thermal: CharacterThermalState::Unavailable,
+        base_motion: CharacterBaseMotionState::NotApplicable,
+    };
+
+    pub const fn new(
+        thermal: CharacterThermalState,
+        base_motion: CharacterBaseMotionState,
+    ) -> Self {
+        Self {
+            thermal,
+            base_motion,
+        }
+    }
+
+    pub const fn thermal(self) -> CharacterThermalState {
+        self.thermal
+    }
+
+    pub const fn base_motion(self) -> CharacterBaseMotionState {
+        self.base_motion
+    }
+}
+
 impl CharacterPetState {
     pub const fn suppresses_expression_motion(self) -> bool {
         !matches!(self, Self::Inactive | Self::Ready)
@@ -502,16 +572,26 @@ impl CharacterPetState {
 pub struct CharacterInputs {
     attention: CharacterAttention,
     pet: CharacterPetState,
+    body: CharacterBodyState,
 }
 
 impl CharacterInputs {
     pub const UNATTENDED: Self = Self {
         attention: CharacterAttention::Absent,
         pet: CharacterPetState::Inactive,
+        body: CharacterBodyState::UNAVAILABLE,
     };
 
-    pub const fn new(attention: CharacterAttention, pet: CharacterPetState) -> Self {
-        Self { attention, pet }
+    pub const fn new(
+        attention: CharacterAttention,
+        pet: CharacterPetState,
+        body: CharacterBodyState,
+    ) -> Self {
+        Self {
+            attention,
+            pet,
+            body,
+        }
     }
 
     pub const fn attention(self) -> CharacterAttention {
@@ -520,6 +600,10 @@ impl CharacterInputs {
 
     pub const fn pet(self) -> CharacterPetState {
         self.pet
+    }
+
+    pub const fn body(self) -> CharacterBodyState {
+        self.body
     }
 }
 
@@ -949,6 +1033,11 @@ pub struct AutonomicCharacterEngine {
     pet_visual_started_ns: u64,
     pet_visual_duration_ns: u64,
     pet_recovery_start_milli: i32,
+    thermal_state: CharacterThermalState,
+    thermal_visual_from_milli: i32,
+    thermal_visual_to_milli: i32,
+    thermal_visual_started_ns: u64,
+    thermal_visual_duration_ns: u64,
 }
 
 impl AutonomicCharacterEngine {
@@ -990,6 +1079,11 @@ impl AutonomicCharacterEngine {
             pet_visual_started_ns: 0,
             pet_visual_duration_ns: 1,
             pet_recovery_start_milli: 0,
+            thermal_state: CharacterThermalState::Unavailable,
+            thermal_visual_from_milli: 0,
+            thermal_visual_to_milli: 0,
+            thermal_visual_started_ns: 0,
+            thermal_visual_duration_ns: 1,
         }
     }
 
@@ -1072,7 +1166,9 @@ impl AutonomicCharacterEngine {
         self.initialize_if_needed(now_ns);
         self.decay_playfulness(now_ns);
         self.update_pet_state(inputs.pet(), now_ns);
+        self.update_thermal_state(inputs.body().thermal(), now_ns);
         self.update_mode(inputs.attention().is_present(), now_ns);
+        let head_motion_permitted = inputs.body().base_motion().permits_character_head_motion();
         if inputs.pet().suppresses_expression_motion() {
             self.saccade_peak_x = 0;
             self.saccade_peak_y = 0;
@@ -1081,7 +1177,10 @@ impl AutonomicCharacterEngine {
             self.active_act = None;
         } else {
             self.update_saccade(now_ns);
-            self.update_act(now_ns);
+            self.update_act(
+                now_ns,
+                !inputs.body().thermal().pitch_derated() && head_motion_permitted,
+            );
         }
 
         let mut fields = EyeFields::from(prepared.intent());
@@ -1095,10 +1194,18 @@ impl AutonomicCharacterEngine {
             self.apply_blink(&mut fields, now_ns);
         }
         self.apply_pet_state(&mut fields, now_ns);
+        self.apply_thermal_state(&mut fields, now_ns);
         let mut head = HeadFields::default();
-        if !inputs.pet().suppresses_expression_motion() {
+        if !inputs.pet().suppresses_expression_motion() && head_motion_permitted {
             self.apply_head_mode(&mut head, now_ns);
             self.apply_head_act(&mut head, now_ns);
+        }
+        if inputs.body().thermal().pitch_derated() {
+            // The head actor independently enforces this in encoder space.
+            // Suppressing the semantic request here keeps character intent
+            // coherent and avoids repeatedly asking for unavailable workload.
+            head.bow = 0;
+            head.curl = 0;
         }
         let rest_envelope = self.rest_envelope(now_ns);
         head.bow = head.bow * rest_envelope / SCALE;
@@ -1225,6 +1332,50 @@ impl AutonomicCharacterEngine {
         fields.color_rgb = blend_color(fields.color_rgb, [255, 145, 92], amount);
         if amount >= 420 {
             fields.expression = Expression::Greet;
+        }
+    }
+
+    fn update_thermal_state(&mut self, state: CharacterThermalState, now_ns: u64) {
+        if state == self.thermal_state {
+            return;
+        }
+        let current = self.thermal_visual_milli(now_ns);
+        self.thermal_state = state;
+        self.thermal_visual_from_milli = current;
+        self.thermal_visual_to_milli = if state.pitch_derated() { SCALE } else { 0 };
+        self.thermal_visual_started_ns = now_ns;
+        self.thermal_visual_duration_ns = if state.pitch_derated() {
+            THERMAL_VISUAL_ATTACK_NS
+        } else {
+            THERMAL_VISUAL_RELEASE_NS
+        };
+    }
+
+    fn thermal_visual_milli(&self, now_ns: u64) -> i32 {
+        let phase = normalized_phase(
+            now_ns.saturating_sub(self.thermal_visual_started_ns),
+            self.thermal_visual_duration_ns,
+        );
+        let eased = minimum_jerk_ramp(phase);
+        self.thermal_visual_from_milli
+            + (self.thermal_visual_to_milli - self.thermal_visual_from_milli) * eased / SCALE
+    }
+
+    fn apply_thermal_state(&self, fields: &mut EyeFields, now_ns: u64) {
+        let amount = self.thermal_visual_milli(now_ns).clamp(0, SCALE);
+        if amount == 0 {
+            return;
+        }
+        // A warm Kiko visibly eases its workload instead of snapping to an
+        // alarm face. Hard over-temperature remains a separate terminal
+        // safety fault owned by the head actor.
+        fields.gaze_y += amount * 80 / SCALE;
+        fields.lid += amount * 150 / SCALE;
+        fields.pupil -= amount * 55 / SCALE;
+        fields.brightness -= amount * 180 / SCALE;
+        fields.color_rgb = blend_color(fields.color_rgb, [255, 168, 76], amount * 3 / 5);
+        if amount >= 650 {
+            fields.expression = Expression::Sleepy;
         }
     }
 
@@ -1363,7 +1514,7 @@ impl AutonomicCharacterEngine {
         self.saccade_y = self.saccade_peak_y * remaining / SCALE;
     }
 
-    fn update_act(&mut self, now_ns: u64) {
+    fn update_act(&mut self, now_ns: u64, allow_start: bool) {
         if let Some(running) = self.active_act {
             if now_ns.saturating_sub(running.started_ns) < running.duration_ns {
                 return;
@@ -1376,7 +1527,8 @@ impl AutonomicCharacterEngine {
             };
             self.next_act_ns = saturating_add(now_ns, self.random_range(minimum, maximum));
         }
-        if self.active_act.is_some()
+        if !allow_start
+            || self.active_act.is_some()
             || now_ns < self.next_act_ns
             || !matches!(self.mode, CharacterMode::Idle | CharacterMode::Tracking)
             || self.rest_envelope(now_ns) == 0
@@ -2283,6 +2435,7 @@ mod tests {
                 state: CharacterFaceAttentionState::Observed,
             }),
             CharacterPetState::Inactive,
+            CharacterBodyState::UNAVAILABLE,
         )
     }
 
@@ -2791,6 +2944,7 @@ mod tests {
             CharacterPetState::Resting {
                 at_rest_target: true,
             },
+            CharacterBodyState::UNAVAILABLE,
         );
         let entered = engine.render_character(
             MonotonicTimestamp::from_nanos_since_epoch(start),
@@ -2820,6 +2974,121 @@ mod tests {
             settled, repeated,
             "same timestamp cannot advance choreography"
         );
+    }
+
+    #[test]
+    fn thermal_derate_suppresses_pitch_workload_and_eases_a_tired_eye_reflex() {
+        let start = 18 * NS_PER_SECOND;
+        let thermal_inputs = CharacterInputs::new(
+            CharacterAttention::Absent,
+            CharacterPetState::Inactive,
+            CharacterBodyState::new(
+                CharacterThermalState::PitchDerated,
+                CharacterBaseMotionState::NotApplicable,
+            ),
+        );
+        let mut engine = AutonomicCharacterEngine::new(73);
+        engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start),
+            thermal_inputs,
+            prepared(start),
+        );
+        engine.active_act = Some(RunningAct {
+            act: CharacterAct::LeanIn,
+            started_ns: start,
+            duration_ns: 3 * NS_PER_SECOND,
+            side: 1,
+            style: 0,
+            energy_milli: 0,
+        });
+
+        let settled_at = start + THERMAL_VISUAL_ATTACK_NS;
+        let settled = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(settled_at),
+            thermal_inputs,
+            prepared(settled_at),
+        );
+        assert_eq!(settled.head().bow(), CharacterHeadAmount::ZERO);
+        assert_eq!(settled.head().curl(), CharacterHeadAmount::ZERO);
+        assert_eq!(settled.eye().intent().expression(), Expression::Sleepy);
+        assert!(settled.eye().intent().lid().get() >= 150);
+        assert!(settled.eye().intent().brightness().get() <= 820);
+
+        engine.next_act_ns = settled_at;
+        engine.active_act = None;
+        engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(settled_at + 1),
+            thermal_inputs,
+            prepared(settled_at + 1),
+        );
+        assert!(engine.active_act().is_none());
+
+        let clear_started = settled_at + 2;
+        let nominal_inputs = CharacterInputs::new(
+            CharacterAttention::Absent,
+            CharacterPetState::Inactive,
+            CharacterBodyState::new(
+                CharacterThermalState::Nominal,
+                CharacterBaseMotionState::NotApplicable,
+            ),
+        );
+        engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(clear_started),
+            nominal_inputs,
+            prepared(clear_started),
+        );
+        assert_eq!(
+            engine.thermal_visual_milli(clear_started + THERMAL_VISUAL_RELEASE_NS),
+            0
+        );
+    }
+
+    #[test]
+    fn base_motion_exclusion_removes_every_character_head_axis_without_hiding_the_eye_frame() {
+        let start = 21 * NS_PER_SECOND;
+        let sample_at = start + NS_PER_SECOND;
+        let mut allowed = AutonomicCharacterEngine::new(79);
+        let mut blocked = AutonomicCharacterEngine::new(79);
+        for engine in [&mut allowed, &mut blocked] {
+            engine.render_character(
+                MonotonicTimestamp::from_nanos_since_epoch(start),
+                CharacterInputs::UNATTENDED,
+                prepared(start),
+            );
+            engine.active_act = Some(RunningAct {
+                act: CharacterAct::PlayBow,
+                started_ns: start,
+                duration_ns: 4 * NS_PER_SECOND,
+                side: 1,
+                style: 0,
+                energy_milli: 0,
+            });
+        }
+        let inputs = |base_motion| {
+            CharacterInputs::new(
+                CharacterAttention::Absent,
+                CharacterPetState::Inactive,
+                CharacterBodyState::new(CharacterThermalState::Nominal, base_motion),
+            )
+        };
+        let allowed_frame = allowed.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(sample_at),
+            inputs(CharacterBaseMotionState::NotApplicable),
+            prepared(sample_at),
+        );
+        let blocked_frame = blocked.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(sample_at),
+            inputs(CharacterBaseMotionState::MayMove),
+            prepared(sample_at),
+        );
+
+        assert!(!allowed_frame.head().is_natural());
+        assert!(blocked_frame.head().is_natural());
+        assert_eq!(
+            blocked_frame.eye().generated_at(),
+            allowed_frame.eye().generated_at()
+        );
+        assert_eq!(blocked.active_act(), Some(CharacterAct::PlayBow));
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //! separately reviewed admission boundary must cross-bind the retained
 //! identifiers and exact evidence digest before it can create those types.
 
-use std::{fmt, time::Duration};
+use std::{fmt, num::NonZeroU8, time::Duration};
 
 use kiko_expression_runtime::{
     CameraToHeadGazeExtrinsicsInput, CharacterHeadMappingDeclaration,
@@ -40,8 +40,9 @@ use kiko_head_runtime::gaze_control::{
     ServoVelocityLimitTicksPerControlTick,
 };
 use kiko_head_runtime::{
-    OrganicHeadMotionBindingError, OrganicHeadMotionPolicy, OrganicJointMotionPolicy,
-    OrganicJointMotionPolicyError, OrganicJointMotionPolicyInput,
+    HeadThermalDeratePolicy, HeadThermalDeratePolicyError, OrganicHeadMotionBindingError,
+    OrganicHeadMotionPolicy, OrganicJointMotionPolicy, OrganicJointMotionPolicyError,
+    OrganicJointMotionPolicyInput,
 };
 use serde::Deserialize;
 
@@ -69,6 +70,7 @@ pub struct HeadGazePolicyV1 {
     character_mapping: Option<CharacterHeadMappingDeclaration>,
     controller: HeadGazeControllerDeclaration,
     compliant_hold: Option<HeadCompliantHoldConfig>,
+    thermal_derate: Option<HeadThermalDeratePolicy>,
     lifecycle: HeadGazePolicyLifecycleClaim,
 }
 
@@ -107,6 +109,11 @@ impl HeadGazePolicyV1 {
             .map(|declaration| parse_compliant_hold(declaration, &mapping))
             .transpose()
             .map_err(HeadGazePolicyParseError::CompliantHold)?;
+        let thermal_derate = dto
+            .thermal_derate_declaration
+            .map(parse_thermal_derate)
+            .transpose()
+            .map_err(HeadGazePolicyParseError::ThermalDerate)?;
         let lifecycle =
             parse_lifecycle(dto.lifecycle).map_err(HeadGazePolicyParseError::Lifecycle)?;
 
@@ -115,6 +122,7 @@ impl HeadGazePolicyV1 {
             character_mapping,
             controller,
             compliant_hold,
+            thermal_derate,
             lifecycle,
         })
     }
@@ -145,6 +153,12 @@ impl HeadGazePolicyV1 {
     /// reviewed return runtime before any serial device is opened.
     pub const fn compliant_hold(&self) -> Option<HeadCompliantHoldConfig> {
         self.compliant_hold
+    }
+
+    /// Optional typed soft pitch-workload derate. Physical admission still
+    /// must bind its declared abort threshold to the runtime safety policy.
+    pub const fn thermal_derate(&self) -> Option<HeadThermalDeratePolicy> {
+        self.thermal_derate
     }
 
     /// Caller-supplied lifecycle/review claim retained for later evidence
@@ -725,6 +739,24 @@ fn parse_organic_motion(
     ))
 }
 
+fn parse_thermal_derate(
+    dto: HeadThermalDerateDeclarationDto,
+) -> Result<HeadThermalDeratePolicy, HeadThermalDerateDeclarationParseError> {
+    let engage_samples = NonZeroU8::new(dto.engage_samples)
+        .ok_or(HeadThermalDerateDeclarationParseError::ZeroEngageSamples)?;
+    let clear_samples = NonZeroU8::new(dto.clear_samples)
+        .ok_or(HeadThermalDerateDeclarationParseError::ZeroClearSamples)?;
+    HeadThermalDeratePolicy::try_new(
+        dto.engage_temperature_raw,
+        dto.clear_temperature_raw,
+        dto.abort_temperature_raw_exclusive,
+        engage_samples,
+        clear_samples,
+        dto.maximum_plausible_temperature_raw_inclusive,
+    )
+    .map_err(HeadThermalDerateDeclarationParseError::Policy)
+}
+
 fn parse_compliant_hold(
     dto: HeadCompliantHoldDeclarationDto,
     mapping: &HeadGazeMappingDeclaration,
@@ -875,6 +907,7 @@ pub enum HeadGazePolicyParseError {
     CharacterMapping(CharacterHeadMappingDeclarationParseError),
     Controller(HeadGazeControllerDeclarationParseError),
     CompliantHold(HeadCompliantHoldDeclarationParseError),
+    ThermalDerate(HeadThermalDerateDeclarationParseError),
     Lifecycle(HeadGazeLifecycleClaimParseError),
 }
 
@@ -892,8 +925,34 @@ impl std::error::Error for HeadGazePolicyParseError {
             Self::CharacterMapping(source) => Some(source),
             Self::Controller(source) => Some(source),
             Self::CompliantHold(source) => Some(source),
+            Self::ThermalDerate(source) => Some(source),
             Self::Lifecycle(source) => Some(source),
             Self::InputTooLarge { .. } | Self::UnsupportedSchemaVersion { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadThermalDerateDeclarationParseError {
+    ZeroEngageSamples,
+    ZeroClearSamples,
+    Policy(HeadThermalDeratePolicyError),
+}
+
+impl fmt::Display for HeadThermalDerateDeclarationParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid head thermal-derate declaration: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for HeadThermalDerateDeclarationParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Policy(source) => Some(source),
+            Self::ZeroEngageSamples | Self::ZeroClearSamples => None,
         }
     }
 }
@@ -1109,6 +1168,18 @@ struct HeadGazePolicyV1Dto {
     mapping_declaration: HeadGazeMappingDeclarationDto,
     controller_declaration: HeadGazeControllerDeclarationDto,
     compliant_hold_declaration: Option<HeadCompliantHoldDeclarationDto>,
+    thermal_derate_declaration: Option<HeadThermalDerateDeclarationDto>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeadThermalDerateDeclarationDto {
+    engage_temperature_raw: u8,
+    clear_temperature_raw: u8,
+    abort_temperature_raw_exclusive: u8,
+    engage_samples: u8,
+    clear_samples: u8,
+    maximum_plausible_temperature_raw_inclusive: u8,
 }
 
 #[derive(Deserialize)]
@@ -2006,6 +2077,52 @@ mod tests {
                     ..
                 }
             ))
+        ));
+    }
+
+    #[test]
+    fn optional_thermal_derate_parses_exact_fable_hysteresis_and_fails_closed() {
+        let declaration = json!({
+            "engage_temperature_raw": 60,
+            "clear_temperature_raw": 56,
+            "abort_temperature_raw_exclusive": 65,
+            "engage_samples": 3,
+            "clear_samples": 10,
+            "maximum_plausible_temperature_raw_inclusive": 95
+        });
+        let mut document = valid_value();
+        document["thermal_derate_declaration"] = declaration;
+        let policy = parse(&document).expect("typed thermal derate declaration");
+        assert_eq!(
+            policy.thermal_derate(),
+            Some(HeadThermalDeratePolicy::kiko_field_profile())
+        );
+
+        let mut zero_streak = document.clone();
+        zero_streak["thermal_derate_declaration"]["engage_samples"] = json!(0);
+        assert!(matches!(
+            parse(&zero_streak),
+            Err(HeadGazePolicyParseError::ThermalDerate(
+                HeadThermalDerateDeclarationParseError::ZeroEngageSamples
+            ))
+        ));
+
+        let mut invalid_hysteresis = document.clone();
+        invalid_hysteresis["thermal_derate_declaration"]["clear_temperature_raw"] = json!(60);
+        assert!(matches!(
+            parse(&invalid_hysteresis),
+            Err(HeadGazePolicyParseError::ThermalDerate(
+                HeadThermalDerateDeclarationParseError::Policy(
+                    HeadThermalDeratePolicyError::ClearNotBelowEngage { .. }
+                )
+            ))
+        ));
+
+        let mut unknown = document;
+        unknown["thermal_derate_declaration"]["temperature_unit"] = json!("raw");
+        assert!(matches!(
+            parse(&unknown),
+            Err(HeadGazePolicyParseError::JsonDecode(_))
         ));
     }
 

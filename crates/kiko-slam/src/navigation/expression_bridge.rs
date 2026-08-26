@@ -25,12 +25,12 @@ use kiko_expression_core::{
 };
 use kiko_expression_runtime::{
     AdaptError, AutonomicCharacterEngine, CameraForwardDepthMeters, CameraToHeadGazeExtrinsics,
-    CharacterAttention, CharacterInputs, CharacterPetEpisode, CharacterPetReaction,
-    CharacterPetState, EyeRenderStyle, FaceTrackingUpdate, HeadGazeProjectionError,
-    HeadRelativeGaze, MonotonicLatestAdmission, MonotonicLatestGap, OakCameraTargetPoint,
-    OakCameraTargetRay, PreparedCharacterFrame, PreparedEyeIntent, RayHeadGazeProjectionError,
-    SceneAnalysis, SceneMotionConfig, SceneMotionError, SceneMotionExtractor,
-    adapt_reaction_output,
+    CharacterAttention, CharacterBaseMotionState, CharacterBodyState, CharacterInputs,
+    CharacterPetEpisode, CharacterPetReaction, CharacterPetState, CharacterThermalState,
+    EyeRenderStyle, FaceTrackingUpdate, HeadGazeProjectionError, HeadRelativeGaze,
+    MonotonicLatestAdmission, MonotonicLatestGap, OakCameraTargetPoint, OakCameraTargetRay,
+    PreparedCharacterFrame, PreparedEyeIntent, RayHeadGazeProjectionError, SceneAnalysis,
+    SceneMotionConfig, SceneMotionError, SceneMotionExtractor, adapt_reaction_output,
 };
 use kiko_eye_runtime::{ClockError, MonotonicClock};
 use oak_sys::{ImageFrame, StreamId};
@@ -280,6 +280,8 @@ pub struct RgbExpressionBridge<C> {
     mixer: ReactionMixer,
     character: Option<AutonomicCharacterEngine>,
     pet_state: CharacterPetState,
+    thermal_state: CharacterThermalState,
+    base_motion_state: CharacterBaseMotionState,
     last_device_timestamp_ns: Option<i64>,
 }
 
@@ -321,6 +323,8 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
             mixer: ReactionMixer::new(RGB_EXPRESSION_HEAD_POLICY),
             character: None,
             pet_state: CharacterPetState::Inactive,
+            thermal_state: CharacterThermalState::Unavailable,
+            base_motion_state: CharacterBaseMotionState::NotApplicable,
             last_device_timestamp_ns: None,
         }
     }
@@ -355,6 +359,19 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
     /// the social act is still selected only from completed evidence.
     pub fn note_pet_state(&mut self, state: CharacterPetState) {
         self.pet_state = state;
+    }
+
+    /// Retain the latest head-owner thermal fact for the next coherent RGB
+    /// sample. The bridge never infers nominal state from a missing update.
+    pub fn note_thermal_state(&mut self, state: CharacterThermalState) {
+        self.thermal_state = state;
+    }
+
+    /// Retain the sole base owner's exact exclusion phase for the next
+    /// coherent character sample. Missing physical authority is not inferred
+    /// to mean stationary.
+    pub fn note_base_motion_state(&mut self, state: CharacterBaseMotionState) {
+        self.base_motion_state = state;
     }
 
     /// Project one already-parsed positive-depth OAK point into neutral-head
@@ -531,7 +548,11 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         let prepared = match self.character.as_mut() {
             Some(character) => character.render_character(
                 now,
-                CharacterInputs::new(attention, self.pet_state),
+                CharacterInputs::new(
+                    attention,
+                    self.pet_state,
+                    CharacterBodyState::new(self.thermal_state, self.base_motion_state),
+                ),
                 prepared,
             ),
             None => PreparedCharacterFrame::eyes_only(prepared),
@@ -922,6 +943,64 @@ mod tests {
         assert_eq!(received.eye().intent().pupil().get(), 420);
         assert_eq!(received.eye().intent().color_rgb(), [255, 145, 92]);
         assert!(received.eye().intent().gaze_y().get() >= 430);
+    }
+
+    #[test]
+    fn head_owner_thermal_fact_shapes_the_next_frame_without_a_nominal_fallback() {
+        let clock = TestClock::new(10);
+        let mut decorated = bridge(clock.clone());
+        decorated.character = Some(AutonomicCharacterEngine::new(stream_epoch().get()));
+        decorated
+            .process_borrowed(rgb(1, 1, &[0; 12]))
+            .expect("prime character frame");
+
+        decorated.note_thermal_state(CharacterThermalState::PitchDerated);
+        clock.set(20);
+        let entered = decorated
+            .process_borrowed(rgb(2, 2, &[0; 12]))
+            .expect("thermal entry frame")
+            .into_character();
+        assert_eq!(entered.head().bow().get(), 0);
+        assert_eq!(entered.head().curl().get(), 0);
+
+        clock.set(20 + 1_400_000_000);
+        let settled = decorated
+            .process_borrowed(rgb(3, 3, &[0; 12]))
+            .expect("settled thermal frame")
+            .into_character();
+        assert_eq!(settled.head().bow().get(), 0);
+        assert_eq!(settled.head().curl().get(), 0);
+        assert_eq!(settled.eye().intent().expression(), Expression::Sleepy);
+    }
+
+    #[test]
+    fn base_owner_may_move_fact_suppresses_character_head_motion_on_the_next_frame() {
+        let clock = TestClock::new(10);
+        let mut decorated = bridge(clock.clone());
+        decorated.character = Some(AutonomicCharacterEngine::new(stream_epoch().get()));
+        decorated
+            .process_borrowed(rgb(1, 1, &[0; 12]))
+            .expect("prime character frame");
+        let boop =
+            CharacterPetEpisode::try_new(std::time::Duration::from_millis(600), 0, 0, false, true)
+                .expect("valid tap episode");
+        assert_eq!(
+            decorated.note_pet_episode(MonotonicTimestamp::from_nanos_since_epoch(20), boop),
+            Some(CharacterPetReaction::Boop)
+        );
+        decorated.note_base_motion_state(CharacterBaseMotionState::MayMove);
+
+        clock.set(30);
+        let frame = decorated
+            .process_borrowed(rgb(2, 2, &[0; 12]))
+            .expect("base-excluded character frame")
+            .into_character();
+        assert_eq!(
+            decorated.base_motion_state,
+            CharacterBaseMotionState::MayMove
+        );
+        assert!(frame.head().is_natural());
+        assert_eq!(frame.act(), Some(CharacterAct::StartleBoop));
     }
 
     #[test]

@@ -52,8 +52,8 @@ use kiko_expression_core::UnitAmount as CoreUnitAmount;
 use kiko_expression_core::{Deadline, NonZeroDuration};
 use kiko_expression_core::{MonotonicTimestamp, StreamEpochId};
 use kiko_expression_runtime::{
-    CharacterHeadOverlay, CharacterPetEpisode, CharacterPetState, PreparedCharacterFrame,
-    PreparedEyeIntent,
+    CharacterBaseMotionState, CharacterHeadOverlay, CharacterPetEpisode, CharacterPetState,
+    CharacterThermalState, PreparedCharacterFrame, PreparedEyeIntent,
 };
 #[cfg(feature = "nano-agent")]
 use kiko_expression_runtime::{CharacterPetEpisodeError, FaceTrackingConfig, MAX_FACE_DETECTIONS};
@@ -85,9 +85,9 @@ use kiko_head_runtime::{
 };
 #[cfg(feature = "nano-agent")]
 use kiko_head_runtime::{
-    HeadGazeBaseInterlockError, HeadGazeBaseZeroExclusiveLeaseIssuer, HeadGazeProposalCommandError,
-    HeadGazeServiceError, HeadGazeServiceOutcome,
-    TensionPreservingHeadGazeActorHandle as HeadGazeActorHandle,
+    HeadGazeBaseInterlockError, HeadGazeBaseMotionPhase, HeadGazeBaseZeroExclusiveLeaseIssuer,
+    HeadGazeProposalCommandError, HeadGazeServiceError, HeadGazeServiceOutcome,
+    HeadThermalDerateState, TensionPreservingHeadGazeActorHandle as HeadGazeActorHandle,
 };
 use oak_sys::ImageFrame;
 #[cfg(feature = "nano-agent")]
@@ -538,6 +538,9 @@ impl NanoAccessoryWorkerConfig {
         if policy.compliant_hold().is_none() {
             return Err(NanoPhysicalHeadGazeConfigError::CompliantHoldRequired);
         }
+        if policy.thermal_derate().is_none() {
+            return Err(NanoPhysicalHeadGazeConfigError::ThermalDerateRequired);
+        }
         let policy =
             EvidenceBoundPhysicalHeadGazePolicy::admit(policy, review_evidence, &self.head_return)
                 .map_err(NanoPhysicalHeadGazeConfigError::Admission)?;
@@ -562,6 +565,7 @@ pub enum NanoPhysicalHeadGazeConfigError {
     AlreadyConfigured,
     CharacterMappingRequired,
     CompliantHoldRequired,
+    ThermalDerateRequired,
     Admission(EvidenceBoundPhysicalHeadGazePolicyError),
 }
 
@@ -582,7 +586,8 @@ impl std::error::Error for NanoPhysicalHeadGazeConfigError {
             Self::Admission(source) => Some(source),
             Self::AlreadyConfigured
             | Self::CharacterMappingRequired
-            | Self::CompliantHoldRequired => None,
+            | Self::CompliantHoldRequired
+            | Self::ThermalDerateRequired => None,
         }
     }
 }
@@ -3850,8 +3855,17 @@ impl AccessoryPetControllerEvidence {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AccessoryPetFeedback {
-    state: CharacterPetState,
+    state: Option<CharacterPetState>,
+    thermal_state: Option<CharacterThermalState>,
     completed_episode: Option<AccessoryPetEpisode>,
+}
+
+#[cfg(feature = "nano-agent")]
+const fn adapt_thermal_state(state: HeadThermalDerateState) -> CharacterThermalState {
+    match state {
+        HeadThermalDerateState::Nominal => CharacterThermalState::Nominal,
+        HeadThermalDerateState::PitchDerated => CharacterThermalState::PitchDerated,
+    }
 }
 
 #[cfg(feature = "nano-agent")]
@@ -3931,12 +3945,27 @@ fn adapt_pet_feedback(
 ) -> Result<AccessoryPetFeedback, NanoPhysicalHeadGazeRuntimeError> {
     let controller = evidence.controller();
     Ok(AccessoryPetFeedback {
-        state: adapt_pet_state(controller.disposition())?,
+        state: Some(adapt_pet_state(controller.disposition())?),
+        thermal_state: evidence
+            .thermal_derate()
+            .map(|step| adapt_thermal_state(step.state())),
         completed_episode: controller
             .completed_episode()
             .map(adapt_pet_episode)
             .transpose()?,
     })
+}
+
+#[cfg(feature = "nano-agent")]
+const fn adapt_base_motion_state(phase: HeadGazeBaseMotionPhase) -> CharacterBaseMotionState {
+    match phase {
+        HeadGazeBaseMotionPhase::ConfirmedZero | HeadGazeBaseMotionPhase::HeadGazeTransaction => {
+            CharacterBaseMotionState::ConfirmedStationary
+        }
+        HeadGazeBaseMotionPhase::BaseTransaction => CharacterBaseMotionState::CommandTransaction,
+        HeadGazeBaseMotionPhase::BaseMayMove => CharacterBaseMotionState::MayMove,
+        HeadGazeBaseMotionPhase::Faulted => CharacterBaseMotionState::Faulted,
+    }
 }
 
 trait ReviewedNaturalHeadPort<F> {
@@ -3955,6 +3984,9 @@ trait ReviewedNaturalHeadPort<F> {
         _character_head: CharacterHeadOverlay,
     ) -> Result<Option<AccessoryPetFeedback>, Self::GazeError> {
         Ok(None)
+    }
+    fn character_base_motion_state(&self) -> CharacterBaseMotionState {
+        CharacterBaseMotionState::NotApplicable
     }
     async fn shutdown(&mut self) -> Self::Shutdown;
 }
@@ -3977,6 +4009,10 @@ trait RgbBridgePort<F> {
     fn process(&mut self, frame: &F) -> Result<Self::Intent, Self::Error>;
 
     fn note_pet_state(&mut self, _state: CharacterPetState) {}
+
+    fn note_thermal_state(&mut self, _state: CharacterThermalState) {}
+
+    fn note_base_motion_state(&mut self, _state: CharacterBaseMotionState) {}
 
     fn note_pet_episode(&mut self, _episode: AccessoryPetEpisode) {}
 }
@@ -4158,6 +4194,7 @@ where
             event = channel.next_event() => {
                 match event {
                     LatestFrameEvent::Frame(frame) => {
+                        bridge.note_base_motion_state(head.character_base_motion_state());
                         match bridge.process(&frame) {
                             Err(source) => Some(CoreTerminalFault::Bridge(source)),
                             Ok(intent) => match head
@@ -4168,7 +4205,12 @@ where
                                 Ok(pet_feedback) => {
                                     let mut completed_episode = None;
                                     if let Some(pet_feedback) = pet_feedback {
-                                        bridge.note_pet_state(pet_feedback.state);
+                                        if let Some(state) = pet_feedback.state {
+                                            bridge.note_pet_state(state);
+                                        }
+                                        if let Some(state) = pet_feedback.thermal_state {
+                                            bridge.note_thermal_state(state);
+                                        }
                                         completed_episode = pet_feedback.completed_episode;
                                     }
                                     #[cfg(feature = "nano-agent")]
@@ -4523,9 +4565,15 @@ impl SerialReviewedNaturalHeadPort {
             .map_err(|source| NanoPhysicalHeadGazeRuntimeError::Service(Box::new(source)))?;
         match outcome {
             HeadGazeServiceOutcome::Compliant(evidence) => adapt_pet_feedback(&evidence).map(Some),
+            HeadGazeServiceOutcome::Applied(evidence) => {
+                Ok(evidence.thermal_derate().map(|step| AccessoryPetFeedback {
+                    state: None,
+                    thermal_state: Some(adapt_thermal_state(step.state())),
+                    completed_episode: None,
+                }))
+            }
             HeadGazeServiceOutcome::BeforeScheduledTick { .. }
-            | HeadGazeServiceOutcome::CompliantTemperatureDeferred(_)
-            | HeadGazeServiceOutcome::Applied(_) => Ok(None),
+            | HeadGazeServiceOutcome::CompliantTemperatureDeferred(_) => Ok(None),
         }
     }
 }
@@ -4717,6 +4765,28 @@ impl<F: NanoHeadGazeFrame> ReviewedNaturalHeadPort<F> for SerialReviewedNaturalH
         }
     }
 
+    fn character_base_motion_state(&self) -> CharacterBaseMotionState {
+        #[cfg(feature = "nano-agent")]
+        {
+            let Some(physical) = self
+                .active
+                .as_ref()
+                .and_then(|active| active.physical_gaze.as_ref())
+            else {
+                return CharacterBaseMotionState::NotApplicable;
+            };
+            physical
+                .lease_issuer
+                .get()
+                .map(|issuer| adapt_base_motion_state(issuer.phase()))
+                .unwrap_or(CharacterBaseMotionState::Unavailable)
+        }
+        #[cfg(not(feature = "nano-agent"))]
+        {
+            CharacterBaseMotionState::NotApplicable
+        }
+    }
+
     async fn shutdown(&mut self) -> Self::Shutdown {
         let active = self
             .active
@@ -4751,6 +4821,14 @@ impl RgbBridgePort<IngressObservedRgbFrame<ImageFrame>>
         RgbExpressionBridge::note_pet_state(self, state);
     }
 
+    fn note_thermal_state(&mut self, state: CharacterThermalState) {
+        RgbExpressionBridge::note_thermal_state(self, state);
+    }
+
+    fn note_base_motion_state(&mut self, state: CharacterBaseMotionState) {
+        RgbExpressionBridge::note_base_motion_state(self, state);
+    }
+
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
         let _reaction =
             RgbExpressionBridge::note_pet_episode(self, feedback.completed_at, feedback.episode);
@@ -4780,6 +4858,14 @@ impl RgbBridgePort<NanoAccessoryRgbWork> for RgbExpressionBridge<NanoAccessoryCl
 
     fn note_pet_state(&mut self, state: CharacterPetState) {
         RgbExpressionBridge::note_pet_state(self, state);
+    }
+
+    fn note_thermal_state(&mut self, state: CharacterThermalState) {
+        RgbExpressionBridge::note_thermal_state(self, state);
+    }
+
+    fn note_base_motion_state(&mut self, state: CharacterBaseMotionState) {
+        RgbExpressionBridge::note_base_motion_state(self, state);
     }
 
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
@@ -4814,6 +4900,14 @@ impl RgbBridgePort<NanoAccessoryRgbWork> for ProductionSceneRgbBridge {
         self.0.note_pet_state(state);
     }
 
+    fn note_thermal_state(&mut self, state: CharacterThermalState) {
+        self.0.note_thermal_state(state);
+    }
+
+    fn note_base_motion_state(&mut self, state: CharacterBaseMotionState) {
+        self.0.note_base_motion_state(state);
+    }
+
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
         let _reaction = self
             .0
@@ -4841,6 +4935,14 @@ impl RgbBridgePort<NanoFacePerceptionWork> for ProductionFaceRgbBridge {
 
     fn note_pet_state(&mut self, state: CharacterPetState) {
         self.0.note_pet_state(state);
+    }
+
+    fn note_thermal_state(&mut self, state: CharacterThermalState) {
+        self.0.note_thermal_state(state);
+    }
+
+    fn note_base_motion_state(&mut self, state: CharacterBaseMotionState) {
+        self.0.note_base_motion_state(state);
     }
 
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
@@ -5232,6 +5334,31 @@ mod tests {
             })
         );
         assert_eq!(health_period(25).get(), Duration::from_millis(25));
+    }
+
+    #[cfg(feature = "nano-agent")]
+    #[test]
+    fn base_interlock_phase_maps_exhaustively_without_guessing_stationary() {
+        assert_eq!(
+            adapt_base_motion_state(HeadGazeBaseMotionPhase::ConfirmedZero),
+            CharacterBaseMotionState::ConfirmedStationary
+        );
+        assert_eq!(
+            adapt_base_motion_state(HeadGazeBaseMotionPhase::HeadGazeTransaction),
+            CharacterBaseMotionState::ConfirmedStationary
+        );
+        assert_eq!(
+            adapt_base_motion_state(HeadGazeBaseMotionPhase::BaseTransaction),
+            CharacterBaseMotionState::CommandTransaction
+        );
+        assert_eq!(
+            adapt_base_motion_state(HeadGazeBaseMotionPhase::BaseMayMove),
+            CharacterBaseMotionState::MayMove
+        );
+        assert_eq!(
+            adapt_base_motion_state(HeadGazeBaseMotionPhase::Faulted),
+            CharacterBaseMotionState::Faulted
+        );
     }
 
     #[cfg(feature = "nano-agent")]
@@ -6264,6 +6391,7 @@ mod tests {
         fail_return: bool,
         fail_gaze: bool,
         emit_pet_episode: bool,
+        emit_thermal_derate: bool,
         fail_health_at: Option<usize>,
     }
 
@@ -6309,7 +6437,8 @@ mod tests {
                 Err("head_gaze")
             } else if self.emit_pet_episode {
                 Ok(Some(AccessoryPetFeedback {
-                    state: CharacterPetState::Ready,
+                    state: Some(CharacterPetState::Ready),
+                    thermal_state: None,
                     completed_episode: Some(AccessoryPetEpisode {
                         completed_at: MonotonicTimestamp::from_nanos_since_epoch(10),
                         episode: CharacterPetEpisode::try_new(
@@ -6325,6 +6454,12 @@ mod tests {
                             fake_tap_evidence(),
                         ),
                     }),
+                }))
+            } else if self.emit_thermal_derate {
+                Ok(Some(AccessoryPetFeedback {
+                    state: None,
+                    thermal_state: Some(CharacterThermalState::PitchDerated),
+                    completed_episode: None,
                 }))
             } else {
                 Ok(None)
@@ -6391,6 +6526,10 @@ mod tests {
             self.log.lock().unwrap().push("pet_state");
         }
 
+        fn note_thermal_state(&mut self, _state: CharacterThermalState) {
+            self.log.lock().unwrap().push("thermal_state");
+        }
+
         fn note_pet_episode(&mut self, _episode: AccessoryPetEpisode) {
             self.log.lock().unwrap().push("pet_episode");
         }
@@ -6444,6 +6583,7 @@ mod tests {
                 fail_return: false,
                 fail_gaze: false,
                 emit_pet_episode: false,
+                emit_thermal_derate: false,
                 fail_health_at,
             },
             FakeEye {
@@ -6625,6 +6765,55 @@ mod tests {
                 "bridge",
                 "pet_state",
                 "pet_episode",
+                "eye_apply",
+            ]
+        );
+        channel.request_shutdown();
+        assert!(matches!(task.await.unwrap(), CoreExit::Shutdown { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn thermal_derate_fact_reaches_character_before_the_current_eye_ack() {
+        let (mut head, eye, bridge, log, _) = fakes(false, false, false, false, None);
+        head.emit_thermal_derate = true;
+        let channel = Arc::new(LatestFrameChannel::new());
+        let task_channel = Arc::clone(&channel);
+        let task = tokio::spawn(async move {
+            run_accessory_core(
+                head,
+                eye,
+                bridge,
+                task_channel,
+                health_period(50),
+                None,
+                CoreObservers {
+                    ready: |_, _| true,
+                    record_health: |_| true,
+                    publish_fault: |_| {},
+                    latch_fault: || {},
+                },
+            )
+            .await
+        });
+        assert_eq!(
+            channel.submit(10_u64),
+            NanoAccessoryFrameSubmitOutcome::Enqueued
+        );
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while channel.counters.snapshot().processed_successfully == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("thermal feedback and eye acknowledgement finish in bounded time");
+        assert_eq!(
+            &*log.lock().unwrap(),
+            &[
+                "eye_start",
+                "head_start",
+                "head_return",
+                "bridge",
+                "thermal_state",
                 "eye_apply",
             ]
         );

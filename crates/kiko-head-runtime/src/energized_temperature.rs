@@ -121,6 +121,10 @@ impl EnergizedTemperatureSupervisor {
         }
     }
 
+    pub(crate) const fn maximum_plausible_raw_inclusive(&self) -> u8 {
+        self.maximum_plausible_raw_inclusive
+    }
+
     pub(crate) fn observe(
         &mut self,
         samples: [EnergizedTemperatureSample; JOINT_COUNT],

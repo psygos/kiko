@@ -206,6 +206,17 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
                 .try_with_compliant_hold(compliant_hold)
                 .map_err(EvidenceBoundPhysicalHeadGazePolicyError::Actuation)?;
         }
+        if let Some(thermal_derate) = policy.thermal_derate() {
+            actuation = actuation
+                .try_with_thermal_derate(
+                    thermal_derate,
+                    reviewed_return
+                        .runtime()
+                        .telemetry_safety_limits()
+                        .maximum_energized_temperature_raw_exclusive(),
+                )
+                .map_err(EvidenceBoundPhysicalHeadGazePolicyError::Actuation)?;
+        }
         let adapter = HeadGazeFaceProposalAdapter::try_new(policy)
             .map_err(EvidenceBoundPhysicalHeadGazePolicyError::Adapter)?;
 

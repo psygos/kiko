@@ -180,5 +180,13 @@
         "maximum_observed_step_ticks": ${HEAD_COMPLIANCE_UNVALIDATED_ROLL_MAXIMUM_OBSERVED_STEP_TICKS}
       }
     }
+  },
+  "thermal_derate_declaration": {
+    "engage_temperature_raw": 60,
+    "clear_temperature_raw": 56,
+    "abort_temperature_raw_exclusive": 65,
+    "engage_samples": 3,
+    "clear_samples": 10,
+    "maximum_plausible_temperature_raw_inclusive": 95
   }
 }

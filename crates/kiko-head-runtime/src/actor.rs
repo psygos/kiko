@@ -31,12 +31,18 @@ use crate::energized_temperature::{
 use crate::framing::{FrameReadError, read_response_frame};
 use crate::gaze_control::{
     HeadGazeCommitReceipt, HeadGazeControlConfig, HeadGazeController, HeadGazeControllerInitError,
-    HeadGazeExternalFault, HeadGazePreparedStepError, HeadGazeProposal, HeadGazeProposalAdmission,
-    HeadGazeProposalAdmissionError, HeadGazeTickError,
+    HeadGazeExternalFault, HeadGazePitchWorkload, HeadGazePreparedStepError, HeadGazeProposal,
+    HeadGazeProposalAdmission, HeadGazeProposalAdmissionError, HeadGazeTickError,
 };
 use crate::motion::{
     FreshHeadTelemetrySet, HeadMotionError, HeadReturnAction, HeadReturnController,
     admit_stopped_return_start,
+};
+#[cfg(test)]
+use crate::thermal_derate::HeadThermalDerateState;
+use crate::thermal_derate::{
+    HeadThermalDerateBindingError, HeadThermalDerateController, HeadThermalDeratePolicy,
+    HeadThermalDerateStep,
 };
 use crate::transport::{
     AsyncByteTransport, MonotonicClock, MonotonicTime, SerialConfigurationEvidence,
@@ -80,6 +86,7 @@ pub struct HeadGazeActuationConfig {
     controller: HeadGazeControlConfig,
     goal_register_transaction_timeout: OperationTimeout,
     compliant_hold: Option<HeadCompliantHoldConfig>,
+    thermal_derate: Option<HeadThermalDeratePolicy>,
 }
 
 impl HeadGazeActuationConfig {
@@ -132,6 +139,7 @@ impl HeadGazeActuationConfig {
             controller,
             goal_register_transaction_timeout,
             compliant_hold: None,
+            thermal_derate: None,
         })
     }
 
@@ -200,6 +208,30 @@ impl HeadGazeActuationConfig {
     pub const fn compliant_hold(self) -> Option<HeadCompliantHoldConfig> {
         self.compliant_hold
     }
+
+    /// Bind the soft pitch-workload derate to the runtime's hard energized
+    /// temperature boundary before any device is opened.
+    pub fn try_with_thermal_derate(
+        mut self,
+        thermal_derate: HeadThermalDeratePolicy,
+        runtime_abort_temperature_raw_exclusive: u8,
+    ) -> Result<Self, HeadGazeActuationConfigError> {
+        let runtime_supervision = EnergizedTemperatureSupervisor::kiko_field_profile(
+            runtime_abort_temperature_raw_exclusive,
+        );
+        thermal_derate
+            .admit_runtime_supervision(
+                runtime_abort_temperature_raw_exclusive,
+                runtime_supervision.maximum_plausible_raw_inclusive(),
+            )
+            .map_err(HeadGazeActuationConfigError::ThermalDerateBinding)?;
+        self.thermal_derate = Some(thermal_derate);
+        Ok(self)
+    }
+
+    pub const fn thermal_derate(self) -> Option<HeadThermalDeratePolicy> {
+        self.thermal_derate
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -233,6 +265,7 @@ pub enum HeadGazeActuationConfigError {
         observation_transaction_timeout: Duration,
         gaze_maximum_lateness: Duration,
     },
+    ThermalDerateBinding(HeadThermalDerateBindingError),
 }
 
 impl fmt::Display for HeadGazeActuationConfigError {
@@ -248,6 +281,7 @@ impl std::error::Error for HeadGazeActuationConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::TransactionTimeout(source) => Some(source),
+            Self::ThermalDerateBinding(source) => Some(source),
             Self::NaturalPoseDoesNotMatchReviewedReturn { .. }
             | Self::TransactionTimeoutExceedsControlPeriod { .. }
             | Self::CompliantEnvelopeOutsideGazeEnvelope { .. }
@@ -1952,6 +1986,7 @@ pub enum HeadGazeHardwareApplication {
 pub struct VerifiedHeadGazeControlStep {
     controller: HeadGazeCommitReceipt,
     hardware: HeadGazeHardwareApplication,
+    thermal_derate: Option<HeadThermalDerateStep>,
 }
 
 /// One compliant-hold step committed by the exclusive serial owner used for
@@ -1963,6 +1998,7 @@ pub struct VerifiedHeadCompliantHoldStep {
     controller: CompliantHoldCommitReceipt,
     hardware: HeadGazeHardwareApplication,
     torque_transition: Option<VerifiedCompliantTorqueTransition>,
+    thermal_derate: Option<HeadThermalDerateStep>,
 }
 
 /// Exact four-write evidence for a compliant torque-profile transition.
@@ -2161,7 +2197,9 @@ impl UnreadableEnergizedTemperatureFault {
 }
 
 enum HeadCompliantHoldExecution {
-    RetainedExpressionTarget,
+    RetainedExpressionTarget {
+        thermal_derate: Option<HeadThermalDerateStep>,
+    },
     TemperatureDeferred(Box<DeferredEnergizedTemperatureObservation>),
     Applied(Box<VerifiedHeadCompliantHoldStep>),
 }
@@ -2178,6 +2216,10 @@ impl VerifiedHeadCompliantHoldStep {
     pub const fn torque_transition(&self) -> Option<&VerifiedCompliantTorqueTransition> {
         self.torque_transition.as_ref()
     }
+
+    pub const fn thermal_derate(&self) -> Option<HeadThermalDerateStep> {
+        self.thermal_derate
+    }
 }
 
 impl VerifiedHeadGazeControlStep {
@@ -2187,6 +2229,10 @@ impl VerifiedHeadGazeControlStep {
 
     pub const fn hardware(&self) -> &HeadGazeHardwareApplication {
         &self.hardware
+    }
+
+    pub const fn thermal_derate(&self) -> Option<HeadThermalDerateStep> {
+        self.thermal_derate
     }
 }
 
@@ -2896,6 +2942,10 @@ where
             .maximum_energized_temperature_raw_exclusive(),
     );
     let applied_torque_limits = AppliedTorqueLimits::Verified(config.torque_limits());
+    let thermal_derate = control_mode
+        .gaze()
+        .and_then(HeadGazeActuationConfig::thermal_derate)
+        .map(HeadThermalDerateController::new);
     let actor = HeadActor {
         transport,
         clock,
@@ -2905,6 +2955,7 @@ where
         return_plan,
         control_mode,
         energized_temperature,
+        thermal_derate,
         temperature_deferred_until: None,
         applied_torque_limits,
     };
@@ -2948,6 +2999,10 @@ where
             .maximum_energized_temperature_raw_exclusive(),
     );
     let applied_torque_limits = AppliedTorqueLimits::Verified(config.torque_limits());
+    let thermal_derate = control_mode
+        .gaze()
+        .and_then(HeadGazeActuationConfig::thermal_derate)
+        .map(HeadThermalDerateController::new);
     let actor = HeadActor {
         transport,
         clock,
@@ -2957,6 +3012,7 @@ where
         return_plan,
         control_mode,
         energized_temperature,
+        thermal_derate,
         temperature_deferred_until: None,
         applied_torque_limits,
     };
@@ -3247,6 +3303,7 @@ struct HeadActor<T, C> {
     return_plan: Option<HeadReturnPlan>,
     control_mode: HeadControlMode,
     energized_temperature: EnergizedTemperatureSupervisor,
+    thermal_derate: Option<HeadThermalDerateController>,
     temperature_deferred_until: Option<MonotonicTime>,
     applied_torque_limits: AppliedTorqueLimits,
 }
@@ -3765,7 +3822,7 @@ where
                                     );
                                 }
                                 Ok(
-                                    HeadCompliantHoldExecution::RetainedExpressionTarget
+                                    HeadCompliantHoldExecution::RetainedExpressionTarget { .. }
                                     | HeadCompliantHoldExecution::TemperatureDeferred(_),
                                 ) => {}
                                 Err(source) => {
@@ -3968,6 +4025,7 @@ where
         commands: &mut mpsc::Receiver<HeadCommand>,
         control: &mut ControlState,
     ) -> Result<HeadGazeServiceOutcome, HeadGazeServiceError> {
+        let mut thermal_derate = None;
         if let Some(compliant) = compliant {
             let now = self.clock.now();
             if self
@@ -4013,24 +4071,27 @@ where
                             evidence,
                         ));
                     }
-                    HeadCompliantHoldExecution::RetainedExpressionTarget => {}
+                    HeadCompliantHoldExecution::RetainedExpressionTarget {
+                        thermal_derate: observed,
+                    } => thermal_derate = observed,
                 }
             }
         }
         let now = self.clock.now();
-        let prepared = match controller.prepare_tick(now) {
-            Ok(prepared) => prepared,
-            Err(HeadGazeTickError::BeforeScheduledTick {
-                scheduled_for,
-                observed_at,
-            }) => {
-                return Ok(HeadGazeServiceOutcome::BeforeScheduledTick {
+        let prepared =
+            match controller.prepare_tick_with_pitch_workload(now, self.thermal_pitch_workload()) {
+                Ok(prepared) => prepared,
+                Err(HeadGazeTickError::BeforeScheduledTick {
                     scheduled_for,
                     observed_at,
-                });
-            }
-            Err(source) => return Err(HeadGazeServiceError::Controller(source)),
-        };
+                }) => {
+                    return Ok(HeadGazeServiceOutcome::BeforeScheduledTick {
+                        scheduled_for,
+                        observed_at,
+                    });
+                }
+                Err(source) => return Err(HeadGazeServiceError::Controller(source)),
+            };
         let target = prepared.planned_target();
         let hardware = if target == controller.committed_target() {
             HeadGazeHardwareApplication::RetainedPreviouslyVerifiedTarget { target }
@@ -4074,6 +4135,7 @@ where
                 VerifiedHeadGazeControlStep {
                     controller,
                     hardware,
+                    thermal_derate,
                 },
             ))),
             Err(source) => {
@@ -4081,6 +4143,17 @@ where
                     .latch_external_fault(HeadGazeExternalFault::ActuatorApplicationUncertain);
                 Err(HeadGazeServiceError::CommitAfterVerifiedApplication { source, target })
             }
+        }
+    }
+
+    fn thermal_pitch_workload(&self) -> HeadGazePitchWorkload {
+        if self
+            .thermal_derate
+            .is_some_and(|controller| controller.state().pitch_derated())
+        {
+            HeadGazePitchWorkload::NaturalPitchOnly
+        } else {
+            HeadGazePitchWorkload::Unrestricted
         }
     }
 
@@ -4185,11 +4258,15 @@ where
         let temperature_samples = std::array::from_fn(|index| {
             EnergizedTemperatureSample::new(samples[index].temperature_raw(), received_at[index])
         });
-        let observation = match observation_result {
+        let (observation, thermal_derate) = match observation_result {
             Ok(observation) => match self.energized_temperature.observe(temperature_samples) {
                 EnergizedTemperatureSupervision::Admitted { .. } => {
                     self.temperature_deferred_until = None;
-                    observation
+                    let thermal_derate = self
+                        .thermal_derate
+                        .as_mut()
+                        .map(|controller| controller.observe(temperature_samples));
+                    (observation, thermal_derate)
                 }
                 EnergizedTemperatureSupervision::AdmittedWithImplausible { .. }
                 | EnergizedTemperatureSupervision::Deferred { .. }
@@ -4209,16 +4286,22 @@ where
             }) => match self.energized_temperature.observe(temperature_samples) {
                 EnergizedTemperatureSupervision::AdmittedWithImplausible { admission, .. } => {
                     self.temperature_deferred_until = None;
-                    CompliantHeadObservation::try_from_supervised_timed_telemetry(
-                        samples,
-                        received_at,
-                        now,
-                        self.config.telemetry_safety_limits(),
-                        compliant_config.maximum_observation_span(),
-                        compliant_config.observation_ttl(),
-                        admission,
-                    )
-                    .map_err(HeadGazeServiceError::CompliantObservation)?
+                    let observation =
+                        CompliantHeadObservation::try_from_supervised_timed_telemetry(
+                            samples,
+                            received_at,
+                            now,
+                            self.config.telemetry_safety_limits(),
+                            compliant_config.maximum_observation_span(),
+                            compliant_config.observation_ttl(),
+                            admission,
+                        )
+                        .map_err(HeadGazeServiceError::CompliantObservation)?;
+                    let thermal_derate = self
+                        .thermal_derate
+                        .as_mut()
+                        .map(|controller| controller.observe(temperature_samples));
+                    (observation, thermal_derate)
                 }
                 EnergizedTemperatureSupervision::Deferred { channels } => {
                     let due_duration = now
@@ -4311,7 +4394,7 @@ where
             // The gaze controller's target already carries complete actor-local
             // goal-register evidence. Synchronising the passive compliance
             // planner must not duplicate those four writes and readbacks.
-            return Ok(HeadCompliantHoldExecution::RetainedExpressionTarget);
+            return Ok(HeadCompliantHoldExecution::RetainedExpressionTarget { thermal_derate });
         }
         let hardware = if target == compliant.committed_target() {
             HeadGazeHardwareApplication::RetainedPreviouslyVerifiedTarget { target }
@@ -4346,6 +4429,7 @@ where
                 controller,
                 hardware,
                 torque_transition,
+                thermal_derate,
             },
         )))
     }
@@ -7012,6 +7096,7 @@ fn apply_completed_waypoint_prefix(
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::io;
+    use std::num::NonZeroU8;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -7616,6 +7701,7 @@ mod tests {
                 return_plan: None,
                 control_mode: HeadControlMode::NaturalHold,
                 energized_temperature: test_energized_temperature(),
+                thermal_derate: None,
                 temperature_deferred_until: None,
                 applied_torque_limits: AppliedTorqueLimits::Verified(
                     valid_config(1).torque_limits(),
@@ -7860,6 +7946,65 @@ mod tests {
             }) if observation_transaction_timeout == Duration::from_millis(22)
                 && gaze_maximum_lateness == Duration::from_millis(21)
         ));
+
+        let thermal = HeadThermalDeratePolicy::kiko_field_profile();
+        assert_eq!(
+            actuation
+                .try_with_thermal_derate(thermal, 65)
+                .expect("matching hard abort boundary")
+                .thermal_derate(),
+            Some(thermal)
+        );
+        assert!(matches!(
+            actuation.try_with_thermal_derate(thermal, 64),
+            Err(HeadGazeActuationConfigError::ThermalDerateBinding(
+                HeadThermalDerateBindingError::AbortThresholdMismatch {
+                    declared_raw_exclusive: 65,
+                    runtime_raw_exclusive: 64,
+                }
+            ))
+        ));
+        let mismatched_plausibility = HeadThermalDeratePolicy::try_new(
+            60,
+            56,
+            65,
+            NonZeroU8::new(3).unwrap(),
+            NonZeroU8::new(10).unwrap(),
+            94,
+        )
+        .unwrap();
+        assert!(matches!(
+            actuation.try_with_thermal_derate(mismatched_plausibility, 65),
+            Err(HeadGazeActuationConfigError::ThermalDerateBinding(
+                HeadThermalDerateBindingError::PlausibilityCeilingMismatch {
+                    declared_raw_inclusive: 94,
+                    runtime_raw_inclusive: 95,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn active_thermal_derate_selects_the_reversible_planner_constraint() {
+        let natural = goal_register_target();
+        let (mut actor, _shared) = goal_register_actor(Vec::new());
+        let actuation = gaze_actuation_config(natural)
+            .try_with_thermal_derate(HeadThermalDeratePolicy::kiko_field_profile(), 65)
+            .expect("field profile binds to the runtime abort boundary");
+        actor.control_mode = HeadControlMode::Gaze(actuation);
+        let mut derate =
+            HeadThermalDerateController::new(HeadThermalDeratePolicy::kiko_field_profile());
+        for sequence in 0..3 {
+            let at = MonotonicTime::from_duration_since_origin(Duration::from_millis(sequence));
+            derate.observe([60, 61, 40, 40].map(|raw| EnergizedTemperatureSample::new(raw, at)));
+        }
+        assert_eq!(derate.state(), HeadThermalDerateState::PitchDerated);
+        actor.thermal_derate = Some(derate);
+
+        assert_eq!(
+            actor.thermal_pitch_workload(),
+            HeadGazePitchWorkload::NaturalPitchOnly
+        );
     }
 
     #[tokio::test]
@@ -11266,6 +11411,7 @@ mod tests {
             return_plan: Some(plan()),
             control_mode: HeadControlMode::NaturalHold,
             energized_temperature: test_energized_temperature(),
+            thermal_derate: None,
             temperature_deferred_until: None,
             applied_torque_limits: AppliedTorqueLimits::Verified(valid_config(1).torque_limits()),
         };
@@ -11315,6 +11461,7 @@ mod tests {
             return_plan: Some(plan()),
             control_mode: HeadControlMode::NaturalHold,
             energized_temperature: test_energized_temperature(),
+            thermal_derate: None,
             temperature_deferred_until: None,
             applied_torque_limits: AppliedTorqueLimits::Verified(valid_config(1).torque_limits()),
         };
@@ -11369,6 +11516,7 @@ mod tests {
             return_plan: None,
             control_mode: HeadControlMode::NaturalHold,
             energized_temperature: test_energized_temperature(),
+            thermal_derate: None,
             temperature_deferred_until: None,
             applied_torque_limits: AppliedTorqueLimits::Verified(valid_config(1).torque_limits()),
         };

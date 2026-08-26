@@ -940,6 +940,18 @@ pub enum HeadGazeTickError {
     FaultHeld(HeadGazeFaultReason),
 }
 
+/// Actor-owned workload constraint applied while preparing one gaze tick.
+///
+/// The admitted proposal remains unchanged so clearing a temporary thermal
+/// derate can resume from fresh proposal evidence rather than from a rewritten
+/// value. `NaturalPitchOnly` affects bow and curl; yaw and roll retain their
+/// ordinary target and every downstream rate/step limit still applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadGazePitchWorkload {
+    Unrestricted,
+    NaturalPitchOnly,
+}
+
 impl fmt::Display for HeadGazeTickError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "head-gaze tick failed: {self:?}")
@@ -1199,6 +1211,14 @@ impl HeadGazeController {
         &mut self,
         now: MonotonicTime,
     ) -> Result<PreparedHeadGazeControlStep, HeadGazeTickError> {
+        self.prepare_tick_with_pitch_workload(now, HeadGazePitchWorkload::Unrestricted)
+    }
+
+    pub(crate) fn prepare_tick_with_pitch_workload(
+        &mut self,
+        now: MonotonicTime,
+        pitch_workload: HeadGazePitchWorkload,
+    ) -> Result<PreparedHeadGazeControlStep, HeadGazeTickError> {
         if let Some(reason) = self.fault {
             return Err(HeadGazeTickError::FaultHeld(reason));
         }
@@ -1213,7 +1233,7 @@ impl HeadGazeController {
             based_on_generation: self.generation,
         };
         let mut candidate = self.planning_snapshot();
-        let planned = match candidate.service_tick_in_place(now) {
+        let planned = match candidate.service_tick_in_place(now, pitch_workload) {
             Ok(planned) => planned,
             Err(HeadGazeTickError::FaultLatched(reason)) => {
                 self.latch_fault(reason);
@@ -1338,6 +1358,7 @@ impl HeadGazeController {
     fn service_tick_in_place(
         &mut self,
         now: MonotonicTime,
+        pitch_workload: HeadGazePitchWorkload,
     ) -> Result<PlannedHeadGazeControlStep, HeadGazeTickError> {
         if now < self.latest_boundary_at {
             let reason = HeadGazeFaultReason::TickClockRegression {
@@ -1383,6 +1404,18 @@ impl HeadGazeController {
         }
 
         let target = self.target_for_step();
+        let target = match pitch_workload {
+            HeadGazePitchWorkload::Unrestricted => target,
+            HeadGazePitchWorkload::NaturalPitchOnly => {
+                let natural = self.config.natural_pose();
+                ExactHeadTargetPose::from_positions(
+                    natural.position(HeadJoint::Bow),
+                    natural.position(HeadJoint::Curl),
+                    target.position(HeadJoint::Yaw),
+                    target.position(HeadJoint::Roll),
+                )
+            }
+        };
         let target = match (self.organic_motion.as_mut(), self.bound_organic_motion) {
             (Some(organic), Some(policy)) => match organic.step(target, policy) {
                 Ok(target) => target,
@@ -2200,6 +2233,47 @@ mod tests {
         assert_eq!(controller.state(), HeadGazeControlState::NaturalHold);
         assert_eq!(controller.committed_target(), pose(1_000));
         assert_eq!(controller.velocity(), HeadServoVelocity::ZERO);
+    }
+
+    #[test]
+    fn natural_pitch_workload_is_immediate_axis_selective_and_reversible() {
+        let config = config_with_ttl(1_000);
+        let mut controller = natural_controller(config, at(0));
+        let target = ExactHeadTargetPose::from_positions(
+            position(1_200),
+            position(1_300),
+            position(1_400),
+            position(1_500),
+        );
+        let proposal = |id, observed_at| {
+            HeadGazeProposal::new(
+                HeadGazeProposalId::try_new(id).unwrap(),
+                at(observed_at),
+                target,
+            )
+        };
+        controller.admit_proposal(proposal(1, 0), at(0)).unwrap();
+        controller.tick(at(0)).unwrap();
+        controller.admit_proposal(proposal(2, 10), at(10)).unwrap();
+
+        let derated = controller
+            .prepare_tick_with_pitch_workload(at(10), HeadGazePitchWorkload::NaturalPitchOnly)
+            .unwrap();
+        assert_eq!(
+            derated.planned_target().position(HeadJoint::Bow).get(),
+            1_000
+        );
+        assert_eq!(
+            derated.planned_target().position(HeadJoint::Curl).get(),
+            1_000
+        );
+        assert!(derated.planned_target().position(HeadJoint::Yaw).get() > 1_000);
+        assert!(derated.planned_target().position(HeadJoint::Roll).get() > 1_000);
+        controller.commit_prepared(derated).unwrap();
+
+        let cleared = controller.prepare_tick(at(20)).unwrap();
+        assert!(cleared.planned_target().position(HeadJoint::Bow).get() > 1_000);
+        assert!(cleared.planned_target().position(HeadJoint::Curl).get() > 1_000);
     }
 
     #[test]
