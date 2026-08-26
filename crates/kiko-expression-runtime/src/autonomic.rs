@@ -33,7 +33,7 @@ const GREETING_MIN_NS: u64 = 900 * NS_PER_MS;
 const GREETING_MAX_NS: u64 = 1_400 * NS_PER_MS;
 const FORMAL_GREETING_MIN_NS: u64 = 1_600 * NS_PER_MS;
 const FORMAL_GREETING_MAX_NS: u64 = 2_100 * NS_PER_MS;
-const GREETING_COOLDOWN_NS: u64 = 10 * NS_PER_SECOND;
+const GREETING_COOLDOWN_NS: u64 = 6 * NS_PER_SECOND;
 const LOST_DURATION_NS: u64 = 700 * NS_PER_MS;
 const SEARCH_MIN_NS: u64 = 2_200 * NS_PER_MS;
 const SEARCH_MAX_NS: u64 = 3_800 * NS_PER_MS;
@@ -958,8 +958,8 @@ impl CharacterAct {
             Self::DoubleTake => 16,
             Self::ExcitedWiggle => 14,
             Self::LeanIn => 15,
-            Self::Nod => 11,
-            Self::SoftNod => 12,
+            Self::Nod => 10,
+            Self::SoftNod => 11,
             Self::HappySquint => 12,
             Self::PuppyEyes => 18,
             Self::ShyDip => 25,
@@ -2835,6 +2835,9 @@ mod tests {
         PositiveUnitAmount, SignedUnitAmount, UnitAmount as CoreUnitAmount,
     };
     use kiko_eye_protocol::{EyeFlags, SignedUnit};
+    use serde::Deserialize;
+    use std::string::String;
+    use std::vec::Vec;
 
     use super::*;
 
@@ -2900,6 +2903,432 @@ mod tests {
                 lifecycle,
             ),
         )
+    }
+
+    const FABLE_BEHAVIOR_TRACE: &str =
+        include_str!("../../../deploy/expression/fixtures/fable-behavior-trace-v1.json");
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FableBehaviorTrace {
+        schema_version: u32,
+        source: String,
+        comparison_contract: String,
+        source_sha256: FableSourceDigests,
+        timing: FableTimingContract,
+        acts: Vec<FableActContract>,
+        mode_trace: Vec<FableModeSample>,
+        pet_trace: Vec<FablePetSample>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FableSourceDigests {
+        kiko_face_follow_py: String,
+        organic_motion_py: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FableTimingContract {
+        greeting_cooldown_ms: u64,
+        greeting_min_ms: u64,
+        greeting_max_ms: u64,
+        formal_greeting_min_ms: u64,
+        formal_greeting_max_ms: u64,
+        lost_ms: u64,
+        search_min_ms: u64,
+        search_max_ms: u64,
+        sleepy_after_idle_ms: u64,
+        rest_after_idle_ms: u64,
+        rest_ease_ms: u64,
+        first_act_min_ms: u64,
+        first_act_max_ms: u64,
+        tracking_act_gap_min_ms: u64,
+        tracking_act_gap_max_ms: u64,
+        idle_act_gap_min_ms: u64,
+        idle_act_gap_max_ms: u64,
+        saccade_min_ms: u64,
+        saccade_max_ms: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FableActContract {
+        name: String,
+        scheduled: bool,
+        eligible_modes: Vec<String>,
+        cooldown_ms: u64,
+        duration_min_ms: u64,
+        duration_max_ms: u64,
+        fable_channels: Vec<String>,
+        pet_reaction: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FableModeSample {
+        at_ms: u64,
+        face_present: bool,
+        expected_mode: String,
+        fable_eye_expression: String,
+        fable_head_natural: bool,
+        require_rust_head_natural: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FablePetSample {
+        at_ms: u64,
+        duration_ms: u64,
+        accumulated_max_delta_ticks: u64,
+        delta_samples: u64,
+        reached_comfy: bool,
+        tap: bool,
+        expected_reaction: String,
+        expected_act: String,
+    }
+
+    fn parse_fable_behavior_trace() -> FableBehaviorTrace {
+        serde_json::from_str(FABLE_BEHAVIOR_TRACE).expect("checked-in Fable trace must parse")
+    }
+
+    fn character_act_named(name: &str) -> Option<CharacterAct> {
+        CharacterAct::ALL
+            .iter()
+            .copied()
+            .find(|act| act.as_str() == name)
+    }
+
+    const fn character_mode_name(mode: CharacterMode) -> &'static str {
+        match mode {
+            CharacterMode::Idle => "idle",
+            CharacterMode::Greeting => "greet",
+            CharacterMode::Tracking => "track",
+            CharacterMode::Lost => "lost",
+            CharacterMode::Searching => "search",
+            CharacterMode::Sleepy => "sleepy",
+        }
+    }
+
+    const fn eye_expression_name(expression: Expression) -> &'static str {
+        match expression {
+            Expression::Neutral => "neutral",
+            Expression::Curious => "curious",
+            Expression::Greet => "greet",
+            Expression::Concerned => "concerned",
+            Expression::Sleepy => "sleepy",
+        }
+    }
+
+    fn assert_sha256_text(digest: &str) {
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn fable_behavior_trace_rejects_unknown_and_duplicate_boundary_fields() {
+        let unknown = FABLE_BEHAVIOR_TRACE.replacen(
+            "\"schema_version\": 1,",
+            "\"unknown\": 0, \"schema_version\": 1,",
+            1,
+        );
+        assert!(serde_json::from_str::<FableBehaviorTrace>(&unknown).is_err());
+        let duplicate = FABLE_BEHAVIOR_TRACE.replacen(
+            "\"schema_version\": 1,",
+            "\"schema_version\": 1, \"schema_version\": 1,",
+            1,
+        );
+        assert!(serde_json::from_str::<FableBehaviorTrace>(&duplicate).is_err());
+    }
+
+    #[test]
+    fn fable_behavior_trace_contract_matches_rust_timing_and_complete_act_vocabulary() {
+        let trace = parse_fable_behavior_trace();
+        assert_eq!(trace.schema_version, 1);
+        assert_eq!(trace.source, "fable_python_expression_lab");
+        assert_eq!(
+            trace.comparison_contract,
+            "semantic_contract_v1_not_numeric_or_physical_parity"
+        );
+        assert_sha256_text(&trace.source_sha256.kiko_face_follow_py);
+        assert_sha256_text(&trace.source_sha256.organic_motion_py);
+        assert_ne!(
+            trace.source_sha256.kiko_face_follow_py,
+            trace.source_sha256.organic_motion_py
+        );
+
+        let timing = trace.timing;
+        assert_eq!(
+            timing.greeting_cooldown_ms * NS_PER_MS,
+            GREETING_COOLDOWN_NS
+        );
+        assert_eq!(timing.greeting_min_ms * NS_PER_MS, GREETING_MIN_NS);
+        assert_eq!(timing.greeting_max_ms * NS_PER_MS, GREETING_MAX_NS);
+        assert_eq!(
+            timing.formal_greeting_min_ms * NS_PER_MS,
+            FORMAL_GREETING_MIN_NS
+        );
+        assert_eq!(
+            timing.formal_greeting_max_ms * NS_PER_MS,
+            FORMAL_GREETING_MAX_NS
+        );
+        assert_eq!(timing.lost_ms * NS_PER_MS, LOST_DURATION_NS);
+        assert_eq!(timing.search_min_ms * NS_PER_MS, SEARCH_MIN_NS);
+        assert_eq!(timing.search_max_ms * NS_PER_MS, SEARCH_MAX_NS);
+        assert_eq!(
+            timing.sleepy_after_idle_ms * NS_PER_MS,
+            SLEEPY_AFTER_IDLE_NS
+        );
+        assert_eq!(timing.rest_after_idle_ms * NS_PER_MS, REST_AFTER_IDLE_NS);
+        assert_eq!(timing.rest_ease_ms * NS_PER_MS, REST_EASE_NS);
+        assert_eq!(timing.first_act_min_ms * NS_PER_MS, FIRST_ACT_MIN_NS);
+        assert_eq!(timing.first_act_max_ms * NS_PER_MS, FIRST_ACT_MAX_NS);
+        assert_eq!(
+            timing.tracking_act_gap_min_ms * NS_PER_MS,
+            TRACK_ACT_GAP_MIN_NS
+        );
+        assert_eq!(
+            timing.tracking_act_gap_max_ms * NS_PER_MS,
+            TRACK_ACT_GAP_MAX_NS
+        );
+        assert_eq!(timing.idle_act_gap_min_ms * NS_PER_MS, IDLE_ACT_GAP_MIN_NS);
+        assert_eq!(timing.idle_act_gap_max_ms * NS_PER_MS, IDLE_ACT_GAP_MAX_NS);
+        assert_eq!(timing.saccade_min_ms * NS_PER_MS, SACCADE_MIN_NS);
+        assert_eq!(timing.saccade_max_ms * NS_PER_MS, SACCADE_MAX_NS);
+
+        assert_eq!(trace.acts.len(), CharacterAct::ALL.len());
+        let mut seen = [false; CharacterAct::ALL.len()];
+        for record in trace.acts {
+            let act = character_act_named(&record.name)
+                .unwrap_or_else(|| panic!("Fable-only act {}", record.name));
+            assert!(!seen[act.index()], "duplicate Fable act {}", record.name);
+            seen[act.index()] = true;
+            assert_eq!(
+                act.duration_bounds_ns(),
+                (
+                    record.duration_min_ms * NS_PER_MS,
+                    record.duration_max_ms * NS_PER_MS,
+                ),
+                "duration drift for {}",
+                record.name
+            );
+            assert_eq!(
+                act.cooldown_ns(),
+                record.cooldown_ms * NS_PER_MS,
+                "cooldown drift for {}",
+                record.name
+            );
+            let idle = record.eligible_modes.iter().any(|mode| mode == "idle");
+            let tracking = record.eligible_modes.iter().any(|mode| mode == "track");
+            assert!(
+                record
+                    .eligible_modes
+                    .iter()
+                    .all(|mode| mode == "idle" || mode == "track")
+            );
+            assert_eq!(
+                act.eligible(CharacterMode::Idle),
+                idle,
+                "{} idle",
+                record.name
+            );
+            assert_eq!(
+                act.eligible(CharacterMode::Tracking),
+                tracking,
+                "{} tracking",
+                record.name
+            );
+            assert_eq!(
+                record.scheduled,
+                idle || tracking,
+                "{} schedule",
+                record.name
+            );
+            assert!(
+                !record.fable_channels.is_empty(),
+                "{} channels",
+                record.name
+            );
+            assert!(record.fable_channels.iter().all(|channel| matches!(
+                channel.as_str(),
+                "bright_mul"
+                    | "gx"
+                    | "gy"
+                    | "hue"
+                    | "lid_add"
+                    | "pitch"
+                    | "posture"
+                    | "pupil_add"
+                    | "roll"
+                    | "yaw"
+            )));
+            let expected_pet_act = match record.pet_reaction.as_deref() {
+                None => None,
+                Some("boop") => Some(CharacterAct::StartleBoop),
+                Some("play") => Some(CharacterAct::PlayBow),
+                Some("affection") => Some(CharacterAct::AffectionMelt),
+                Some(other) => panic!("unknown Fable pet reaction {other}"),
+            };
+            if expected_pet_act.is_some() {
+                assert_eq!(Some(act), expected_pet_act);
+            }
+        }
+        assert!(seen.into_iter().all(|present| present));
+    }
+
+    #[test]
+    fn fable_act_trace_semantics_are_a_subset_of_each_rust_act() {
+        let trace = parse_fable_behavior_trace();
+        let started_ns = 5 * NS_PER_SECOND;
+        for record in trace.acts {
+            let act = character_act_named(&record.name).expect("act vocabulary was checked");
+            let duration_ns = record.duration_max_ms * NS_PER_MS;
+            let engine = AutonomicCharacterEngine {
+                active_act: Some(RunningAct {
+                    act,
+                    started_ns,
+                    duration_ns,
+                    side: 1,
+                    style: 1,
+                    energy_milli: 500,
+                }),
+                ..AutonomicCharacterEngine::new(1)
+            };
+            let mut gaze_x = false;
+            let mut gaze_y = false;
+            let mut lid = false;
+            let mut pupil = false;
+            let mut brightness = false;
+            let mut color = false;
+            let mut moved = [false; 4];
+            for step in 1..100_u64 {
+                let now_ns = started_ns + duration_ns * step / 100;
+                let mut eye =
+                    EyeFields::lifecycle(0, 0, 60, 500, 700, Expression::Neutral, [10, 20, 30]);
+                engine.apply_act(&mut eye, now_ns);
+                gaze_x |= eye.gaze_x != 0;
+                gaze_y |= eye.gaze_y != 0;
+                lid |= eye.lid != 60;
+                pupil |= eye.pupil != 500;
+                brightness |= eye.brightness != 700;
+                color |= eye.color_rgb != [10, 20, 30];
+
+                let mut head = HeadFields::default();
+                engine.apply_head_act(&mut head, now_ns);
+                for (changed, value) in moved
+                    .iter_mut()
+                    .zip([head.bow, head.curl, head.yaw, head.roll])
+                {
+                    *changed |= value != 0;
+                }
+            }
+            assert_eq!(moved, [true; 4], "{} lost whole-neck motion", record.name);
+            for channel in &record.fable_channels {
+                let retained = match channel.as_str() {
+                    "gx" => gaze_x,
+                    "gy" => gaze_y,
+                    "lid_add" => lid,
+                    "pupil_add" => pupil,
+                    "bright_mul" => brightness,
+                    "hue" => color,
+                    "pitch" | "posture" => moved[0] && moved[1],
+                    "yaw" => moved[2],
+                    "roll" => moved[3],
+                    other => panic!("unknown trace channel {other}"),
+                };
+                assert!(retained, "{} lost Fable channel {channel}", record.name);
+            }
+
+            let mut start_head = HeadFields::default();
+            engine.apply_head_act(&mut start_head, started_ns);
+            assert_eq!(start_head, HeadFields::default(), "{} start", record.name);
+            let mut end_head = HeadFields::default();
+            engine.apply_head_act(&mut end_head, started_ns + duration_ns);
+            assert_eq!(end_head, HeadFields::default(), "{} end", record.name);
+        }
+    }
+
+    #[test]
+    fn recorded_fable_mode_and_pet_sequences_replay_in_the_rust_character_owner() {
+        let trace = parse_fable_behavior_trace();
+        let mut engine = AutonomicCharacterEngine::new(7);
+        let mut previous_ms = 0;
+        for sample in trace.mode_trace {
+            assert!(sample.at_ms >= previous_ms, "mode trace clock regressed");
+            previous_ms = sample.at_ms;
+            engine.next_act_ns = u64::MAX;
+            let now_ns = sample.at_ms * NS_PER_MS;
+            let frame = engine.render_character(
+                MonotonicTimestamp::from_nanos_since_epoch(now_ns),
+                character_inputs(sample.face_present, now_ns),
+                prepared(now_ns),
+            );
+            assert_eq!(
+                character_mode_name(frame.mode()),
+                sample.expected_mode,
+                "mode at {} ms",
+                sample.at_ms
+            );
+            assert!(matches!(
+                sample.fable_eye_expression.as_str(),
+                "neutral" | "curious" | "greet" | "concerned" | "sleepy"
+            ));
+            if matches!(
+                frame.mode(),
+                CharacterMode::Idle
+                    | CharacterMode::Lost
+                    | CharacterMode::Searching
+                    | CharacterMode::Sleepy
+            ) {
+                assert_eq!(
+                    eye_expression_name(frame.eye().intent().expression()),
+                    sample.fable_eye_expression,
+                    "fixed mode expression at {} ms",
+                    sample.at_ms
+                );
+            }
+            assert!(!sample.require_rust_head_natural || sample.fable_head_natural);
+            if sample.require_rust_head_natural {
+                assert!(
+                    frame.head().is_natural(),
+                    "rest endpoint at {} ms",
+                    sample.at_ms
+                );
+            }
+        }
+
+        let mut pet_engine = AutonomicCharacterEngine::new(11);
+        let mut previous_ms = 0;
+        for sample in trace.pet_trace {
+            assert!(sample.at_ms >= previous_ms, "pet trace clock regressed");
+            previous_ms = sample.at_ms;
+            let episode = CharacterPetEpisode::try_new(
+                Duration::from_millis(sample.duration_ms),
+                sample.accumulated_max_delta_ticks,
+                sample.delta_samples,
+                sample.reached_comfy,
+                sample.tap,
+            )
+            .expect("Fable trace contains typed pet evidence");
+            let reaction = pet_engine.note_pet_episode(
+                MonotonicTimestamp::from_nanos_since_epoch(sample.at_ms * NS_PER_MS),
+                episode,
+            );
+            let expected_reaction = match sample.expected_reaction.as_str() {
+                "boop" => CharacterPetReaction::Boop,
+                "play" => CharacterPetReaction::Play,
+                "affection" => CharacterPetReaction::Affection,
+                other => panic!("unknown reaction {other}"),
+            };
+            assert_eq!(reaction, expected_reaction);
+            assert_eq!(
+                pet_engine.active_act(),
+                character_act_named(&sample.expected_act),
+                "pet act at {} ms",
+                sample.at_ms
+            );
+        }
     }
 
     #[test]

@@ -2195,6 +2195,8 @@ dependencies = [
  "kiko-eye-protocol",
  "kiko-head-protocol",
  "libm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

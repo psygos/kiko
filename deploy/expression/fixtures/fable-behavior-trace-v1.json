@@ -1,0 +1,519 @@
+{
+  "acts": [
+    {
+      "cooldown_ms": 0,
+      "duration_max_ms": 3600,
+      "duration_min_ms": 2800,
+      "eligible_modes": [],
+      "fable_channels": [
+        "bright_mul",
+        "lid_add",
+        "pitch",
+        "pupil_add"
+      ],
+      "name": "affection_melt",
+      "pet_reaction": "affection",
+      "scheduled": false
+    },
+    {
+      "cooldown_ms": 8000,
+      "duration_max_ms": 1300,
+      "duration_min_ms": 900,
+      "eligible_modes": [
+        "track",
+        "idle"
+      ],
+      "fable_channels": [
+        "roll"
+      ],
+      "name": "blink_flourish",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 9000,
+      "duration_max_ms": 1400,
+      "duration_min_ms": 1000,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "posture",
+        "pupil_add"
+      ],
+      "name": "bow_bob",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 9000,
+      "duration_max_ms": 3600,
+      "duration_min_ms": 2200,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "gy",
+        "pupil_add",
+        "roll",
+        "yaw"
+      ],
+      "name": "curious_tilt",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 30000,
+      "duration_max_ms": 6800,
+      "duration_min_ms": 4200,
+      "eligible_modes": [
+        "track",
+        "idle"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "gx",
+        "hue",
+        "pitch",
+        "roll",
+        "yaw"
+      ],
+      "name": "dance",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 12000,
+      "duration_max_ms": 6500,
+      "duration_min_ms": 4000,
+      "eligible_modes": [
+        "idle"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "gx",
+        "gy"
+      ],
+      "name": "daydream",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 16000,
+      "duration_max_ms": 1900,
+      "duration_min_ms": 1300,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "gx",
+        "yaw"
+      ],
+      "name": "double_take",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 14000,
+      "duration_max_ms": 2600,
+      "duration_min_ms": 1600,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "pitch",
+        "pupil_add",
+        "roll"
+      ],
+      "name": "excited_wiggle",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 12000,
+      "duration_max_ms": 2600,
+      "duration_min_ms": 1600,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "lid_add",
+        "pupil_add",
+        "roll"
+      ],
+      "name": "happy_squint",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 13000,
+      "duration_max_ms": 2800,
+      "duration_min_ms": 1800,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "pitch",
+        "roll"
+      ],
+      "name": "head_bob",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 15000,
+      "duration_max_ms": 4400,
+      "duration_min_ms": 2800,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "gy",
+        "pitch",
+        "pupil_add",
+        "roll"
+      ],
+      "name": "lean_in",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 7000,
+      "duration_max_ms": 5500,
+      "duration_min_ms": 3200,
+      "eligible_modes": [
+        "idle"
+      ],
+      "fable_channels": [
+        "gx",
+        "gy",
+        "yaw"
+      ],
+      "name": "look_around",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 10000,
+      "duration_max_ms": 2300,
+      "duration_min_ms": 1600,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "pitch"
+      ],
+      "name": "nod",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 13000,
+      "duration_max_ms": 2200,
+      "duration_min_ms": 1400,
+      "eligible_modes": [
+        "idle"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "pitch",
+        "pupil_add",
+        "roll"
+      ],
+      "name": "perk_up",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 20000,
+      "duration_max_ms": 3200,
+      "duration_min_ms": 2400,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "gy",
+        "posture",
+        "pupil_add",
+        "roll",
+        "yaw"
+      ],
+      "name": "play_bow",
+      "pet_reaction": "play",
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 18000,
+      "duration_max_ms": 3800,
+      "duration_min_ms": 2600,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "gy",
+        "pupil_add",
+        "roll"
+      ],
+      "name": "puppy_eyes",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 25000,
+      "duration_max_ms": 2600,
+      "duration_min_ms": 1800,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "gy",
+        "lid_add",
+        "pitch",
+        "roll"
+      ],
+      "name": "shy_dip",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 22000,
+      "duration_max_ms": 3400,
+      "duration_min_ms": 2600,
+      "eligible_modes": [
+        "track",
+        "idle"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "lid_add",
+        "posture"
+      ],
+      "name": "sigh",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 45000,
+      "duration_max_ms": 3200,
+      "duration_min_ms": 2400,
+      "eligible_modes": [
+        "track",
+        "idle"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "gy",
+        "lid_add",
+        "pitch",
+        "roll"
+      ],
+      "name": "sneeze",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 11000,
+      "duration_max_ms": 3400,
+      "duration_min_ms": 2400,
+      "eligible_modes": [
+        "track"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "pitch"
+      ],
+      "name": "soft_nod",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 10000,
+      "duration_max_ms": 1700,
+      "duration_min_ms": 1000,
+      "eligible_modes": [
+        "track",
+        "idle"
+      ],
+      "fable_channels": [
+        "bright_mul",
+        "pupil_add"
+      ],
+      "name": "sparkle",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 0,
+      "duration_max_ms": 2100,
+      "duration_min_ms": 1600,
+      "eligible_modes": [],
+      "fable_channels": [
+        "bright_mul",
+        "lid_add",
+        "posture",
+        "pupil_add",
+        "roll"
+      ],
+      "name": "startle_boop",
+      "pet_reaction": "boop",
+      "scheduled": false
+    },
+    {
+      "cooldown_ms": 40000,
+      "duration_max_ms": 3600,
+      "duration_min_ms": 2600,
+      "eligible_modes": [
+        "idle"
+      ],
+      "fable_channels": [
+        "lid_add",
+        "pitch",
+        "yaw"
+      ],
+      "name": "stretch",
+      "pet_reaction": null,
+      "scheduled": true
+    },
+    {
+      "cooldown_ms": 16000,
+      "duration_max_ms": 5200,
+      "duration_min_ms": 3400,
+      "eligible_modes": [
+        "track",
+        "idle"
+      ],
+      "fable_channels": [
+        "gx",
+        "roll",
+        "yaw"
+      ],
+      "name": "sweep_scan",
+      "pet_reaction": null,
+      "scheduled": true
+    }
+  ],
+  "comparison_contract": "semantic_contract_v1_not_numeric_or_physical_parity",
+  "mode_trace": [
+    {
+      "at_ms": 0,
+      "expected_mode": "idle",
+      "fable_eye_expression": "neutral",
+      "fable_head_natural": true,
+      "face_present": false,
+      "require_rust_head_natural": false
+    },
+    {
+      "at_ms": 7000,
+      "expected_mode": "greet",
+      "fable_eye_expression": "curious",
+      "fable_head_natural": false,
+      "face_present": true,
+      "require_rust_head_natural": false
+    },
+    {
+      "at_ms": 9201,
+      "expected_mode": "track",
+      "fable_eye_expression": "curious",
+      "fable_head_natural": false,
+      "face_present": true,
+      "require_rust_head_natural": false
+    },
+    {
+      "at_ms": 9250,
+      "expected_mode": "lost",
+      "fable_eye_expression": "concerned",
+      "fable_head_natural": false,
+      "face_present": false,
+      "require_rust_head_natural": false
+    },
+    {
+      "at_ms": 9951,
+      "expected_mode": "search",
+      "fable_eye_expression": "curious",
+      "fable_head_natural": false,
+      "face_present": false,
+      "require_rust_head_natural": false
+    },
+    {
+      "at_ms": 13752,
+      "expected_mode": "idle",
+      "fable_eye_expression": "neutral",
+      "fable_head_natural": false,
+      "face_present": false,
+      "require_rust_head_natural": false
+    },
+    {
+      "at_ms": 70000,
+      "expected_mode": "sleepy",
+      "fable_eye_expression": "sleepy",
+      "fable_head_natural": true,
+      "face_present": false,
+      "require_rust_head_natural": true
+    }
+  ],
+  "pet_trace": [
+    {
+      "accumulated_max_delta_ticks": 200,
+      "at_ms": 5000,
+      "delta_samples": 100,
+      "duration_ms": 600,
+      "expected_act": "startle_boop",
+      "expected_reaction": "boop",
+      "reached_comfy": false,
+      "tap": true
+    },
+    {
+      "accumulated_max_delta_ticks": 950,
+      "at_ms": 8000,
+      "delta_samples": 100,
+      "duration_ms": 2000,
+      "expected_act": "play_bow",
+      "expected_reaction": "play",
+      "reached_comfy": false,
+      "tap": false
+    },
+    {
+      "accumulated_max_delta_ticks": 150,
+      "at_ms": 13000,
+      "delta_samples": 100,
+      "duration_ms": 6000,
+      "expected_act": "affection_melt",
+      "expected_reaction": "affection",
+      "reached_comfy": true,
+      "tap": false
+    }
+  ],
+  "schema_version": 1,
+  "source": "fable_python_expression_lab",
+  "source_sha256": {
+    "kiko_face_follow_py": "f64db90e2eee5fbb4ffb5dc6505bb49788077ffbe05bba02d93ca202e3ba9dd0",
+    "organic_motion_py": "0775399dba74339af421885edaa0814cd3800bdf01c254cf3b3e7f9c7ac7bef8"
+  },
+  "timing": {
+    "first_act_max_ms": 5000,
+    "first_act_min_ms": 2000,
+    "formal_greeting_max_ms": 2100,
+    "formal_greeting_min_ms": 1600,
+    "greeting_cooldown_ms": 6000,
+    "greeting_max_ms": 1400,
+    "greeting_min_ms": 900,
+    "idle_act_gap_max_ms": 12000,
+    "idle_act_gap_min_ms": 4000,
+    "lost_ms": 700,
+    "rest_after_idle_ms": 20000,
+    "rest_ease_ms": 6000,
+    "saccade_max_ms": 2400,
+    "saccade_min_ms": 900,
+    "search_max_ms": 3800,
+    "search_min_ms": 2200,
+    "sleepy_after_idle_ms": 60000,
+    "tracking_act_gap_max_ms": 9000,
+    "tracking_act_gap_min_ms": 3000
+  }
+}

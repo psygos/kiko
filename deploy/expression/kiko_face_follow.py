@@ -109,6 +109,21 @@ BOW, CURL, YAW, ROLL = 0, 1, 2, 3
 SERVO_IDS = [1, 2, 3, 4]
 JOINT_NAMES = ["bow", "curl", "yaw", "roll"]
 
+# Stochastic character timing retained by the cross-language behavior trace.
+# Keep these ranges named: qualification compares their semantic contract to
+# the fixed-point Rust owner without pretending the two RNG implementations
+# produce the same samples.
+BEHAVIOR_TIMING_S = {
+    "greeting": (0.9, 1.4),
+    "formal_greeting": (1.6, 2.1),
+    "lost": 0.7,
+    "search": (2.2, 3.8),
+    "first_act": (2.0, 5.0),
+    "tracking_act_gap": (3.0, 9.0),
+    "idle_act_gap": (4.0, 12.0),
+    "recurrent_saccade": (0.9, 2.4),
+}
+
 # ----------------------------------------------------------------------------
 # STS servo bus (protocol facts from crates/kiko-head-protocol)
 # ----------------------------------------------------------------------------
@@ -1591,7 +1606,8 @@ class CharacterEngine:
         self.next_blink = time.monotonic() + 4.0
         self.act = None
         self.act_started = 0.0
-        self.next_act_at = time.monotonic() + self.rng.uniform(2.0, 5.0)
+        self.next_act_at = time.monotonic() + self.rng.uniform(
+            *BEHAVIOR_TIMING_S["first_act"])
         self.last_run = {}
         self.history = []
         self.saccade = (0.0, 0.0)
@@ -1630,17 +1646,20 @@ class CharacterEngine:
                     self.greet_style = self.rng.randrange(4)
                     # Style 3 is the formal bow — it needs time to land.
                     self.greet_until = now + (
-                        self.rng.uniform(1.6, 2.1) if self.greet_style == 3
-                        else self.rng.uniform(0.9, 1.4))
+                        self.rng.uniform(*BEHAVIOR_TIMING_S["formal_greeting"])
+                        if self.greet_style == 3
+                        else self.rng.uniform(*BEHAVIOR_TIMING_S["greeting"]))
                 else:
                     self._enter("TRACK", now)
             self.last_person_at = now
         else:
             if self.mode in ("TRACK", "GREET"):
                 self._enter("LOST", now)
-            elif self.mode == "LOST" and now - self.mode_since > 0.7:
+            elif (self.mode == "LOST" and
+                  now - self.mode_since > BEHAVIOR_TIMING_S["lost"]):
                 self._enter("SEARCH", now)
-                self.search_until = now + self.rng.uniform(2.2, 3.8)
+                self.search_until = now + self.rng.uniform(
+                    *BEHAVIOR_TIMING_S["search"])
             elif self.mode == "SEARCH" and now > self.search_until:
                 self._enter("IDLE", now)
             elif self.mode == "IDLE" and (now - self.last_person_at
@@ -1706,8 +1725,9 @@ class CharacterEngine:
             return {}, False
         frac = (now - self.act_started) / self.act.duration
         if frac >= 1.0:
-            gap = (self.rng.uniform(3.0, 9.0) if self.mode == "TRACK"
-                   else self.rng.uniform(4.0, 12.0))
+            gap = (self.rng.uniform(*BEHAVIOR_TIMING_S["tracking_act_gap"])
+                   if self.mode == "TRACK"
+                   else self.rng.uniform(*BEHAVIOR_TIMING_S["idle_act_gap"]))
             self.next_act_at = now + gap
             self.act = None
             return {}, False
@@ -1766,7 +1786,8 @@ class CharacterEngine:
         # dynamics turns each target change into one continuous trajectory.
         if now >= self.saccade_until:
             self.saccade = (self.rng.gauss(0, 14), self.rng.gauss(0, 9))
-            self.saccade_until = now + self.rng.uniform(0.9, 2.4)
+            self.saccade_until = now + self.rng.uniform(
+                *BEHAVIOR_TIMING_S["recurrent_saccade"])
 
         # Slowly drifting base color, warmed by proximity.
         hue = 0.52 + 0.10 * math.sin(now * 0.045 + self.hue_phase)

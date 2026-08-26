@@ -34,11 +34,13 @@ jobs:
         run: >-
           python3 -m py_compile
           deploy/expression/compliant_head.py
+          deploy/expression/fable_behavior_trace.py
           deploy/expression/head_thermal.py
           deploy/expression/kiko_face_follow.py
           deploy/expression/organic_motion.py
           deploy/expression/test_compliant_head.py
           deploy/expression/test_engine_lifecycle.py
+          deploy/expression/test_fable_behavior_trace.py
           deploy/expression/test_head_thermal.py
           deploy/expression/test_organic_motion.py
 
