@@ -1,11 +1,99 @@
 # Unification plan — merging the field-proven expression engine into `kiko-slam nano-agent`
 
 Date: 2026-08-03. Author: Fable (attended session with operator).
-Status: proposal for the single explicit handoff demanded by
+Status: active merge-back; the dated ledger below is authoritative and the
+remaining sections retain Fable's original plan for provenance. The target is
+the single explicit handoff demanded by
 `docs/nano-integrated-readiness-2026-07-31.md:182-191` ("running both is not
 integration").
 
-## 1. The situation, stated honestly
+## 0. Implementation ledger (updated 2026-08-26)
+
+This is the durable handoff between Fable's field behavior work and the
+canonical Rust owner. It distinguishes source behavior, ported behavior, and
+remaining work; a passing host test is never presented as physical evidence.
+
+### Retained from Fable as an executable specification
+
+- `deploy/expression/` remains the behavior laboratory and incident corpus.
+  Its 82 Python tests are a required CI job (`3e11c8f`); it is not a second
+  production owner.
+- The touch-observation envelope fix was merged into the Rust compliant hold
+  in `a4c8213`. Its intent is to let a yielding head be *observed* outside the
+  strict command envelope without ever permitting a command outside that
+  envelope.
+- The incident semantics retained for the Rust port are: streak-based thermal
+  supervision; static-residual pet release; stillness-gated recontact;
+  rest-pose arrival–measured comfort; bounded yield duration; per-joint
+  backdrivable torque floors; true unattended rest; organic target shaping;
+  explicit liveness supervision; and durable pet-session evidence.
+
+### Implemented in the canonical Rust path
+
+- `bd1c7bd`: autonomic saccades now hold, decay smoothly to centre, and are
+  suppressed while authoritative face tracking owns gaze. Intent: make the
+  two-position eye ping-pong impossible during tracking.
+- `727ea1a`: energized temperature decisions are parsed into per-joint streak
+  state across control slots; corrupt/unreadable/hot evidence is distinct and
+  the control step has no confirmation sleep. Intent: retain the live thermal
+  incident fixes without blocking the owner loop or swallowing uncertainty.
+- `e29f365`: a deterministic protocol-level STS servo plant synthesizes
+  register traffic and motion evidence. Intent: exercise transactional actor
+  behavior without pretending a byte replay is a physical plant.
+- `a7a0db4`: the compliant controller owns typed `Resting`, static release,
+  stillness-gated recontact, contextual multi-axis rest, tap classification,
+  bounded yield, and a complete episode summary. Intent: represent a pet as
+  one evidence-bearing state transition system rather than timing scripts.
+- `533db00`: holding and yield torque profiles are parsed once and switched
+  transactionally; gravity axes soften selectively, lateral axes remain
+  backdrivable, and holding torque restoration is mandatory on exit paths.
+  Intent: allow touch while preserving a known load-bearing floor.
+- `365cdbf`: completed pet episodes cross one typed feedback edge into the
+  character engine and select `StartleBoop`, `PlayBow`, or `AffectionMelt`;
+  their eye and four-joint responses share one clock and minimum-jerk
+  keyframes. Intent: let sensed interaction cause a coherent social answer,
+  not an unrelated canned eye change.
+- `4e6b756`: periodic energized health reads every servo's torque-enable
+  register before accepting pose telemetry and reports exact prefixes on
+  failure. Intent: never call a free or partially observed neck "healthy" and
+  never hide the condition behind an automatic write.
+- `f2fc5d8`: Idle/Tracking now have deterministic, phase-varied living motion
+  on bow, curl, yaw, and roll; an integer smooth-wave texture avoids float/libm
+  and triangle-wave velocity corners; after 20 unattended seconds a six-second
+  quintic envelope reaches exact natural and remains there through `Sleepy`;
+  face return wakes immediately. Intent: make the bow/base a living joint while
+  guaranteeing a real, stable rest state.
+
+Host evidence at this checkpoint is 90/90 `kiko-expression-runtime` unit
+tests plus its compile-fail doctest, warning-free expression and Nano
+compile-only Clippy, 163 `kiko-head-runtime` library tests plus 11 binary
+tests, 1,365 `kiko-slam` Nano-commissioning library tests, and 82/82 Python
+behavior tests. Native OAK linking and physical feel are deliberately not
+claimed by those results.
+
+### Remaining before the single-owner handoff is complete
+
+1. Widen the character input boundary to typed face bearing, proximity,
+   commanded-head feedback, thermal/body state, and base-motion facts. Then
+   port dynamic bow/curl recruitment, turn-dip weight shift, pet-state eye
+   choreography, formal bow greeting, and the remaining interoceptive acts.
+2. Put a typed jerk-bounded, clamped-gap organic prefilter ahead of the
+   transactional head planner. Keep its fixed-tick lateness and commit/abort
+   semantics underneath. Prove bounds, clock regression, long gaps, target
+   jumps, exact settling, and actor abort behavior on the deterministic plant.
+3. Add accessory-loop heartbeat, `sd_notify` watchdog, bounded restart/backoff
+   policy, and failure-latched ownership admission. A watchdog must never
+   create a competing camera, eye, head, or STM32 owner.
+4. Add format-compatible behavior/pet NDJSON evidence and replay comparisons;
+   retain the Python lane as a non-booted behavior lab until the Rust owner has
+   attended physical parity evidence.
+5. Re-audit the current navigation graph, make live SLAM rate/backend/fallback
+   observable, verify the manual/emergency-stop GUI and autonomous MPC share
+   one authority path, and close every wheels-off gate before requesting wheel
+   attachment. Only an attended wheels-on session can calibrate the
+   encoderless plant and prove mapping/navigation on the robot.
+
+## 1. Original situation recorded 2026-08-03
 
 The recorded target (`docs/nano-agent-architecture.md`,
 `docs/fable-integration-audit-2026-07-23.md:136-155`) is one production
