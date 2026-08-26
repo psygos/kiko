@@ -2365,28 +2365,61 @@ impl NanoAccessoryOwnerState {
 }
 
 #[derive(Debug)]
-struct NanoAccessoryOwnerLifecycle(AtomicU8);
+struct NanoAccessoryOwnerLifecycle {
+    state: AtomicU8,
+    completed_health_transactions: AtomicU64,
+}
 
 impl NanoAccessoryOwnerLifecycle {
     fn starting() -> Self {
-        Self(AtomicU8::new(NanoAccessoryOwnerState::Starting.encoded()))
+        Self {
+            state: AtomicU8::new(NanoAccessoryOwnerState::Starting.encoded()),
+            completed_health_transactions: AtomicU64::new(0),
+        }
     }
 
     fn state(&self) -> NanoAccessoryOwnerState {
-        NanoAccessoryOwnerState::decode(self.0.load(Ordering::Acquire))
+        NanoAccessoryOwnerState::decode(self.state.load(Ordering::Acquire))
     }
 
     fn mark_running(&self) {
-        let _ = self.0.compare_exchange(
-            NanoAccessoryOwnerState::Starting.encoded(),
-            NanoAccessoryOwnerState::Running.encoded(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if self
+            .state
+            .compare_exchange(
+                NanoAccessoryOwnerState::Starting.encoded(),
+                NanoAccessoryOwnerState::Running.encoded(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            // Readiness is published only after the first complete four-joint
+            // health transaction. Count that transaction as the first proof
+            // that the sole owner loop reached a bounded completion boundary.
+            self.completed_health_transactions
+                .store(1, Ordering::Release);
+        }
+    }
+
+    fn record_completed_health_transaction(&self) -> bool {
+        self.completed_health_transactions
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .is_ok()
+    }
+
+    fn liveness_snapshot(&self) -> NanoAccessoryLoopLivenessSnapshot {
+        NanoAccessoryLoopLivenessSnapshot {
+            owner_state: self.state(),
+            completed_health_transactions: self
+                .completed_health_transactions
+                .load(Ordering::Acquire),
+        }
     }
 
     fn mark_fault_latched(&self) {
-        let mut current = self.0.load(Ordering::Acquire);
+        let mut current = self.state.load(Ordering::Acquire);
         loop {
             if !matches!(
                 NanoAccessoryOwnerState::decode(current),
@@ -2394,7 +2427,7 @@ impl NanoAccessoryOwnerLifecycle {
             ) {
                 return;
             }
-            match self.0.compare_exchange_weak(
+            match self.state.compare_exchange_weak(
                 current,
                 NanoAccessoryOwnerState::FaultLatched.encoded(),
                 Ordering::AcqRel,
@@ -2407,21 +2440,21 @@ impl NanoAccessoryOwnerLifecycle {
     }
 
     fn mark_shutting_down(&self) {
-        self.0.store(
+        self.state.store(
             NanoAccessoryOwnerState::ShuttingDown.encoded(),
             Ordering::Release,
         );
     }
 
     fn mark_stopped(&self) {
-        self.0.store(
+        self.state.store(
             NanoAccessoryOwnerState::Stopped.encoded(),
             Ordering::Release,
         );
     }
 
     fn mark_detached_if_live(&self) {
-        let mut current = self.0.load(Ordering::Acquire);
+        let mut current = self.state.load(Ordering::Acquire);
         loop {
             if matches!(
                 NanoAccessoryOwnerState::decode(current),
@@ -2429,7 +2462,7 @@ impl NanoAccessoryOwnerLifecycle {
             ) {
                 return;
             }
-            match self.0.compare_exchange_weak(
+            match self.state.compare_exchange_weak(
                 current,
                 NanoAccessoryOwnerState::Detached.encoded(),
                 Ordering::AcqRel,
@@ -2442,7 +2475,7 @@ impl NanoAccessoryOwnerLifecycle {
     }
 
     fn mark_owner_exited_unexpectedly_if_live(&self) {
-        let mut current = self.0.load(Ordering::Acquire);
+        let mut current = self.state.load(Ordering::Acquire);
         loop {
             if matches!(
                 NanoAccessoryOwnerState::decode(current),
@@ -2453,7 +2486,7 @@ impl NanoAccessoryOwnerLifecycle {
             ) {
                 return;
             }
-            match self.0.compare_exchange_weak(
+            match self.state.compare_exchange_weak(
                 current,
                 NanoAccessoryOwnerState::OwnerExitedUnexpectedly.encoded(),
                 Ordering::AcqRel,
@@ -2463,6 +2496,31 @@ impl NanoAccessoryOwnerLifecycle {
                 Err(observed) => current = observed,
             }
         }
+    }
+}
+
+/// Monotonic proof that the sole accessory owner completed bounded work.
+///
+/// The counter advances only after a complete four-joint servo-health
+/// transaction. Because the same single-threaded actor also owns expression
+/// bridging, gaze/compliance, and KEP2 writes, a stuck operation on any of
+/// those paths prevents the next health transaction and therefore prevents a
+/// false heartbeat. This is observation only; it carries no device handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NanoAccessoryLoopLivenessSnapshot {
+    pub owner_state: NanoAccessoryOwnerState,
+    pub completed_health_transactions: u64,
+}
+
+/// Cloneable observer for process supervision; never a second device owner.
+#[derive(Clone, Debug)]
+pub struct NanoAccessoryLoopLivenessObserver {
+    lifecycle: Arc<NanoAccessoryOwnerLifecycle>,
+}
+
+impl NanoAccessoryLoopLivenessObserver {
+    pub fn snapshot(&self) -> NanoAccessoryLoopLivenessSnapshot {
+        self.lifecycle.liveness_snapshot()
     }
 }
 
@@ -3081,6 +3139,14 @@ impl NanoAccessoryWorker {
             lifecycle: Arc::clone(&self.lifecycle),
             health_period: self.ready.health_period(),
             rgb_frame_freshness: self.ready.rgb_frame_freshness(),
+        }
+    }
+
+    /// Observe completed sole-owner loop transactions without cloning any
+    /// serial, camera, or actuator authority.
+    pub fn loop_liveness_observer(&self) -> NanoAccessoryLoopLivenessObserver {
+        NanoAccessoryLoopLivenessObserver {
+            lifecycle: Arc::clone(&self.lifecycle),
         }
     }
 
@@ -4763,6 +4829,7 @@ where
         Duration::from_nanos(config.rgb_expression.frame_freshness().as_nanos());
     let readiness_head_health = Arc::clone(&latest_head_health);
     let readiness_lifecycle = Arc::clone(&lifecycle);
+    let health_lifecycle = Arc::clone(&lifecycle);
     let fault_lifecycle = Arc::clone(&lifecycle);
 
     let core_exit = runtime.block_on(run_accessory_core(
@@ -4800,7 +4867,7 @@ where
             record_health: move |evidence| match latest_head_health.lock() {
                 Ok(mut latest) => {
                     latest.record(evidence);
-                    true
+                    health_lifecycle.record_completed_health_transaction()
                 }
                 Err(_) => false,
             },
@@ -6355,6 +6422,44 @@ mod tests {
                 rgb_expression: NanoAccessoryComponentHealth::Faulted,
                 successful_rgb_expression_frames: 1,
             }
+        );
+    }
+
+    #[test]
+    fn loop_liveness_advances_only_at_readiness_and_completed_health_boundaries() {
+        let lifecycle = Arc::new(NanoAccessoryOwnerLifecycle::starting());
+        let observer = NanoAccessoryLoopLivenessObserver {
+            lifecycle: Arc::clone(&lifecycle),
+        };
+        assert_eq!(
+            observer.snapshot(),
+            NanoAccessoryLoopLivenessSnapshot {
+                owner_state: NanoAccessoryOwnerState::Starting,
+                completed_health_transactions: 0,
+            }
+        );
+
+        lifecycle.mark_running();
+        assert_eq!(
+            observer.snapshot(),
+            NanoAccessoryLoopLivenessSnapshot {
+                owner_state: NanoAccessoryOwnerState::Running,
+                completed_health_transactions: 1,
+            }
+        );
+        assert!(lifecycle.record_completed_health_transaction());
+        assert_eq!(observer.snapshot().completed_health_transactions, 2);
+
+        lifecycle.mark_fault_latched();
+        assert_eq!(
+            observer.snapshot().owner_state,
+            NanoAccessoryOwnerState::FaultLatched
+        );
+        assert!(lifecycle.record_completed_health_transaction());
+        assert_eq!(
+            observer.snapshot().completed_health_transactions,
+            3,
+            "the retained owner may keep producing diagnostic health evidence after the first fault"
         );
     }
 

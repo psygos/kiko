@@ -2,6 +2,10 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(all(feature = "nano-agent", unix))]
+#[path = "kiko_slam_systemd.rs"]
+mod nano_systemd;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
@@ -191,6 +195,10 @@ use kiko_slam::{
     StereoObservation, StereoObservationError, StereoPairer, TrackerOutput, VizConfigError,
     bounded_channel, dense_command_channel, depth_router, imu_report_router, oak_to_depth_image,
     oak_to_frame, oak_to_imu_report,
+};
+#[cfg(all(feature = "nano-agent", unix))]
+use nano_systemd::{
+    NanoSystemdRuntimeSupervision, NanoSystemdServiceSupervision, NanoSystemdSupervisionError,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
@@ -11951,6 +11959,10 @@ impl Drop for LiveThreadExitGuard {
 #[derive(Debug)]
 enum LiveCaptureError {
     #[cfg(all(feature = "nano-agent", unix))]
+    SystemdSupervision {
+        source: NanoSystemdSupervisionError,
+    },
+    #[cfg(all(feature = "nano-agent", unix))]
     RgbImage {
         source: ImageError,
     },
@@ -12007,6 +12019,10 @@ impl std::fmt::Display for LiveCaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             #[cfg(all(feature = "nano-agent", unix))]
+            Self::SystemdSupervision { source } => {
+                write!(f, "integrated service supervision failed: {source}")
+            }
+            #[cfg(all(feature = "nano-agent", unix))]
             Self::RgbImage { source } => write!(f, "RGB camera capture failed: {source}"),
             Self::LeftImage { source } => write!(f, "left camera capture failed: {source}"),
             Self::RightImage { source } => write!(f, "right camera capture failed: {source}"),
@@ -12046,6 +12062,8 @@ impl std::fmt::Display for LiveCaptureError {
 impl std::error::Error for LiveCaptureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            #[cfg(all(feature = "nano-agent", unix))]
+            Self::SystemdSupervision { source } => Some(source),
             #[cfg(all(feature = "nano-agent", unix))]
             Self::RgbImage { source } => Some(source),
             Self::LeftImage { source } | Self::RightImage { source } => Some(source),
@@ -12445,6 +12463,8 @@ struct PreparedLiveSession {
     production_state: Option<NanoProductionStateOwners>,
     #[cfg(all(feature = "nano-agent", unix))]
     warm_start_replay: Option<Box<NanoDatasetReplayRequired>>,
+    #[cfg(all(feature = "nano-agent", unix))]
+    systemd_supervision: Option<NanoSystemdRuntimeSupervision>,
 }
 
 /// Owns the admitted zero-only controller and already-held head while the
@@ -14626,6 +14646,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
         accessory: Some(accessory),
         production_state: Some(software.production_state),
         warm_start_replay: software.warm_start_replay,
+        systemd_supervision: None,
     })
 }
 
@@ -14878,6 +14899,7 @@ fn prepare_nano_attended_navigation_trial_live_session(
             accessory: Some(accessory),
             production_state: Some(software.production_state),
             warm_start_replay: software.warm_start_replay,
+            systemd_supervision: None,
         },
         controller,
     ))
@@ -14887,6 +14909,7 @@ fn prepare_nano_attended_navigation_trial_live_session(
 fn prepare_nano_live_session(
     bootstrap: PreparedNanoBootstrap,
     stream_epoch: StreamEpochId,
+    systemd_supervision: NanoSystemdServiceSupervision,
     running: &AtomicBool,
 ) -> Result<PreparedLiveSession, Box<dyn std::error::Error>> {
     let oak_provenance = OakRuntimeProvenance::from_nano_bootstrap(&bootstrap);
@@ -14945,6 +14968,11 @@ fn prepare_nano_live_session(
         .as_ref()
         .expect("successful accessory startup retains its sole owner")
         .health_observer();
+    let accessory_liveness = resources
+        .accessory
+        .as_ref()
+        .expect("successful accessory startup retains its sole owner")
+        .loop_liveness_observer();
     let (runtime, accessory, device) = resources.into_parts();
     Ok(PreparedLiveSession {
         device,
@@ -14982,6 +15010,7 @@ fn prepare_nano_live_session(
         accessory: Some(accessory),
         production_state: Some(software.production_state),
         warm_start_replay: software.warm_start_replay,
+        systemd_supervision: Some(systemd_supervision.bind(accessory_liveness)),
     })
 }
 
@@ -15166,6 +15195,10 @@ fn run_nano_attended_navigation_trial(
 
 #[cfg(all(feature = "nano-agent", unix))]
 fn run_nano_agent(args: NanoAgentArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Parse the weak process environment exactly once before any worker thread
+    // or hardware owner exists. Manual foreground runs have all three systemd
+    // variables absent and remain intentionally unsupervised.
+    let systemd_supervision = NanoSystemdServiceSupervision::from_process_environment()?;
     let running = install_live_shutdown_handler()?;
     let capture_clock_origin = Instant::now();
     let navigation_clock_epoch = NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(0));
@@ -15200,15 +15233,20 @@ fn run_nano_agent(args: NanoAgentArgs) -> Result<(), Box<dyn std::error::Error>>
             .await
     });
 
-    let operation =
-        prepare_nano_live_session(bootstrap, stream_epoch, running.as_ref()).and_then(|prepared| {
-            run_prepared_live_session(
-                prepared,
-                running,
-                capture_clock_origin,
-                navigation_clock_epoch,
-            )
-        });
+    let operation = prepare_nano_live_session(
+        bootstrap,
+        stream_epoch,
+        systemd_supervision,
+        running.as_ref(),
+    )
+    .and_then(|prepared| {
+        run_prepared_live_session(
+            prepared,
+            running,
+            capture_clock_origin,
+            navigation_clock_epoch,
+        )
+    });
     let _ = request_controller_shutdown.send(());
     let controller = async_runtime.block_on(controller_task);
     drop(async_runtime);
@@ -15457,6 +15495,8 @@ fn prepare_compatibility_live_session(
         production_state: None,
         #[cfg(all(feature = "nano-agent", unix))]
         warm_start_replay: None,
+        #[cfg(all(feature = "nano-agent", unix))]
+        systemd_supervision: None,
     })
 }
 
@@ -15515,6 +15555,8 @@ fn run_prepared_live_session(
         production_state,
         #[cfg(all(feature = "nano-agent", unix))]
         warm_start_replay,
+        #[cfg(all(feature = "nano-agent", unix))]
+        mut systemd_supervision,
     } = prepared;
     let depth_enabled = depth_config.is_some();
     let operation = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -16659,12 +16701,18 @@ fn run_prepared_live_session(
         #[cfg(all(feature = "nano-agent", unix))]
         let mut accessory_worker = accessory;
         let mut capture_error = None;
+        #[cfg(all(feature = "nano-agent", unix))]
+        let mut supervision_errors = Vec::new();
         let rgb_viz_tx = Some(rgb_viz_tx);
         #[cfg(all(feature = "nano-agent", unix))]
         let mut rgb_viz_tx = rgb_viz_tx;
         #[cfg(all(feature = "nano-agent", unix))]
         let mut rgb_viz_frame_index = 0_usize;
 
+        #[cfg(all(feature = "nano-agent", unix))]
+        if let Some(supervision) = systemd_supervision.as_mut() {
+            supervision.notify_ready(Instant::now())?;
+        }
         eprintln!("streaming matches... press ctrl+c to stop");
 
         #[cfg(all(feature = "nano-agent", unix))]
@@ -16697,6 +16745,15 @@ fn run_prepared_live_session(
                         break 'capture;
                     }
                 }
+            }
+
+            #[cfg(all(feature = "nano-agent", unix))]
+            if let Some(supervision) = systemd_supervision.as_mut()
+                && let Err(source) = supervision.poll_watchdog(Instant::now())
+            {
+                supervision_errors.push(LiveCaptureError::SystemdSupervision { source });
+                running.store(false, Ordering::SeqCst);
+                break 'capture;
             }
 
             #[cfg(all(feature = "nano-agent", unix))]
@@ -16976,6 +17033,13 @@ fn run_prepared_live_session(
             }
         }
 
+        #[cfg(all(feature = "nano-agent", unix))]
+        if let Some(supervision) = systemd_supervision.as_mut()
+            && let Err(source) = supervision.notify_stopping()
+        {
+            supervision_errors.push(LiveCaptureError::SystemdSupervision { source });
+        }
+
         // Dropping the capture exit guard propagates every normal/error exit
         // before the remaining bounded queues are joined and drained. It also
         // covers unwinding through this scope.
@@ -16991,6 +17055,8 @@ fn run_prepared_live_session(
             .into_iter()
             .map(LiveWorkerFailure::Capture)
             .collect::<Vec<_>>();
+        #[cfg(all(feature = "nano-agent", unix))]
+        live_failures.extend(supervision_errors.drain(..).map(LiveWorkerFailure::Capture));
         #[cfg(all(feature = "nano-agent", unix))]
         live_failures.extend(
             accessory_failures

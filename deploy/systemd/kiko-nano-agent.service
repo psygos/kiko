@@ -3,9 +3,16 @@ Description=Kiko production Nano agent (manual qualification gate)
 Documentation=file:/opt/kiko/deployment/README.md
 After=local-fs.target
 RequiresMountsFor=/opt/kiko/deployment /var/lib/kiko-nano-agent
+# Five failed admissions or runs inside ten minutes latch systemd's start
+# limiter. A replacement waits for the preceding systemd stop job; exact
+# device admission then rejects any endpoint retained by an unkillable owner.
+# A human can inspect and explicitly reset a latched unit.
+StartLimitIntervalSec=10min
+StartLimitBurst=5
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=main
 User=makerspace
 SupplementaryGroups=dialout video render plugdev
 WorkingDirectory=/opt/kiko
@@ -18,7 +25,14 @@ ExecStartPre=+/opt/kiko/bin/kiko-nano-deployment-gate verify --marker /etc/kiko/
 # service-wide would load unverified deployment libraries into ExecStartPre
 # before the root-owned gate could verify their exact bytes.
 ExecStart=/usr/bin/env LD_LIBRARY_PATH=/opt/kiko/deployment/lib /opt/kiko/bin/kiko-slam nano-agent --deployment-root /opt/kiko/deployment --launch-config nano-agent-launch-v3.json --state-root /var/lib/kiko-nano-agent
-Restart=no
+# The OAK capture loop sends watchdog datagrams only after observing a new
+# completed four-servo health transaction from the sole accessory owner.
+# Frozen capture, expression, eye, gaze/compliance, or head-bus work therefore
+# cannot be hidden by an independent timer thread.
+WatchdogSec=60s
+TimeoutStartSec=300s
+Restart=on-failure
+RestartSec=15s
 # Operational kill guard, not a proven graceful-shutdown bound. Parsed maxima
 # bound Rerun/controller/accessory attempts, but worker joins, dataset fsync and
 # finalization, OAK close, and native/OS I/O have no outer application deadline.

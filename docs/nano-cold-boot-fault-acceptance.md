@@ -31,7 +31,7 @@ reviewed revision and lockfile when using it as acceptance evidence.
 | Unified console and browser loss | One typed surface projects map, pose, path, MPC timing, requested/actual authority, exact controller receipt, health, and stop state. Stale/lost connections visibly freeze the map and inhibit motion/persistence; stop-reducing actions remain available, the server deadman owns exact-zero fallback, and response IDs never cross sessions. |
 | Fault stop | Clock regression and simulated transport failure latch typed faults; uncertain stop is never reported as a safe cancellation. |
 | Map recovery | Atomic save/reload preserves exact map bytes; warm start requires exact dataset replay and never invents localization. |
-| Shutdown and restart | Lifecycle zero precedes controller disarm, uncertain terminal stop remains faulted, the control-socket owner joins, `Restart=no` prevents an automatic loop, and the console capability is atomically replaced rather than reused. |
+| Shutdown and restart | Lifecycle zero precedes controller disarm, uncertain terminal stop remains faulted, and the control-socket owner joins. The OAK capture loop can kick the 60-second watchdog only after a new sole-accessory-owner four-joint health transaction; `Restart=on-failure` waits 15 seconds and for the preceding stop job, exact device admission rejects retained old owners, five failures in ten minutes trip the start limiter, and the console capability is atomically replaced rather than reused. |
 
 The systemd assertions are source/effective-text component checks. The bundle
 case uses a temporary directory as a simulated installation destination.

@@ -1394,8 +1394,60 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(assignment_count("Type="), 1);
+        assert_eq!(
+            base.lines().filter(|line| *line == "Type=notify").count(),
+            1
+        );
         assert_eq!(assignment_count("Restart="), 1);
-        assert_eq!(base.lines().filter(|line| *line == "Restart=no").count(), 1);
+        assert_eq!(
+            base.lines()
+                .filter(|line| *line == "Restart=on-failure")
+                .count(),
+            1
+        );
+        assert_eq!(assignment_count("WatchdogSec="), 1);
+        assert_eq!(
+            base.lines()
+                .filter(|line| *line == "WatchdogSec=60s")
+                .count(),
+            1
+        );
+        assert_eq!(assignment_count("TimeoutStartSec="), 1);
+        assert_eq!(
+            base.lines()
+                .filter(|line| *line == "TimeoutStartSec=300s")
+                .count(),
+            1
+        );
+        assert_eq!(assignment_count("RestartSec="), 1);
+        assert_eq!(
+            base.lines()
+                .filter(|line| *line == "RestartSec=15s")
+                .count(),
+            1
+        );
+        assert_eq!(assignment_count("NotifyAccess="), 1);
+        assert_eq!(
+            base.lines()
+                .filter(|line| *line == "NotifyAccess=main")
+                .count(),
+            1
+        );
+        assert_eq!(assignment_count("StartLimitIntervalSec="), 1);
+        assert_eq!(assignment_count("StartLimitBurst="), 1);
+        assert_eq!(
+            base.lines()
+                .filter(|line| *line == "StartLimitIntervalSec=10min")
+                .count(),
+            1
+        );
+        assert_eq!(
+            base.lines()
+                .filter(|line| *line == "StartLimitBurst=5")
+                .count(),
+            1
+        );
         assert_eq!(assignment_count("ExecStartPre="), 1);
         assert_eq!(
             base.lines()
@@ -1481,7 +1533,16 @@ WantedBy=multi-user.target\n"
                 .count(),
             1
         );
-        assert!(effective.lines().any(|line| line.trim() == "Restart=no"));
+        assert!(
+            effective
+                .lines()
+                .any(|line| line.trim() == "Restart=on-failure")
+        );
+        assert!(
+            effective
+                .lines()
+                .any(|line| line.trim() == "WatchdogSec=60s")
+        );
         assert!(
             !effective.contains("kiko-robot-server.service"),
             "production must retain one integrated controller owner"

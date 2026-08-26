@@ -40,13 +40,24 @@ symlinked), root-owned directory with no group/world write bit. Normalize
 `/opt/kiko/deployment/lib` explicitly before qualification; a safe final file
 does not compensate for an unsafe ancestor.
 
-The base unit has no `[Install]` section, always runs the root-privileged
-offline-install verifier, uses `Restart=no`, and has no process-kill or
-competing-owner cleanup. A missing marker, binary, launch file, or changed
+The base unit has no `[Install]` section and always runs the root-privileged
+offline-install verifier. A missing marker, binary, launch file, or changed
 bound byte fails every start; none is a `ConditionPath` skip. Keeping the
 verifier in the base unit matters because an enablement symlink survives
 removal of a drop-in. The production service therefore has no ungated
 fallback start.
+
+The qualified unit uses `Type=notify`, a 60-second systemd watchdog,
+`Restart=on-failure`, and a fixed 15-second restart delay. Five failed starts
+or runs inside ten minutes trip systemd's start limiter. A watchdog datagram
+is sent only by the OAK capture loop and only after that loop observes a new
+completed four-joint health transaction from the sole accessory owner. An
+independent timer, live PID, or responsive guardian therefore cannot mask a
+frozen camera/expression/head loop. A replacement waits for the preceding
+systemd stop job; the application's one-shot exact-device acquisition remains
+the second, fail-closed ownership boundary and rejects an endpoint still held
+by an unkillable old owner. This policy is not permission to leave the legacy
+Fable guardian or its crontab respawn authorities installed.
 
 The qualifier compares the installed base unit byte-for-byte with the unit
 compiled from this checkout. It also admits exactly one drop-in,
@@ -68,22 +79,24 @@ Install the exact enablement-only file
 ```
 
 That drop-in adds only the `[Install]` section; it never owns the verifier.
-The service process still runs as `makerspace`. `Restart=no` remains
-unchanged, so a failed gate or runtime does not create a restart loop. Do not
-call `systemctl enable` until Gate B and the attended production qualification
-have passed.
+The service process still runs as `makerspace`. The bounded restart policy is
+part of the byte-qualified base unit and cannot be replaced by the
+enablement-only drop-in. Do not call `systemctl enable` until Gate B and the
+attended production qualification have passed.
 
 The compiled fixed 30-second device-presence window covers only late cold-boot
 enumeration. Before any serial probe or torque operation, the process observes
 the exact three serial-by-id character devices and exact OAK MXID in
 `Available` or `InUse` state immediately, then pauses for at most 100 ms after
 each unsuccessful observation until the fixed poll/sleep budget expires.
-`Bootloader` and `Unknown` OAK states keep the wait active. This does not weaken
-`Restart=no`: once one sequential composite polling pass reports all targets
-present, each downstream serial probe or owner open and the OAK connect remains
-a one-shot acquisition. In-use, permission, identity, USB-speed, protocol, and
-all other acquisition failures end the start without another presence wait or
-process restart. A signal stops the polling between observations and bounded
+`Bootloader` and `Unknown` OAK states keep the wait active. Once one sequential
+composite polling pass reports all targets present, each downstream serial
+probe or owner open and the OAK connect remains a one-shot acquisition. In-use,
+permission, identity, USB-speed, protocol, and all other acquisition failures
+end that attempt without an internal acquisition loop. A later systemd attempt
+can start only after the preceding cgroup has stopped and the configured
+restart delay has elapsed, and the start limiter bounds repeated failures. A
+signal stops the polling between observations and bounded
 sleeps and between serial metadata calls before native OAK discovery. Native
 discovery and filesystem calls already in progress remain operating-system
 boundaries rather than cancellable tasks; no later component call starts after
