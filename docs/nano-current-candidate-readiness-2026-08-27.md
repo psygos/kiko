@@ -155,6 +155,10 @@ exact production-feature-only renderer library check, strict renderer Clippy,
 all 36 renderer integration tests, and renderer doctests. The CI workflow now
 keeps that smaller graph separate because `--all-targets` feature unification
 can otherwise hide the missing-export class of error.
+The exact standalone `nano-calibration-prepare` feature/bin graph separately
+passed strict Clippy and all 14 preparer tests, including duplicate-key,
+sentinel, provenance, unit, affine-stability, baseline-discrepancy, bit-exact
+binding, cleanup, no-replace race, and transactional-publication coverage.
 
 The first in-sandbox test pass produced 27 local-socket `EPERM` failures; the
 identical command was rerun with local socket permission and all tests passed.
