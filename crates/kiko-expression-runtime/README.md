@@ -105,9 +105,12 @@ candidate, yielding, release dwell, resting, and controller-progress recovery
 drive one minimum-jerk eye envelope before the completed episode selects its
 social act. This lets the eyes soften, shrink, and look down while touch is
 still happening; expressive head scripts are suppressed while the compliant
-controller owns motion. All output is reconstructed through KEP2's
-signed/unit domain constructors after explicit saturation to `[-1000,1000]`
-or `[0,1000]`; the frame path retains no untyped eye values.
+controller owns motion. The Nano owner records each complete controller
+episode through a bounded Fable-compatible NDJSON journal before admitting the
+social response; disk append/sync runs on a separate writer thread and any
+writer failure is a terminal accessory fault. All output is reconstructed
+through KEP2's signed/unit domain constructors after explicit saturation to
+`[-1000,1000]` or `[0,1000]`; the frame path retains no untyped eye values.
 
 `render_character` returns one `PreparedCharacterFrame`: the KEP2 eye intent,
 mode, optional named act, and a semantic overlay for bow, curl, yaw, and roll.

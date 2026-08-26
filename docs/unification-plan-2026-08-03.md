@@ -113,17 +113,37 @@ remaining work; a passing host test is never presented as physical evidence.
   the typed physical controller existed but production always left it
   unconfigured, without treating a JSON operator claim as authenticated or
   physically proven evidence.
+- `5d4dbd6`: Fable's historical pet-session NDJSON and Nano V1 records cross
+  one strict parser into the same typed episode evidence. V1 retains the
+  legacy keys but adds exact integer wall/monotonic times; replay compares the
+  recorded Fable reaction with the Rust reaction. The `5.995 -> 6.00` play
+  boundary uses exact integer round-half-even arithmetic, while unknown,
+  hybrid, oversized, inconsistent, or impossible records fail closed. Intent:
+  carry the field corpus forward without making floating-point compatibility
+  values authoritative or silently repairing damaged evidence.
+- `6f8ab84`: production bootstrap now starts a state-root pet journal before
+  the head/eye actors and requires its readiness. The fixed
+  `pet-episodes-v1.ndjson` file is opened relative to a component-wise
+  no-follow root, must remain a single-link owner-mode-`0600` regular file,
+  validates every retained record, and is capped at 16 MiB. Completed episodes
+  are encoded and admitted to an eight-record FIFO before the social reaction;
+  a separate named thread performs append and `sync_data`. Queue saturation,
+  clock/encoding failure, file replacement, I/O failure, or writer exit is a
+  terminal accessory/base-stop fault, and shutdown retains bounded join
+  evidence. Intent: preserve Fable's durable pet evidence without putting disk
+  I/O in the servo/eye loop or swallowing logging failures. No throughput or
+  latency improvement is claimed without a benchmark.
 
 Host evidence at this checkpoint is 95/95 `kiko-expression-runtime` unit
 tests plus its compile-fail doctest, warning-free expression and Nano
 compile-only Clippy, 170 `kiko-head-runtime` library tests plus 11 binary
-tests, 1,438/1,438 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
+tests, 1,448/1,448 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
 binary tests, 7/7 offline-qualifier tests, 36/36 immutable-renderer tests,
 all 6 deployment-gate tests, the 13 focused base-commissioning tests, and
 82/82 Python behavior tests. The complete Nano-agent library suite was run
 outside the filesystem sandbox because 23 otherwise-green local socket and
 loopback-listener tests are denied binding by that sandbox; the unrestricted
-run passed all 1,438 tests.
+run passed all 1,448 tests.
 The Linux-aarch64 standard-library abstract notify-socket API was compiled
 directly. A complete Linux-aarch64 dependency cross-check remains unclaimed
 because this Mac does not have `aarch64-linux-gnu-gcc`; native OAK linking,
@@ -139,7 +159,8 @@ claimed by these host results.
    face bearing, apparent-width proximity cue, continuous pet-state eye
    choreography, and the formal bow greeting are complete; apparent width is
    not relabeled as metric range.
-2. Add format-compatible behavior/pet NDJSON evidence and replay comparisons;
+2. Pet NDJSON compatibility, durable production recording, and reaction replay
+   are complete. Add the remaining general behavior-trace replay comparison;
    retain the Python lane as a non-booted behavior lab until the Rust owner has
    attended physical parity evidence.
 3. Re-audit the current navigation graph, make live SLAM rate/backend/fallback
