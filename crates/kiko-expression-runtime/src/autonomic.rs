@@ -31,6 +31,8 @@ const NS_PER_MS: u64 = 1_000_000;
 const NS_PER_SECOND: u64 = 1_000 * NS_PER_MS;
 const GREETING_MIN_NS: u64 = 900 * NS_PER_MS;
 const GREETING_MAX_NS: u64 = 1_400 * NS_PER_MS;
+const FORMAL_GREETING_MIN_NS: u64 = 1_600 * NS_PER_MS;
+const FORMAL_GREETING_MAX_NS: u64 = 2_100 * NS_PER_MS;
 const GREETING_COOLDOWN_NS: u64 = 10 * NS_PER_SECOND;
 const LOST_DURATION_NS: u64 = 700 * NS_PER_MS;
 const SEARCH_MIN_NS: u64 = 2_200 * NS_PER_MS;
@@ -1234,10 +1236,15 @@ impl AutonomicCharacterEngine {
             ) {
                 if greeting_due {
                     self.enter(CharacterMode::Greeting, now_ns);
-                    self.greeting_style = (self.next_u64() % 3) as u8;
+                    self.greeting_style = (self.next_u64() % 4) as u8;
                     self.greeting_blink_pending = true;
+                    let (minimum, maximum) = if self.greeting_style == 3 {
+                        (FORMAL_GREETING_MIN_NS, FORMAL_GREETING_MAX_NS)
+                    } else {
+                        (GREETING_MIN_NS, GREETING_MAX_NS)
+                    };
                     self.greeting_until_ns =
-                        saturating_add(now_ns, self.random_range(GREETING_MIN_NS, GREETING_MAX_NS));
+                        saturating_add(now_ns, self.random_range(minimum, maximum));
                 } else {
                     self.enter(CharacterMode::Tracking, now_ns);
                 }
@@ -1403,18 +1410,21 @@ impl AutonomicCharacterEngine {
         let elapsed = now_ns.saturating_sub(self.mode_started_ns);
         match self.mode {
             CharacterMode::Greeting => {
-                fields.expression = if self.greeting_style == 2 {
-                    Expression::Curious
-                } else {
-                    Expression::Greet
+                let (expression, brightness, pupil, color_rgb) = match self.greeting_style {
+                    0 => (Expression::Greet, 880, 740, [255, 180, 70]),
+                    1 => (Expression::Greet, 820, 680, [80, 255, 95]),
+                    2 => (Expression::Curious, 760, 800, [255, 120, 150]),
+                    // Formal bow: warm gold, softer pupils, and no random
+                    // blink interrupt while the whole-neck dip is in flight.
+                    _ => (Expression::Greet, 780, 700, [255, 205, 120]),
                 };
-                fields.brightness = fields.brightness.max(800);
-                fields.pupil = fields.pupil.max(720);
-                fields.color_rgb = match self.greeting_style {
-                    0 => [255, 180, 70],
-                    1 => [80, 255, 95],
-                    _ => [255, 120, 150],
-                };
+                fields.expression = expression;
+                fields.brightness = fields.brightness.max(brightness);
+                fields.pupil = fields.pupil.max(pupil);
+                fields.color_rgb = color_rgb;
+                if self.greeting_style == 3 {
+                    fields.blink = false;
+                }
                 fields.gaze_x += self.saccade_x;
                 fields.gaze_y += self.saccade_y;
             }
@@ -1638,6 +1648,14 @@ impl AutonomicCharacterEngine {
                     .max(1);
                 let phase = normalized_phase(elapsed, duration);
                 let pulse = delayed_symmetric_pulse(elapsed, duration, HEAD_EYE_LEAD_NS);
+                if self.greeting_style == 3 {
+                    // Deliberately symmetric in semantic character space: the
+                    // reviewed per-joint mapping, not this engine, owns the
+                    // mounting signs and physical tick magnitudes.
+                    fields.bow += pulse * 145 / SCALE;
+                    fields.curl += pulse * 145 / SCALE;
+                    return;
+                }
                 let side = if self.greeting_style & 1 == 0 { -1 } else { 1 };
                 fields.bow += pulse * 85 / SCALE;
                 fields.curl -= pulse * 55 / SCALE;
@@ -1944,6 +1962,11 @@ impl AutonomicCharacterEngine {
     }
 
     fn apply_blink(&mut self, fields: &mut EyeFields, now_ns: u64) {
+        if self.mode == CharacterMode::Greeting && self.greeting_style == 3 {
+            self.greeting_blink_pending = false;
+            self.next_blink_ns = self.next_blink_ns.max(saturating_add(now_ns, BLINK_MIN_NS));
+            return;
+        }
         if self.greeting_blink_pending {
             fields.blink = true;
             self.greeting_blink_pending = false;
@@ -2254,7 +2277,7 @@ mod tests {
         );
         assert_eq!(engine.mode(), CharacterMode::Greeting);
 
-        let tracked_at = start + GREETING_MAX_NS + 1;
+        let tracked_at = start + FORMAL_GREETING_MAX_NS + 1;
         engine.render(
             MonotonicTimestamp::from_nanos_since_epoch(tracked_at),
             character_inputs(true, tracked_at),
@@ -2538,6 +2561,12 @@ mod tests {
     fn greeting_blink_is_one_command_edge_not_a_streamed_level() {
         let mut engine = AutonomicCharacterEngine::new(13);
         let start = NS_PER_SECOND;
+        engine.initialize_if_needed(start);
+        engine.mode = CharacterMode::Greeting;
+        engine.mode_started_ns = start;
+        engine.greeting_style = 0;
+        engine.greeting_blink_pending = true;
+        engine.greeting_until_ns = start + GREETING_MAX_NS;
         let first = engine.render(
             MonotonicTimestamp::from_nanos_since_epoch(start),
             character_inputs(true, start),
@@ -2552,6 +2581,57 @@ mod tests {
 
         assert!(first.intent().flags().requests_blink());
         assert!(!second.intent().flags().requests_blink());
+    }
+
+    #[test]
+    fn formal_greeting_is_a_warm_blink_free_whole_neck_bow() {
+        let start = 2 * NS_PER_SECOND;
+        let duration = 2 * NS_PER_SECOND;
+        let peak_at = start + (duration + HEAD_EYE_LEAD_NS) / 2;
+        let mut engine = AutonomicCharacterEngine::new(17);
+        engine.initialize_if_needed(start);
+        engine.mode = CharacterMode::Greeting;
+        engine.mode_started_ns = start;
+        engine.greeting_style = 3;
+        engine.greeting_blink_pending = true;
+        engine.greeting_until_ns = start + duration;
+        engine.next_act_ns = u64::MAX;
+
+        let output = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(peak_at),
+            character_inputs(true, peak_at),
+            prepared(peak_at),
+        );
+        assert_eq!(output.mode(), CharacterMode::Greeting);
+        assert_eq!(output.eye().intent().expression(), Expression::Greet);
+        assert_eq!(output.eye().intent().pupil().get(), 700);
+        assert_eq!(output.eye().intent().brightness().get(), 780);
+        assert_eq!(output.eye().intent().color_rgb(), [255, 205, 120]);
+        assert!(!output.eye().intent().flags().requests_blink());
+        assert_eq!(
+            output.head(),
+            CharacterHeadOverlay::try_new(145, 145, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn formal_greeting_selection_uses_its_deliberate_longer_duration() {
+        let start = 3 * NS_PER_SECOND;
+        let mut observed = None;
+        for seed in 1..=64_u64 {
+            let mut engine = AutonomicCharacterEngine::new(seed);
+            engine.render_character(
+                MonotonicTimestamp::from_nanos_since_epoch(start),
+                character_inputs(true, start),
+                prepared(start),
+            );
+            if engine.greeting_style == 3 {
+                observed = Some(engine.greeting_until_ns - start);
+                break;
+            }
+        }
+        let duration = observed.expect("bounded seed search reaches formal greeting style");
+        assert!((FORMAL_GREETING_MIN_NS..=FORMAL_GREETING_MAX_NS).contains(&duration));
     }
 
     #[test]
