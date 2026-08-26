@@ -8,10 +8,14 @@ calibration records from being mistaken for a qualified deployment.
 The approved `60983f0` archive was transferred to the Orin, extracted, and
 built in an isolated private directory. That build exposed one release-binary
 provenance defect: generic development model defaults embedded the build
-machine's absolute source directory. Commit `9deda40` removes that fallback,
-adds regression coverage, and is now the hardened candidate. Its exact source
-archive and executable are staged only below
-`/home/makerspace/kiko-candidate-9deda40`; neither is installed or deployed.
+machine's absolute source directory. Commit `9deda40` removes that fallback
+and adds regression coverage. Building the offline bundle renderer then exposed
+a second feature-graph defect: its production dependency graph could not import
+a byte bound that was hidden behind OAK recording features. Commit `5680472`
+moves that bound to the hardware-neutral policy contract and adds an exact CI
+check. It is now the hardened candidate. Its exact source archive and three
+executables are staged only below
+`/home/makerspace/kiko-candidate-5680472`; none is installed or deployed.
 
 No live process was stopped or signalled, no hardware endpoint was opened, and
 no firmware, bundle, service, configuration, or hardware state was changed.
@@ -37,7 +41,7 @@ completed in that isolated root without modifying `/home/makerspace/kiko`.
 The first executable was invalidated after inspection found the absolute source
 path described above; it is not the staged qualification candidate.
 
-## Hardened exact candidate
+## Intermediate hardened candidate
 
 | Field | Value |
 | --- | --- |
@@ -58,6 +62,28 @@ resulting five source files matched `9deda40` byte-for-byte. The exact
 `9deda40` archive was then transferred and extracted beside it. This is exact
 source identity evidence, but not a claim that a second cold build was made
 from the later directory.
+
+## Final exact candidate
+
+| Field | Value |
+| --- | --- |
+| branch | `codex/nano-expression-integration-stage` |
+| commit | `568047255446343dd3c0ce8e08900d7c829b3b9d` |
+| Git tree | `cafc1419022d021575741fea40a29c35f2cb75d0` |
+| source tar | `/tmp/kiko-5680472-source.tar` |
+| source tar bytes | `191651840` |
+| source tar SHA-256 | `28b1ccb2dc3e8021eb2566f125840e6d75c7251ccaeb2ba71335ffb64e67d4c9` |
+| compressed source tar | `/tmp/kiko-5680472-source.tar.gz` |
+| compressed bytes | `164842868` |
+| compressed SHA-256 | `1b37b67c3954c29f221c6a8c074ce3e118b1318daa1f081f3447e14dcf3696b7` |
+| isolated Orin root | `/home/makerspace/kiko-candidate-5680472` |
+
+The transferred archive matched the local compressed bytes and was extracted
+into the private final-candidate root. Hashes of the four source files changed
+by `5680472` matched the local commit. The three binaries below were built from
+the `60983f0` archive after applying the SHA-verified `9deda40` and `5680472`
+patches; the resulting source files match the final archive. No claim of a
+second cold build from the final directory is made.
 
 ## Isolated Linux AArch64 build evidence
 
@@ -82,23 +108,35 @@ The build host and toolchain were:
 | DepthAI headers | SDK `3.4.0`, commit `ba7a920a2568ea6eaaaebf3f92bbdb40924187ae`, device artifact `86cc8f6aa527b7c1f4b62129decd68e12bcf7d8a`, bootloader `0.0.28` |
 | DepthAI version header SHA-256 | `91eded0aa1468a5e8ca7ee13b51f2e2f8475c616922a59c684ecb59fc61e6e80` |
 
-The current executable is retained, not installed:
+The current runtime executable is retained, not installed:
 
 | Field | Value |
 | --- | --- |
-| path | `/home/makerspace/kiko-candidate-9deda40/bin/kiko-nano-wheels-off-qualification` |
-| bytes | `31221720` |
-| SHA-256 | `9d746650c3d86cea4292fecc5bb9098c1cfc8a0ccb9d29ab018ede821ffc82f9` |
-| GNU build ID | `84f56531c586d2963fdfd08fd6cf7a8c820c5c96` |
+| path | `/home/makerspace/kiko-candidate-5680472/bin/kiko-nano-wheels-off-qualification` |
+| bytes | `31221240` |
+| SHA-256 | `6b0c2ee3ce0184975d35d8d13618b3c14c2e0f275982fd5cc5e753d00d63a64d` |
+| GNU build ID | `c44ed1c959faa6dae6b93f26857e2a1ef9115bc9` |
 | format | ELF64 AArch64 PIE, GNU/Linux 3.7, interpreter `/lib/ld-linux-aarch64.so.1` |
 | mode and owner | `0755`, `makerspace:makerspace` |
+
+Two matching-revision offline tools are staged beside it:
+
+| Tool | Bytes | SHA-256 | GNU build ID |
+| --- | ---: | --- | --- |
+| `kiko-nano-bundle-renderer` | `2971536` | `f0f26c56c57816ec1079a32aeeb2cf3e484ccd31e5e62da38d8eaebbe0bb38e8` | `71f320a6bc43370bf9e4ace1289f827787578990` |
+| `kiko-nano-calibration-prepare` | `2276784` | `9fe343b61834e48c675658874916bc39439485a46f7206df1b152326e7a95784` | `695b5816198ae1985fa2f4c0f0302b91887ef108` |
+
+Both are AArch64 PIE executables, have complete system dependency closures,
+and ran their `--help` boundaries. The renderer explicitly describes itself as
+offline and non-installing; the preparer explicitly describes itself as doing
+no device I/O. Neither was invoked on an input or output directory.
 
 `readelf` found direct dependencies on DepthAI, the three required OpenCV
 libraries, and the expected C/C++ runtime libraries. With the retained native
 directory on `LD_LIBRARY_PATH`, `ldd` resolved DepthAI, dynamic calibration,
 OpenCV, and the pinned libusb leaf. A system libusb also remains in the
 transitive closure, so this is not described as a wholly hermetic OS closure.
-The exact old candidate source path is absent from the hardened executable.
+The exact build source path is absent from all three hardened executables.
 `--help` ran successfully and exposed the qualification command without
 opening a hardware endpoint. Runtime `/proc/self/maps` admission remains a
 bundle-launch gate.
@@ -112,6 +150,12 @@ Host verification for the exact wheels-off feature graph passed:
 - 7 qualification-template integration tests; and
 - doctests, with one intentionally ignored backend example.
 
+After the Orin found the renderer-only graph defect, its fix also passed the
+exact production-feature-only renderer library check, strict renderer Clippy,
+all 36 renderer integration tests, and renderer doctests. The CI workflow now
+keeps that smaller graph separate because `--all-targets` feature unification
+can otherwise hide the missing-export class of error.
+
 The first in-sandbox test pass produced 27 local-socket `EPERM` failures; the
 identical command was rerun with local socket permission and all tests passed.
 `OAK_SYS_CHECK_ONLY=1` intentionally makes these host checks compile-only for
@@ -120,7 +164,7 @@ release build above.
 
 ## Live Orin state retained during preparation
 
-The final read-only refresh at `2026-08-27T04:02:24+05:30` observed an NVIDIA
+The final read-only refresh at `2026-08-27T04:55:54+05:30` observed an NVIDIA
 Jetson Orin Nano running Linux `aarch64`. `/home/makerspace/kiko` remained at
 `e53d7cb084a9b56f49df484f6d8bc7f46f0b39e6`; it is the intentionally preserved
 dirty field worktree and must not be reset, overwritten, or used as a clean
