@@ -112,6 +112,24 @@ writer failure is a terminal accessory fault. All output is reconstructed
 through KEP2's signed/unit domain constructors after explicit saturation to
 `[-1000,1000]` or `[0,1000]`; the frame path retains no untyped eye values.
 
+Product lifecycle is a separate closed fact vocabulary: booting, four-joint
+admission recovery, operational, firmware maintenance by controller and
+phase, fault recovery, and parking. Exclusive lifecycle facts preempt face
+tracking, random saccades, pet/thermal overlays, scheduled acts, and every
+semantic head axis. Entry starts from the last rendered eye state; return to
+ambient character and head movement follows one 1.2 s minimum-jerk release,
+so a fact transition cannot reintroduce a head pose in one frame. The emitted
+`PreparedCharacterFrame` retains the exact body fact for trace comparison.
+
+Eye-controller `InProgress` is only a dark anesthesia intent: the RP2350
+application cannot render while BOOTSEL owns the device. Literal Matrix-green
+rain remains firmware-owned and runs on both panels after the new image boots,
+before KEP2 enumeration. Maintenance of another controller can retain a
+green KEP2 dream, but that is not mislabeled as the literal Matrix renderer.
+The RGB bridge can request a fresh lifecycle-only frame without inventing an
+RGB observation or advancing scene continuity; this is used for startup and
+normal coordinated shutdown when camera frames are unavailable.
+
 `render_character` returns one `PreparedCharacterFrame`: the KEP2 eye intent,
 mode, optional named act, and a semantic overlay for bow, curl, yaw, and roll.
 The eyes begin the reaction first; the four head axes remain exactly natural

@@ -160,6 +160,15 @@ pitch signs; any composed envelope overflow is withheld rather than clamped.
 The separately retained policy/review pair remains mandatory, and these
 behavior constants still require attended physical observation.
 
+The sole accessory owner also owns lifecycle presentation. The RP2350 image
+renders its literal 2.4 s Matrix-green boot cue before KEP2 enumeration. After
+the eye session and all four head joints have completed admission, the owner
+streams the character engine's 2.6 s groggy-to-warm recovery before publishing
+accessory readiness. Normal coordinated shutdown streams a 1.8 s goodnight at
+20 Hz before releasing KEP2. Lifecycle generation or eye-apply failure is a
+typed owner fault; it cannot be swallowed or followed by false readiness.
+These are in-process facts and reflexes, not another service or boot owner.
+
 Do not expand these templates with shell substitution. Feed exact discovery
 and reviewed source paths to `kiko-nano-bundle-renderer`; it emits the agent
 policy, production controller, inventory, navigation-actuation,

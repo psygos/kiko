@@ -187,17 +187,41 @@ remaining work; a passing host test is never presented as physical evidence.
   instead of clamping. Intent: preserve Fable's whole-neck lean into a turn
   without feeding posture back into gaze, hiding scheduler gaps, or weakening
   physical bounds.
+- `9043c1f`: lifecycle interoception is now one closed character-owned input:
+  booting, admission recovery, operational, controller- and phase-specific
+  firmware maintenance, fault recovery, and parking. Exclusive facts suppress
+  face gaze, saccades, pet/thermal decoration, acts, and all four semantic head
+  axes. Every entry captures the last rendered eye state, every ambient return
+  uses a 1.2-second minimum-jerk release, and the coherent frame retains its
+  exact body evidence. A camera-independent bridge sample does not fabricate
+  or advance RGB continuity. Eye BOOTSEL is stated truthfully as unrenderable;
+  literal Matrix remains the post-upload firmware boot renderer, while another
+  controller may receive a deliberately distinct green KEP2 dream. Intent:
+  make body facts standing reflexes owned by Kiko instead of animation calls.
+- `4ff1d1e`: the sole Nano accessory loop now publishes `Booting`, waits for
+  the eye session and four-joint head admission, streams the 2.6-second
+  character-owned admission recovery, and publishes `Operational` only after
+  it succeeds. Normal shutdown streams the 1.8-second goodnight at 20 Hz before
+  KEP2 release. Generation or eye-apply failures retain their typed cause,
+  latch the owner fault, close both actors, and cannot report false readiness.
+  A terminal fault publishes `FaultRecovery` immediately without delaying the
+  existing stop latch; the terminal branch does not yet stream fresh fault-eye
+  samples, because secondary presentation failure still needs durable evidence
+  without replacing the primary fault. Intent: make startup and park observable
+  consequences of lifecycle facts without weakening fault ordering.
 
-Host evidence at this checkpoint is 105/105 `kiko-expression-runtime` unit
+Host evidence at this checkpoint is 108/108 `kiko-expression-runtime` unit
 tests plus its compile-fail doctest, warning-free expression, head, and Nano
 compile-only Clippy, 177 `kiko-head-runtime` library tests plus 11 binary
-tests, 1,460/1,460 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
+tests, 1,464/1,464 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
 binary tests, 7/7 offline-qualifier tests, 36/36 immutable-renderer tests,
 all 6 deployment-gate tests, the 13 focused base-commissioning tests, and
-82/82 Python behavior tests. The complete Nano-agent library suite was run
+82/82 Python behavior tests. The standalone KEP2 firmware passed all 8
+renderer tests, including literal Matrix dynamics and maximum-time totality.
+The complete Nano-agent library suite was run
 outside the filesystem sandbox because 23 otherwise-green local socket and
 loopback-listener tests are denied binding by that sandbox; the unrestricted
-run passed all 1,460 tests.
+run passed all 1,464 tests.
 The Linux-aarch64 standard-library abstract notify-socket API was compiled
 directly. A complete Linux-aarch64 dependency cross-check remains unclaimed
 because this Mac does not have `aarch64-linux-gnu-gcc`; native OAK linking,
@@ -206,12 +230,15 @@ claimed by these host results.
 
 ### Remaining before the single-owner handoff is complete
 
-1. Commanded-head feedback and residual-driven eyes are complete. Add metric
-   proximity only when depth has valid face-association evidence, then port the
-   remaining interoceptive acts. Turn-dip weight shift, thermal/body state,
-   base-motion exclusion, image-plane face bearing, apparent-width proximity
-   cue, continuous pet-state eye choreography, and the formal bow greeting are
-   complete; apparent width is not relabeled as metric range.
+1. Commanded-head feedback, residual-driven eyes, turn dip, thermal/body state,
+   base-motion exclusion, image-plane face bearing, apparent-width proximity,
+   continuous pet-state eyes, the formal bow, startup recovery, firmware
+   anesthesia/wake semantics, and normal goodnight are complete in the typed
+   owner. Add metric proximity only when depth has valid face-association
+   evidence. Wire firmware-maintenance facts when a canonical firmware
+   coordinator exists, and add durable secondary-fault evidence before the
+   terminal branch streams fault-recovery eyes; do not replace the primary
+   stop fault or call apparent width metric range.
 2. Pet NDJSON compatibility, durable production recording, and reaction replay
    are complete. Add the remaining general behavior-trace replay comparison;
    retain the Python lane as a non-booted behavior lab until the Rust owner has
