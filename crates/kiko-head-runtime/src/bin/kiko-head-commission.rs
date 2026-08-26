@@ -8,10 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use kiko_head_protocol::{FrameBuildError, HeadJoint, PositionTicks};
+use kiko_head_protocol::{
+    FrameBuildError, HeadJoint, HeadTorqueLimits, PositionTicks, TorqueLimitPermille,
+};
 use kiko_head_runtime::compliant_hold::{
-    CompliantJointPolicy, CompliantJointPolicyError, HeadCompliantHoldConfig,
-    HeadCompliantHoldConfigError,
+    CompliantJointPolicy, CompliantJointPolicyError, CompliantPetJointPolicy,
+    CompliantPetJointPolicyError, CompliantPetProfile, CompliantPetProfileError,
+    HeadCompliantHoldConfig, HeadCompliantHoldConfigError,
 };
 use kiko_head_runtime::{
     ActorExit, AttendedCompliantCommissioningTakeoverConsent, HeadProbeConfig,
@@ -325,6 +328,15 @@ enum CompliantInputParseError {
         joint: HeadJoint,
         source: CompliantJointPolicyError,
     },
+    PetJoint {
+        joint: HeadJoint,
+        source: CompliantPetJointPolicyError,
+    },
+    YieldTorque {
+        joint: HeadJoint,
+        source: FrameBuildError,
+    },
+    PetProfile(CompliantPetProfileError),
     Config(HeadCompliantHoldConfigError),
 }
 
@@ -339,6 +351,9 @@ impl Error for CompliantInputParseError {
         match self {
             Self::Position { source, .. } => Some(source),
             Self::Joint { source, .. } => Some(source),
+            Self::PetJoint { source, .. } => Some(source),
+            Self::YieldTorque { source, .. } => Some(source),
+            Self::PetProfile(source) => Some(source),
             Self::Config(source) => Some(source),
         }
     }
@@ -418,6 +433,26 @@ struct CompliantInput {
     release_dwell_ms: u64,
     recovery_duration_ms: u64,
     follow_permille: u16,
+    pet_profile: Option<CompliantPetInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompliantPetInput {
+    maximum_baseline_error_ticks: [u16; 4],
+    contact_rest_pose_offset_ticks: [i16; 4],
+    contact_directional_rest_offset_ticks: [u16; 4],
+    rest_dwell_ms: u64,
+    rest_per_additional_joint_ms: u64,
+    maximum_rest_dwell_ms: u64,
+    recovery_per_additional_joint_permille: u16,
+    yield_static_release_ms: u64,
+    maximum_yield_dwell_ms: u64,
+    residual_stillness_ticks: u16,
+    comfort_roll_tilt_ticks: u16,
+    yield_torque_limit_permille: [u16; 4],
+    tap_max_contact_ms: u64,
+    tap_recovery_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -779,7 +814,7 @@ fn parse_compliant_input(
         .map_err(|source| CompliantInputParseError::Joint { joint, source })
     });
     let [bow, curl, yaw, roll] = joints;
-    HeadCompliantHoldConfig::try_new(
+    let config = HeadCompliantHoldConfig::try_new(
         bow?,
         curl?,
         yaw?,
@@ -795,7 +830,46 @@ fn parse_compliant_input(
         Duration::from_millis(input.recovery_duration_ms),
         input.follow_permille,
     )
-    .map_err(CompliantInputParseError::Config)
+    .map_err(CompliantInputParseError::Config)?;
+    let Some(pet) = input.pet_profile else {
+        return Ok(config);
+    };
+    let pet_joints = HeadJoint::ALL.map(|joint| {
+        let index = joint as usize;
+        CompliantPetJointPolicy::try_new(
+            pet.maximum_baseline_error_ticks[index],
+            pet.contact_rest_pose_offset_ticks[index],
+            pet.contact_directional_rest_offset_ticks[index],
+        )
+        .map_err(|source| CompliantInputParseError::PetJoint { joint, source })
+    });
+    let torque = HeadJoint::ALL.map(|joint| {
+        TorqueLimitPermille::try_new(pet.yield_torque_limit_permille[joint as usize])
+            .map_err(|source| CompliantInputParseError::YieldTorque { joint, source })
+    });
+    let [bow, curl, yaw, roll] = pet_joints;
+    let [bow_torque, curl_torque, yaw_torque, roll_torque] = torque;
+    let profile = CompliantPetProfile::try_new(
+        bow?,
+        curl?,
+        yaw?,
+        roll?,
+        Duration::from_millis(pet.rest_dwell_ms),
+        Duration::from_millis(pet.rest_per_additional_joint_ms),
+        Duration::from_millis(pet.maximum_rest_dwell_ms),
+        pet.recovery_per_additional_joint_permille,
+        Duration::from_millis(pet.yield_static_release_ms),
+        Duration::from_millis(pet.maximum_yield_dwell_ms),
+        pet.residual_stillness_ticks,
+        pet.comfort_roll_tilt_ticks,
+        HeadTorqueLimits::new(bow_torque?, curl_torque?, yaw_torque?, roll_torque?),
+        Duration::from_millis(pet.tap_max_contact_ms),
+        Duration::from_millis(pet.tap_recovery_ms),
+    )
+    .map_err(CompliantInputParseError::PetProfile)?;
+    config
+        .try_with_pet_profile(profile)
+        .map_err(CompliantInputParseError::Config)
 }
 
 fn path_contains_dot_segment(path: &Path) -> bool {
@@ -1478,11 +1552,18 @@ mod tests {
                 .target()
                 .positions()
                 .map(PositionTicks::get),
-            [2174, 2570, 1637, 3047]
+            [1505, 3937, 1551, 3018]
         );
         assert_eq!(compliant.control_period(), Duration::from_millis(100));
-        assert_eq!(compliant.contact_acquisition_samples(), 3);
-        assert_eq!(compliant.recovery_duration(), Duration::from_millis(2400));
+        assert_eq!(compliant.contact_acquisition_samples(), 2);
+        assert_eq!(compliant.recovery_duration(), Duration::from_millis(3000));
+        let pet = compliant.pet_profile().expect("field pet profile");
+        assert_eq!(pet.static_release_dwell(), Duration::from_millis(1800));
+        assert_eq!(pet.comfort_roll_tilt_ticks(), 14);
+        assert_eq!(
+            HeadJoint::ALL.map(|joint| pet.yield_torque_limits().for_joint(joint).get()),
+            [450, 350, 220, 250]
+        );
         compliant
             .admit_runtime_torque_limits(head_return.transaction.runtime().torque_limits())
             .expect("exact torque binding");

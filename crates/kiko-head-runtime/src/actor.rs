@@ -3,11 +3,12 @@ use std::time::Duration;
 
 use kiko_head_protocol::{
     ExactHeadTargetPose, FullTelemetry, GoalPositionObservation, GoalSpeedTicksPerSecond,
-    HeadJoint, HeadPose, HeadPoseError, ObservedTorqueSwitch, PositionAgreementError,
-    PositionAgreementTicks, PositionTicks, ResponseParseError, TelemetryParseError, TorqueSwitch,
-    TorqueSwitchObservation, ValidatedPresentPosition, build_full_telemetry_read,
-    build_goal_position_read, build_goal_with_speed_write, build_natural_hold_frames,
-    build_torque_switch_read, build_torque_switch_write,
+    HeadJoint, HeadPose, HeadPoseError, HeadTorqueLimits, ObservedTorqueSwitch,
+    PositionAgreementError, PositionAgreementTicks, PositionTicks, ResponseParseError,
+    TelemetryParseError, TorqueSwitch, TorqueSwitchObservation, ValidatedPresentPosition,
+    build_full_telemetry_read, build_goal_position_read, build_goal_with_speed_write,
+    build_natural_hold_frames, build_torque_limit_write, build_torque_switch_read,
+    build_torque_switch_write,
 };
 use tokio::runtime::{Handle, TryCurrentError};
 use tokio::sync::{mpsc, oneshot};
@@ -1838,7 +1839,9 @@ impl ActorExit {
 }
 
 /// Evidence that the production actor closed its bus owner without issuing a
-/// torque-switch write as part of cleanup.
+/// torque-switch write as part of cleanup. If compliant interaction had
+/// softened any joint, cleanup first attempts the complete declared holding
+/// torque-limit profile and retains every outcome here.
 ///
 /// This does not prove that servo torque was enabled before or after release.
 /// Electrical power loss, another bus owner, or the servo itself can still
@@ -1846,6 +1849,7 @@ impl ActorExit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HoldPreservingOwnershipReleaseEvidence {
     recorded_at: MonotonicTime,
+    holding_torque_restore: Option<Box<CompliantHoldingTorqueRestoreReport>>,
 }
 
 impl HoldPreservingOwnershipReleaseEvidence {
@@ -1853,6 +1857,10 @@ impl HoldPreservingOwnershipReleaseEvidence {
     /// It is not a measurement of the physical torque state.
     pub const fn recorded_at(&self) -> MonotonicTime {
         self.recorded_at
+    }
+
+    pub fn holding_torque_restore(&self) -> Option<&CompliantHoldingTorqueRestoreReport> {
+        self.holding_torque_restore.as_deref()
     }
 }
 
@@ -1920,6 +1928,129 @@ pub struct VerifiedHeadGazeControlStep {
 pub struct VerifiedHeadCompliantHoldStep {
     controller: CompliantHoldCommitReceipt,
     hardware: HeadGazeHardwareApplication,
+    torque_transition: Option<VerifiedCompliantTorqueTransition>,
+}
+
+/// Exact four-write evidence for a compliant torque-profile transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedCompliantTorqueTransition {
+    previous: HeadTorqueLimits,
+    applied: HeadTorqueLimits,
+    precondition_restore: Option<Box<CompliantHoldingTorqueRestoreReport>>,
+    writes: [WriteEvidence; 4],
+}
+
+impl VerifiedCompliantTorqueTransition {
+    pub const fn previous(&self) -> HeadTorqueLimits {
+        self.previous
+    }
+
+    pub const fn applied(&self) -> HeadTorqueLimits {
+        self.applied
+    }
+
+    pub fn precondition_restore(&self) -> Option<&CompliantHoldingTorqueRestoreReport> {
+        self.precondition_restore.as_deref()
+    }
+
+    pub const fn writes(&self) -> &[WriteEvidence; 4] {
+        &self.writes
+    }
+}
+
+/// Best-effort all-joint restoration evidence. Every joint is attempted even
+/// after an earlier failure, so a failed result never masquerades as a known
+/// installed profile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompliantHoldingTorqueRestoreReport {
+    holding: HeadTorqueLimits,
+    outcomes: [Result<WriteEvidence, FrameWriteError>; 4],
+}
+
+impl CompliantHoldingTorqueRestoreReport {
+    pub const fn holding(&self) -> HeadTorqueLimits {
+        self.holding
+    }
+
+    pub const fn outcomes(&self) -> &[Result<WriteEvidence, FrameWriteError>; 4] {
+        &self.outcomes
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.outcomes.iter().all(Result::is_ok)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompliantTorqueTransitionFailure {
+    PriorProfileUncertain,
+    Cancelled {
+        joint: HeadJoint,
+        cause: CancellationCause,
+    },
+    Write(FrameWriteError),
+}
+
+impl fmt::Display for CompliantTorqueTransitionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "compliant torque transition failed: {self:?}")
+    }
+}
+
+impl std::error::Error for CompliantTorqueTransitionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Write(source) => Some(source),
+            Self::PriorProfileUncertain | Self::Cancelled { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompliantTorqueTransitionError {
+    previous: Option<HeadTorqueLimits>,
+    requested: HeadTorqueLimits,
+    completed_writes: [Option<WriteEvidence>; 4],
+    failure: CompliantTorqueTransitionFailure,
+    holding_restore: CompliantHoldingTorqueRestoreReport,
+}
+
+impl CompliantTorqueTransitionError {
+    pub const fn previous(&self) -> Option<HeadTorqueLimits> {
+        self.previous
+    }
+
+    pub const fn requested(&self) -> HeadTorqueLimits {
+        self.requested
+    }
+
+    pub const fn completed_writes(&self) -> &[Option<WriteEvidence>; 4] {
+        &self.completed_writes
+    }
+
+    pub const fn failure(&self) -> &CompliantTorqueTransitionFailure {
+        &self.failure
+    }
+
+    pub const fn holding_restore(&self) -> &CompliantHoldingTorqueRestoreReport {
+        &self.holding_restore
+    }
+}
+
+impl fmt::Display for CompliantTorqueTransitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "compliant torque profile application failed: {}",
+            self.failure
+        )
+    }
+}
+
+impl std::error::Error for CompliantTorqueTransitionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.failure)
+    }
 }
 
 /// One complete, structurally valid telemetry set whose temperature channels
@@ -1998,7 +2129,7 @@ impl UnreadableEnergizedTemperatureFault {
 enum HeadCompliantHoldExecution {
     RetainedExpressionTarget,
     TemperatureDeferred(Box<DeferredEnergizedTemperatureObservation>),
-    Applied(VerifiedHeadCompliantHoldStep),
+    Applied(Box<VerifiedHeadCompliantHoldStep>),
 }
 
 impl VerifiedHeadCompliantHoldStep {
@@ -2008,6 +2139,10 @@ impl VerifiedHeadCompliantHoldStep {
 
     pub const fn hardware(&self) -> &HeadGazeHardwareApplication {
         &self.hardware
+    }
+
+    pub const fn torque_transition(&self) -> Option<&VerifiedCompliantTorqueTransition> {
+        self.torque_transition.as_ref()
     }
 }
 
@@ -2093,6 +2228,14 @@ pub enum HeadGazeServiceError {
     ConfirmedEnergizedTemperature(Box<ConfirmedEnergizedTemperatureFault>),
     UnreadableEnergizedTemperature(Box<UnreadableEnergizedTemperatureFault>),
     CompliantPlanner(CompliantHoldPrepareError),
+    CompliantTorqueTransition {
+        source: Box<CompliantTorqueTransitionError>,
+        abort: Result<(), CompliantHoldCommitError>,
+    },
+    CompliantHoldingTorqueRestore {
+        trigger: Box<CompliantHoldingTorqueRestoreTrigger>,
+        report: Box<CompliantHoldingTorqueRestoreReport>,
+    },
     CompliantGoalRegisters {
         source: Box<HeadGoalRegisterError>,
         abort: Result<(), CompliantHoldCommitError>,
@@ -2133,6 +2276,8 @@ impl std::error::Error for HeadGazeServiceError {
             Self::CompliantControl(source) => Some(source.as_ref()),
             Self::CompliantObservation(source) => Some(source),
             Self::CompliantPlanner(source) => Some(source),
+            Self::CompliantTorqueTransition { source, .. } => Some(source.as_ref()),
+            Self::CompliantHoldingTorqueRestore { trigger, .. } => Some(trigger.as_ref()),
             Self::CompliantGoalRegisters { source, .. } => Some(source.as_ref()),
             Self::CompliantCommitAfterVerifiedApplication { source, .. } => Some(source),
             Self::Controller(source) => Some(source),
@@ -2143,6 +2288,30 @@ impl std::error::Error for HeadGazeServiceError {
             | Self::NotConfigured
             | Self::ConfirmedEnergizedTemperature(_)
             | Self::UnreadableEnergizedTemperature(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompliantHoldingTorqueRestoreTrigger {
+    TemperatureDeferred(Box<DeferredEnergizedTemperatureObservation>),
+    ServiceFault(Box<HeadGazeServiceError>),
+}
+
+impl fmt::Display for CompliantHoldingTorqueRestoreTrigger {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "compliant holding-torque restoration trigger: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for CompliantHoldingTorqueRestoreTrigger {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ServiceFault(source) => Some(source.as_ref()),
+            Self::TemperatureDeferred(_) => None,
         }
     }
 }
@@ -2692,6 +2861,7 @@ where
             .telemetry_safety_limits()
             .maximum_energized_temperature_raw_exclusive(),
     );
+    let applied_torque_limits = AppliedTorqueLimits::Verified(config.torque_limits());
     let actor = HeadActor {
         transport,
         clock,
@@ -2702,6 +2872,7 @@ where
         control_mode,
         energized_temperature,
         temperature_deferred_until: None,
+        applied_torque_limits,
     };
     let task = runtime.spawn(async move {
         actor
@@ -2742,6 +2913,7 @@ where
             .telemetry_safety_limits()
             .maximum_energized_temperature_raw_exclusive(),
     );
+    let applied_torque_limits = AppliedTorqueLimits::Verified(config.torque_limits());
     let actor = HeadActor {
         transport,
         clock,
@@ -2752,6 +2924,7 @@ where
         control_mode,
         energized_temperature,
         temperature_deferred_until: None,
+        applied_torque_limits,
     };
     let task = runtime.spawn(async move {
         actor
@@ -3041,6 +3214,13 @@ struct HeadActor<T, C> {
     control_mode: HeadControlMode,
     energized_temperature: EnergizedTemperatureSupervisor,
     temperature_deferred_until: Option<MonotonicTime>,
+    applied_torque_limits: AppliedTorqueLimits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppliedTorqueLimits {
+    Verified(HeadTorqueLimits),
+    Uncertain,
 }
 
 struct ControlState {
@@ -3461,9 +3641,9 @@ where
             }
             StartupTorquePolicy::TensionPreservingTakeover
             | StartupTorquePolicy::AttendedEnabledHoldTakeover => {
-                HeadActorCleanup::HoldPreservingRelease(HoldPreservingOwnershipReleaseEvidence {
-                    recorded_at: self.clock.now(),
-                })
+                HeadActorCleanup::HoldPreservingRelease(
+                    self.prepare_hold_preserving_ownership_release().await,
+                )
             }
         };
         match (control.shutdown_response, &cleanup) {
@@ -3792,7 +3972,7 @@ where
                     .await?
                 {
                     HeadCompliantHoldExecution::Applied(evidence) => {
-                        return Ok(HeadGazeServiceOutcome::Compliant(Box::new(evidence)));
+                        return Ok(HeadGazeServiceOutcome::Compliant(evidence));
                     }
                     HeadCompliantHoldExecution::TemperatureDeferred(evidence) => {
                         return Ok(HeadGazeServiceOutcome::CompliantTemperatureDeferred(
@@ -3878,6 +4058,56 @@ where
     }
 
     async fn execute_compliant_hold_step(
+        &mut self,
+        expression_target: ExactHeadTargetPose,
+        expression_quiet: bool,
+        goal_register_transaction_timeout: OperationTimeout,
+        compliant: &mut HeadCompliantHoldController,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<HeadCompliantHoldExecution, HeadGazeServiceError> {
+        let result = self
+            .execute_compliant_hold_step_inner(
+                expression_target,
+                expression_quiet,
+                goal_register_transaction_timeout,
+                compliant,
+                commands,
+                control,
+            )
+            .await;
+        let interrupted = matches!(
+            &result,
+            Ok(HeadCompliantHoldExecution::TemperatureDeferred(_)) | Err(_)
+        );
+        let holding = compliant.config().holding_torque_limits();
+        let holding_is_verified =
+            self.applied_torque_limits == AppliedTorqueLimits::Verified(holding);
+        if interrupted && !holding_is_verified {
+            let report = self.restore_compliant_holding_torque(holding).await;
+            if report.is_complete() {
+                self.applied_torque_limits = AppliedTorqueLimits::Verified(holding);
+            } else {
+                self.applied_torque_limits = AppliedTorqueLimits::Uncertain;
+                let trigger = match result {
+                    Ok(HeadCompliantHoldExecution::TemperatureDeferred(evidence)) => {
+                        CompliantHoldingTorqueRestoreTrigger::TemperatureDeferred(evidence)
+                    }
+                    Err(source) => {
+                        CompliantHoldingTorqueRestoreTrigger::ServiceFault(Box::new(source))
+                    }
+                    Ok(_) => unreachable!("only interrupted outcomes require holding restore"),
+                };
+                return Err(HeadGazeServiceError::CompliantHoldingTorqueRestore {
+                    trigger: Box::new(trigger),
+                    report: Box::new(report),
+                });
+            }
+        }
+        result
+    }
+
+    async fn execute_compliant_hold_step_inner(
         &mut self,
         expression_target: ExactHeadTargetPose,
         expression_quiet: bool,
@@ -4009,12 +4239,37 @@ where
         let prepared = compliant
             .prepare(now, expression_target, expression_quiet, observation)
             .map_err(HeadGazeServiceError::CompliantPlanner)?;
+        let desired_torque_limits = prepared.desired_torque_limits();
+        let torque_transition =
+            if self.applied_torque_limits == AppliedTorqueLimits::Verified(desired_torque_limits) {
+                None
+            } else {
+                match self
+                    .write_compliant_torque_transition(
+                        desired_torque_limits,
+                        compliant.config().holding_torque_limits(),
+                        commands,
+                        control,
+                    )
+                    .await
+                {
+                    Ok(evidence) => Some(evidence),
+                    Err(source) => {
+                        let abort = compliant.abort_with_application_uncertain(prepared);
+                        return Err(HeadGazeServiceError::CompliantTorqueTransition {
+                            source: Box::new(source),
+                            abort,
+                        });
+                    }
+                }
+            };
         let disposition = prepared.disposition();
         let target = prepared.target();
         if matches!(
             disposition,
             crate::compliant_hold::CompliantHoldDisposition::FollowingExpression
         ) {
+            debug_assert!(torque_transition.is_none());
             debug_assert_eq!(target, expression_target);
             compliant.commit(prepared).map_err(|source| {
                 HeadGazeServiceError::CompliantCommitAfterVerifiedApplication { source, target }
@@ -4052,12 +4307,153 @@ where
         let controller = compliant.commit(prepared).map_err(|source| {
             HeadGazeServiceError::CompliantCommitAfterVerifiedApplication { source, target }
         })?;
-        Ok(HeadCompliantHoldExecution::Applied(
+        Ok(HeadCompliantHoldExecution::Applied(Box::new(
             VerifiedHeadCompliantHoldStep {
                 controller,
                 hardware,
+                torque_transition,
             },
-        ))
+        )))
+    }
+
+    async fn write_compliant_torque_transition(
+        &mut self,
+        requested: HeadTorqueLimits,
+        holding: HeadTorqueLimits,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<VerifiedCompliantTorqueTransition, CompliantTorqueTransitionError> {
+        let (previous, precondition_restore) = match self.applied_torque_limits {
+            AppliedTorqueLimits::Verified(previous) => (previous, None),
+            AppliedTorqueLimits::Uncertain => {
+                let report = self.restore_compliant_holding_torque(holding).await;
+                if !report.is_complete() {
+                    return Err(CompliantTorqueTransitionError {
+                        previous: None,
+                        requested,
+                        completed_writes: std::array::from_fn(|_| None),
+                        failure: CompliantTorqueTransitionFailure::PriorProfileUncertain,
+                        holding_restore: report,
+                    });
+                }
+                self.applied_torque_limits = AppliedTorqueLimits::Verified(holding);
+                (holding, Some(Box::new(report)))
+            }
+        };
+        let frames = HeadJoint::ALL
+            .map(|joint| build_torque_limit_write(joint.servo_id(), requested.for_joint(joint)));
+        let mut completed_writes: [Option<WriteEvidence>; 4] = std::array::from_fn(|_| None);
+        for joint in HeadJoint::ALL {
+            if let Err(cause) = self.check_goal_register_control(commands, control) {
+                let holding_restore = self.restore_compliant_holding_torque(holding).await;
+                self.applied_torque_limits = if holding_restore.is_complete() {
+                    AppliedTorqueLimits::Verified(holding)
+                } else {
+                    AppliedTorqueLimits::Uncertain
+                };
+                return Err(CompliantTorqueTransitionError {
+                    previous: Some(previous),
+                    requested,
+                    completed_writes,
+                    failure: CompliantTorqueTransitionFailure::Cancelled { joint, cause },
+                    holding_restore,
+                });
+            }
+            let index = joint as usize;
+            match self
+                .write_frame(joint, WritePurpose::TorqueLimit, frames[index].as_bytes())
+                .await
+            {
+                Ok(evidence) => completed_writes[index] = Some(evidence),
+                Err(source) => {
+                    let holding_restore = self.restore_compliant_holding_torque(holding).await;
+                    self.applied_torque_limits = if holding_restore.is_complete() {
+                        AppliedTorqueLimits::Verified(holding)
+                    } else {
+                        AppliedTorqueLimits::Uncertain
+                    };
+                    return Err(CompliantTorqueTransitionError {
+                        previous: Some(previous),
+                        requested,
+                        completed_writes,
+                        failure: CompliantTorqueTransitionFailure::Write(source),
+                        holding_restore,
+                    });
+                }
+            }
+        }
+        let writes = completed_writes.map(|write| {
+            write.expect("all four completed writes exist after the canonical transition loop")
+        });
+        self.applied_torque_limits = AppliedTorqueLimits::Verified(requested);
+        Ok(VerifiedCompliantTorqueTransition {
+            previous,
+            applied: requested,
+            precondition_restore,
+            writes,
+        })
+    }
+
+    async fn restore_compliant_holding_torque(
+        &mut self,
+        holding: HeadTorqueLimits,
+    ) -> CompliantHoldingTorqueRestoreReport {
+        let frames = HeadJoint::ALL
+            .map(|joint| build_torque_limit_write(joint.servo_id(), holding.for_joint(joint)));
+        let bow = self
+            .write_frame(
+                HeadJoint::Bow,
+                WritePurpose::TorqueLimit,
+                frames[HeadJoint::Bow as usize].as_bytes(),
+            )
+            .await;
+        let curl = self
+            .write_frame(
+                HeadJoint::Curl,
+                WritePurpose::TorqueLimit,
+                frames[HeadJoint::Curl as usize].as_bytes(),
+            )
+            .await;
+        let yaw = self
+            .write_frame(
+                HeadJoint::Yaw,
+                WritePurpose::TorqueLimit,
+                frames[HeadJoint::Yaw as usize].as_bytes(),
+            )
+            .await;
+        let roll = self
+            .write_frame(
+                HeadJoint::Roll,
+                WritePurpose::TorqueLimit,
+                frames[HeadJoint::Roll as usize].as_bytes(),
+            )
+            .await;
+        CompliantHoldingTorqueRestoreReport {
+            holding,
+            outcomes: [bow, curl, yaw, roll],
+        }
+    }
+
+    async fn prepare_hold_preserving_ownership_release(
+        &mut self,
+    ) -> HoldPreservingOwnershipReleaseEvidence {
+        let holding = self.config.torque_limits();
+        let holding_torque_restore =
+            if self.applied_torque_limits == AppliedTorqueLimits::Verified(holding) {
+                None
+            } else {
+                let report = self.restore_compliant_holding_torque(holding).await;
+                self.applied_torque_limits = if report.is_complete() {
+                    AppliedTorqueLimits::Verified(holding)
+                } else {
+                    AppliedTorqueLimits::Uncertain
+                };
+                Some(Box::new(report))
+            };
+        HoldPreservingOwnershipReleaseEvidence {
+            recorded_at: self.clock.now(),
+            holding_torque_restore,
+        }
     }
 
     async fn read_compliant_telemetry(
@@ -6510,6 +6906,7 @@ mod tests {
     use super::*;
     use crate::compliant_hold::{
         CompliantHoldDisposition, CompliantHoldFault, CompliantHoldState, CompliantJointPolicy,
+        CompliantPetJointPolicy, CompliantPetProfile,
     };
     use crate::config::{
         HeadProbeConfig, HeadProbeConfigInput, HeadRuntimeConfigInput, ReturnToTargetConfigInput,
@@ -7088,6 +7485,9 @@ mod tests {
                 control_mode: HeadControlMode::NaturalHold,
                 energized_temperature: test_energized_temperature(),
                 temperature_deferred_until: None,
+                applied_torque_limits: AppliedTorqueLimits::Verified(
+                    valid_config(1).torque_limits(),
+                ),
             },
             shared,
         )
@@ -7180,6 +7580,70 @@ mod tests {
             800,
         )
         .expect("test compliant config")
+    }
+
+    fn pet_compliant_hold_config(natural: ExactHeadTargetPose) -> HeadCompliantHoldConfig {
+        let joint = |joint| {
+            let center = natural.position(joint).get();
+            CompliantJointPolicy::try_new(
+                PositionTicks::try_new(center - 100).unwrap(),
+                PositionTicks::try_new(center + 100).unwrap(),
+                10,
+                3,
+                40,
+                4,
+                50,
+            )
+            .expect("test compliant joint")
+        };
+        let base = HeadCompliantHoldConfig::try_new(
+            joint(HeadJoint::Bow),
+            joint(HeadJoint::Curl),
+            joint(HeadJoint::Yaw),
+            joint(HeadJoint::Roll),
+            HeadTorqueLimits::new(
+                TorqueLimitPermille::try_new(600).unwrap(),
+                TorqueLimitPermille::try_new(400).unwrap(),
+                TorqueLimitPermille::try_new(400).unwrap(),
+                TorqueLimitPermille::try_new(400).unwrap(),
+            ),
+            Duration::from_millis(200),
+            Duration::from_millis(21),
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+            1,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            600,
+        )
+        .expect("test compliant config");
+        let pet_joint = || CompliantPetJointPolicy::try_new(20, 0, 0).unwrap();
+        let profile = CompliantPetProfile::try_new(
+            pet_joint(),
+            pet_joint(),
+            pet_joint(),
+            pet_joint(),
+            Duration::from_millis(400),
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            100,
+            Duration::from_millis(600),
+            Duration::from_secs(5),
+            3,
+            6,
+            HeadTorqueLimits::new(
+                TorqueLimitPermille::try_new(450).unwrap(),
+                TorqueLimitPermille::try_new(300).unwrap(),
+                TorqueLimitPermille::try_new(200).unwrap(),
+                TorqueLimitPermille::try_new(250).unwrap(),
+            ),
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        )
+        .expect("test pet profile");
+        base.try_with_pet_profile(profile)
+            .expect("test pet-profile binding")
     }
 
     fn gaze_with_compliance(natural: ExactHeadTargetPose) -> HeadGazeActuationConfig {
@@ -7449,6 +7913,315 @@ mod tests {
         ));
         assert_eq!(shared.lock().unwrap().writes.len(), 20);
         drop(commands);
+    }
+
+    #[tokio::test]
+    async fn pet_contact_softens_only_touched_gravity_axes_and_always_lateral_axes() {
+        let natural = goal_register_target();
+        let yielded = ExactHeadTargetPose::try_from_ticks([
+            natural.position(HeadJoint::Bow).get() + 4,
+            natural.position(HeadJoint::Curl).get(),
+            natural.position(HeadJoint::Yaw).get(),
+            natural.position(HeadJoint::Roll).get() + 2,
+        ])
+        .unwrap();
+        let natural_positions = natural.positions().map(PositionTicks::get);
+        let mut reads = health_reads(natural_positions);
+        reads.extend(health_reads(natural_positions));
+        reads.extend(health_reads([
+            natural.position(HeadJoint::Bow).get() + 20,
+            natural.position(HeadJoint::Curl).get(),
+            natural.position(HeadJoint::Yaw).get(),
+            natural.position(HeadJoint::Roll).get(),
+        ]));
+        reads.extend(HeadJoint::ALL.into_iter().map(|joint| {
+            ReadAction::Bytes(goal_position_response(joint, yielded.position(joint).get()))
+        }));
+        reads.extend(health_reads(yielded.positions().map(PositionTicks::get)));
+        let (mut actor, shared) = goal_register_actor(reads);
+        let compliant_config = pet_compliant_hold_config(natural);
+        actor.control_mode = HeadControlMode::Gaze(
+            gaze_actuation_config(natural)
+                .try_with_compliant_hold(compliant_config)
+                .unwrap(),
+        );
+        let mut gaze =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .unwrap();
+        let mut compliant =
+            HeadCompliantHoldController::try_new(compliant_config, natural, MonotonicTime::ZERO)
+                .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+        arm_compliance_actor(
+            &mut actor,
+            &mut gaze,
+            &mut compliant,
+            &mut receiver,
+            &mut control,
+        )
+        .await;
+
+        let outcome = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect("pet contact transaction");
+        let HeadGazeServiceOutcome::Compliant(evidence) = outcome else {
+            panic!("pet contact owns this control slot");
+        };
+        let transition = evidence
+            .torque_transition()
+            .expect("contact applies one torque transition");
+        assert_eq!(
+            HeadJoint::ALL.map(|joint| transition.previous().for_joint(joint).get()),
+            [600, 400, 400, 400]
+        );
+        assert_eq!(
+            HeadJoint::ALL.map(|joint| transition.applied().for_joint(joint).get()),
+            [450, 400, 200, 250]
+        );
+        assert!(transition.precondition_restore().is_none());
+        assert_eq!(transition.writes().len(), 4);
+        assert_eq!(
+            actor.applied_torque_limits,
+            AppliedTorqueLimits::Verified(transition.applied())
+        );
+
+        {
+            let shared = shared.lock().unwrap();
+            assert_eq!(shared.writes.len(), 24);
+            let actual_limits: Vec<u16> = shared.writes[12..16]
+                .iter()
+                .map(|write| {
+                    assert_eq!(
+                        write[5], 48,
+                        "transition writes only the torque-limit register"
+                    );
+                    u16::from_le_bytes([write[6], write[7]])
+                })
+                .collect();
+            assert_eq!(actual_limits, [450, 400, 200, 250]);
+        }
+
+        actor.clock.set_milliseconds(700);
+        let released = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect("tap release restores holding authority");
+        let HeadGazeServiceOutcome::Compliant(released) = released else {
+            panic!("tap recovery remains a compliant-owned slot");
+        };
+        assert_eq!(
+            released.controller().pet_event(),
+            Some(crate::compliant_hold::CompliantPetEvent::Tap)
+        );
+        assert_eq!(
+            released.controller().state(),
+            CompliantHoldState::Recovering
+        );
+        let restore = released
+            .torque_transition()
+            .expect("leaving yield restores holding torque once");
+        assert_eq!(restore.previous(), transition.applied());
+        assert_eq!(restore.applied(), compliant_config.holding_torque_limits());
+        assert_eq!(
+            actor.applied_torque_limits,
+            AppliedTorqueLimits::Verified(compliant_config.holding_torque_limits())
+        );
+        assert_eq!(shared.lock().unwrap().writes.len(), 32);
+        drop(commands);
+    }
+
+    #[tokio::test]
+    async fn partial_softening_restores_all_holding_limits_and_faults_the_candidate() {
+        let natural = goal_register_target();
+        let natural_positions = natural.positions().map(PositionTicks::get);
+        let mut reads = health_reads(natural_positions);
+        reads.extend(health_reads(natural_positions));
+        reads.extend(health_reads([
+            natural.position(HeadJoint::Bow).get() + 20,
+            natural.position(HeadJoint::Curl).get(),
+            natural.position(HeadJoint::Yaw).get(),
+            natural.position(HeadJoint::Roll).get(),
+        ]));
+        let (mut actor, shared) = goal_register_actor(reads);
+        shared.lock().unwrap().write_failures.insert(
+            13,
+            TransportFailure::timed_out(TransportOperation::Write, 0),
+        );
+        let compliant_config = pet_compliant_hold_config(natural);
+        actor.control_mode = HeadControlMode::Gaze(
+            gaze_actuation_config(natural)
+                .try_with_compliant_hold(compliant_config)
+                .unwrap(),
+        );
+        let mut gaze =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .unwrap();
+        let mut compliant =
+            HeadCompliantHoldController::try_new(compliant_config, natural, MonotonicTime::ZERO)
+                .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+        arm_compliance_actor(
+            &mut actor,
+            &mut gaze,
+            &mut compliant,
+            &mut receiver,
+            &mut control,
+        )
+        .await;
+
+        let error = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect_err("partial torque transition cannot commit contact");
+        let HeadGazeServiceError::CompliantTorqueTransition { source, abort } = error else {
+            panic!("exact torque transition failure retained");
+        };
+        assert_eq!(abort, Ok(()));
+        assert!(source.completed_writes()[0].is_some());
+        assert!(source.completed_writes()[1..].iter().all(Option::is_none));
+        assert!(matches!(
+            source.failure(),
+            CompliantTorqueTransitionFailure::Write(FrameWriteError {
+                joint: HeadJoint::Curl,
+                purpose: WritePurpose::TorqueLimit,
+                ..
+            })
+        ));
+        assert!(source.holding_restore().is_complete());
+        assert_eq!(
+            actor.applied_torque_limits,
+            AppliedTorqueLimits::Verified(compliant_config.holding_torque_limits())
+        );
+        assert_eq!(
+            compliant.fault(),
+            Some(CompliantHoldFault::ApplicationUncertain)
+        );
+        assert_eq!(compliant.committed_target(), natural);
+
+        let shared = shared.lock().unwrap();
+        assert_eq!(shared.writes.len(), 18);
+        let restored: Vec<u16> = shared.writes[14..18]
+            .iter()
+            .map(|write| u16::from_le_bytes([write[6], write[7]]))
+            .collect();
+        assert_eq!(restored, [600, 400, 400, 400]);
+        drop(shared);
+        drop(commands);
+    }
+
+    #[tokio::test]
+    async fn thermal_deferral_restores_holding_before_freezing_a_softened_episode() {
+        let natural = goal_register_target();
+        let yielded = ExactHeadTargetPose::try_from_ticks([
+            natural.position(HeadJoint::Bow).get() + 4,
+            natural.position(HeadJoint::Curl).get(),
+            natural.position(HeadJoint::Yaw).get(),
+            natural.position(HeadJoint::Roll).get() + 2,
+        ])
+        .unwrap();
+        let natural_positions = natural.positions().map(PositionTicks::get);
+        let mut reads = health_reads(natural_positions);
+        reads.extend(health_reads(natural_positions));
+        reads.extend(health_reads([
+            natural.position(HeadJoint::Bow).get() + 20,
+            natural.position(HeadJoint::Curl).get(),
+            natural.position(HeadJoint::Yaw).get(),
+            natural.position(HeadJoint::Roll).get(),
+        ]));
+        reads.extend(HeadJoint::ALL.into_iter().map(|joint| {
+            ReadAction::Bytes(goal_position_response(joint, yielded.position(joint).get()))
+        }));
+        reads.extend(temperature_reads(yielded, [72, 30, 30, 30]));
+        let (mut actor, shared) = goal_register_actor(reads);
+        let compliant_config = pet_compliant_hold_config(natural);
+        actor.control_mode = HeadControlMode::Gaze(
+            gaze_actuation_config(natural)
+                .try_with_compliant_hold(compliant_config)
+                .unwrap(),
+        );
+        let mut gaze =
+            HeadGazeController::try_new(gaze_control_config(natural), natural, MonotonicTime::ZERO)
+                .unwrap();
+        let mut compliant =
+            HeadCompliantHoldController::try_new(compliant_config, natural, MonotonicTime::ZERO)
+                .unwrap();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+        arm_compliance_actor(
+            &mut actor,
+            &mut gaze,
+            &mut compliant,
+            &mut receiver,
+            &mut control,
+        )
+        .await;
+        actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect("contact softens torque");
+        assert!(matches!(
+            actor.applied_torque_limits,
+            AppliedTorqueLimits::Verified(limits)
+                if limits != compliant_config.holding_torque_limits()
+        ));
+
+        actor.clock.set_milliseconds(700);
+        let outcome = actor
+            .execute_gaze_control_step(&mut gaze, Some(&mut compliant), &mut receiver, &mut control)
+            .await
+            .expect("thermal deferral safely restores holding");
+        assert!(matches!(
+            outcome,
+            HeadGazeServiceOutcome::CompliantTemperatureDeferred(_)
+        ));
+        assert_eq!(compliant.state(), CompliantHoldState::Yielding);
+        assert_eq!(
+            actor.applied_torque_limits,
+            AppliedTorqueLimits::Verified(compliant_config.holding_torque_limits())
+        );
+        let shared = shared.lock().unwrap();
+        assert_eq!(shared.writes.len(), 32);
+        let restored: Vec<u16> = shared.writes[28..32]
+            .iter()
+            .map(|write| u16::from_le_bytes([write[6], write[7]]))
+            .collect();
+        assert_eq!(restored, [600, 400, 400, 400]);
+        drop(shared);
+        drop(commands);
+    }
+
+    #[tokio::test]
+    async fn ownership_release_restores_holding_if_compliance_was_soft() {
+        let (mut actor, shared) = goal_register_actor(Vec::new());
+        actor.startup_torque_policy = StartupTorquePolicy::TensionPreservingTakeover;
+        actor.applied_torque_limits = AppliedTorqueLimits::Verified(HeadTorqueLimits::new(
+            TorqueLimitPermille::try_new(450).unwrap(),
+            TorqueLimitPermille::try_new(400).unwrap(),
+            TorqueLimitPermille::try_new(200).unwrap(),
+            TorqueLimitPermille::try_new(250).unwrap(),
+        ));
+
+        let evidence = actor.prepare_hold_preserving_ownership_release().await;
+        let report = evidence
+            .holding_torque_restore()
+            .expect("soft state requires an explicit holding restore");
+        assert!(report.is_complete());
+        assert_eq!(
+            actor.applied_torque_limits,
+            AppliedTorqueLimits::Verified(actor.config.torque_limits())
+        );
+        let shared = shared.lock().unwrap();
+        assert_eq!(shared.writes.len(), 4);
+        assert!(shared.writes.iter().all(|write| write[5] == 48));
+        let limits: Vec<u16> = shared
+            .writes
+            .iter()
+            .map(|write| u16::from_le_bytes([write[6], write[7]]))
+            .collect();
+        assert_eq!(limits, [600, 400, 400, 400]);
     }
 
     #[tokio::test]
@@ -10267,6 +11040,7 @@ mod tests {
             control_mode: HeadControlMode::NaturalHold,
             energized_temperature: test_energized_temperature(),
             temperature_deferred_until: None,
+            applied_torque_limits: AppliedTorqueLimits::Verified(valid_config(1).torque_limits()),
         };
         let (commands, mut receiver) = mpsc::channel(1);
         let mut control = ControlState::new();
@@ -10315,6 +11089,7 @@ mod tests {
             control_mode: HeadControlMode::NaturalHold,
             energized_temperature: test_energized_temperature(),
             temperature_deferred_until: None,
+            applied_torque_limits: AppliedTorqueLimits::Verified(valid_config(1).torque_limits()),
         };
         let (commands, mut receiver) = mpsc::channel(1);
         let mut control = ControlState::new();
@@ -10368,6 +11143,7 @@ mod tests {
             control_mode: HeadControlMode::NaturalHold,
             energized_temperature: test_energized_temperature(),
             temperature_deferred_until: None,
+            applied_torque_limits: AppliedTorqueLimits::Verified(valid_config(1).torque_limits()),
         };
         let positions =
             kiko_head_protocol::ExactHeadTargetPose::try_from_ticks([2_127, 2_558, 2_925, 2_930])
