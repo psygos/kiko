@@ -328,6 +328,18 @@ fn rendered_contract_is_typed_proposal_only_with_exact_known_geometry() {
         ],
         [110, -180, 480, 160]
     );
+    let organic = policy
+        .controller()
+        .organic_motion()
+        .expect("template carries the field-derived organic motion policy");
+    assert_eq!(
+        kiko_head_protocol::HeadJoint::ALL.map(|joint| organic.joint(joint).response_millihertz()),
+        [400, 850, 1050, 900]
+    );
+    assert_eq!(
+        kiko_head_protocol::HeadJoint::ALL.map(|joint| organic.joint(joint).damping_permille()),
+        [1400, 1400, 1150, 850]
+    );
     let compliant = policy
         .compliant_hold()
         .expect("rendered fixture carries typed but explicitly unvalidated compliance dynamics");

@@ -102,6 +102,36 @@
         "maximum_acceleration_ticks_per_control_tick_squared": ${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_ACCELERATION_TICKS_PER_CONTROL_TICK_SQUARED},
         "maximum_position_step_ticks": ${HEAD_GAZE_UNVALIDATED_ROLL_MAXIMUM_POSITION_STEP_TICKS}
       }
+    },
+    "organic_motion": {
+      "bow": {
+        "response_millihertz": 400,
+        "damping_permille": 1400,
+        "maximum_velocity_ticks_per_second": 100,
+        "maximum_acceleration_ticks_per_second_squared": 400,
+        "maximum_jerk_ticks_per_second_cubed": 3200
+      },
+      "curl": {
+        "response_millihertz": 850,
+        "damping_permille": 1400,
+        "maximum_velocity_ticks_per_second": 170,
+        "maximum_acceleration_ticks_per_second_squared": 640,
+        "maximum_jerk_ticks_per_second_cubed": 5200
+      },
+      "yaw": {
+        "response_millihertz": 1050,
+        "damping_permille": 1150,
+        "maximum_velocity_ticks_per_second": 320,
+        "maximum_acceleration_ticks_per_second_squared": 1600,
+        "maximum_jerk_ticks_per_second_cubed": 14000
+      },
+      "roll": {
+        "response_millihertz": 900,
+        "damping_permille": 850,
+        "maximum_velocity_ticks_per_second": 200,
+        "maximum_acceleration_ticks_per_second_squared": 1000,
+        "maximum_jerk_ticks_per_second_cubed": 9000
+      }
     }
   },
   "compliant_hold_declaration": {

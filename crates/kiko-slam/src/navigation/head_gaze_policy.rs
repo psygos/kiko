@@ -39,6 +39,10 @@ use kiko_head_runtime::gaze_control::{
     PositiveTimeValueError, ServoAccelerationLimitTicksPerControlTickSquared,
     ServoVelocityLimitTicksPerControlTick,
 };
+use kiko_head_runtime::{
+    OrganicHeadMotionBindingError, OrganicHeadMotionPolicy, OrganicJointMotionPolicy,
+    OrganicJointMotionPolicyError, OrganicJointMotionPolicyInput,
+};
 use serde::Deserialize;
 
 /// The only admitted head-gaze policy schema.
@@ -156,6 +160,7 @@ pub struct HeadGazeControllerDeclaration {
     timing: HeadGazeTiming,
     motion_limits: HeadMotionLimits,
     error_band: HeadGazeErrorBand,
+    organic_motion: Option<OrganicHeadMotionPolicy>,
 }
 
 impl HeadGazeControllerDeclaration {
@@ -166,10 +171,19 @@ impl HeadGazeControllerDeclaration {
         let timing = parse_timing(dto.timing)?;
         let motion_limits = parse_motion_limits(dto.motion_limits, mapping)?;
         let error_band = parse_error_band(dto.error_band)?;
+        let organic_motion = dto.organic_motion.map(parse_organic_motion).transpose()?;
+        if let Some(organic_motion) = organic_motion {
+            organic_motion
+                .admit_for_control(timing.control_period(), motion_limits)
+                .map_err(|source| {
+                    HeadGazeControllerDeclarationParseError::OrganicMotionBinding { source }
+                })?;
+        }
         Ok(Self {
             timing,
             motion_limits,
             error_band,
+            organic_motion,
         })
     }
 
@@ -183,6 +197,10 @@ impl HeadGazeControllerDeclaration {
 
     pub const fn error_band(self) -> HeadGazeErrorBand {
         self.error_band
+    }
+
+    pub const fn organic_motion(self) -> Option<OrganicHeadMotionPolicy> {
+        self.organic_motion
     }
 }
 
@@ -683,6 +701,30 @@ fn parse_joint_motion(
     .map_err(|source| HeadGazeControllerDeclarationParseError::JointMotionLimits { joint, source })
 }
 
+fn parse_organic_motion(
+    dto: NamedOrganicHeadMotionPolicyDto,
+) -> Result<OrganicHeadMotionPolicy, HeadGazeControllerDeclarationParseError> {
+    let joint = |joint, dto: OrganicJointMotionPolicyDto| {
+        OrganicJointMotionPolicy::parse(OrganicJointMotionPolicyInput {
+            response_millihertz: dto.response_millihertz,
+            damping_permille: dto.damping_permille,
+            maximum_velocity_ticks_per_second: dto.maximum_velocity_ticks_per_second,
+            maximum_acceleration_ticks_per_second_squared: dto
+                .maximum_acceleration_ticks_per_second_squared,
+            maximum_jerk_ticks_per_second_cubed: dto.maximum_jerk_ticks_per_second_cubed,
+        })
+        .map_err(
+            |source| HeadGazeControllerDeclarationParseError::OrganicMotionValue { joint, source },
+        )
+    };
+    Ok(OrganicHeadMotionPolicy::new(
+        joint(HeadJoint::Bow, dto.bow)?,
+        joint(HeadJoint::Curl, dto.curl)?,
+        joint(HeadJoint::Yaw, dto.yaw)?,
+        joint(HeadJoint::Roll, dto.roll)?,
+    ))
+}
+
 fn parse_compliant_hold(
     dto: HeadCompliantHoldDeclarationDto,
     mapping: &HeadGazeMappingDeclaration,
@@ -944,6 +986,13 @@ pub enum HeadGazeControllerDeclarationParseError {
         joint: HeadJoint,
         source: HeadJointMotionLimitsError,
     },
+    OrganicMotionValue {
+        joint: HeadJoint,
+        source: OrganicJointMotionPolicyError,
+    },
+    OrganicMotionBinding {
+        source: OrganicHeadMotionBindingError,
+    },
 }
 
 impl fmt::Display for HeadGazeControllerDeclarationParseError {
@@ -964,6 +1013,8 @@ impl std::error::Error for HeadGazeControllerDeclarationParseError {
             Self::ErrorBand { source } => Some(source),
             Self::MotionValue { source, .. } => Some(source),
             Self::JointMotionLimits { source, .. } => Some(source),
+            Self::OrganicMotionValue { source, .. } => Some(source),
+            Self::OrganicMotionBinding { source } => Some(source),
             Self::TimingAboveMaximum { .. }
             | Self::TickLatenessNotBelowControlPeriod { .. }
             | Self::TimingNanosecondsOverflow { .. }
@@ -1196,6 +1247,7 @@ struct HeadGazeControllerDeclarationDto {
     timing: HeadGazeTimingDto,
     error_band: HeadGazeErrorBandDto,
     motion_limits: NamedHeadGazeMotionLimitsDto,
+    organic_motion: Option<NamedOrganicHeadMotionPolicyDto>,
 }
 
 #[derive(Deserialize)]
@@ -1229,6 +1281,25 @@ struct HeadGazeJointMotionLimitsDto {
     maximum_velocity_ticks_per_control_tick: u32,
     maximum_acceleration_ticks_per_control_tick_squared: u32,
     maximum_position_step_ticks: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamedOrganicHeadMotionPolicyDto {
+    bow: OrganicJointMotionPolicyDto,
+    curl: OrganicJointMotionPolicyDto,
+    yaw: OrganicJointMotionPolicyDto,
+    roll: OrganicJointMotionPolicyDto,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrganicJointMotionPolicyDto {
+    response_millihertz: u32,
+    damping_permille: u32,
+    maximum_velocity_ticks_per_second: u32,
+    maximum_acceleration_ticks_per_second_squared: u32,
+    maximum_jerk_ticks_per_second_cubed: u32,
 }
 
 #[derive(Deserialize)]
@@ -1406,6 +1477,36 @@ mod tests {
                         "maximum_acceleration_ticks_per_control_tick_squared": 1,
                         "maximum_position_step_ticks": 4
                     }
+                },
+                "organic_motion": {
+                    "bow": {
+                        "response_millihertz": 400,
+                        "damping_permille": 1400,
+                        "maximum_velocity_ticks_per_second": 100,
+                        "maximum_acceleration_ticks_per_second_squared": 400,
+                        "maximum_jerk_ticks_per_second_cubed": 3200
+                    },
+                    "curl": {
+                        "response_millihertz": 850,
+                        "damping_permille": 1400,
+                        "maximum_velocity_ticks_per_second": 170,
+                        "maximum_acceleration_ticks_per_second_squared": 640,
+                        "maximum_jerk_ticks_per_second_cubed": 5200
+                    },
+                    "yaw": {
+                        "response_millihertz": 1050,
+                        "damping_permille": 1150,
+                        "maximum_velocity_ticks_per_second": 320,
+                        "maximum_acceleration_ticks_per_second_squared": 1600,
+                        "maximum_jerk_ticks_per_second_cubed": 14000
+                    },
+                    "roll": {
+                        "response_millihertz": 900,
+                        "damping_permille": 850,
+                        "maximum_velocity_ticks_per_second": 200,
+                        "maximum_acceleration_ticks_per_second_squared": 1000,
+                        "maximum_jerk_ticks_per_second_cubed": 9000
+                    }
                 }
             }
         })
@@ -1532,6 +1633,24 @@ mod tests {
         assert_eq!(yaw.maximum_position_step().get(), 8);
         assert_eq!(policy.controller().error_band().deadband().get(), 2);
         assert_eq!(policy.controller().error_band().resume_threshold().get(), 5);
+        let organic = policy
+            .controller()
+            .organic_motion()
+            .expect("fixture carries the Fable-derived organic policy");
+        assert_eq!(organic.joint(HeadJoint::Bow).response_millihertz(), 400);
+        assert_eq!(organic.joint(HeadJoint::Curl).damping_permille(), 1_400);
+        assert_eq!(
+            organic
+                .joint(HeadJoint::Yaw)
+                .maximum_velocity_ticks_per_second(),
+            320
+        );
+        assert_eq!(
+            organic
+                .joint(HeadJoint::Roll)
+                .maximum_jerk_ticks_per_second_cubed(),
+            9_000
+        );
         assert_eq!(policy.character_mapping(), None);
     }
 
@@ -1676,6 +1795,8 @@ mod tests {
             "/controller_declaration/error_band",
             "/controller_declaration/motion_limits",
             "/controller_declaration/motion_limits/bow",
+            "/controller_declaration/organic_motion",
+            "/controller_declaration/organic_motion/bow",
         ] {
             let mut document = valid_value();
             document
@@ -1796,6 +1917,34 @@ mod tests {
             parse(&no_hysteresis),
             Err(HeadGazePolicyParseError::Controller(
                 HeadGazeControllerDeclarationParseError::ErrorBand { .. }
+            ))
+        ));
+
+        let mut zero_organic_jerk = valid_value();
+        zero_organic_jerk["controller_declaration"]["organic_motion"]["curl"]["maximum_jerk_ticks_per_second_cubed"] =
+            json!(0);
+        assert!(matches!(
+            parse(&zero_organic_jerk),
+            Err(HeadGazePolicyParseError::Controller(
+                HeadGazeControllerDeclarationParseError::OrganicMotionValue {
+                    joint: HeadJoint::Curl,
+                    source: OrganicJointMotionPolicyError::Zero { .. }
+                }
+            ))
+        ));
+
+        let mut organic_outruns_planner = valid_value();
+        organic_outruns_planner["controller_declaration"]["organic_motion"]["roll"]["maximum_velocity_ticks_per_second"] =
+            json!(1_000);
+        assert!(matches!(
+            parse(&organic_outruns_planner),
+            Err(HeadGazePolicyParseError::Controller(
+                HeadGazeControllerDeclarationParseError::OrganicMotionBinding {
+                    source: OrganicHeadMotionBindingError::VelocityExceedsPlanner {
+                        joint: HeadJoint::Roll,
+                        ..
+                    }
+                }
             ))
         ));
     }

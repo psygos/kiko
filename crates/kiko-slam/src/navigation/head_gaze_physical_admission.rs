@@ -180,13 +180,18 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
         let declaration = *policy.controller();
         let character_mapping = policy.character_mapping();
         let compliant_hold = policy.compliant_hold();
-        let controller = HeadGazeControlConfig::try_new(
+        let mut controller = HeadGazeControlConfig::try_new(
             declaration.timing(),
             reviewed_natural,
             declaration.motion_limits(),
             declaration.error_band(),
         )
         .map_err(EvidenceBoundPhysicalHeadGazePolicyError::Controller)?;
+        if let Some(organic_motion) = declaration.organic_motion() {
+            controller = controller
+                .try_with_organic_motion(organic_motion)
+                .map_err(EvidenceBoundPhysicalHeadGazePolicyError::Controller)?;
+        }
         let mut actuation = HeadGazeActuationConfig::try_new_with_transaction_timeout(
             controller,
             reviewed_natural,
