@@ -796,6 +796,22 @@
     return value == null ? "unknown" : value;
   }
 
+  function slamRateLabel(rateWindow) {
+    if (!rateWindow) return "rate collecting";
+    const count = BigInt(rateWindow.successful_completions);
+    const span = BigInt(rateWindow.span_ns);
+    const milliHertz = ((count - 1n) * 1_000_000_000_000n + span / 2n) / span;
+    return `${milliHertz / 1000n}.${(milliHertz % 1000n)
+      .toString().padStart(3, "0")} measured Hz`;
+  }
+
+  function slamInferenceLabel(slam) {
+    if (!slam) return "providers unknown";
+    const sp = slam.inference.superpoint;
+    const lg = slam.inference.lightglue;
+    return `SP ${sp.requested}→${sp.selected} · LG ${lg.requested}→${lg.selected}`;
+  }
+
   function exactQualificationPattern(pattern, left, right, maximum) {
     return pattern != null
       && Number.isInteger(pattern.left_timer_pwm_percent)
@@ -981,7 +997,8 @@
     const terminal = state.snapshot?.terminal != null;
     const navigation = navigationAuthority();
     const sensorMotionReady = !navigation
-      || state.snapshot?.health?.oak === "ready";
+      || (state.snapshot?.health?.oak === "ready"
+        && state.snapshot?.health?.slam === "ready");
     const enabled = !terminal
       && !state.driveSafety.localInhibit
       && qualificationReady
@@ -1179,14 +1196,27 @@
     );
     $("stm-health").textContent = health(snapshot.health?.stm32);
     setEvidenceClass($("stm-health"), snapshot.health?.stm32);
-    $("oak-health").textContent =
-      `${health(snapshot.health?.oak)} / ${snapshot.map?.localization || "unknown"}`;
+    $("oak-health").textContent = health(snapshot.health?.oak);
     setEvidenceClass(
       $("oak-health"),
       snapshot.health?.oak === "faulted"
         ? "fault"
         : snapshot.health?.oak === "ready"
-          && snapshot.map?.localization === "localized"
+          ? "ready"
+          : "warn",
+    );
+    const slam = snapshot.slam;
+    $("slam-health").textContent = [
+      health(snapshot.health?.slam),
+      snapshot.map?.localization || "localization unknown",
+      slamRateLabel(slam?.rate_window),
+      slamInferenceLabel(slam),
+    ].join(" · ");
+    setEvidenceClass(
+      $("slam-health"),
+      snapshot.health?.slam === "faulted"
+        ? "fault"
+        : snapshot.health?.slam === "ready"
           ? "ready"
           : "warn",
     );

@@ -4,6 +4,12 @@
   const DECIMAL_ID = /^[1-9][0-9]*$/;
   const DECIMAL_U64 = /^(0|[1-9][0-9]*)$/;
   const HEALTH = new Set(["ready", "degraded", "faulted", "unavailable"]);
+  const REQUESTED_INFERENCE_BACKENDS = new Set([
+    "auto", "cpu", "coreml_gpu", "cuda", "tensorrt",
+  ]);
+  const SELECTED_INFERENCE_BACKENDS = new Set([
+    "cpu", "coreml_gpu", "cuda", "tensorrt",
+  ]);
   const LOCALIZATION = new Set(["localized", "lost", "unavailable"]);
   const RUNTIME = new Set([
     "booting",
@@ -124,12 +130,89 @@
 
   function parseHealth(value) {
     const health = object(value, "health");
-    for (const component of ["stm32", "head", "eyes", "oak"]) {
+    for (const component of ["stm32", "head", "eyes", "oak", "slam"]) {
       if (health[component] != null) {
         enumValue(health[component], HEALTH, `health.${component}`);
       }
     }
     return health;
+  }
+
+  function parseSlam(value) {
+    const slam = optionalObject(value, "slam");
+    if (!slam) return null;
+    const inference = object(slam.inference, "slam.inference");
+    for (const component of ["superpoint", "lightglue"]) {
+      const selection = object(
+        inference[component],
+        `slam.inference.${component}`,
+      );
+      enumValue(
+        selection.requested,
+        REQUESTED_INFERENCE_BACKENDS,
+        `slam.inference.${component}.requested`,
+      );
+      enumValue(
+        selection.selected,
+        SELECTED_INFERENCE_BACKENDS,
+        `slam.inference.${component}.selected`,
+      );
+    }
+    const counters = {};
+    for (const field of [
+      "started_pairs",
+      "successful_pairs",
+      "recoverable_failures",
+      "fatal_failures",
+    ]) {
+      counters[field] = BigInt(exactString(slam[field], DECIMAL_U64, `slam.${field}`));
+    }
+    const completed = counters.successful_pairs
+      + counters.recoverable_failures
+      + counters.fatal_failures;
+    if (completed > counters.started_pairs || counters.started_pairs - completed > 1n) {
+      throw new Error("slam counters do not describe at most one in-flight pair");
+    }
+    const sourceArrival = slam.last_successful_source_arrival_host_monotonic_ns;
+    const completion = slam.last_successful_completion_host_monotonic_ns;
+    if ((sourceArrival == null) !== (completion == null)) {
+      throw new Error("slam successful timestamps must be present together");
+    }
+    if (sourceArrival != null) {
+      const source = BigInt(exactString(
+        sourceArrival,
+        DECIMAL_U64,
+        "slam.last_successful_source_arrival_host_monotonic_ns",
+      ));
+      const completedAt = BigInt(exactString(
+        completion,
+        DECIMAL_U64,
+        "slam.last_successful_completion_host_monotonic_ns",
+      ));
+      if (completedAt < source) {
+        throw new Error("slam completion precedes its source arrival");
+      }
+    } else if (counters.successful_pairs !== 0n) {
+      throw new Error("slam successful pairs require successful timestamps");
+    }
+    const rateWindow = optionalObject(slam.rate_window, "slam.rate_window");
+    if (rateWindow) {
+      const count = integer(
+        rateWindow.successful_completions,
+        2,
+        64,
+        "slam.rate_window.successful_completions",
+      );
+      const span = BigInt(exactString(
+        rateWindow.span_ns,
+        DECIMAL_U64,
+        "slam.rate_window.span_ns",
+      ));
+      if (span === 0n || BigInt(count) > counters.successful_pairs) {
+        throw new Error("slam rate window is inconsistent with successful pairs");
+      }
+    }
+    return slam;
   }
 
   function parseGrid(value) {
@@ -393,7 +476,7 @@
 
   function parseConsoleSnapshot(raw) {
     const snapshot = object(raw, "snapshot");
-    if (snapshot.schema_version !== 4) {
+    if (snapshot.schema_version !== 5) {
       throw new Error("unsupported snapshot schema");
     }
     const authorityKind = enumValue(
@@ -418,6 +501,7 @@
     parseActualAuthority(snapshot.actual_authority);
     parseMap(snapshot.map);
     parseNavigation(snapshot.navigation);
+    const slam = parseSlam(snapshot.slam);
     parseRequestedActuation(snapshot.last_requested_actuation);
     parseReceipt(snapshot.last_applied);
     parseHealth(snapshot.health);
@@ -449,6 +533,7 @@
     }
     return {
       ...snapshot,
+      slam,
       authority_kind: authorityKind,
       rerun_diagnostics_url: parseRerunDiagnosticsUrl(
         snapshot.rerun_diagnostics_url,
@@ -536,17 +621,20 @@
       : "unknown";
     const stm32 = snapshot.health?.stm32 || "unknown";
     const oak = snapshot.health?.oak || "unknown";
+    const slam = snapshot.health?.slam || "unknown";
     const faulted = runtime?.kind === "faulted"
       || stm32 === "faulted"
-      || oak === "faulted";
+      || oak === "faulted"
+      || slam === "faulted";
     const ready = ["ready_stopped", "active"].includes(runtime?.kind)
       && stm32 === "ready"
-      && oak === "ready";
+      && oak === "ready"
+      && slam === "ready";
     return {
       runtimeLabel,
       readinessLabel: terminal
         ? "terminal checkpoint · capture stop requested · sensor/map streams draining · finalizing exact warm-replay inputs · current-camera localization not claimed"
-        : `runtime ${runtimeLabel} · STM32 ${stm32} · OAK ${oak}`,
+        : `runtime ${runtimeLabel} · STM32 ${stm32} · OAK ${oak} · SLAM ${slam}`,
       className: faulted ? "fault" : ready ? "ready" : "warn",
     };
   }
@@ -571,7 +659,7 @@
   function faultView(snapshot) {
     const faults = [];
     if (snapshot.runtime?.kind === "faulted") faults.push("runtime faulted");
-    for (const component of ["stm32", "oak", "head", "eyes"]) {
+    for (const component of ["stm32", "oak", "slam", "head", "eyes"]) {
       if (snapshot.health?.[component] === "faulted") {
         faults.push(`${component} faulted`);
       }

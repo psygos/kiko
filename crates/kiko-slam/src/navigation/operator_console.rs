@@ -78,6 +78,12 @@ pub const OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V3: u32 = 3;
 /// V4 prevents a client from inferring production authority from the absence
 /// of a qualification-only field.
 pub const OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V4: u32 = 4;
+/// Snapshot schema with separate OAK transport and sparse-SLAM evidence.
+///
+/// V5 removes the misleading implication that fresh camera streams alone are
+/// evidence of a healthy tracker. It also carries the requested and actually
+/// selected inference providers plus an exact integer throughput window.
+pub const OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V5: u32 = 5;
 pub const MAX_OPERATOR_CONSOLE_REQUEST_BYTES: usize = 8 * 1_024;
 pub const MAX_OPERATOR_CONSOLE_SESSIONS: usize = 32;
 pub const MAX_OPERATOR_CONSOLE_QUEUE_CAPACITY: usize = 256;
@@ -2527,6 +2533,71 @@ pub struct ConsoleSubsystemHealth {
     pub head: Option<ConsoleHealth>,
     pub eyes: Option<ConsoleHealth>,
     pub oak: Option<ConsoleHealth>,
+    pub slam: Option<ConsoleHealth>,
+}
+
+/// Requested provider names retain `auto`; selected provider names do not.
+/// This separation prevents an unresolved request from being serialized as
+/// runtime evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleRequestedInferenceBackend {
+    Auto,
+    Cpu,
+    CoremlGpu,
+    Cuda,
+    #[serde(rename = "tensorrt")]
+    TensorRt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleSelectedInferenceBackend {
+    Cpu,
+    CoremlGpu,
+    Cuda,
+    #[serde(rename = "tensorrt")]
+    TensorRt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ConsoleInferenceSelection {
+    pub requested: ConsoleRequestedInferenceBackend,
+    pub selected: ConsoleSelectedInferenceBackend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ConsoleInferenceRuntime {
+    pub superpoint: ConsoleInferenceSelection,
+    pub lightglue: ConsoleInferenceSelection,
+}
+
+/// Exact measurement window. Consumers derive hertz as
+/// `(successful_completions - 1) * 1e9 / span_ns`; neither endpoint is a
+/// nominal camera rate or a benchmark claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ConsoleSlamRateWindow {
+    pub successful_completions: u8,
+    #[serde(serialize_with = "serialize_u64_as_decimal_string")]
+    pub span_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ConsoleSlamSnapshot {
+    pub inference: ConsoleInferenceRuntime,
+    #[serde(serialize_with = "serialize_u64_as_decimal_string")]
+    pub started_pairs: u64,
+    #[serde(serialize_with = "serialize_u64_as_decimal_string")]
+    pub successful_pairs: u64,
+    #[serde(serialize_with = "serialize_u64_as_decimal_string")]
+    pub recoverable_failures: u64,
+    #[serde(serialize_with = "serialize_u64_as_decimal_string")]
+    pub fatal_failures: u64,
+    #[serde(serialize_with = "serialize_optional_u64_as_decimal_string")]
+    pub last_successful_source_arrival_host_monotonic_ns: Option<u64>,
+    #[serde(serialize_with = "serialize_optional_u64_as_decimal_string")]
+    pub last_successful_completion_host_monotonic_ns: Option<u64>,
+    pub rate_window: Option<ConsoleSlamRateWindow>,
 }
 
 /// UI command magnitudes projected from the already admitted manual-control
@@ -2651,6 +2722,7 @@ pub struct OperatorConsoleSnapshot {
     pub manual_command_envelope: Option<ConsoleManualCommandEnvelope>,
     pub map: Option<ConsoleMapSnapshot>,
     pub navigation: Option<ConsoleNavigationSnapshot>,
+    pub slam: Option<ConsoleSlamSnapshot>,
     pub last_requested: Option<ConsoleRequestedCommand>,
     pub last_requested_actuation: Option<ConsoleRequestedActuation>,
     pub last_applied: Option<ConsoleAppliedReceipt>,
@@ -2671,7 +2743,7 @@ impl OperatorConsoleSnapshot {
         authority_kind: ConsoleRuntimeAuthorityKind,
     ) -> Self {
         Self {
-            schema_version: OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V4,
+            schema_version: OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V5,
             authority_kind,
             revision,
             telemetry_observed_at_host_monotonic_ns: None,
@@ -2682,6 +2754,7 @@ impl OperatorConsoleSnapshot {
             manual_command_envelope: None,
             map: None,
             navigation: None,
+            slam: None,
             last_requested: None,
             last_requested_actuation: None,
             last_applied: None,
@@ -2691,6 +2764,7 @@ impl OperatorConsoleSnapshot {
                 head: None,
                 eyes: None,
                 oak: None,
+                slam: None,
             },
             software_safety_stop_latched: false,
             software_safety_signal_state: ConsoleSafetySignalState::NotLatched,
@@ -3987,7 +4061,7 @@ mod tests {
             ConsoleSnapshotRevision::parse(1).unwrap(),
             ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
         );
-        assert_eq!(snapshot.schema_version, OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V4);
+        assert_eq!(snapshot.schema_version, OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V5);
         assert_eq!(
             snapshot.authority_kind,
             ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks
@@ -4007,6 +4081,55 @@ mod tests {
         assert_eq!(
             configured["rerun_diagnostics_url"],
             serde_json::json!("rerun+http://127.0.0.1:9876/proxy")
+        );
+    }
+
+    #[test]
+    fn slam_snapshot_serializes_exact_counters_clocks_and_runtime_providers() {
+        let mut snapshot = OperatorConsoleSnapshot::unknown(
+            ConsoleSnapshotRevision::parse(1).unwrap(),
+            ConsoleRuntimeAuthorityKind::ProductionExternalInterlocks,
+        );
+        snapshot.health.slam = Some(ConsoleHealth::Ready);
+        snapshot.slam = Some(ConsoleSlamSnapshot {
+            inference: ConsoleInferenceRuntime {
+                superpoint: ConsoleInferenceSelection {
+                    requested: ConsoleRequestedInferenceBackend::Auto,
+                    selected: ConsoleSelectedInferenceBackend::Cuda,
+                },
+                lightglue: ConsoleInferenceSelection {
+                    requested: ConsoleRequestedInferenceBackend::TensorRt,
+                    selected: ConsoleSelectedInferenceBackend::TensorRt,
+                },
+            },
+            started_pairs: u64::MAX,
+            successful_pairs: u64::MAX - 1,
+            recoverable_failures: 1,
+            fatal_failures: 0,
+            last_successful_source_arrival_host_monotonic_ns: Some(u64::MAX - 1),
+            last_successful_completion_host_monotonic_ns: Some(u64::MAX),
+            rate_window: Some(ConsoleSlamRateWindow {
+                successful_completions: 64,
+                span_ns: u64::MAX,
+            }),
+        });
+
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["schema_version"], serde_json::json!(5));
+        assert_eq!(json["health"]["slam"], serde_json::json!("ready"));
+        assert_eq!(json["slam"]["started_pairs"], u64::MAX.to_string());
+        assert_eq!(
+            json["slam"]["last_successful_completion_host_monotonic_ns"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(json["slam"]["rate_window"]["span_ns"], u64::MAX.to_string());
+        assert_eq!(
+            json["slam"]["inference"]["superpoint"],
+            serde_json::json!({"requested": "auto", "selected": "cuda"})
+        );
+        assert_eq!(
+            json["slam"]["inference"]["lightglue"],
+            serde_json::json!({"requested": "tensorrt", "selected": "tensorrt"})
         );
     }
 
@@ -4703,7 +4826,7 @@ mod tests {
         let json = serde_json::to_value(overlaid.as_ref()).unwrap();
         assert_eq!(
             json["schema_version"],
-            serde_json::Value::from(OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V4)
+            serde_json::Value::from(OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V5)
         );
         assert_eq!(
             json["authority_kind"],

@@ -134,19 +134,20 @@ use kiko_slam::navigation::{
     AgentRuntimeStateV1, ConsoleActualAuthority, ConsoleActualAuthorityMode,
     ConsoleActualAuthoritySource, ConsoleAppliedReceipt, ConsoleCheckpointLocalizationEvidence,
     ConsoleFiniteF64Error, ConsoleGridProjectionError, ConsoleHealth, ConsoleHostTimestampNs,
-    ConsoleLocalization, ConsoleManualCommandEnvelope, ConsoleManualCommandEnvelopeError,
-    ConsoleMapSnapshot, ConsoleNavigationSnapshot, ConsoleOccupancyGrid, ConsolePathError,
-    ConsolePoint2, ConsolePose2, ConsoleReceiptProjectionError, ConsoleRequestedActuation,
-    ConsoleRerunDiagnosticsUrl, ConsoleRuntimeAuthorityKind, ConsoleSnapshotRevision,
-    ConsoleSourceKind, ConsoleStopCertainty, ConsoleSubsystemHealth, ConsoleTerminalReason,
-    ConsoleTerminalState, LiveMotionAuthorityState, LiveMotionAuthorityStateError,
-    NanoAccessoryComponentHealth, NanoAccessoryHealthStatusError, NanoAccessoryRuntimeHealth,
-    NanoOperatorConsoleFrontend, NanoOperatorConsoleFrontendShutdownEvidence,
-    NanoOperatorConsoleFrontendStartError, OperatorConsoleIngressDisposition,
-    OperatorConsoleLimits, OperatorConsoleProcessDisposition, OperatorConsoleRetainedAuthorityKind,
-    OperatorConsoleRuntimeAdapter, OperatorConsoleRuntimeAdapterError,
-    OperatorConsoleRuntimeIngressError, OperatorConsoleSnapshot, OperatorConsoleSnapshotError,
-    operator_console,
+    ConsoleInferenceRuntime, ConsoleInferenceSelection, ConsoleLocalization,
+    ConsoleManualCommandEnvelope, ConsoleManualCommandEnvelopeError, ConsoleMapSnapshot,
+    ConsoleNavigationSnapshot, ConsoleOccupancyGrid, ConsolePathError, ConsolePoint2, ConsolePose2,
+    ConsoleReceiptProjectionError, ConsoleRequestedActuation, ConsoleRequestedInferenceBackend,
+    ConsoleRerunDiagnosticsUrl, ConsoleRuntimeAuthorityKind, ConsoleSelectedInferenceBackend,
+    ConsoleSlamRateWindow, ConsoleSlamSnapshot, ConsoleSnapshotRevision, ConsoleSourceKind,
+    ConsoleStopCertainty, ConsoleSubsystemHealth, ConsoleTerminalReason, ConsoleTerminalState,
+    LiveMotionAuthorityState, LiveMotionAuthorityStateError, NanoAccessoryComponentHealth,
+    NanoAccessoryHealthStatusError, NanoAccessoryRuntimeHealth, NanoOperatorConsoleFrontend,
+    NanoOperatorConsoleFrontendShutdownEvidence, NanoOperatorConsoleFrontendStartError,
+    OperatorConsoleIngressDisposition, OperatorConsoleLimits, OperatorConsoleProcessDisposition,
+    OperatorConsoleRetainedAuthorityKind, OperatorConsoleRuntimeAdapter,
+    OperatorConsoleRuntimeAdapterError, OperatorConsoleRuntimeIngressError,
+    OperatorConsoleSnapshot, OperatorConsoleSnapshotError, operator_console,
 };
 #[cfg(feature = "record")]
 use kiko_slam::navigation::{
@@ -224,6 +225,8 @@ use robot_server::V2ControllerOwnerTerminationError;
 use std::num::{NonZeroU32, NonZeroU64};
 #[cfg(any(feature = "record", test))]
 use std::sync::Arc;
+#[cfg(feature = "record")]
+use std::sync::Mutex;
 #[cfg(any(feature = "record", test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "record")]
@@ -1232,10 +1235,404 @@ impl std::fmt::Display for RerunFinishTimeout {
     }
 }
 
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveInferenceRuntimeEvidence {
+    superpoint_requested: InferenceBackend,
+    superpoint_selected: LiveSelectedInferenceBackend,
+    lightglue_requested: InferenceBackend,
+    lightglue_selected: LiveSelectedInferenceBackend,
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveSelectedInferenceBackend {
+    Cpu,
+    CoremlGpu,
+    Cuda,
+    TensorRt,
+}
+
+#[cfg(feature = "record")]
+impl LiveSelectedInferenceBackend {
+    fn parse(
+        component: &'static str,
+        backend: InferenceBackend,
+    ) -> Result<Self, LiveInferenceRuntimeEvidenceError> {
+        match backend {
+            InferenceBackend::Auto => {
+                Err(LiveInferenceRuntimeEvidenceError::UnresolvedAuto { component })
+            }
+            InferenceBackend::Cpu => Ok(Self::Cpu),
+            InferenceBackend::CoreMLGpu => Ok(Self::CoremlGpu),
+            InferenceBackend::Cuda => Ok(Self::Cuda),
+            InferenceBackend::TensorRT => Ok(Self::TensorRt),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveInferenceRuntimeEvidenceError {
+    UnresolvedAuto {
+        component: &'static str,
+    },
+    SuperpointReplicaBackendMismatch {
+        left: InferenceBackend,
+        right: InferenceBackend,
+    },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for LiveInferenceRuntimeEvidenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnresolvedAuto { component } => write!(
+                formatter,
+                "{component} reported unresolved auto as its selected inference backend"
+            ),
+            Self::SuperpointReplicaBackendMismatch { left, right } => write!(
+                formatter,
+                "SuperPoint replicas selected different inference backends: left={left:?} right={right:?}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for LiveInferenceRuntimeEvidenceError {}
+
+#[cfg(feature = "record")]
+const LIVE_SLAM_RATE_WINDOW_CAPACITY: usize = 64;
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveSlamPipelineState {
+    Running,
+    Faulted,
+    Closed,
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug, PartialEq, Eq)]
+struct LiveSlamAttempt {
+    source_arrival: HostMonotonicTimestamp,
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveSlamRateWindowEvidence {
+    successful_completions: u8,
+    span_ns: u64,
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveSlamTelemetrySnapshot {
+    inference: LiveInferenceRuntimeEvidence,
+    pipeline_state: LiveSlamPipelineState,
+    started_pairs: u64,
+    successful_pairs: u64,
+    recoverable_failures: u64,
+    fatal_failures: u64,
+    last_successful_source_arrival: Option<HostMonotonicTimestamp>,
+    last_successful_completion: Option<HostMonotonicTimestamp>,
+    rate_window: Option<LiveSlamRateWindowEvidence>,
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
+struct LiveSlamTelemetryState {
+    inference: LiveInferenceRuntimeEvidence,
+    pipeline_state: LiveSlamPipelineState,
+    started_pairs: u64,
+    successful_pairs: u64,
+    recoverable_failures: u64,
+    fatal_failures: u64,
+    in_flight: bool,
+    last_started_source_arrival: Option<HostMonotonicTimestamp>,
+    last_completion: Option<HostMonotonicTimestamp>,
+    last_successful_source_arrival: Option<HostMonotonicTimestamp>,
+    last_successful_completion: Option<HostMonotonicTimestamp>,
+    successful_completion_history_ns: [u64; LIVE_SLAM_RATE_WINDOW_CAPACITY],
+    successful_completion_history_len: usize,
+    successful_completion_history_next: usize,
+}
+
+#[cfg(feature = "record")]
+impl LiveSlamTelemetryState {
+    fn snapshot(&self) -> LiveSlamTelemetrySnapshot {
+        let rate_window = if self.successful_completion_history_len < 2 {
+            None
+        } else {
+            let oldest_index =
+                if self.successful_completion_history_len < LIVE_SLAM_RATE_WINDOW_CAPACITY {
+                    0
+                } else {
+                    self.successful_completion_history_next
+                };
+            let newest_index =
+                (self.successful_completion_history_next + LIVE_SLAM_RATE_WINDOW_CAPACITY - 1)
+                    % LIVE_SLAM_RATE_WINDOW_CAPACITY;
+            let oldest = self.successful_completion_history_ns[oldest_index];
+            let newest = self.successful_completion_history_ns[newest_index];
+            newest.checked_sub(oldest).and_then(|span_ns| {
+                (span_ns > 0).then_some(LiveSlamRateWindowEvidence {
+                    successful_completions: u8::try_from(self.successful_completion_history_len)
+                        .expect("the fixed SLAM rate window capacity fits u8"),
+                    span_ns,
+                })
+            })
+        };
+        LiveSlamTelemetrySnapshot {
+            inference: self.inference,
+            pipeline_state: self.pipeline_state,
+            started_pairs: self.started_pairs,
+            successful_pairs: self.successful_pairs,
+            recoverable_failures: self.recoverable_failures,
+            fatal_failures: self.fatal_failures,
+            last_successful_source_arrival: self.last_successful_source_arrival,
+            last_successful_completion: self.last_successful_completion,
+            rate_window,
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Debug)]
+struct LiveSlamTelemetry {
+    state: Arc<Mutex<LiveSlamTelemetryState>>,
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveSlamTelemetryError {
+    LockPoisoned,
+    PipelineNotRunning {
+        state: LiveSlamPipelineState,
+    },
+    AttemptAlreadyInFlight,
+    NoAttemptInFlight,
+    AttemptSourceMismatch {
+        expected: HostMonotonicTimestamp,
+        actual: HostMonotonicTimestamp,
+    },
+    SourceArrivalRegressed {
+        previous: HostMonotonicTimestamp,
+        actual: HostMonotonicTimestamp,
+    },
+    CompletionBeforeSource {
+        source: HostMonotonicTimestamp,
+        completion: HostMonotonicTimestamp,
+    },
+    CompletionRegressed {
+        previous: HostMonotonicTimestamp,
+        actual: HostMonotonicTimestamp,
+    },
+    CounterExhausted {
+        field: &'static str,
+    },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for LiveSlamTelemetryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "invalid live SLAM telemetry transition: {self:?}"
+        )
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for LiveSlamTelemetryError {}
+
+#[cfg(feature = "record")]
+impl LiveSlamTelemetry {
+    fn new(inference: LiveInferenceRuntimeEvidence) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LiveSlamTelemetryState {
+                inference,
+                pipeline_state: LiveSlamPipelineState::Running,
+                started_pairs: 0,
+                successful_pairs: 0,
+                recoverable_failures: 0,
+                fatal_failures: 0,
+                in_flight: false,
+                last_started_source_arrival: None,
+                last_completion: None,
+                last_successful_source_arrival: None,
+                last_successful_completion: None,
+                successful_completion_history_ns: [0; LIVE_SLAM_RATE_WINDOW_CAPACITY],
+                successful_completion_history_len: 0,
+                successful_completion_history_next: 0,
+            })),
+        }
+    }
+
+    fn begin(
+        &self,
+        source_arrival: HostMonotonicTimestamp,
+    ) -> Result<LiveSlamAttempt, LiveSlamTelemetryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LiveSlamTelemetryError::LockPoisoned)?;
+        if state.pipeline_state != LiveSlamPipelineState::Running {
+            return Err(LiveSlamTelemetryError::PipelineNotRunning {
+                state: state.pipeline_state,
+            });
+        }
+        if state.in_flight {
+            return Err(LiveSlamTelemetryError::AttemptAlreadyInFlight);
+        }
+        if let Some(previous) = state.last_started_source_arrival
+            && source_arrival < previous
+        {
+            return Err(LiveSlamTelemetryError::SourceArrivalRegressed {
+                previous,
+                actual: source_arrival,
+            });
+        }
+        state.started_pairs =
+            state
+                .started_pairs
+                .checked_add(1)
+                .ok_or(LiveSlamTelemetryError::CounterExhausted {
+                    field: "started_pairs",
+                })?;
+        state.in_flight = true;
+        state.last_started_source_arrival = Some(source_arrival);
+        Ok(LiveSlamAttempt { source_arrival })
+    }
+
+    fn complete_success(
+        &self,
+        attempt: LiveSlamAttempt,
+        completed_at: HostMonotonicTimestamp,
+    ) -> Result<LiveSlamTelemetrySnapshot, LiveSlamTelemetryError> {
+        let mut state = self.lock_for_completion(&attempt, completed_at)?;
+        state.successful_pairs = state.successful_pairs.checked_add(1).ok_or(
+            LiveSlamTelemetryError::CounterExhausted {
+                field: "successful_pairs",
+            },
+        )?;
+        state.in_flight = false;
+        state.last_completion = Some(completed_at);
+        state.last_successful_source_arrival = Some(attempt.source_arrival);
+        state.last_successful_completion = Some(completed_at);
+        let next = state.successful_completion_history_next;
+        state.successful_completion_history_ns[next] = completed_at.as_nanos();
+        state.successful_completion_history_next = (next + 1) % LIVE_SLAM_RATE_WINDOW_CAPACITY;
+        state.successful_completion_history_len = state
+            .successful_completion_history_len
+            .saturating_add(1)
+            .min(LIVE_SLAM_RATE_WINDOW_CAPACITY);
+        Ok(state.snapshot())
+    }
+
+    fn complete_failure(
+        &self,
+        attempt: LiveSlamAttempt,
+        completed_at: HostMonotonicTimestamp,
+        fatal: bool,
+    ) -> Result<LiveSlamTelemetrySnapshot, LiveSlamTelemetryError> {
+        let mut state = self.lock_for_completion(&attempt, completed_at)?;
+        if fatal {
+            state.fatal_failures = state.fatal_failures.checked_add(1).ok_or(
+                LiveSlamTelemetryError::CounterExhausted {
+                    field: "fatal_failures",
+                },
+            )?;
+            state.in_flight = false;
+            state.last_completion = Some(completed_at);
+            state.pipeline_state = LiveSlamPipelineState::Faulted;
+        } else {
+            state.recoverable_failures = state.recoverable_failures.checked_add(1).ok_or(
+                LiveSlamTelemetryError::CounterExhausted {
+                    field: "recoverable_failures",
+                },
+            )?;
+            state.in_flight = false;
+            state.last_completion = Some(completed_at);
+        }
+        Ok(state.snapshot())
+    }
+
+    fn lock_for_completion(
+        &self,
+        attempt: &LiveSlamAttempt,
+        completed_at: HostMonotonicTimestamp,
+    ) -> Result<std::sync::MutexGuard<'_, LiveSlamTelemetryState>, LiveSlamTelemetryError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| LiveSlamTelemetryError::LockPoisoned)?;
+        if !state.in_flight {
+            return Err(LiveSlamTelemetryError::NoAttemptInFlight);
+        }
+        if let Some(expected) = state.last_started_source_arrival
+            && expected != attempt.source_arrival
+        {
+            return Err(LiveSlamTelemetryError::AttemptSourceMismatch {
+                expected,
+                actual: attempt.source_arrival,
+            });
+        }
+        if completed_at < attempt.source_arrival {
+            return Err(LiveSlamTelemetryError::CompletionBeforeSource {
+                source: attempt.source_arrival,
+                completion: completed_at,
+            });
+        }
+        if let Some(previous) = state.last_completion
+            && completed_at < previous
+        {
+            return Err(LiveSlamTelemetryError::CompletionRegressed {
+                previous,
+                actual: completed_at,
+            });
+        }
+        Ok(state)
+    }
+
+    fn close(&self) -> Result<LiveSlamTelemetrySnapshot, LiveSlamTelemetryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LiveSlamTelemetryError::LockPoisoned)?;
+        if state.in_flight {
+            return Err(LiveSlamTelemetryError::AttemptAlreadyInFlight);
+        }
+        if state.pipeline_state == LiveSlamPipelineState::Running {
+            state.pipeline_state = LiveSlamPipelineState::Closed;
+        }
+        Ok(state.snapshot())
+    }
+
+    fn fault(&self) -> Result<LiveSlamTelemetrySnapshot, LiveSlamTelemetryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| LiveSlamTelemetryError::LockPoisoned)?;
+        state.pipeline_state = LiveSlamPipelineState::Faulted;
+        Ok(state.snapshot())
+    }
+
+    fn snapshot(&self) -> Result<LiveSlamTelemetrySnapshot, LiveSlamTelemetryError> {
+        self.state
+            .lock()
+            .map(|state| state.snapshot())
+            .map_err(|_| LiveSlamTelemetryError::LockPoisoned)
+    }
+}
+
 struct InferenceConfig {
     superpoint_left: SuperPoint,
     superpoint_right: SuperPoint,
     lightglue: LightGlue,
+    superpoint_requested_backend: InferenceBackend,
+    lightglue_requested_backend: InferenceBackend,
     key_limit: KeypointLimit,
     downscale: DownscaleFactor,
 }
@@ -1283,8 +1680,36 @@ impl InferenceConfig {
             superpoint_left,
             superpoint_right,
             lightglue,
+            superpoint_requested_backend: superpoint_backend,
+            lightglue_requested_backend: lightglue_backend,
             key_limit,
             downscale,
+        })
+    }
+
+    #[cfg(feature = "record")]
+    fn runtime_evidence(
+        &self,
+    ) -> Result<LiveInferenceRuntimeEvidence, LiveInferenceRuntimeEvidenceError> {
+        let superpoint_left = self.superpoint_left.backend();
+        let superpoint_right = self.superpoint_right.backend();
+        if superpoint_left != superpoint_right {
+            return Err(
+                LiveInferenceRuntimeEvidenceError::SuperpointReplicaBackendMismatch {
+                    left: superpoint_left,
+                    right: superpoint_right,
+                },
+            );
+        }
+        let superpoint_selected =
+            LiveSelectedInferenceBackend::parse("SuperPoint", superpoint_left)?;
+        let lightglue_selected =
+            LiveSelectedInferenceBackend::parse("LightGlue", self.lightglue.backend())?;
+        Ok(LiveInferenceRuntimeEvidence {
+            superpoint_requested: self.superpoint_requested_backend,
+            superpoint_selected,
+            lightglue_requested: self.lightglue_requested_backend,
+            lightglue_selected,
         })
     }
 
@@ -1839,6 +2264,29 @@ fn report_tracker_runtime(config: &TrackerConfig, tracker: &SlamTracker) {
     );
 }
 
+#[cfg(feature = "record")]
+const fn live_inference_backend_name(backend: InferenceBackend) -> &'static str {
+    match backend {
+        InferenceBackend::Auto => "auto",
+        InferenceBackend::Cpu => "cpu",
+        InferenceBackend::CoreMLGpu => "coreml_gpu",
+        InferenceBackend::Cuda => "cuda",
+        InferenceBackend::TensorRT => "tensorrt",
+    }
+}
+
+#[cfg(feature = "record")]
+const fn live_selected_inference_backend_name(
+    backend: LiveSelectedInferenceBackend,
+) -> &'static str {
+    match backend {
+        LiveSelectedInferenceBackend::Cpu => "cpu",
+        LiveSelectedInferenceBackend::CoremlGpu => "coreml_gpu",
+        LiveSelectedInferenceBackend::Cuda => "cuda",
+        LiveSelectedInferenceBackend::TensorRt => "tensorrt",
+    }
+}
+
 fn run_viz_odometry(
     args: &VizArgs,
     destination: RerunDestination<'_>,
@@ -1907,6 +2355,8 @@ fn run_viz_odometry(
         superpoint_left,
         superpoint_right,
         lightglue,
+        superpoint_requested_backend: _,
+        lightglue_requested_backend: _,
         key_limit,
         downscale,
     } = inference;
@@ -3805,6 +4255,7 @@ struct LiveVizMsg {
     points: Option<Vec<CameraPoint3>>,
     output: TrackerOutput,
     dense_stats: Option<DenseStats>,
+    slam: LiveSlamTelemetrySnapshot,
 }
 
 #[cfg(feature = "record")]
@@ -5786,6 +6237,7 @@ fn log_live_viz_message(
     recording: &rerun::RecordingStream,
     sink: &mut RerunSink,
     msg: LiveVizMsg,
+    slam_context_logged: &mut bool,
 ) -> Result<(), VizLogError> {
     apply_live_rerun_timeline_domain(recording, LiveRerunTimelineDomain::Capture)?;
     if let Some(packet) = msg.packet.as_ref() {
@@ -5806,6 +6258,80 @@ fn log_live_viz_message(
     }
     if let Some(ref dense_stats) = msg.dense_stats {
         sink.log_dense_stats(msg.left.timestamp(), dense_stats)?;
+    }
+    if !*slam_context_logged {
+        recording.log_static(
+            "diagnostics/slam/inference_runtime",
+            &rerun::TextLog::new(format!(
+                "superpoint_requested={} superpoint_selected={} lightglue_requested={} lightglue_selected={}; selected is runtime session evidence, not a speed or utilization claim",
+                live_inference_backend_name(msg.slam.inference.superpoint_requested),
+                live_selected_inference_backend_name(msg.slam.inference.superpoint_selected),
+                live_inference_backend_name(msg.slam.inference.lightglue_requested),
+                live_selected_inference_backend_name(msg.slam.inference.lightglue_selected),
+            )),
+        )?;
+        recording.log_static(
+            "diagnostics/slam/rate_contract",
+            &rerun::TextLog::new(
+                "successful_rate_window_hz is derived from at most 64 actual successful tracker completion timestamps: (count-1)*1e9/span_ns. It is neither the configured camera FPS nor a benchmark claim.",
+            ),
+        )?;
+        *slam_context_logged = true;
+    }
+    for (path, value) in [
+        ("diagnostics/slam/started_pairs", msg.slam.started_pairs),
+        (
+            "diagnostics/slam/successful_pairs",
+            msg.slam.successful_pairs,
+        ),
+        (
+            "diagnostics/slam/recoverable_failures",
+            msg.slam.recoverable_failures,
+        ),
+        ("diagnostics/slam/fatal_failures", msg.slam.fatal_failures),
+    ] {
+        recording.log(path, &rerun::Scalars::single(value as f64))?;
+    }
+    recording.log(
+        "diagnostics/slam/status",
+        &rerun::TextLog::new(format!(
+            "pipeline_state={:?} started_pairs={} successful_pairs={} recoverable_failures={} fatal_failures={} last_successful_source_arrival_host_monotonic_ns={} last_successful_completion_host_monotonic_ns={}",
+            msg.slam.pipeline_state,
+            msg.slam.started_pairs,
+            msg.slam.successful_pairs,
+            msg.slam.recoverable_failures,
+            msg.slam.fatal_failures,
+            msg.slam
+                .last_successful_source_arrival
+                .map_or_else(|| "unavailable".to_owned(), |value| value.as_nanos().to_string()),
+            msg.slam
+                .last_successful_completion
+                .map_or_else(|| "unavailable".to_owned(), |value| value.as_nanos().to_string()),
+        )),
+    )?;
+    if let Some(window) = msg.slam.rate_window {
+        let rate_hz = f64::from(window.successful_completions.saturating_sub(1)) * 1e9
+            / window.span_ns as f64;
+        recording.log(
+            "diagnostics/slam/successful_rate_window_hz",
+            &rerun::Scalars::single(rate_hz),
+        )?;
+        recording.log(
+            "diagnostics/slam/rate_window_span_ns",
+            &rerun::Scalars::single(window.span_ns as f64),
+        )?;
+        recording.log(
+            "diagnostics/slam/rate_window_successful_completions",
+            &rerun::Scalars::single(f64::from(window.successful_completions)),
+        )?;
+    } else {
+        for path in [
+            "diagnostics/slam/successful_rate_window_hz",
+            "diagnostics/slam/rate_window_span_ns",
+            "diagnostics/slam/rate_window_successful_completions",
+        ] {
+            recording.log(path, &rerun::Clear::flat())?;
+        }
     }
     Ok(())
 }
@@ -6474,6 +7000,7 @@ enum LiveProductionConsoleProjectionError {
     AuthorityState(LiveMotionAuthorityStateError),
     AuthorityAdapter(OperatorConsoleRuntimeAdapterError),
     AccessoryHealth(NanoAccessoryHealthStatusError),
+    SlamTelemetry(LiveSlamTelemetryError),
     OwnerAuthorityWithoutConsole {
         owner: LiveMotionAuthorityState,
     },
@@ -6516,6 +7043,7 @@ impl std::fmt::Display for LiveProductionConsoleProjectionError {
             Self::AuthorityState(source) => write!(formatter, "{source}"),
             Self::AuthorityAdapter(source) => write!(formatter, "{source}"),
             Self::AccessoryHealth(source) => write!(formatter, "{source}"),
+            Self::SlamTelemetry(source) => write!(formatter, "{source}"),
             Self::OwnerAuthorityWithoutConsole { owner } => write!(
                 formatter,
                 "sole owner retains {owner:?} authority without its unified-console linear guard"
@@ -6558,6 +7086,7 @@ impl std::error::Error for LiveProductionConsoleProjectionError {
             Self::AuthorityState(source) => Some(source),
             Self::AuthorityAdapter(source) => Some(source),
             Self::AccessoryHealth(source) => Some(source),
+            Self::SlamTelemetry(source) => Some(source),
             Self::Snapshot(source) => Some(source),
             Self::GridPublicationRejected { .. }
             | Self::OwnerAuthorityWithoutConsole { .. }
@@ -6690,19 +7219,107 @@ impl LiveSensorStreamHealth {
 }
 
 #[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
-fn console_oak_motion_health<J: kiko_slam::navigation::NavigationIngressSink>(
+fn console_oak_stream_health(
     sensor_health: LiveSensorStreamHealth,
-    coordinator: &ShadowNavigationCoordinator<J>,
     observed_at: HostMonotonicTimestamp,
 ) -> ConsoleHealth {
-    let stream_health = sensor_health.console_health(observed_at);
-    if stream_health == ConsoleHealth::Ready
-        && coordinator.motion_start_readiness_at(observed_at).is_err()
-    {
-        ConsoleHealth::Degraded
-    } else {
-        stream_health
+    sensor_health.console_health(observed_at)
+}
+
+#[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+const fn console_requested_inference_backend(
+    backend: InferenceBackend,
+) -> ConsoleRequestedInferenceBackend {
+    match backend {
+        InferenceBackend::Auto => ConsoleRequestedInferenceBackend::Auto,
+        InferenceBackend::Cpu => ConsoleRequestedInferenceBackend::Cpu,
+        InferenceBackend::CoreMLGpu => ConsoleRequestedInferenceBackend::CoremlGpu,
+        InferenceBackend::Cuda => ConsoleRequestedInferenceBackend::Cuda,
+        InferenceBackend::TensorRT => ConsoleRequestedInferenceBackend::TensorRt,
     }
+}
+
+#[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+const fn console_selected_inference_backend(
+    backend: LiveSelectedInferenceBackend,
+) -> ConsoleSelectedInferenceBackend {
+    match backend {
+        LiveSelectedInferenceBackend::Cpu => ConsoleSelectedInferenceBackend::Cpu,
+        LiveSelectedInferenceBackend::CoremlGpu => ConsoleSelectedInferenceBackend::CoremlGpu,
+        LiveSelectedInferenceBackend::Cuda => ConsoleSelectedInferenceBackend::Cuda,
+        LiveSelectedInferenceBackend::TensorRt => ConsoleSelectedInferenceBackend::TensorRt,
+    }
+}
+
+#[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+fn live_slam_sample_is_fresh(
+    sample: Option<HostMonotonicTimestamp>,
+    observed_at: HostMonotonicTimestamp,
+) -> bool {
+    sample.is_some_and(|sample| {
+        observed_at
+            .as_nanos()
+            .checked_sub(sample.as_nanos())
+            .is_some_and(|age| age <= LIVE_SENSOR_CONSOLE_MAX_SAMPLE_AGE_NS)
+    })
+}
+
+#[cfg(all(feature = "nano-agent", feature = "operator-console", unix))]
+fn project_live_slam_console(
+    telemetry: &LiveSlamTelemetry,
+    observed_at: HostMonotonicTimestamp,
+) -> Result<(ConsoleSlamSnapshot, ConsoleHealth), LiveSlamTelemetryError> {
+    let snapshot = telemetry.snapshot()?;
+    let health = match snapshot.pipeline_state {
+        LiveSlamPipelineState::Faulted => ConsoleHealth::Faulted,
+        LiveSlamPipelineState::Closed => ConsoleHealth::Unavailable,
+        LiveSlamPipelineState::Running => {
+            if live_slam_sample_is_fresh(snapshot.last_successful_source_arrival, observed_at)
+                && live_slam_sample_is_fresh(snapshot.last_successful_completion, observed_at)
+            {
+                ConsoleHealth::Ready
+            } else {
+                ConsoleHealth::Degraded
+            }
+        }
+    };
+    Ok((
+        ConsoleSlamSnapshot {
+            inference: ConsoleInferenceRuntime {
+                superpoint: ConsoleInferenceSelection {
+                    requested: console_requested_inference_backend(
+                        snapshot.inference.superpoint_requested,
+                    ),
+                    selected: console_selected_inference_backend(
+                        snapshot.inference.superpoint_selected,
+                    ),
+                },
+                lightglue: ConsoleInferenceSelection {
+                    requested: console_requested_inference_backend(
+                        snapshot.inference.lightglue_requested,
+                    ),
+                    selected: console_selected_inference_backend(
+                        snapshot.inference.lightglue_selected,
+                    ),
+                },
+            },
+            started_pairs: snapshot.started_pairs,
+            successful_pairs: snapshot.successful_pairs,
+            recoverable_failures: snapshot.recoverable_failures,
+            fatal_failures: snapshot.fatal_failures,
+            last_successful_source_arrival_host_monotonic_ns: snapshot
+                .last_successful_source_arrival
+                .map(HostMonotonicTimestamp::as_nanos),
+            last_successful_completion_host_monotonic_ns: snapshot
+                .last_successful_completion
+                .map(HostMonotonicTimestamp::as_nanos),
+            rate_window: snapshot.rate_window.map(|window| ConsoleSlamRateWindow {
+                successful_completions: window.successful_completions,
+                span_ns: window.span_ns,
+            }),
+        },
+        health,
+    ))
 }
 
 #[cfg(all(
@@ -8146,6 +8763,7 @@ fn start_production_motion_runtime(
                 ConsoleHealth::Unavailable
             }),
             oak: Some(ConsoleHealth::Degraded),
+            slam: Some(ConsoleHealth::Degraded),
         };
         initial_snapshot.health =
             match refresh_console_accessory_health(initial_snapshot.health, &accessory_health) {
@@ -9017,6 +9635,7 @@ struct ProductionConsoleSnapshotContext<'runtime> {
     terminal_checkpoint_pending: bool,
     accessory_health: &'runtime NanoAccessoryHealthObserver,
     sensor_health: LiveSensorStreamHealth,
+    slam_telemetry: &'runtime LiveSlamTelemetry,
     map_state: AgentMapStateV1,
     snapshot_clock: &'runtime InstantHostClock,
     tick_timing: LiveControlTickTiming,
@@ -9039,6 +9658,7 @@ fn publish_production_console_snapshot(
         terminal_checkpoint_pending,
         accessory_health,
         sensor_health,
+        slam_telemetry,
         map_state,
         snapshot_clock,
         tick_timing,
@@ -9117,11 +9737,14 @@ fn publish_production_console_snapshot(
     let telemetry_observed_at = snapshot_clock
         .checked_now()
         .map_err(LiveProductionConsoleProjectionError::HostClock)?;
-    snapshot.health.oak = Some(console_oak_motion_health(
+    snapshot.health.oak = Some(console_oak_stream_health(
         sensor_health,
-        owner.coordinator(),
         telemetry_observed_at,
     ));
+    let (slam, slam_health) = project_live_slam_console(slam_telemetry, telemetry_observed_at)
+        .map_err(LiveProductionConsoleProjectionError::SlamTelemetry)?;
+    snapshot.slam = Some(slam);
+    snapshot.health.slam = Some(slam_health);
     snapshot.telemetry_observed_at_host_monotonic_ns =
         Some(ConsoleHostTimestampNs::from_host(telemetry_observed_at));
     adapter
@@ -9326,6 +9949,7 @@ fn publish_wheels_off_qualification_snapshot(
     runtime: &mut LiveWheelsOffQualificationMotionRuntime,
     snapshot_clock: &InstantHostClock,
     tick_timing: LiveControlTickTiming,
+    slam_telemetry: &LiveSlamTelemetry,
 ) -> Result<NanoAccessoryRuntimeHealth, LiveNavigationWorkerError> {
     observe_wheels_off_qualification_controller(runtime)?;
     let revision = runtime.observation.next_snapshot_revision.take().ok_or(
@@ -9430,11 +10054,18 @@ fn publish_wheels_off_qualification_snapshot(
     let telemetry_observed_at = snapshot_clock
         .checked_now()
         .map_err(LiveNavigationWorkerError::HostClock)?;
-    snapshot.health.oak = Some(console_oak_motion_health(
+    snapshot.health.oak = Some(console_oak_stream_health(
         runtime.sensor_health,
-        &runtime.coordinator,
         telemetry_observed_at,
     ));
+    let (slam, slam_health) = project_live_slam_console(slam_telemetry, telemetry_observed_at)
+        .map_err(
+            |source| LiveNavigationWorkerError::WheelsOffQualificationProjection {
+                source: LiveProductionConsoleProjectionError::SlamTelemetry(source),
+            },
+        )?;
+    snapshot.slam = Some(slam);
+    snapshot.health.slam = Some(slam_health);
     snapshot.telemetry_observed_at_host_monotonic_ns =
         Some(ConsoleHostTimestampNs::from_host(telemetry_observed_at));
     runtime
@@ -9667,6 +10298,7 @@ fn run_production_console_control_period(
     pending_warm_checkpoint: &mut Option<PendingNanoWarmCheckpoint>,
     checkpoint_bridge: &NanoDatasetCheckpointWorkerBridge,
     running: &AtomicBool,
+    slam_telemetry: &LiveSlamTelemetry,
     map_state: AgentMapStateV1,
     tick: HostMonotonicTimestamp,
     snapshot_clock: &InstantHostClock,
@@ -9744,6 +10376,7 @@ fn run_production_console_control_period(
                 terminal_checkpoint_pending: *terminal_checkpoint_pending,
                 accessory_health,
                 sensor_health: *sensor_health,
+                slam_telemetry,
                 map_state,
                 snapshot_clock,
                 tick_timing,
@@ -10013,6 +10646,7 @@ fn run_production_console_control_period(
             terminal_checkpoint_pending: *terminal_checkpoint_pending,
             accessory_health,
             sensor_health: *sensor_health,
+            slam_telemetry,
             map_state,
             snapshot_clock,
             tick_timing,
@@ -10099,6 +10733,7 @@ fn run_live_navigation_worker(
         NanoDatasetCheckpointWorkerBridge,
     >,
     running: Arc<AtomicBool>,
+    slam_telemetry: LiveSlamTelemetry,
     visual_rx: crossbeam_channel::Receiver<VisualAdmission>,
     depth_rx: DropReceiver<DepthObservation>,
     imu_rx: DropReceiver<ImuReport>,
@@ -10522,6 +11157,7 @@ fn run_live_navigation_worker(
                                         "production Nano navigation has one checkpoint bridge",
                                     ),
                                     running.as_ref(),
+                                    &slam_telemetry,
                                     map_state,
                                     tick,
                                     &clock,
@@ -10795,6 +11431,7 @@ fn run_live_navigation_worker(
                                 qualification,
                                 &clock,
                                 tick_timing,
+                                &slam_telemetry,
                             )?;
                             // The candidate controller is intentionally absent
                             // from this diagnostic builder: this is the MPC
@@ -11374,6 +12011,12 @@ enum LiveThreadError {
     VisualAdmissionRoute {
         source: LiveLosslessRouteError,
     },
+    SlamClock {
+        source: HostMonotonicRangeError,
+    },
+    SlamTelemetry {
+        source: LiveSlamTelemetryError,
+    },
     RequiredDenseUnavailable {
         reason: &'static str,
     },
@@ -11447,6 +12090,12 @@ impl std::fmt::Display for LiveThreadError {
             LiveThreadError::VisualAdmissionRoute { source } => {
                 write!(f, "visual admission routing failed: {source}")
             }
+            LiveThreadError::SlamClock { source } => {
+                write!(f, "live SLAM completion clock failed: {source}")
+            }
+            LiveThreadError::SlamTelemetry { source } => {
+                write!(f, "live SLAM telemetry failed: {source}")
+            }
             LiveThreadError::RequiredDenseUnavailable { reason } => {
                 write!(
                     f,
@@ -11503,6 +12152,8 @@ impl std::error::Error for LiveThreadError {
             Self::VisualIngressBoundary { source } => Some(source),
             Self::VisualAdmissionBuild { source } => Some(source),
             Self::VisualAdmissionRoute { source } => Some(source),
+            Self::SlamClock { source } => Some(source),
+            Self::SlamTelemetry { source } => Some(source),
             Self::RequiredDenseUnavailable { .. } => None,
             Self::RequiredDenseAndInferenceUnavailable { inference, .. } => Some(inference),
             Self::InferenceUnavailable { source } => Some(source),
@@ -11723,6 +12374,7 @@ enum LiveWorkerFailure {
     NavigationPanic {
         detail: String,
     },
+    SlamTelemetry(LiveSlamTelemetryError),
     DatasetFinalization(DatasetError),
     DatasetAbort(DatasetError),
     #[cfg(all(feature = "nano-agent", unix))]
@@ -11747,6 +12399,9 @@ impl std::fmt::Display for LiveWorkerFailure {
             Self::Navigation(source) => write!(f, "live navigation worker failed: {source}"),
             Self::NavigationPanic { detail } => {
                 write!(f, "live navigation worker panicked: {detail}")
+            }
+            Self::SlamTelemetry(source) => {
+                write!(f, "live SLAM telemetry finalization failed: {source}")
             }
             Self::DatasetFinalization(source) => {
                 write!(f, "live navigation dataset finalization failed: {source}")
@@ -11773,6 +12428,7 @@ impl std::error::Error for LiveWorkerFailure {
             Self::Inference(source) => Some(source),
             Self::Occupancy(source) => Some(source),
             Self::Navigation(source) => Some(source),
+            Self::SlamTelemetry(source) => Some(source),
             Self::DatasetFinalization(source) | Self::DatasetAbort(source) => Some(source),
             #[cfg(all(feature = "nano-agent", unix))]
             Self::WarmCheckpointCoordination(source) => Some(source),
@@ -13344,6 +14000,8 @@ fn prepare_nano_common_live_software(
         superpoint_left,
         superpoint_right,
         lightglue,
+        superpoint_requested_backend: superpoint_backend,
+        lightglue_requested_backend: lightglue_backend,
         key_limit: KeypointLimit::try_from(usize::try_from(
             input.inference_policy.maximum_keypoints(),
         )?)?,
@@ -14597,6 +15255,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
             ConsoleHealth::Unavailable
         }),
         oak: Some(ConsoleHealth::Degraded),
+        slam: Some(ConsoleHealth::Degraded),
     };
     let accessory_health = resources
         .accessory
@@ -15621,10 +16280,21 @@ fn run_prepared_live_session(
                 _ => unreachable!("IMU session and queue capacity are derived together"),
             };
 
+        let inference_runtime = inference.runtime_evidence()?;
+        eprintln!(
+            "live inference providers: superpoint requested={:?} selected={:?}; lightglue requested={:?} selected={:?}",
+            inference_runtime.superpoint_requested,
+            inference_runtime.superpoint_selected,
+            inference_runtime.lightglue_requested,
+            inference_runtime.lightglue_selected,
+        );
+        let slam_telemetry = LiveSlamTelemetry::new(inference_runtime);
         let InferenceConfig {
             superpoint_left,
             superpoint_right,
             lightglue,
+            superpoint_requested_backend: _,
+            lightglue_requested_backend: _,
             key_limit,
             downscale,
         } = inference;
@@ -15970,6 +16640,7 @@ fn run_prepared_live_session(
                     .take()
                     .expect("enabled navigation requires a dense map route");
                 let navigation_running = Arc::clone(&running);
+                let navigation_slam_telemetry = slam_telemetry.clone();
                 Some(spawn_live_thread("kiko-navigation", move || {
                     run_live_navigation_worker(
                         coordinator,
@@ -15985,6 +16656,7 @@ fn run_prepared_live_session(
                         #[cfg(all(feature = "nano-agent", unix))]
                         checkpoint_worker_bridge.take(),
                         navigation_running,
+                        navigation_slam_telemetry,
                         visual_rx,
                         depth_rx,
                         imu_rx,
@@ -16004,6 +16676,7 @@ fn run_prepared_live_session(
         );
 
         let inference_running = Arc::clone(&running);
+        let inference_slam_telemetry = slam_telemetry.clone();
         #[cfg(all(feature = "nano-agent", unix))]
         let inference_checkpoint_requested = Arc::clone(&quiescent_checkpoint_requested);
         let inference_handle = spawn_live_thread(
@@ -16017,6 +16690,7 @@ fn run_prepared_live_session(
                 #[cfg(not(all(feature = "nano-agent", unix)))]
                 let _exit_guard = LiveThreadExitGuard::new(Arc::clone(&inference_running));
                 let mut tracker = tracker;
+                let inference_clock = InstantHostClock::new(capture_clock_origin);
                 let depth_rx = depth_rx;
                 let depth_enabled_for_diagnostics = depth_rx.is_some();
                 let mut dense_generation = dense_generation;
@@ -16045,6 +16719,10 @@ fn run_prepared_live_session(
                     let left = observation.pair().left().clone();
                     let right = observation.pair().right().clone();
                     let timestamp = left.timestamp();
+                    let slam_attempt =
+                        inference_slam_telemetry
+                            .begin(observation.host_arrival())
+                            .map_err(|source| LiveThreadError::SlamTelemetry { source })?;
                     let depth_batch = depth_rx.as_ref().map(drain_depth_batch).unwrap_or_default();
                     let depth = depth_batch.last().cloned();
                     for depth_image in depth_batch {
@@ -16061,8 +16739,14 @@ fn run_prepared_live_session(
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             tracker.process(observation.into_pair())
                         }));
+                    let slam_completed_at = inference_clock
+                        .checked_now()
+                        .map_err(|source| LiveThreadError::SlamClock { source })?;
                     match process_result {
                         Ok(Ok(mut output)) => {
+                            let slam_snapshot = inference_slam_telemetry
+                                .complete_success(slam_attempt, slam_completed_at)
+                                .map_err(|source| LiveThreadError::SlamTelemetry { source })?;
                             #[cfg(all(feature = "nano-agent", unix))]
                             let warm_localized = match warm_relocalization_gate.take() {
                                 None => true,
@@ -16199,6 +16883,7 @@ fn run_prepared_live_session(
                                 points,
                                 output,
                                 dense_stats,
+                                slam: slam_snapshot,
                             };
                             if let Some(sender) = viz_tx.as_ref()
                                 && matches!(sender.try_send(msg), SendOutcome::Disconnected)
@@ -16211,6 +16896,13 @@ fn run_prepared_live_session(
                         }
                         Ok(Err(err)) => {
                             let requires_pipeline_shutdown = err.requires_pipeline_shutdown();
+                            inference_slam_telemetry
+                                .complete_failure(
+                                    slam_attempt,
+                                    slam_completed_at,
+                                    requires_pipeline_shutdown,
+                                )
+                                .map_err(|source| LiveThreadError::SlamTelemetry { source })?;
                             if let (Some(sender), Some(pending)) =
                                 (navigation_visual_tx.as_ref(), pending_visual)
                             {
@@ -16303,6 +16995,9 @@ fn run_prepared_live_session(
                             eprintln!("tracker error: {err}");
                         }
                         Err(payload) => {
+                            inference_slam_telemetry
+                                .complete_failure(slam_attempt, slam_completed_at, true)
+                                .map_err(|source| LiveThreadError::SlamTelemetry { source })?;
                             if let (Some(sender), Some(pending)) =
                                 (navigation_visual_tx.as_ref(), pending_visual)
                             {
@@ -16334,6 +17029,9 @@ fn run_prepared_live_session(
                 if depth_reorder_warnings_seen > 0 {
                     eprintln!("depth reorder warnings observed: {depth_reorder_warnings_seen}");
                 }
+                inference_slam_telemetry
+                    .close()
+                    .map_err(|source| LiveThreadError::SlamTelemetry { source })?;
                 Ok(())
             },
         )?;
@@ -16394,6 +17092,7 @@ fn run_prepared_live_session(
                 let mut map_rx = occupancy_snapshot_rx;
                 let mut navigation_rx = navigation_viz_rx;
                 let mut navigation_context_logged = false;
+                let mut slam_context_logged = false;
                 #[cfg(all(feature = "nano-agent", unix))]
                 let mut face_rx = face_viz_rx;
                 #[cfg(all(feature = "nano-agent", unix))]
@@ -16476,8 +17175,12 @@ fn run_prepared_live_session(
                                     if logging_error.is_none()
                                         && let Some(sink) = sink.as_mut()
                                         && let Some(recording) = navigation_recording.as_ref()
-                                        && let Err(error) =
-                                            log_live_viz_message(recording, sink, message)
+                                        && let Err(error) = log_live_viz_message(
+                                            recording,
+                                            sink,
+                                            message,
+                                            &mut slam_context_logged,
+                                        )
                                     {
                                         eprintln!(
                                             "live Rerun logging failed; disconnecting visualization producers: {error}"
@@ -17076,12 +17779,21 @@ fn run_prepared_live_session(
                 .drain(..)
                 .map(LiveWorkerFailure::Accessory),
         );
-        match inference_handle.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => live_failures.push(LiveWorkerFailure::Inference(error)),
-            Err(payload) => live_failures.push(LiveWorkerFailure::InferencePanic {
-                detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
-            }),
+        let inference_failed = match inference_handle.join() {
+            Ok(Ok(())) => false,
+            Ok(Err(error)) => {
+                live_failures.push(LiveWorkerFailure::Inference(error));
+                true
+            }
+            Err(payload) => {
+                live_failures.push(LiveWorkerFailure::InferencePanic {
+                    detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+                });
+                true
+            }
+        };
+        if inference_failed && let Err(source) = slam_telemetry.fault() {
+            live_failures.push(LiveWorkerFailure::SlamTelemetry(source));
         }
 
         // Drain the causal chain in ownership order. Inference closes the dense
@@ -17453,6 +18165,35 @@ fn run_prepared_live_session(
             pairer_stats.dropped_right,
             pairer_stats.outside_window
         );
+        match slam_telemetry.snapshot() {
+            Ok(snapshot) => {
+                let rate = snapshot.rate_window.map_or_else(
+                    || "unavailable".to_owned(),
+                    |window| {
+                        let hz = f64::from(window.successful_completions.saturating_sub(1)) * 1e9
+                            / window.span_ns as f64;
+                        format!(
+                            "{hz:.6}Hz from {} successful completions over {}ns",
+                            window.successful_completions, window.span_ns
+                        )
+                    },
+                );
+                eprintln!(
+                    "live SLAM evidence: pipeline_state={:?} started_pairs={} successful_pairs={} recoverable_failures={} fatal_failures={} measured_success_rate_window={}; superpoint requested={} selected={}; lightglue requested={} selected={}",
+                    snapshot.pipeline_state,
+                    snapshot.started_pairs,
+                    snapshot.successful_pairs,
+                    snapshot.recoverable_failures,
+                    snapshot.fatal_failures,
+                    rate,
+                    live_inference_backend_name(snapshot.inference.superpoint_requested),
+                    live_selected_inference_backend_name(snapshot.inference.superpoint_selected),
+                    live_inference_backend_name(snapshot.inference.lightglue_requested),
+                    live_selected_inference_backend_name(snapshot.inference.lightglue_selected),
+                );
+            }
+            Err(source) => live_failures.push(LiveWorkerFailure::SlamTelemetry(source)),
+        }
 
         if !live_failures.is_empty() {
             return Err(LiveRunError {
@@ -17740,9 +18481,11 @@ mod tests {
     };
     #[cfg(feature = "record")]
     use super::{
-        HostMonotonicRangeError, LiveNavigationWorkerError, LiveNavigationWorkerInput,
-        checked_monotonic_duration_ns, combine_live_navigation_failures, drain_entry_snapshot,
-        measure_live_control_tick_timing, select_live_navigation_worker_input,
+        HostMonotonicRangeError, LiveInferenceRuntimeEvidence, LiveNavigationWorkerError,
+        LiveNavigationWorkerInput, LiveSelectedInferenceBackend, LiveSlamPipelineState,
+        LiveSlamTelemetry, LiveSlamTelemetryError, checked_monotonic_duration_ns,
+        combine_live_navigation_failures, drain_entry_snapshot, measure_live_control_tick_timing,
+        select_live_navigation_worker_input,
     };
     #[cfg(all(
         feature = "record",
@@ -17886,6 +18629,141 @@ mod tests {
     }
     #[cfg(feature = "record")]
     use std::time::Instant;
+
+    #[cfg(feature = "record")]
+    fn test_slam_telemetry() -> LiveSlamTelemetry {
+        LiveSlamTelemetry::new(LiveInferenceRuntimeEvidence {
+            superpoint_requested: kiko_slam::InferenceBackend::Auto,
+            superpoint_selected: LiveSelectedInferenceBackend::Cpu,
+            lightglue_requested: kiko_slam::InferenceBackend::Cpu,
+            lightglue_selected: LiveSelectedInferenceBackend::Cpu,
+        })
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn live_slam_telemetry_preserves_exact_outcomes_and_measured_rate_window() {
+        let telemetry = test_slam_telemetry();
+        let first = telemetry
+            .begin(kiko_slam::HostMonotonicTimestamp::from_nanos(100))
+            .expect("first pair starts");
+        assert!(matches!(
+            telemetry.begin(kiko_slam::HostMonotonicTimestamp::from_nanos(101)),
+            Err(LiveSlamTelemetryError::AttemptAlreadyInFlight)
+        ));
+        let first_snapshot = telemetry
+            .complete_success(first, kiko_slam::HostMonotonicTimestamp::from_nanos(200))
+            .expect("first success completes");
+        assert_eq!(first_snapshot.started_pairs, 1);
+        assert_eq!(first_snapshot.successful_pairs, 1);
+        assert_eq!(first_snapshot.rate_window, None);
+
+        let recoverable = telemetry
+            .begin(kiko_slam::HostMonotonicTimestamp::from_nanos(250))
+            .expect("second pair starts");
+        telemetry
+            .complete_failure(
+                recoverable,
+                kiko_slam::HostMonotonicTimestamp::from_nanos(300),
+                false,
+            )
+            .expect("recoverable result completes");
+        let second_success = telemetry
+            .begin(kiko_slam::HostMonotonicTimestamp::from_nanos(350))
+            .expect("third pair starts");
+        let snapshot = telemetry
+            .complete_success(
+                second_success,
+                kiko_slam::HostMonotonicTimestamp::from_nanos(500),
+            )
+            .expect("second success completes");
+        assert_eq!(snapshot.started_pairs, 3);
+        assert_eq!(snapshot.successful_pairs, 2);
+        assert_eq!(snapshot.recoverable_failures, 1);
+        assert_eq!(snapshot.fatal_failures, 0);
+        assert_eq!(
+            snapshot.rate_window,
+            Some(super::LiveSlamRateWindowEvidence {
+                successful_completions: 2,
+                span_ns: 300,
+            })
+        );
+        assert_eq!(
+            snapshot.last_successful_source_arrival,
+            Some(kiko_slam::HostMonotonicTimestamp::from_nanos(350))
+        );
+
+        let fatal = telemetry
+            .begin(kiko_slam::HostMonotonicTimestamp::from_nanos(600))
+            .expect("fatal pair starts");
+        let faulted = telemetry
+            .complete_failure(
+                fatal,
+                kiko_slam::HostMonotonicTimestamp::from_nanos(700),
+                true,
+            )
+            .expect("fatal outcome remains observable");
+        assert_eq!(faulted.pipeline_state, LiveSlamPipelineState::Faulted);
+        assert_eq!(faulted.fatal_failures, 1);
+        assert!(matches!(
+            telemetry.begin(kiko_slam::HostMonotonicTimestamp::from_nanos(800)),
+            Err(LiveSlamTelemetryError::PipelineNotRunning {
+                state: LiveSlamPipelineState::Faulted
+            })
+        ));
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn live_slam_telemetry_rejects_clock_regression_without_rounding_it_valid() {
+        let telemetry = test_slam_telemetry();
+        let attempt = telemetry
+            .begin(kiko_slam::HostMonotonicTimestamp::from_nanos(200))
+            .expect("pair starts");
+        assert!(matches!(
+            telemetry.complete_success(attempt, kiko_slam::HostMonotonicTimestamp::from_nanos(199)),
+            Err(LiveSlamTelemetryError::CompletionBeforeSource { .. })
+        ));
+
+        let ordered = test_slam_telemetry();
+        let first = ordered
+            .begin(kiko_slam::HostMonotonicTimestamp::from_nanos(300))
+            .expect("pair starts");
+        ordered
+            .complete_success(first, kiko_slam::HostMonotonicTimestamp::from_nanos(400))
+            .expect("pair completes");
+        assert!(matches!(
+            ordered.begin(kiko_slam::HostMonotonicTimestamp::from_nanos(299)),
+            Err(LiveSlamTelemetryError::SourceArrivalRegressed { .. })
+        ));
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn live_slam_rate_window_retains_the_latest_sixty_four_completions() {
+        let telemetry = test_slam_telemetry();
+        let mut snapshot = None;
+        for index in 0_u64..65 {
+            let source = kiko_slam::HostMonotonicTimestamp::from_nanos(index * 10);
+            let completion = kiko_slam::HostMonotonicTimestamp::from_nanos(index * 10 + 1);
+            let attempt = telemetry.begin(source).expect("ordered pair starts");
+            snapshot = Some(
+                telemetry
+                    .complete_success(attempt, completion)
+                    .expect("ordered pair completes"),
+            );
+        }
+        let snapshot = snapshot.expect("the loop produced a snapshot");
+        assert_eq!(snapshot.started_pairs, 65);
+        assert_eq!(snapshot.successful_pairs, 65);
+        assert_eq!(
+            snapshot.rate_window,
+            Some(super::LiveSlamRateWindowEvidence {
+                successful_completions: 64,
+                span_ns: 630,
+            })
+        );
+    }
 
     #[cfg(all(feature = "nano-agent", unix))]
     #[test]

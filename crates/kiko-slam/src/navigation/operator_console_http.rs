@@ -2363,6 +2363,8 @@ mod tests {
             "requested-owner-state",
             "readiness-state",
             "physical-estop-state",
+            "oak-health",
+            "slam-health",
             "fault-state",
             "telemetry-state",
             "map-freshness",
@@ -2375,7 +2377,8 @@ mod tests {
             );
         }
         assert!(VIEW_MODEL_JS.contains("function parseConsoleSnapshot(raw)"));
-        assert!(VIEW_MODEL_JS.contains("snapshot.schema_version !== 4"));
+        assert!(VIEW_MODEL_JS.contains("snapshot.schema_version !== 5"));
+        assert!(VIEW_MODEL_JS.contains("function parseSlam(value)"));
         assert!(VIEW_MODEL_JS.contains("snapshot.authority_kind"));
         assert!(VIEW_MODEL_JS.contains("map.grid geometry contract is unsupported"));
         assert!(VIEW_MODEL_JS.contains("function authorityView(snapshot, sessionId)"));

@@ -5,7 +5,7 @@ const model = require("./view-model.js");
 
 function snapshot() {
   return {
-    schema_version: 4,
+    schema_version: 5,
     authority_kind: "production_external_interlocks",
     revision: "9",
     telemetry_observed_at_host_monotonic_ns: "1000",
@@ -46,6 +46,19 @@ function snapshot() {
       solver_duration_ns: "1500000",
       control_tick_lateness_ns: "250000",
     },
+    slam: {
+      inference: {
+        superpoint: { requested: "auto", selected: "cpu" },
+        lightglue: { requested: "cpu", selected: "cpu" },
+      },
+      started_pairs: "12",
+      successful_pairs: "10",
+      recoverable_failures: "2",
+      fatal_failures: "0",
+      last_successful_source_arrival_host_monotonic_ns: "900",
+      last_successful_completion_host_monotonic_ns: "950",
+      rate_window: { successful_completions: 10, span_ns: "900000000" },
+    },
     last_requested_actuation: {
       downstream_request_id: "11",
       decision_id: "22",
@@ -66,6 +79,7 @@ function snapshot() {
       head: "ready",
       eyes: "ready",
       oak: "ready",
+      slam: "ready",
     },
     software_safety_stop_latched: false,
     software_safety_signal_state: "not_latched",
@@ -326,6 +340,33 @@ for (const invalid of [
 }
 
 {
+  const unresolved = snapshot();
+  unresolved.slam.inference.superpoint.selected = "auto";
+  assert.throws(() => model.parseConsoleSnapshot(unresolved), /selected is unsupported/);
+
+  const impossibleCounters = snapshot();
+  impossibleCounters.slam.started_pairs = "11";
+  assert.throws(
+    () => model.parseConsoleSnapshot(impossibleCounters),
+    /at most one in-flight pair/,
+  );
+
+  const reversedClock = snapshot();
+  reversedClock.slam.last_successful_completion_host_monotonic_ns = "899";
+  assert.throws(
+    () => model.parseConsoleSnapshot(reversedClock),
+    /completion precedes its source arrival/,
+  );
+
+  const emptyRateWindow = snapshot();
+  emptyRateWindow.slam.rate_window.span_ns = "0";
+  assert.throws(
+    () => model.parseConsoleSnapshot(emptyRateWindow),
+    /rate window is inconsistent/,
+  );
+}
+
+{
   const view = model.authorityView(snapshot(), "7");
   assert.equal(view.actualLabel, "agent · frontier explore · lease 19");
   assert.equal(view.requestedLabel, "this session · frontier explore · generation 11");
@@ -335,7 +376,10 @@ for (const invalid of [
 {
   const view = model.readinessView(snapshot());
   assert.equal(view.className, "ready");
-  assert.equal(view.readinessLabel, "runtime active / frontier explore · STM32 ready · OAK ready");
+  assert.equal(
+    view.readinessLabel,
+    "runtime active / frontier explore · STM32 ready · OAK ready · SLAM ready",
+  );
 }
 
 {
