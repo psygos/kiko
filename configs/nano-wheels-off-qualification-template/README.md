@@ -49,10 +49,10 @@ asking deployment-time string replacement to make software-policy decisions:
 - Rerun is decimated by 2 with a 128 MiB memory bound and 2 s flush timeout;
 - map/dataset storage has explicit 64 MiB, 4 GiB, file-count, ingress-count,
   free-space, and terminal-reserve bounds; and
-- the superseding natural-head policy is copied exactly: operator-confirmed
-  target `[2174,2570,1637,3047]`, start bounds
-  `[2133,2550,1617,3023]..[2194,2660,1852,3067]`, software travel caps
-  `[48,96,224,32]`, and retained torque limits `[600,400,400,400]`, all in
+- the replacement-bow-servo natural-head policy is copied exactly: field
+  target `[1505,3937,1551,3018]`, start bounds
+  `[1377,3809,1423,2890]..[1633,4065,1679,3146]`, software travel caps
+  `[128,128,128,128]`, and holding torque limits `[650,550,400,400]`, all in
   bow/curl/yaw/roll order; and
 - the RGB-expression values retain the operator-declared head origin
   `[0.0,-0.25,-0.20] m` and parallel neutral axes.
@@ -78,17 +78,18 @@ fixes only these currently declared facts:
 - a two-dimensional face ray uses an assumed `1.5 m` camera-forward focus
   plane, not observed range;
 - the natural encoder declaration is bow/curl/yaw/roll
-  `[2174, 2570, 1637, 3047]`;
+  `[1505, 3937, 1551, 3018]`;
 - the active four-axis configuration SHA-256
-  `0d98af8c9fde9f34686375ff49a963c9f290386e3bdb7d623390cc3fbe82085f`
-  supplies software offset limits `[110,180,480,160]`, which produce the
+  `46d69519425caba5ace1920d39ff8a07101bf86b79eacb1cdeb53f1dd8957a56`
+  supplies software offset limits `[110,150,480,160]`, which produce the
   inclusive envelopes
-  `[2064..2284,2390..2750,1157..2117,2887..3207]`;
-- the same configuration plus source SHA-256
-  `a41f6d4717dd1b301da04e89906587aa6d4f1b9238e041ab9e9480e8bc1938ad`
-  supplies the exact coordinate conversion: pitch-down maps to bow/curl
-  `[-93,+465]` ticks/radian, yaw-right maps to yaw `-1050` ticks/radian,
-  and character-positive full scale maps to `[+110,-180,+480,+160]` ticks;
+  `[1395..1615,3787..4087,1071..2031,2858..3178]`;
+- the same configuration supplies the exact coordinate conversion: its
+  pitch-up convention maps through `620 ticks/radian`, bow/curl shares
+  `0.35/0.65`, and curl sign `-1`; after conversion to canonical pitch-down,
+  that is bow/curl `[-217,+403]` ticks/radian. Yaw-right maps to yaw `-1050`
+  ticks/radian, and character-positive full scale maps to
+  `[+110,-150,+480,+160]` ticks;
 - the Fable behavior specification supplies dynamic serial-pitch recruitment:
   bow grows from the coefficient-derived baseline share toward `600` permille
   and reaches that share at `140` combined absolute pitch-demand ticks. These
@@ -101,7 +102,7 @@ fixes only these currently declared facts:
   The parser requires opposing pitch signs and enough natural-to-minimum
   travel; composed overflow is reported and withheld rather than clamped;
 - the compliant-hold declaration is cross-bound to the currently configured
-  startup torque limits `[600,400,400,400]` permille. This records what the
+  startup torque limits `[650,550,400,400]` permille. This records what the
   runtime would install; it does **not** claim those limits are the minimum
   safe holding torque or that contact dynamics have been commissioned; and
 - the lifecycle is `proposal_only`.

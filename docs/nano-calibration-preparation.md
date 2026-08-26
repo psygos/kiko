@@ -24,6 +24,14 @@ plant/MPC/control periods, a 100 ms shadow lease, candidate-compatible
 costmap freshness, and explicit solver/journal limits. Those values are
 software admission choices, not tuned navigation or performance evidence.
 
+The operator geometry declarations currently available are retained in
+`docs/kiko-assembly-geometry-declaration-2026-08-27.md`. They include a
+0.293 m physical footprint radius, 0.05 m drive-axle midpoint height, and an
+OAK-housing offset whose “centre” datum remains ambiguous. The footprint is
+not yet a margin-inflated navigation radius, and the housing measurement is
+not yet an optical-centre-to-base transform. The preparer must continue to
+reject unresolved camera/base and native-IMU rotations rather than infer them.
+
 Only seven physically dependent `NAV_SHADOW_UNVALIDATED_*` leaves remain:
 world-to-occupancy rotation and translation, footprint radius, the minimum
 and maximum floor-relative global occupancy heights, and the minimum and

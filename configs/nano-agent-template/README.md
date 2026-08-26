@@ -136,20 +136,24 @@ explicit `SUPER_PLUS/SUPER` startup was not reliable. Retained launch
 documents with that exact policy remain parseable and retain their request;
 fresh rendering does not silently select or relabel it.
 
-The renderer also admits only the superseding bow/curl/yaw/roll head policy:
-target `[2174,2570,1637,3047]`, start bounds
-`[2133,2550,1617,3023]..[2194,2660,1852,3067]`, software travel caps
-`[48,96,224,32]`, and torque limits `[600,400,400,400]`. These values and
-their deliberately narrow claim boundary are recorded in
-`docs/nano-head-neutral-policy-2026-07-29.md`. They do not replace the
-attended wheels-off return-and-hold test.
+The renderer admits only the replacement-bow-servo bow/curl/yaw/roll head
+policy: target `[1505,3937,1551,3018]`, start bounds
+`[1377,3809,1423,2890]..[1633,4065,1679,3146]`, software travel caps
+`[128,128,128,128]`, and holding torque limits `[650,550,400,400]`. These
+values come from the 2026-08-06 Fable field configuration whose SHA-256 is
+`46d69519425caba5ace1920d39ff8a07101bf86b79eacb1cdeb53f1dd8957a56`.
+The exact claim boundary and the older policy it supersedes are recorded in
+`docs/kiko-head-assembly-policy-2026-08-27.md`. This source binding does not
+replace a fresh attended wheels-off return, hold, compliance, and expression
+review for the rendered binary.
 
 Production physical-expression admission additionally requires the typed
-dynamic serial-pitch block. The checked-in source retains Fable's behavior
-constants: bow recruitment approaches `600` permille of combined bow/curl
-pitch demand and is complete at `140` total demand ticks. The renderer does
-not treat those constants, or this illustrative encoder mapping, as an
-attended physical review.
+dynamic serial-pitch block. At small demand the current mapping assigns
+`217/620` of pitch to bow and `403/620` to curl; canonical pitch-down therefore
+maps to `[-217,+403]` bow/curl ticks per radian. Bow recruitment approaches
+`600` permille of combined demand and is complete at `140` total demand ticks.
+The renderer does not treat those source-bound constants as a fresh attended
+physical review.
 
 Admission also requires Fable's typed rapid-turn posture. Yaw demand below
 `120 ticks/s` produces no posture. Excess rate recruits up to `26` equal

@@ -1,5 +1,10 @@
 # Nano head neutral-policy evidence — 2026-07-29
 
+> Historical assembly record. The bow servo was subsequently replaced.
+> Current canonical constants are source-bound in
+> `docs/kiko-head-assembly-policy-2026-08-27.md`; do not use the values below
+> to render a new bundle for the installed neck.
+
 This document records the evidence used to supersede Kiko's canonical
 bow/curl/yaw/roll neutral target and startup policy. It does not alter the
 historical records of earlier head returns, and it does not authorize wheel

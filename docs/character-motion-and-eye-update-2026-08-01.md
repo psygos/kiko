@@ -6,6 +6,11 @@ Scope: canonical host/runtime and RP2350 eye-firmware source
 
 Hardware action in this change: none
 
+Calibration supersession: the character design and source evidence in this
+document remain relevant, but any natural pose, curl range, pitch share, or
+torque value predating the 2026-08-06 bow-servo replacement is historical.
+Current values are in `docs/kiko-head-assembly-policy-2026-08-27.md`.
+
 ## Outcome
 
 Kiko now has one deterministic character decision per accepted RGB frame. The

@@ -270,18 +270,17 @@ behavior, voltage/temperature
 limits, process-kill behavior, and safe natural-pose approach have been
 qualified on this assembly.
 
-The superseding production target is the operator-confirmed bow/curl/yaw/roll
-pose `[2174,2570,1637,3047]`. Its start window is the exact per-joint union of
-that target plus/minus 20 ticks and the five-sample canonical stopped pose
-`[2153,2640,1832,3043]` plus/minus 20 ticks:
-`[2133..2194,2550..2660,1617..1852,3023..3067]`. Policy parsing rejects a
-window which excludes any part of the target tolerance or widens beyond that
-union. It also requires the exact software travel caps `[48,96,224,32]`,
-which cover the respective worst admitted start-to-target distances
-`[41,90,215,24]`. Neither the admission window nor those caps claim a
-mechanical envelope or a completed Kiko motion qualification; the bounded
-evidence and claim limits are recorded in
-`docs/nano-head-neutral-policy-2026-07-29.md`.
+The current production target is the operator-confirmed replacement-bow-servo
+bow/curl/yaw/roll pose `[1505,3937,1551,3018]`. Its commissioning start window
+is the symmetric 128-tick envelope
+`[1377..1633,3809..4065,1423..1679,2890..3146]`; policy parsing requires the
+exact window and software travel caps `[128,128,128,128]`. Current holding
+torque is `[650,550,400,400]` permille. These values are source-bound to the
+2026-08-06 Fable configuration, not inferred from the earlier neck. Neither
+the admission window nor those caps claim a mechanical envelope or a fresh
+unattended return qualification. The evidence, mapping derivation, and
+supersession boundary are recorded in
+`docs/kiko-head-assembly-policy-2026-08-27.md`.
 
 The production head handle has no torque-disable operation. A terminal
 health/accessory fault stops the base/eye path but keeps the head owner and

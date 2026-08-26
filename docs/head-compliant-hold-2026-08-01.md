@@ -1,5 +1,10 @@
 # Four-axis compliant hold
 
+Calibration supersession: the controller/state-machine design in this
+document remains current, but physical constants predating the 2026-08-06
+bow-servo replacement are historical. Current natural, envelope, and torque
+values are source-bound in `docs/kiko-head-assembly-policy-2026-08-27.md`.
+
 ## Outcome
 
 Kiko now has a source-complete, disabled-until-reviewed compliant-hold path in

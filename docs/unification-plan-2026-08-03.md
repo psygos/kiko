@@ -221,6 +221,19 @@ remaining work; a passing host test is never presented as physical evidence.
   normalized character offsets, encoder ticks, and physical motion remain
   explicitly non-equivalent domains. Intent: make general software parity a
   reproducible gate without manufacturing a physical-parity claim.
+- `92acb38`: the canonical natural-return and head-gaze policy now uses
+  Fable's 2026-08-06 replacement-bow-servo configuration rather than the
+  superseded July neck values. The one exported constant set carries target
+  `[1505,3937,1551,3018]`, symmetric 128-tick start/travel bounds, and
+  `[650,550,400,400]` holding torque into both the agent and renderer. The
+  canonical pitch-down mapping is derived from Fable's opposite pitch-up
+  convention as bow/curl `[-217,+403]` ticks/radian; expressive envelopes,
+  character scale, and full source digest follow the same current JSON. A
+  regression test derives these facts from the retained Fable file and checks
+  both policy templates, while the renderer no longer owns a duplicate
+  constant copy. Intent: make the single-owner binary capable of representing
+  the neck that is actually installed, without relabelling source parity as a
+  fresh physical qualification.
 - `29ec63d`: console snapshot schema V5 now separates OAK stream health from
   sparse-SLAM completion health. One fixed-size telemetry owner retains exact
   started, successful, recoverable, and fatal outcomes; successful source and
