@@ -47,6 +47,8 @@ const SACCADE_MAX_NS: u64 = 2_400 * NS_PER_MS;
 const SACCADE_HOLD_NS: u64 = 120 * NS_PER_MS;
 const SACCADE_DECAY_NS: u64 = 280 * NS_PER_MS;
 const HEAD_EYE_LEAD_NS: u64 = 120 * NS_PER_MS;
+const REST_AFTER_IDLE_NS: u64 = 20 * NS_PER_SECOND;
+const REST_EASE_NS: u64 = 6 * NS_PER_SECOND;
 const NEVER_RUN: u64 = u64::MAX;
 
 /// Dimensionless signed character displacement scale.
@@ -668,6 +670,8 @@ impl EyeFields {
 pub struct AutonomicCharacterEngine {
     random_state: u64,
     initialized: bool,
+    created_ns: u64,
+    life_phase_milli: [u16; 6],
     ever_saw_face: bool,
     mode: CharacterMode,
     mode_started_ns: u64,
@@ -701,6 +705,8 @@ impl AutonomicCharacterEngine {
                 seed
             },
             initialized: false,
+            created_ns: 0,
+            life_phase_milli: [0; 6],
             ever_saw_face: false,
             mode: CharacterMode::Idle,
             mode_started_ns: 0,
@@ -819,6 +825,11 @@ impl AutonomicCharacterEngine {
         let mut head = HeadFields::default();
         self.apply_head_mode(&mut head, now_ns);
         self.apply_head_act(&mut head, now_ns);
+        let rest_envelope = self.rest_envelope(now_ns);
+        head.bow = head.bow * rest_envelope / SCALE;
+        head.curl = head.curl * rest_envelope / SCALE;
+        head.yaw = head.yaw * rest_envelope / SCALE;
+        head.roll = head.roll * rest_envelope / SCALE;
         PreparedCharacterFrame::new(
             prepared.with_intent(fields.into_intent()),
             CharacterHeadOverlay::from_clamped(head),
@@ -832,6 +843,7 @@ impl AutonomicCharacterEngine {
             return;
         }
         self.initialized = true;
+        self.created_ns = now_ns;
         self.mode_started_ns = now_ns;
         self.last_face_ns = now_ns;
         self.next_blink_ns = saturating_add(
@@ -844,6 +856,13 @@ impl AutonomicCharacterEngine {
             now_ns,
             self.random_range(FIRST_ACT_MIN_NS, FIRST_ACT_MAX_NS),
         );
+        let life_phase_milli = core::array::from_fn(|_| {
+            u16::try_from(
+                self.next_u64() % u64::try_from(SCALE).expect("positive normalized scale"),
+            )
+            .expect("normalized phase seed fits u16")
+        });
+        self.life_phase_milli = life_phase_milli;
         self.playfulness_updated_ns = now_ns;
     }
 
@@ -864,6 +883,21 @@ impl AutonomicCharacterEngine {
             .expect("bounded playfulness decay fits u16");
         self.playfulness_milli = self.playfulness_milli.saturating_sub(decrease);
         self.playfulness_updated_ns = now_ns;
+    }
+
+    fn rest_envelope(&self, now_ns: u64) -> i32 {
+        if matches!(self.mode, CharacterMode::Greeting | CharacterMode::Tracking) {
+            return SCALE;
+        }
+        let idle_ns = now_ns.saturating_sub(self.last_face_ns);
+        if idle_ns <= REST_AFTER_IDLE_NS {
+            return SCALE;
+        }
+        let easing_ns = idle_ns - REST_AFTER_IDLE_NS;
+        if easing_ns >= REST_EASE_NS {
+            return 0;
+        }
+        SCALE - minimum_jerk_ramp(normalized_phase(easing_ns, REST_EASE_NS))
     }
 
     fn update_mode(&mut self, face_present: bool, now_ns: u64) {
@@ -997,6 +1031,7 @@ impl AutonomicCharacterEngine {
         if self.active_act.is_some()
             || now_ns < self.next_act_ns
             || !matches!(self.mode, CharacterMode::Idle | CharacterMode::Tracking)
+            || self.rest_envelope(now_ns) == 0
         {
             return;
         }
@@ -1318,7 +1353,44 @@ impl AutonomicCharacterEngine {
                 fields.yaw += scale_wave(elapsed, 17 * NS_PER_SECOND, 10);
                 fields.roll += scale_wave(elapsed, 13 * NS_PER_SECOND, 14);
             }
-            CharacterMode::Idle | CharacterMode::Tracking => {}
+            CharacterMode::Idle | CharacterMode::Tracking => {
+                let living_elapsed = now_ns.saturating_sub(self.created_ns);
+                let phase = self.life_phase_milli;
+                // Two incommensurate slow waves make the energy ebb instead
+                // of exposing one endlessly repeated mechanical loop.
+                let energy_tide = 720
+                    + phase_shifted_sine_wave(living_elapsed, phase[1], 299 * NS_PER_SECOND, SCALE)
+                        * phase_shifted_sine_wave(
+                            living_elapsed,
+                            phase[3],
+                            483 * NS_PER_SECOND,
+                            280,
+                        )
+                        / SCALE;
+                let pitch =
+                    (phase_shifted_sine_wave(living_elapsed, phase[0], 14_600 * NS_PER_MS, 70)
+                        + phase_shifted_sine_wave(living_elapsed, phase[1], 6_900 * NS_PER_MS, 32))
+                        * energy_tide
+                        / SCALE;
+                let posture =
+                    (phase_shifted_sine_wave(living_elapsed, phase[0], 17_000 * NS_PER_MS, 45)
+                        + phase_shifted_sine_wave(living_elapsed, phase[5], 7_600 * NS_PER_MS, 22))
+                        * energy_tide
+                        / SCALE;
+                fields.bow += pitch * 2 / 5 + posture;
+                fields.curl += pitch * 3 / 5 + posture;
+                fields.yaw +=
+                    (phase_shifted_sine_wave(living_elapsed, phase[2], 20_300 * NS_PER_MS, 80)
+                        + phase_shifted_sine_wave(living_elapsed, phase[3], 9_400 * NS_PER_MS, 35))
+                        * energy_tide
+                        / SCALE;
+                fields.roll +=
+                    (phase_shifted_sine_wave(living_elapsed, phase[4], 23_300 * NS_PER_MS, 70)
+                        + phase_shifted_sine_wave(living_elapsed, phase[5], 8_600 * NS_PER_MS, 38))
+                        * energy_tide
+                        / SCALE
+                        + phase_shifted_sine_wave(living_elapsed, phase[4], 5_556 * NS_PER_MS, 55);
+            }
         }
     }
 
@@ -1709,6 +1781,44 @@ fn scale_wave(elapsed_ns: u64, period_ns: u64, amplitude: i32) -> i32 {
     normalized * amplitude / SCALE
 }
 
+fn phase_shifted_sine_wave(
+    elapsed_ns: u64,
+    phase_offset_milli: u16,
+    period_ns: u64,
+    amplitude: i32,
+) -> i32 {
+    if period_ns == 0 {
+        return 0;
+    }
+    let phase_offset_ns = u64::try_from(
+        u128::from(period_ns) * u128::from(phase_offset_milli)
+            / u128::try_from(SCALE).expect("positive normalized scale"),
+    )
+    .expect("normalized offset never exceeds its u64 period");
+    let shifted = u64::try_from(
+        (u128::from(elapsed_ns % period_ns) + u128::from(phase_offset_ns)) % u128::from(period_ns),
+    )
+    .expect("modulo period fits u64");
+    // Fast integer sine approximation. Unlike the retained triangle wave
+    // used by deliberately rhythmic acts, this has no velocity reversal at
+    // zero crossings and its slope joins across the period boundary. The
+    // 0.225 correction keeps the maximum error small without adding a float
+    // or libm dependency to this no-allocation frame path.
+    let doubled_phase =
+        i64::try_from(u128::from(shifted) * u128::from((2 * SCALE) as u32) / u128::from(period_ns))
+            .expect("sine phase is bounded");
+    let x = if doubled_phase <= i64::from(SCALE) {
+        doubled_phase
+    } else {
+        doubled_phase - 2 * i64::from(SCALE)
+    };
+    let scale = i64::from(SCALE);
+    let parabola = 4 * x - 4 * x * x.abs() / scale;
+    let corrected = parabola + 225 * (parabola * parabola.abs() / scale - parabola) / 1_000;
+    i32::try_from(corrected * i64::from(amplitude) / scale)
+        .expect("bounded sine amplitude fits i32")
+}
+
 fn drifting_palette(elapsed_ns: u64) -> [u8; 3] {
     const COLORS: [[u8; 3]; 6] = [
         [70, 180, 220],
@@ -1880,31 +1990,99 @@ mod tests {
             energy_milli: 0,
         });
 
-        let at_start = engine.render_character(
-            MonotonicTimestamp::from_nanos_since_epoch(start),
-            true,
-            prepared(start),
-        );
-        let during_eye_lead = engine.render_character(
-            MonotonicTimestamp::from_nanos_since_epoch(start + HEAD_EYE_LEAD_NS),
-            true,
-            prepared(start + HEAD_EYE_LEAD_NS),
-        );
-        let moving = engine.render_character(
-            MonotonicTimestamp::from_nanos_since_epoch(start + 500 * NS_PER_MS),
-            true,
-            prepared(start + 500 * NS_PER_MS),
-        );
-        let complete = engine.render_character(
-            MonotonicTimestamp::from_nanos_since_epoch(start + duration),
-            true,
-            prepared(start + duration),
-        );
+        let sample_act = |now_ns| {
+            let mut fields = HeadFields::default();
+            engine.apply_head_act(&mut fields, now_ns);
+            CharacterHeadOverlay::from_clamped(fields)
+        };
 
-        assert!(at_start.head().is_natural());
-        assert!(during_eye_lead.head().is_natural());
-        assert!(!moving.head().is_natural());
-        assert!(complete.head().is_natural());
+        assert!(sample_act(start).is_natural());
+        assert!(sample_act(start + HEAD_EYE_LEAD_NS).is_natural());
+        assert!(!sample_act(start + 500 * NS_PER_MS).is_natural());
+        assert!(sample_act(start + duration).is_natural());
+    }
+
+    #[test]
+    fn idle_living_motion_uses_every_joint_then_rests_and_wakes() {
+        let start = 8 * NS_PER_SECOND;
+        let mut engine = AutonomicCharacterEngine::new(20);
+        engine.initialize_if_needed(start);
+        engine.mode = CharacterMode::Idle;
+        engine.mode_started_ns = start;
+        engine.last_face_ns = start;
+        engine.life_phase_milli = [0; 6];
+        engine.next_act_ns = u64::MAX;
+
+        let mut moved = [false; 4];
+        for step in 1..=200_u64 {
+            let now_ns = start + step * 50 * NS_PER_MS;
+            let frame = engine.render_character(
+                MonotonicTimestamp::from_nanos_since_epoch(now_ns),
+                false,
+                prepared(now_ns),
+            );
+            for (axis_moved, amount) in moved.iter_mut().zip(frame.head().amounts()) {
+                *axis_moved |= amount.get() != 0;
+            }
+        }
+        assert_eq!(moved, [true; 4]);
+
+        let rested_at = start + REST_AFTER_IDLE_NS + REST_EASE_NS;
+        let rested = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(rested_at),
+            false,
+            prepared(rested_at),
+        );
+        assert!(rested.head().is_natural());
+
+        let sleepy_at = start + SLEEPY_AFTER_IDLE_NS + NS_PER_SECOND;
+        let still_rested = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(sleepy_at),
+            false,
+            prepared(sleepy_at),
+        );
+        assert_eq!(still_rested.mode(), CharacterMode::Sleepy);
+        assert!(still_rested.head().is_natural());
+
+        let wake_at = sleepy_at + NS_PER_MS;
+        engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(wake_at),
+            true,
+            prepared(wake_at),
+        );
+        let moving_at = wake_at + HEAD_EYE_LEAD_NS + 200 * NS_PER_MS;
+        let awake = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(moving_at),
+            true,
+            prepared(moving_at),
+        );
+        assert_eq!(awake.mode(), CharacterMode::Greeting);
+        assert!(!awake.head().is_natural());
+    }
+
+    #[test]
+    fn unattended_rest_envelope_has_exact_endpoints_and_never_rises() {
+        let start = 9 * NS_PER_SECOND;
+        let mut engine = AutonomicCharacterEngine::new(21);
+        engine.initialize_if_needed(start);
+        engine.mode = CharacterMode::Idle;
+        engine.last_face_ns = start;
+
+        assert_eq!(engine.rest_envelope(start + REST_AFTER_IDLE_NS), SCALE);
+        let mut previous = SCALE;
+        for step in 1..=600_u64 {
+            let now_ns = start + REST_AFTER_IDLE_NS + step * 10 * NS_PER_MS;
+            let envelope = engine.rest_envelope(now_ns);
+            assert!(envelope <= previous);
+            assert!((0..=SCALE).contains(&envelope));
+            previous = envelope;
+        }
+        assert_eq!(previous, 0);
+
+        engine.mode = CharacterMode::Sleepy;
+        assert_eq!(engine.rest_envelope(start + SLEEPY_AFTER_IDLE_NS), 0);
+        engine.mode = CharacterMode::Tracking;
+        assert_eq!(engine.rest_envelope(start + SLEEPY_AFTER_IDLE_NS), SCALE);
     }
 
     #[test]
@@ -1917,6 +2095,26 @@ mod tests {
             assert!(actual >= previous);
             assert!((0..=SCALE).contains(&actual));
             previous = actual;
+        }
+    }
+
+    #[test]
+    fn living_sine_has_exact_quadrants_and_stays_bounded() {
+        let period = 4 * NS_PER_SECOND;
+        assert_eq!(phase_shifted_sine_wave(0, 0, period, 100), 0);
+        assert_eq!(phase_shifted_sine_wave(NS_PER_SECOND, 0, period, 100), 100);
+        assert_eq!(
+            phase_shifted_sine_wave(2 * NS_PER_SECOND, 0, period, 100),
+            0
+        );
+        assert_eq!(
+            phase_shifted_sine_wave(3 * NS_PER_SECOND, 0, period, 100),
+            -100
+        );
+        assert_eq!(phase_shifted_sine_wave(0, 250, period, 100), 100);
+        for step in 0..=4_000_u64 {
+            let sample = phase_shifted_sine_wave(step * NS_PER_MS, 0, period, 100);
+            assert!((-100..=100).contains(&sample));
         }
     }
 
