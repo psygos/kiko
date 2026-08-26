@@ -75,8 +75,9 @@ use super::{
     NanoFacePerceptionShutdownClass, NanoFacePerceptionShutdownEvidence, NanoHeadGazeAssetRole,
     NanoLaunchAssetRole, NanoLaunchBoundAssetLoadError, NanoLaunchFacePerception,
     NanoObservedInventoryBuildError, NanoObservedInventoryBuilder,
-    NanoObservedInventoryEvidenceError, NanoPhysicalHeadGazeConfigError,
-    NanoProductionAdmissionError, NanoProductionAdmissionTimeline,
+    NanoObservedInventoryEvidenceError, NanoPetEvidenceJournalConfig,
+    NanoPetEvidenceJournalConfigError, NanoPetEvidenceLifecycleReadyEvidence,
+    NanoPhysicalHeadGazeConfigError, NanoProductionAdmissionError, NanoProductionAdmissionTimeline,
     NanoProductionAdmissionTimelineError, NavigationActuationConfigV1, NavigationClockEpoch,
     PendingLiveMpcControlDriver, PreparedNanoProductionRuntime,
     ProductionNavigationControllerBindingError, ProductionNavigationControllerBindingV1,
@@ -1032,6 +1033,12 @@ pub async fn bootstrap_nano_production(
                     NanoBootstrapPrimaryError::AccessoryHealthPeriod(source),
                 )
             })?;
+    let pet_evidence_journal = NanoPetEvidenceJournalConfig::for_state_root(roots.state_root())
+        .map_err(|source| {
+            NanoBootstrapError::before_hardware(
+                NanoBootstrapPrimaryError::PetEvidenceJournalConfig(source),
+            )
+        })?;
     let accessory_config = NanoAccessoryWorkerConfig::from_manifest_bound_policy(
         &probe_policy,
         accessory_stream_epoch,
@@ -1045,7 +1052,8 @@ pub async fn bootstrap_nano_production(
         NanoBootstrapError::before_hardware(NanoBootstrapPrimaryError::PhysicalHeadGazeConfig(
             source,
         ))
-    })?;
+    })?
+    .with_pet_evidence_journal(pet_evidence_journal);
     let (frontal_face_cascade, profile_face_cascade) = face_perception_assets.into_parts();
     let face_perception_assets =
         NanoFacePerceptionAssets::from_v3_loaded_assets(frontal_face_cascade, profile_face_cascade);
@@ -1060,6 +1068,15 @@ pub async fn bootstrap_nano_production(
     ) {
         return Err(NanoBootstrapError::before_hardware(
             NanoBootstrapPrimaryError::AccessoryFacePerceptionReadinessMissing,
+        )
+        .with_accessory_shutdown(accessory));
+    }
+    if !matches!(
+        accessory.readiness().pet_evidence(),
+        NanoPetEvidenceLifecycleReadyEvidence::Enabled(_)
+    ) {
+        return Err(NanoBootstrapError::before_hardware(
+            NanoBootstrapPrimaryError::PetEvidenceJournalReadinessMissing,
         )
         .with_accessory_shutdown(accessory));
     }
@@ -2760,8 +2777,10 @@ pub enum NanoBootstrapPrimaryError {
     AccessoryHealthPeriod(NanoAccessoryHealthPeriodError),
     AccessoryConfig(NanoAccessoryWorkerConfigError),
     PhysicalHeadGazeConfig(NanoPhysicalHeadGazeConfigError),
+    PetEvidenceJournalConfig(NanoPetEvidenceJournalConfigError),
     AccessoryStart(NanoAccessoryWorkerStartError),
     AccessoryFacePerceptionReadinessMissing,
+    PetEvidenceJournalReadinessMissing,
     AccessoryTerminalFault(NanoAccessoryTerminalFault),
     AccessoryFaultMonitor(NanoAccessoryFaultWaitError),
     OakConnect(oak_sys::ConnectionError),
@@ -2865,6 +2884,7 @@ impl std::error::Error for NanoBootstrapPrimaryError {
             Self::AccessoryHealthPeriod(source) => Some(source),
             Self::AccessoryConfig(source) => Some(source),
             Self::PhysicalHeadGazeConfig(source) => Some(source),
+            Self::PetEvidenceJournalConfig(source) => Some(source),
             Self::AccessoryStart(source) => Some(source),
             Self::AccessoryFaultMonitor(source) => Some(source),
             Self::OakConnect(source) => Some(source),
@@ -2903,6 +2923,7 @@ impl std::error::Error for NanoBootstrapPrimaryError {
             | Self::ControllerFingerprintMismatch
             | Self::ControllerEndpointMismatch { .. }
             | Self::AccessoryFacePerceptionReadinessMissing
+            | Self::PetEvidenceJournalReadinessMissing
             | Self::AccessoryTerminalFault(_)
             | Self::EmptyOpenedOakMxid
             | Self::StereoTimedOut { .. }

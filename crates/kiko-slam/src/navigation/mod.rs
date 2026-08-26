@@ -77,6 +77,8 @@ mod nano_observed_inventory;
 mod nano_operator_console_service;
 #[cfg(feature = "agent-runtime")]
 mod nano_pet_evidence;
+#[cfg(all(feature = "nano-agent", unix))]
+mod nano_pet_evidence_journal;
 #[cfg(all(feature = "nano-plant-promotion", unix))]
 pub mod nano_plant_promotion;
 #[cfg(all(
@@ -332,14 +334,15 @@ pub use nano_accessory_worker::{
 #[cfg(all(feature = "nano-agent", unix))]
 pub use nano_accessory_worker::{
     NANO_FACE_PERCEPTION_JOIN_TIMEOUT, NANO_FACE_PERCEPTION_STARTUP_TIMEOUT,
-    NanoFaceCascadeAssetEvidence, NanoFaceDiagnosticFrame, NanoFaceDiagnosticReceiver,
-    NanoFaceDiagnosticStatsHandle, NanoFacePerceptionAssetEvidence, NanoFacePerceptionConfigError,
-    NanoFacePerceptionJoinEvidence, NanoFacePerceptionReadyEvidence,
-    NanoFacePerceptionRuntimeError, NanoFacePerceptionShutdownClass,
-    NanoFacePerceptionShutdownEvidence, NanoFacePerceptionStageStats,
-    NanoFacePerceptionStageStatsHandle, NanoFacePerceptionThreadExit,
+    NANO_PET_EVIDENCE_JOURNAL_SHUTDOWN_TIMEOUT, NanoFaceCascadeAssetEvidence,
+    NanoFaceDiagnosticFrame, NanoFaceDiagnosticReceiver, NanoFaceDiagnosticStatsHandle,
+    NanoFacePerceptionAssetEvidence, NanoFacePerceptionConfigError, NanoFacePerceptionJoinEvidence,
+    NanoFacePerceptionReadyEvidence, NanoFacePerceptionRuntimeError,
+    NanoFacePerceptionShutdownClass, NanoFacePerceptionShutdownEvidence,
+    NanoFacePerceptionStageStats, NanoFacePerceptionStageStatsHandle, NanoFacePerceptionThreadExit,
     NanoHeadGazeActuationAvailability, NanoHeadGazeDiagnostic, NanoHeadGazeDiagnosticConfigError,
     NanoHeadGazeDiagnosticError, NanoHeadGazeLeaseBindError, NanoHeadGazeRgbProjectionEvidence,
+    NanoPetEvidenceLifecycleReadyEvidence, NanoPetEvidenceLifecycleShutdownEvidence,
     NanoPhysicalHeadGazeConfigError, NanoPhysicalHeadGazeRuntimeError,
 };
 #[cfg(all(
@@ -377,6 +380,16 @@ pub use nano_pet_evidence::{
     FABLE_PET_LOG_SCHEMA_LEGACY, MAX_NANO_PET_EVIDENCE_RECORD_BYTES, NANO_PET_EVIDENCE_SCHEMA_V1,
     NanoPetEpisodeEvidence, NanoPetEvidenceDecodeError, NanoPetEvidenceEncodeError,
     NanoPetEvidenceFormat, NanoPetReplayComparison,
+};
+#[cfg(all(feature = "nano-agent", unix))]
+pub use nano_pet_evidence_journal::{
+    MAX_NANO_PET_EVIDENCE_JOURNAL_BYTES, NANO_PET_EVIDENCE_JOURNAL_FILENAME,
+    NANO_PET_EVIDENCE_JOURNAL_QUEUE_CAPACITY, NanoPetEvidenceJournal, NanoPetEvidenceJournalConfig,
+    NanoPetEvidenceJournalConfigError, NanoPetEvidenceJournalExit,
+    NanoPetEvidenceJournalIoOperation, NanoPetEvidenceJournalJoinEvidence,
+    NanoPetEvidenceJournalReadyEvidence, NanoPetEvidenceJournalRuntimeError,
+    NanoPetEvidenceJournalShutdownEvidence, NanoPetEvidenceJournalShutdownSignalError,
+    NanoPetEvidenceJournalStartError, NanoPetEvidenceJournalStats,
 };
 #[cfg(all(
     feature = "agent-runtime",

@@ -38,6 +38,8 @@ use std::sync::{Arc, Mutex};
 ))]
 use std::thread;
 use std::thread::JoinHandle;
+#[cfg(feature = "nano-agent")]
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "nano-agent")]
@@ -111,6 +113,16 @@ use super::{
     ManifestBoundNanoAgentPolicyConfigV3, NanoRgbExpressionConfig, RgbExpressionBridge,
     RgbExpressionBridgeError,
 };
+#[cfg(all(feature = "nano-agent", test))]
+use super::{
+    NanoPetEpisodeEvidence, NanoPetEvidenceJournalExit, NanoPetEvidenceJournalJoinEvidence,
+};
+#[cfg(feature = "nano-agent")]
+use super::{
+    NanoPetEvidenceJournal, NanoPetEvidenceJournalConfig, NanoPetEvidenceJournalReadyEvidence,
+    NanoPetEvidenceJournalRuntimeError, NanoPetEvidenceJournalShutdownEvidence,
+    NanoPetEvidenceJournalStartError,
+};
 #[cfg(feature = "nano-agent")]
 use crate::{
     ChannelCapacity, ChannelStats, ChannelStatsHandle, DropPolicy, DropReceiver, DropSender,
@@ -125,6 +137,10 @@ pub const MAX_NANO_ACCESSORY_HEALTH_PERIOD: Duration = Duration::from_secs(5);
 /// public terminal-fault monitor. Expiry is itself reported as a typed monitor
 /// timeout; it is not evidence that the original fault disappeared.
 pub const NANO_ACCESSORY_TERMINAL_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bounded coordinated shutdown/join budget for the non-actuating evidence
+/// writer. Expiry is retained as detachment evidence, never claimed as a join.
+#[cfg(feature = "nano-agent")]
+pub const NANO_PET_EVIDENCE_JOURNAL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum wait for the hardware-free native detector constructor to report
 /// readiness. Expiry requests shutdown and returns typed cleanup evidence; it
@@ -415,6 +431,8 @@ pub struct NanoAccessoryWorkerConfig {
     head_gaze_diagnostics: Option<HeadGazeFaceProposalAdapter>,
     #[cfg(feature = "nano-agent")]
     physical_head_gaze: Option<NanoPhysicalHeadGazeConfig>,
+    #[cfg(feature = "nano-agent")]
+    pet_evidence_journal: Option<NanoPetEvidenceJournalConfig>,
 }
 
 impl NanoAccessoryWorkerConfig {
@@ -457,7 +475,18 @@ impl NanoAccessoryWorkerConfig {
             head_gaze_diagnostics: None,
             #[cfg(feature = "nano-agent")]
             physical_head_gaze: None,
+            #[cfg(feature = "nano-agent")]
+            pet_evidence_journal: None,
         })
+    }
+
+    /// Attach the production state-root journal. Commissioning constructors
+    /// intentionally remain journal-disabled unless their caller does this
+    /// explicitly.
+    #[cfg(feature = "nano-agent")]
+    pub fn with_pet_evidence_journal(mut self, journal: NanoPetEvidenceJournalConfig) -> Self {
+        self.pet_evidence_journal = Some(journal);
+        self
     }
 
     /// Attach a parsed proposal-only policy to the non-actuating face
@@ -658,6 +687,13 @@ pub enum NanoAccessoryPerceptionReadyEvidence {
     Face(NanoFacePerceptionReadyEvidence),
 }
 
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NanoPetEvidenceLifecycleReadyEvidence {
+    Disabled,
+    Enabled(NanoPetEvidenceJournalReadyEvidence),
+}
+
 /// Readiness is emitted only after eye startup and the head's startup,
 /// reviewed return, and immediate exact-target health check all succeeded.
 /// In production, face-detector load evidence is also present because detector
@@ -667,6 +703,8 @@ pub struct NanoAccessoryReadyEvidence {
     eye: NanoEyeReadyEvidence,
     head: NanoHeadReadyEvidence,
     perception: NanoAccessoryPerceptionReadyEvidence,
+    #[cfg(feature = "nano-agent")]
+    pet_evidence: NanoPetEvidenceLifecycleReadyEvidence,
     stream_epoch: StreamEpochId,
     health_period: NanoAccessoryHealthPeriod,
     rgb_frame_freshness: Duration,
@@ -683,6 +721,11 @@ impl NanoAccessoryReadyEvidence {
 
     pub const fn perception(&self) -> &NanoAccessoryPerceptionReadyEvidence {
         &self.perception
+    }
+
+    #[cfg(feature = "nano-agent")]
+    pub const fn pet_evidence(&self) -> &NanoPetEvidenceLifecycleReadyEvidence {
+        &self.pet_evidence
     }
 
     pub const fn stream_epoch(&self) -> StreamEpochId {
@@ -1955,6 +1998,8 @@ pub enum NanoAccessoryTerminalFault {
     #[cfg(feature = "nano-agent")]
     FacePerception(NanoFacePerceptionRuntimeError),
     EyeApply(EyeHandleRequestError),
+    #[cfg(feature = "nano-agent")]
+    PetEvidence(NanoPetEvidenceJournalRuntimeError),
     RgbIngressDisconnected,
     RgbChannelPoisoned,
     ReadinessObserverDropped,
@@ -1976,6 +2021,8 @@ impl std::error::Error for NanoAccessoryTerminalFault {
             #[cfg(feature = "nano-agent")]
             Self::FacePerception(source) => Some(source),
             Self::EyeApply(source) => Some(source),
+            #[cfg(feature = "nano-agent")]
+            Self::PetEvidence(source) => Some(source),
             Self::HeadHealthStatusPoisoned
             | Self::RgbHealthStatusPoisoned
             | Self::RgbIngressDisconnected
@@ -2156,6 +2203,8 @@ pub struct NanoAccessoryShutdownEvidence {
     eye: NanoEyeShutdownEvidence,
     head: NanoHeadShutdownEvidence,
     #[cfg(feature = "nano-agent")]
+    pet_evidence: NanoPetEvidenceLifecycleShutdownEvidence,
+    #[cfg(feature = "nano-agent")]
     face_perception: NanoFacePerceptionShutdownEvidence,
 }
 
@@ -2169,6 +2218,11 @@ impl NanoAccessoryShutdownEvidence {
     }
 
     #[cfg(feature = "nano-agent")]
+    pub const fn pet_evidence(&self) -> &NanoPetEvidenceLifecycleShutdownEvidence {
+        &self.pet_evidence
+    }
+
+    #[cfg(feature = "nano-agent")]
     pub const fn face_perception(&self) -> &NanoFacePerceptionShutdownEvidence {
         &self.face_perception
     }
@@ -2179,9 +2233,29 @@ impl NanoAccessoryShutdownEvidence {
     ) -> (
         NanoEyeShutdownEvidence,
         NanoHeadShutdownEvidence,
+        NanoPetEvidenceLifecycleShutdownEvidence,
         NanoFacePerceptionShutdownEvidence,
     ) {
-        (self.eye, self.head, self.face_perception)
+        (self.eye, self.head, self.pet_evidence, self.face_perception)
+    }
+}
+
+/// Exact lifecycle result for the optional pet-evidence writer. Production
+/// enables it; qualification paths retain an explicit `Disabled` value.
+#[cfg(feature = "nano-agent")]
+#[derive(Debug)]
+pub enum NanoPetEvidenceLifecycleShutdownEvidence {
+    Disabled,
+    Enabled(NanoPetEvidenceJournalShutdownEvidence),
+}
+
+#[cfg(feature = "nano-agent")]
+impl NanoPetEvidenceLifecycleShutdownEvidence {
+    pub fn clean(&self) -> bool {
+        match self {
+            Self::Disabled => true,
+            Self::Enabled(evidence) => evidence.clean(),
+        }
     }
 }
 
@@ -2191,10 +2265,18 @@ pub enum NanoAccessoryWorkerExit {
         message: Box<str>,
     },
     EyeSessionMaterialFailed(OsEyeSessionMaterialError),
-    EyeStartupFailed(Box<NanoEyeActorStartupError>),
+    #[cfg(feature = "nano-agent")]
+    PetEvidenceJournalStartupFailed(NanoPetEvidenceJournalStartError),
+    EyeStartupFailed {
+        source: Box<NanoEyeActorStartupError>,
+        #[cfg(feature = "nano-agent")]
+        pet_evidence: NanoPetEvidenceLifecycleShutdownEvidence,
+    },
     HeadStartupFailed {
         source: Box<NanoHeadActorStartupError>,
         eye_shutdown: Box<NanoEyeShutdownEvidence>,
+        #[cfg(feature = "nano-agent")]
+        pet_evidence: NanoPetEvidenceLifecycleShutdownEvidence,
     },
     Shutdown {
         terminal_fault: Option<NanoAccessoryTerminalFault>,
@@ -2218,7 +2300,9 @@ impl std::error::Error for NanoAccessoryWorkerExit {
         match self {
             Self::RuntimeBuildFailed { .. } => None,
             Self::EyeSessionMaterialFailed(source) => Some(source),
-            Self::EyeStartupFailed(source) => Some(source.as_ref()),
+            #[cfg(feature = "nano-agent")]
+            Self::PetEvidenceJournalStartupFailed(source) => Some(source),
+            Self::EyeStartupFailed { source, .. } => Some(source.as_ref()),
             Self::HeadStartupFailed { source, .. } => Some(source.as_ref()),
             Self::Shutdown {
                 terminal_fault: Some(source),
@@ -3738,6 +3822,30 @@ fn publish_face_diagnostic_if_active(
 struct AccessoryPetEpisode {
     completed_at: MonotonicTimestamp,
     episode: CharacterPetEpisode,
+    #[cfg(feature = "nano-agent")]
+    controller_evidence: AccessoryPetControllerEvidence,
+}
+
+#[cfg(feature = "nano-agent")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessoryPetControllerEvidence {
+    Completed(CompliantPetEpisodeSummary),
+    #[cfg(test)]
+    GenericCoreFixture(NanoPetEpisodeEvidence),
+}
+
+#[cfg(feature = "nano-agent")]
+impl AccessoryPetControllerEvidence {
+    fn try_append(
+        self,
+        journal: &mut NanoPetEvidenceJournal,
+    ) -> Result<(), NanoPetEvidenceJournalRuntimeError> {
+        match self {
+            Self::Completed(summary) => journal.try_append_completed(summary, SystemTime::now()),
+            #[cfg(test)]
+            Self::GenericCoreFixture(evidence) => journal.try_append(evidence),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3765,6 +3873,7 @@ fn adapt_pet_episode(
     Ok(AccessoryPetEpisode {
         completed_at: MonotonicTimestamp::from_nanos_since_epoch(completed_at_ns),
         episode,
+        controller_evidence: AccessoryPetControllerEvidence::Completed(summary),
     })
 }
 
@@ -3912,6 +4021,8 @@ enum CoreTerminalFault<H, G, B, E> {
     RgbHealthStatusPoisoned,
     Bridge(B),
     EyeApply(E),
+    #[cfg(feature = "nano-agent")]
+    PetEvidence(NanoPetEvidenceJournalRuntimeError),
     IngressDisconnected,
     ChannelPoisoned,
     ReadinessObserverDropped,
@@ -3943,6 +4054,7 @@ async fn run_accessory_core<F, H, E, B, Ready, RecordHealth, PublishFault, Latch
     mut bridge: B,
     channel: Arc<LatestFrameChannel<F>>,
     health_period: NanoAccessoryHealthPeriod,
+    #[cfg(feature = "nano-agent")] mut pet_evidence_journal: Option<&mut NanoPetEvidenceJournal>,
     observers: CoreObservers<Ready, RecordHealth, PublishFault, LatchFault>,
 ) -> CoreExit<
     E::StartError,
@@ -4022,7 +4134,7 @@ where
                 health.tick().await;
                 head.check_health().await
             } => {
-                match health_result {
+                let health_fault = match health_result {
                     Ok(evidence) => {
                         if record_health(evidence) {
                             None
@@ -4031,7 +4143,17 @@ where
                         }
                     }
                     Err(source) => Some(CoreTerminalFault::HeadHealth(source)),
-                }
+                };
+                #[cfg(feature = "nano-agent")]
+                let health_fault = if let Some(source) = pet_evidence_journal
+                    .as_deref_mut()
+                    .and_then(NanoPetEvidenceJournal::poll_fault)
+                {
+                    Some(CoreTerminalFault::PetEvidence(source))
+                } else {
+                    health_fault
+                };
+                health_fault
             }
             event = channel.next_event() => {
                 match event {
@@ -4044,13 +4166,29 @@ where
                             {
                                 Err(source) => Some(CoreTerminalFault::HeadGaze(source)),
                                 Ok(pet_feedback) => {
+                                    let mut completed_episode = None;
                                     if let Some(pet_feedback) = pet_feedback {
                                         bridge.note_pet_state(pet_feedback.state);
-                                        if let Some(pet_episode) = pet_feedback.completed_episode {
+                                        completed_episode = pet_feedback.completed_episode;
+                                    }
+                                    #[cfg(feature = "nano-agent")]
+                                    let pet_evidence_fault = completed_episode
+                                        .and_then(|episode| {
+                                            pet_evidence_journal.as_deref_mut().map(|journal| {
+                                                episode.controller_evidence.try_append(journal)
+                                            })
+                                        })
+                                        .and_then(Result::err)
+                                        .map(CoreTerminalFault::PetEvidence);
+                                    #[cfg(not(feature = "nano-agent"))]
+                                    let pet_evidence_fault = None;
+                                    if let Some(fault) = pet_evidence_fault {
+                                        Some(fault)
+                                    } else {
+                                        if let Some(pet_episode) = completed_episode {
                                             bridge.note_pet_episode(pet_episode);
                                         }
-                                    }
-                                    match eye.apply(intent.into_eye()).await {
+                                        match eye.apply(intent.into_eye()).await {
                                     Ok(()) => match channel.counters.record_processed_successfully() {
                                         Ok(()) => None,
                                         Err(
@@ -4061,6 +4199,7 @@ where
                                         ) => Some(CoreTerminalFault::RgbHealthStatusPoisoned),
                                     },
                                     Err(source) => Some(CoreTerminalFault::EyeApply(source)),
+                                        }
                                     }
                                 }
                             },
@@ -4780,9 +4919,21 @@ fn run_production_worker_with_face(
     )
 }
 
+#[cfg(feature = "nano-agent")]
+fn shutdown_pet_evidence_journal(
+    journal: Option<NanoPetEvidenceJournal>,
+) -> NanoPetEvidenceLifecycleShutdownEvidence {
+    match journal {
+        Some(journal) => NanoPetEvidenceLifecycleShutdownEvidence::Enabled(
+            journal.shutdown(NANO_PET_EVIDENCE_JOURNAL_SHUTDOWN_TIMEOUT),
+        ),
+        None => NanoPetEvidenceLifecycleShutdownEvidence::Disabled,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_production_worker_core<F, B, LatchFault>(
-    config: NanoAccessoryWorkerConfig,
+    mut config: NanoAccessoryWorkerConfig,
     channel: Arc<LatestFrameChannel<F>>,
     latest_head_health: Arc<Mutex<NanoAccessoryHeadHealthState>>,
     startup_tx: std::sync::mpsc::SyncSender<StartupSignal>,
@@ -4820,6 +4971,17 @@ where
             return NanoAccessoryWorkerExit::EyeSessionMaterialFailed(source);
         }
     };
+    #[cfg(feature = "nano-agent")]
+    let mut pet_evidence_journal = match config.pet_evidence_journal.take() {
+        Some(config) => match NanoPetEvidenceJournal::start(config) {
+            Ok(journal) => Some(journal),
+            Err(source) => {
+                let _ = startup_tx.send(StartupSignal::Failed);
+                return NanoAccessoryWorkerExit::PetEvidenceJournalStartupFailed(source);
+            }
+        },
+        None => None,
+    };
     let eye_clock = expression_clock.clone();
     let eye = SerialKep2EyePort::new(eye_config, eye_clock);
     let head = SerialReviewedNaturalHeadPort::new(
@@ -4837,6 +4999,13 @@ where
     let health_period = config.health_period;
     let rgb_frame_freshness =
         Duration::from_nanos(config.rgb_expression.frame_freshness().as_nanos());
+    #[cfg(feature = "nano-agent")]
+    let pet_evidence_ready = match pet_evidence_journal.as_ref() {
+        Some(journal) => {
+            NanoPetEvidenceLifecycleReadyEvidence::Enabled(journal.readiness().clone())
+        }
+        None => NanoPetEvidenceLifecycleReadyEvidence::Disabled,
+    };
     let readiness_head_health = Arc::clone(&latest_head_health);
     let readiness_lifecycle = Arc::clone(&lifecycle);
     let health_lifecycle = Arc::clone(&lifecycle);
@@ -4848,6 +5017,8 @@ where
         bridge,
         channel,
         health_period,
+        #[cfg(feature = "nano-agent")]
+        pet_evidence_journal.as_mut(),
         CoreObservers {
             ready: move |head: NanoHeadReadyEvidence, eye: NanoEyeReadyEvidence| {
                 let initial_health_recorded = readiness_head_health
@@ -4866,6 +5037,8 @@ where
                             eye,
                             head,
                             perception: perception_ready,
+                            #[cfg(feature = "nano-agent")]
+                            pet_evidence: pet_evidence_ready,
                             stream_epoch,
                             health_period,
                             rgb_frame_freshness,
@@ -4892,13 +5065,20 @@ where
         },
     ));
 
+    #[cfg(feature = "nano-agent")]
+    let pet_evidence = shutdown_pet_evidence_journal(pet_evidence_journal);
+
     match core_exit {
         CoreExit::EyeStartupFailed(source) => {
             // No ready signal was sent; wake the synchronous starter.
             // Sending can fail only if that starter disappeared.
             // `startup_tx` was moved into the readiness closure, so the channel
             // also disconnects here and wakes `recv`.
-            NanoAccessoryWorkerExit::EyeStartupFailed(Box::new(source))
+            NanoAccessoryWorkerExit::EyeStartupFailed {
+                source: Box::new(source),
+                #[cfg(feature = "nano-agent")]
+                pet_evidence,
+            }
         }
         CoreExit::HeadStartupFailed {
             source,
@@ -4906,6 +5086,8 @@ where
         } => NanoAccessoryWorkerExit::HeadStartupFailed {
             source: Box::new(source),
             eye_shutdown: Box::new(eye_shutdown),
+            #[cfg(feature = "nano-agent")]
+            pet_evidence,
         },
         CoreExit::Shutdown {
             terminal_fault,
@@ -4919,6 +5101,8 @@ where
                 evidence: Box::new(NanoAccessoryShutdownEvidence {
                     eye: eye_shutdown,
                     head: head_shutdown,
+                    #[cfg(feature = "nano-agent")]
+                    pet_evidence,
                     #[cfg(feature = "nano-agent")]
                     face_perception: NanoFacePerceptionShutdownEvidence::Disabled,
                 }),
@@ -4960,6 +5144,8 @@ fn map_production_core_fault(
             NanoAccessoryTerminalFault::FacePerception(source)
         }
         CoreTerminalFault::EyeApply(source) => NanoAccessoryTerminalFault::EyeApply(source),
+        #[cfg(feature = "nano-agent")]
+        CoreTerminalFault::PetEvidence(source) => NanoAccessoryTerminalFault::PetEvidence(source),
         CoreTerminalFault::IngressDisconnected => {
             #[cfg(feature = "nano-agent")]
             if face_perception_enabled {
@@ -4987,12 +5173,49 @@ fn map_production_core_fault(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "nano-agent")]
+    use std::fs;
+    #[cfg(feature = "nano-agent")]
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
 
     fn health_period(milliseconds: u64) -> NanoAccessoryHealthPeriod {
         NanoAccessoryHealthPeriod::try_from_duration(Duration::from_millis(milliseconds))
             .expect("valid test period")
+    }
+
+    #[cfg(feature = "nano-agent")]
+    static NEXT_PET_JOURNAL_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(feature = "nano-agent")]
+    struct PetJournalTestDirectory(PathBuf);
+
+    #[cfg(feature = "nano-agent")]
+    impl PetJournalTestDirectory {
+        fn create() -> Self {
+            let base = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+            for _ in 0..1_000 {
+                let serial = NEXT_PET_JOURNAL_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let path = base.join(format!(
+                    "kiko-accessory-pet-journal-{}-{serial}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(source) => panic!("create pet-journal test root: {source}"),
+                }
+            }
+            panic!("could not allocate pet-journal test root")
+        }
+    }
+
+    #[cfg(feature = "nano-agent")]
+    impl Drop for PetJournalTestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
@@ -6024,6 +6247,15 @@ mod tests {
         assert_eq!(clock.0.load(Ordering::Relaxed), 90);
     }
 
+    #[cfg(feature = "nano-agent")]
+    fn fake_tap_evidence() -> NanoPetEpisodeEvidence {
+        let line = concat!(
+            r#"{"schema_version":1,"wall":1787759000.25,"wall_unix_ms":1787759000250,"completed_monotonic_ns":10600000000,"episode":{"started_at":10.0,"started_monotonic_ns":10000000000,"completed_monotonic_ns":10600000000,"yield_entries":1,"samples":1,"peak_residual":[1,0,0,0],"delta_accum":0,"delta_samples":0,"reached_rest":false,"reached_comfy":false,"tap":true,"duration_s":0.6,"duration_ns":600000000,"mean_delta":0.0}}"#,
+            "\n"
+        );
+        NanoPetEpisodeEvidence::parse_ndjson_line(line.as_bytes()).expect("fake tap evidence")
+    }
+
     #[derive(Clone)]
     struct FakeHead {
         log: Arc<Mutex<Vec<&'static str>>>,
@@ -6088,6 +6320,10 @@ mod tests {
                             true,
                         )
                         .expect("valid fake tap"),
+                        #[cfg(feature = "nano-agent")]
+                        controller_evidence: AccessoryPetControllerEvidence::GenericCoreFixture(
+                            fake_tap_evidence(),
+                        ),
                     }),
                 }))
             } else {
@@ -6238,6 +6474,7 @@ mod tests {
                 bridge,
                 task_channel,
                 health_period(50),
+                None,
                 CoreObservers {
                     ready: move |head, eye| {
                         assert_eq!(head, "head_ready");
@@ -6284,6 +6521,7 @@ mod tests {
                 bridge,
                 task_channel,
                 health_period(50),
+                None,
                 CoreObservers {
                     ready: |_, _| true,
                     record_health: |_| true,
@@ -6318,6 +6556,7 @@ mod tests {
                 bridge,
                 task_channel,
                 health_period(50),
+                None,
                 CoreObservers {
                     ready: |_, _| true,
                     record_health: |_| true,
@@ -6356,6 +6595,7 @@ mod tests {
                 bridge,
                 task_channel,
                 health_period(50),
+                None,
                 CoreObservers {
                     ready: |_, _| true,
                     record_health: |_| true,
@@ -6390,6 +6630,132 @@ mod tests {
         );
         channel.request_shutdown();
         assert!(matches!(task.await.unwrap(), CoreExit::Shutdown { .. }));
+    }
+
+    #[cfg(feature = "nano-agent")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_pet_episode_is_enqueued_before_character_feedback_and_durable_on_shutdown() {
+        let root = PetJournalTestDirectory::create();
+        let config = NanoPetEvidenceJournalConfig::for_state_root(&root.0).unwrap();
+        let path = config.path();
+        let mut journal = NanoPetEvidenceJournal::start(config).expect("journal startup");
+        let (mut head, eye, bridge, log, _) = fakes(false, false, false, false, None);
+        head.emit_pet_episode = true;
+        let channel = Arc::new(LatestFrameChannel::new());
+        let task_channel = Arc::clone(&channel);
+
+        let core = run_accessory_core(
+            head,
+            eye,
+            bridge,
+            task_channel,
+            health_period(50),
+            Some(&mut journal),
+            CoreObservers {
+                ready: |_, _| true,
+                record_health: |_| true,
+                publish_fault: |_| {},
+                latch_fault: || {},
+            },
+        );
+        let producer = async {
+            assert_eq!(
+                channel.submit(10_u64),
+                NanoAccessoryFrameSubmitOutcome::Enqueued
+            );
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while channel.counters.snapshot().processed_successfully == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("episode enqueue and eye acknowledgement complete");
+            channel.request_shutdown();
+        };
+        let (exit, ()) = tokio::join!(core, producer);
+        assert!(matches!(exit, CoreExit::Shutdown { .. }));
+        assert!(log.lock().unwrap().contains(&"pet_episode"));
+
+        let shutdown = journal.shutdown(Duration::from_secs(1));
+        assert!(shutdown.clean());
+        let bytes = fs::read(path).expect("durable pet record");
+        let record = NanoPetEpisodeEvidence::parse_ndjson_line(&bytes).expect("typed record");
+        assert!(record.was_tap());
+        assert!(record.replay_comparison().unwrap().matches());
+    }
+
+    #[cfg(feature = "nano-agent")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn asynchronous_pet_journal_fault_latches_the_accessory_owner() {
+        let root = PetJournalTestDirectory::create();
+        let config = NanoPetEvidenceJournalConfig::for_state_root(&root.0).unwrap();
+        let path = config.path();
+        let mut journal = NanoPetEvidenceJournal::start(config).expect("journal startup");
+        fs::remove_file(&path).expect("replace admitted path");
+        fs::write(&path, []).expect("replacement file");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (mut head, eye, bridge, _, _) = fakes(false, false, false, false, None);
+        head.emit_pet_episode = true;
+        let channel = Arc::new(LatestFrameChannel::new());
+        let task_channel = Arc::clone(&channel);
+        let (fault_tx, mut fault_rx) = tokio::sync::mpsc::unbounded_channel();
+        let core = run_accessory_core(
+            head,
+            eye,
+            bridge,
+            task_channel,
+            health_period(5),
+            Some(&mut journal),
+            CoreObservers {
+                ready: |_, _| true,
+                record_health: |_| true,
+                publish_fault: move |fault| fault_tx.send(fault).unwrap(),
+                latch_fault: || {},
+            },
+        );
+        let producer = async {
+            assert_eq!(
+                channel.submit(11_u64),
+                NanoAccessoryFrameSubmitOutcome::Enqueued
+            );
+            let fault = tokio::time::timeout(Duration::from_millis(100), fault_rx.recv())
+                .await
+                .expect("journal fault reaches owner within health cadence")
+                .expect("fault publisher remains connected");
+            assert!(matches!(
+                fault,
+                CoreTerminalFault::PetEvidence(
+                    NanoPetEvidenceJournalRuntimeError::JournalPathReplaced { .. }
+                )
+            ));
+            assert_eq!(
+                channel.submit(12_u64),
+                NanoAccessoryFrameSubmitOutcome::TerminalFaultLatched
+            );
+            channel.request_shutdown();
+        };
+        let (exit, ()) = tokio::join!(core, producer);
+        assert!(matches!(
+            exit,
+            CoreExit::Shutdown {
+                terminal_fault: Some(CoreTerminalFault::PetEvidence(
+                    NanoPetEvidenceJournalRuntimeError::JournalPathReplaced { .. }
+                )),
+                ..
+            }
+        ));
+        let shutdown = journal.shutdown(Duration::from_secs(1));
+        assert!(!shutdown.clean());
+        assert!(matches!(
+            shutdown.join(),
+            super::NanoPetEvidenceJournalJoinEvidence::Joined(
+                super::NanoPetEvidenceJournalExit::Fault(
+                    NanoPetEvidenceJournalRuntimeError::JournalPathReplaced { .. }
+                )
+            )
+        ));
     }
 
     #[test]
@@ -6721,6 +7087,7 @@ mod tests {
             bridge,
             channel,
             health_period(50),
+            None,
             CoreObservers {
                 ready: move |_, _| {
                     ready_flag.store(true, Ordering::SeqCst);
@@ -6743,6 +7110,7 @@ mod tests {
             bridge,
             Arc::new(LatestFrameChannel::new()),
             health_period(50),
+            None,
             CoreObservers {
                 ready: |_, _| panic!("head startup failure cannot report ready"),
                 record_health: |_| true,
@@ -6767,6 +7135,7 @@ mod tests {
             bridge,
             Arc::new(LatestFrameChannel::new()),
             health_period(50),
+            None,
             CoreObservers {
                 ready: move |_, _| {
                     ready_flag.store(true, Ordering::SeqCst);
@@ -6806,6 +7175,7 @@ mod tests {
                 bridge,
                 task_channel,
                 health_period(5),
+                None,
                 CoreObservers {
                     ready: |_, _| true,
                     record_health: move |evidence| {
@@ -6853,6 +7223,7 @@ mod tests {
                 bridge,
                 task_channel,
                 health_period(5),
+                None,
                 CoreObservers {
                     ready: |_, _| true,
                     record_health: |_| true,
@@ -6929,6 +7300,7 @@ mod tests {
                 bridge,
                 task_channel,
                 health_period(50),
+                None,
                 CoreObservers {
                     ready: |_, _| true,
                     record_health: |_| true,
@@ -6990,6 +7362,7 @@ mod tests {
                 bridge,
                 task_channel,
                 health_period(5),
+                None,
                 CoreObservers {
                     ready: |_, _| true,
                     record_health: |_| true,
@@ -7018,6 +7391,7 @@ mod tests {
                 bridge,
                 task_channel,
                 health_period(5),
+                None,
                 CoreObservers {
                     ready: |_, _| true,
                     record_health: |_| true,

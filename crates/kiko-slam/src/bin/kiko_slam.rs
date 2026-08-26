@@ -11554,6 +11554,7 @@ struct NanoAccessoryShutdownSummary {
     terminal_fault: Option<NanoAccessoryTerminalFault>,
     eye_release_verified: bool,
     head_hold_preserving_release_completed: bool,
+    pet_evidence_clean: bool,
     face_perception: NanoFacePerceptionShutdownEvidence,
 }
 
@@ -11563,11 +11564,12 @@ impl NanoAccessoryShutdownSummary {
         terminal_fault: Option<NanoAccessoryTerminalFault>,
         evidence: NanoAccessoryShutdownEvidence,
     ) -> Self {
-        let (eye, head, face_perception) = evidence.into_parts();
+        let (eye, head, pet_evidence, face_perception) = evidence.into_parts();
         Self {
             terminal_fault,
             eye_release_verified: eye.release_verified(),
             head_hold_preserving_release_completed: head.hold_preserving_release_completed(),
+            pet_evidence_clean: pet_evidence.clean(),
             face_perception,
         }
     }
@@ -11603,6 +11605,7 @@ impl NanoAccessoryShutdownSummary {
         self.terminal_fault.is_none()
             && self.eye_release_verified
             && self.head_hold_preserving_release_completed
+            && self.pet_evidence_clean
             && self.face_classification().is_healthy()
     }
 }
@@ -11620,6 +11623,7 @@ enum LiveAccessoryError {
     UnexpectedExit(Box<NanoAccessoryWorkerExit>),
     EyeReleaseUnverified,
     HeadHoldPreservingReleaseUnverified,
+    PetEvidenceShutdownUnclean,
     FaceShutdown {
         kind: NanoFaceShutdownProblemKind,
         evidence: NanoFacePerceptionShutdownEvidence,
@@ -11672,6 +11676,9 @@ impl std::fmt::Display for LiveAccessoryError {
             Self::HeadHoldPreservingReleaseUnverified => formatter.write_str(
                 "the head hold-preserving ownership release could not be verified during accessory shutdown",
             ),
+            Self::PetEvidenceShutdownUnclean => formatter.write_str(
+                "the pet-evidence writer did not complete a clean coordinated shutdown and join",
+            ),
             Self::FaceShutdown { kind, evidence } => write!(
                 formatter,
                 "face-perception shutdown was {kind:?}; retained evidence: {evidence:?}"
@@ -11694,6 +11701,7 @@ impl std::error::Error for LiveAccessoryError {
             | Self::UnexpectedExit(_)
             | Self::EyeReleaseUnverified
             | Self::HeadHoldPreservingReleaseUnverified
+            | Self::PetEvidenceShutdownUnclean
             | Self::FaceShutdown { .. } => None,
         }
     }
@@ -12586,17 +12594,19 @@ impl Drop for NanoLiveSetupGuard {
                 if !summary.is_fully_healthy() {
                     if self.accessory_terminal_fault_reported && summary.terminal_fault.is_some() {
                         eprintln!(
-                            "early live setup accessory shutdown was not fully healthy: terminal_fault=retained_for_consistency_and_already_reported_by_primary eye_release_verified={} head_hold_preserving_release_completed={} face_perception={}",
+                            "early live setup accessory shutdown was not fully healthy: terminal_fault=retained_for_consistency_and_already_reported_by_primary eye_release_verified={} head_hold_preserving_release_completed={} pet_evidence_clean={} face_perception={}",
                             summary.eye_release_verified,
                             summary.head_hold_preserving_release_completed,
+                            summary.pet_evidence_clean,
                             summary.face_classification(),
                         );
                     } else {
                         eprintln!(
-                            "early live setup accessory shutdown was not fully healthy: terminal_fault={:?} eye_release_verified={} head_hold_preserving_release_completed={} face_perception={}",
+                            "early live setup accessory shutdown was not fully healthy: terminal_fault={:?} eye_release_verified={} head_hold_preserving_release_completed={} pet_evidence_clean={} face_perception={}",
                             summary.terminal_fault,
                             summary.eye_release_verified,
                             summary.head_hold_preserving_release_completed,
+                            summary.pet_evidence_clean,
                             summary.face_classification(),
                         );
                     }
@@ -12680,10 +12690,11 @@ impl Drop for NanoPostNavigationSetupGuard {
                     NanoAccessoryShutdownSummary::from_evidence(terminal_fault, *evidence);
                 if !summary.is_fully_healthy() {
                     eprintln!(
-                        "post-navigation setup accessory shutdown was not fully healthy: terminal_fault={:?} eye_release_verified={} head_hold_preserving_release_completed={} face_perception={}",
+                        "post-navigation setup accessory shutdown was not fully healthy: terminal_fault={:?} eye_release_verified={} head_hold_preserving_release_completed={} pet_evidence_clean={} face_perception={}",
                         summary.terminal_fault,
                         summary.eye_release_verified,
                         summary.head_hold_preserving_release_completed,
+                        summary.pet_evidence_clean,
                         summary.face_classification(),
                     );
                 }
@@ -12736,18 +12747,20 @@ impl std::fmt::Display for NanoPreOwnerAccessoryShutdown {
                 if *terminal_fault_already_reported && summary.terminal_fault.is_some() {
                     write!(
                         formatter,
-                        "accessory shutdown evidence (terminal_fault=retained_for_consistency_and_already_reported_by_primary, eye_release_verified={}, head_hold_preserving_release_completed={}, face_perception={})",
+                        "accessory shutdown evidence (terminal_fault=retained_for_consistency_and_already_reported_by_primary, eye_release_verified={}, head_hold_preserving_release_completed={}, pet_evidence_clean={}, face_perception={})",
                         summary.eye_release_verified,
                         summary.head_hold_preserving_release_completed,
+                        summary.pet_evidence_clean,
                         summary.face_classification(),
                     )
                 } else {
                     write!(
                         formatter,
-                        "accessory shutdown evidence (terminal_fault={:?}, eye_release_verified={}, head_hold_preserving_release_completed={}, face_perception={})",
+                        "accessory shutdown evidence (terminal_fault={:?}, eye_release_verified={}, head_hold_preserving_release_completed={}, pet_evidence_clean={}, face_perception={})",
                         summary.terminal_fault,
                         summary.eye_release_verified,
                         summary.head_hold_preserving_release_completed,
+                        summary.pet_evidence_clean,
                         summary.face_classification(),
                     )
                 }
@@ -17120,6 +17133,7 @@ fn run_prepared_live_session(
                         terminal_fault,
                         eye_release_verified,
                         head_hold_preserving_release_completed,
+                        pet_evidence_clean,
                         face_perception,
                     } = summary;
                     if let Some(fault) = terminal_fault
@@ -17137,6 +17151,11 @@ fn run_prepared_live_session(
                     if !head_hold_preserving_release_completed {
                         live_failures.push(LiveWorkerFailure::Accessory(
                             LiveAccessoryError::HeadHoldPreservingReleaseUnverified,
+                        ));
+                    }
+                    if !pet_evidence_clean {
+                        live_failures.push(LiveWorkerFailure::Accessory(
+                            LiveAccessoryError::PetEvidenceShutdownUnclean,
                         ));
                     }
                     if let Some(kind) = face_problem_kind {
@@ -18034,6 +18053,7 @@ mod tests {
                 ),
                 eye_release_verified: true,
                 head_hold_preserving_release_completed: true,
+                pet_evidence_clean: true,
                 face_perception: super::NanoFacePerceptionShutdownEvidence::Disabled,
             },
             terminal_fault_already_reported: true,
@@ -18050,6 +18070,7 @@ mod tests {
             terminal_fault: None,
             eye_release_verified: true,
             head_hold_preserving_release_completed: true,
+            pet_evidence_clean: true,
             face_perception: super::NanoFacePerceptionShutdownEvidence::Disabled,
         };
         assert!(disabled.is_fully_healthy());
@@ -18060,6 +18081,7 @@ mod tests {
             terminal_fault: None,
             eye_release_verified: true,
             head_hold_preserving_release_completed: true,
+            pet_evidence_clean: true,
             face_perception: super::NanoFacePerceptionShutdownEvidence::Join(
                 kiko_slam::navigation::NanoFacePerceptionJoinEvidence::DetachedAfterTimeout {
                     configured_timeout: std::time::Duration::from_secs(2),
