@@ -30,6 +30,18 @@ jobs:
           node --check crates/kiko-slam/src/operator-console/view-model.js
           node --check crates/kiko-slam/src/operator-console/app.js
 
+      - name: Compile the field expression specification
+        run: >-
+          python3 -m py_compile
+          deploy/expression/compliant_head.py
+          deploy/expression/head_thermal.py
+          deploy/expression/kiko_face_follow.py
+          deploy/expression/organic_motion.py
+          deploy/expression/test_compliant_head.py
+          deploy/expression/test_engine_lifecycle.py
+          deploy/expression/test_head_thermal.py
+          deploy/expression/test_organic_motion.py
+
       - name: Check standalone KEP2 eye firmware formatting
         run: >-
           cargo fmt --manifest-path firmware/eyes-kep2/Cargo.toml
@@ -188,6 +200,16 @@ jobs:
         run: >-
           cargo test --locked
           --manifest-path firmware/eyes-kep2/Cargo.toml
+
+      # This attended Python lane is the executable behavior specification
+      # until its field-proven incidents and motion semantics have equivalent
+      # coverage in the sole-owner Rust runtime. Keeping it in CI prevents the
+      # merge-back from silently drifting away from the robot-proven behavior.
+      - name: Test the field expression specification
+        run: >-
+          python3 -m unittest discover
+          -s deploy/expression
+          -p 'test_*.py'
 
       - name: Test Kiko Nano support crates
         env:
