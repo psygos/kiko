@@ -586,9 +586,7 @@ impl DescriptorWorker {
             }
             return Ok(PathBuf::from(path));
         }
-        Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("models")
-            .join("eigenplaces.onnx"))
+        Ok(PathBuf::from(crate::inference::WORKSPACE_MODEL_DIRECTORY).join("eigenplaces.onnx"))
     }
 
     fn model_path() -> Result<PathBuf, TrackerInitError> {
@@ -7380,6 +7378,10 @@ mod tests {
             DescriptorWorker::model_path_from_override(Some(override_path))
                 .expect("nonempty model path"),
             PathBuf::from("custom-eigenplaces.onnx")
+        );
+        assert_eq!(
+            DescriptorWorker::model_path_from_override(None).expect("workspace default"),
+            PathBuf::from(crate::inference::WORKSPACE_MODEL_DIRECTORY).join("eigenplaces.onnx")
         );
     }
 

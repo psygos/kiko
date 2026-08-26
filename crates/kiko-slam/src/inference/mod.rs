@@ -31,6 +31,12 @@ pub use backend::InferenceBackend;
 pub use eigenplaces::EigenPlaces;
 pub use place::PlaceDescriptorExtractor;
 
+/// Generic CLI model directory, resolved from the process working directory.
+///
+/// Nano launch paths do not use this development default: their exact model
+/// assets are loaded from the admitted immutable bundle.
+pub const WORKSPACE_MODEL_DIRECTORY: &str = "crates/kiko-slam/models";
+
 #[derive(Debug)]
 pub enum InferenceError {
     RuntimeLibraryUnavailable {

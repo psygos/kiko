@@ -1653,9 +1653,9 @@ impl InferenceConfig {
             .map(InferenceBackend::from)
             .unwrap_or(default_backend);
 
-        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
-        let sp_path = resolve_model_path(&model_dir, args.superpoint_model.as_ref(), "sp.onnx");
-        let lg_path = resolve_model_path(&model_dir, args.lightglue_model.as_ref(), "lg.onnx");
+        let model_dir = Path::new(kiko_slam::WORKSPACE_MODEL_DIRECTORY);
+        let sp_path = resolve_model_path(model_dir, args.superpoint_model.as_ref(), "sp.onnx");
+        let lg_path = resolve_model_path(model_dir, args.lightglue_model.as_ref(), "lg.onnx");
         eprintln!(
             "models: superpoint={} lightglue={}",
             sp_path.display(),
@@ -18511,6 +18511,28 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generic_cli_model_defaults_are_workspace_relative() {
+        let model_dir = Path::new(kiko_slam::WORKSPACE_MODEL_DIRECTORY);
+        assert!(model_dir.is_relative());
+        assert_eq!(
+            resolve_model_path(model_dir, None, "sp.onnx"),
+            PathBuf::from("crates/kiko-slam/models/sp.onnx")
+        );
+        assert_eq!(
+            resolve_model_path(model_dir, Some(&PathBuf::from("alternate.onnx")), "sp.onnx"),
+            PathBuf::from("crates/kiko-slam/models/alternate.onnx")
+        );
+        assert_eq!(
+            resolve_model_path(
+                model_dir,
+                Some(&PathBuf::from("/opt/models/sp.onnx")),
+                "sp.onnx"
+            ),
+            PathBuf::from("/opt/models/sp.onnx")
+        );
+    }
+
     #[cfg(all(feature = "record", feature = "actuation"))]
     use super::LiveNavigationWorkerMotion;
     #[cfg(all(
@@ -18548,7 +18570,7 @@ mod tests {
         classify_live_dense_route, classify_live_visual_shape, classify_lossless_send,
         combine_rerun_results, live_decision_viz_status, navigation_dataset_may_publish,
         occupancy_depth_camera, reject_removed_ba_motion_prior, require_level_optical_world,
-        take_deferred_offline_snapshot_error,
+        resolve_model_path, take_deferred_offline_snapshot_error,
     };
     #[cfg(feature = "record")]
     use super::{
@@ -18600,7 +18622,7 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::num::NonZeroU16;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},

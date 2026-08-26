@@ -187,7 +187,8 @@ convention and class annotations are static.
 
 ## Models
 
-Default model paths are resolved under `crates/kiko-slam/models/`:
+Generic CLI default model paths are resolved under
+`crates/kiko-slam/models/`, relative to the process working directory:
 
 - `sp.onnx` (SuperPoint)
 - `lg.onnx` (LightGlue)
@@ -195,7 +196,10 @@ Default model paths are resolved under `crates/kiko-slam/models/`:
 Override with `--superpoint-model` / `--lightglue-model` or `KIKO_SUPERPOINT_MODEL` /
 `KIKO_LIGHTGLUE_MODEL`. A SuperPoint override must implement Kiko's exact
 [tensor and coordinate profile](crates/kiko-slam/models/README.md); the path option does not infer
-or adapt alternate layouts, units, or axis orders.
+or adapt alternate layouts, units, or axis orders. Production and wheels-off
+Nano modes do not use this development default; they load exact model bytes
+from the admitted immutable bundle. No build-time source directory is embedded
+as a runtime model fallback.
 
 The offline compatibility tracker's learned place-recognition mode resolves
 `eigenplaces.onnx` from the same directory. That model is not stored in this
