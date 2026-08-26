@@ -33,8 +33,9 @@ pub use adapter::{
 pub use autonomic::{
     AutonomicCharacterEngine, CHARACTER_HEAD_SCALE, CharacterAct, CharacterAttention,
     CharacterBaseMotionState, CharacterBodyState, CharacterFaceAttention,
-    CharacterFaceAttentionState, CharacterHeadAmount, CharacterHeadAmountError, CharacterHeadAxis,
-    CharacterHeadOverlay, CharacterHeadOverlayParseError, CharacterInputs, CharacterMode,
+    CharacterFaceAttentionState, CharacterFirmwarePhase, CharacterFirmwareTarget,
+    CharacterHeadAmount, CharacterHeadAmountError, CharacterHeadAxis, CharacterHeadOverlay,
+    CharacterHeadOverlayParseError, CharacterInputs, CharacterLifecycleState, CharacterMode,
     CharacterPetEpisode, CharacterPetEpisodeError, CharacterPetReaction, CharacterPetState,
     CharacterThermalState, PreparedCharacterFrame, TrackingEyeGaze,
     TrackingEyeGazeReplacementError,

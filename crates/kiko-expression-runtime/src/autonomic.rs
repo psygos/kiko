@@ -59,6 +59,13 @@ const PET_VISUAL_ATTACK_NS: u64 = 350 * NS_PER_MS;
 const PET_VISUAL_RELEASE_NS: u64 = 900 * NS_PER_MS;
 const THERMAL_VISUAL_ATTACK_NS: u64 = 1_400 * NS_PER_MS;
 const THERMAL_VISUAL_RELEASE_NS: u64 = 2_600 * NS_PER_MS;
+const WAKE_RITUAL_NS: u64 = 2_400 * NS_PER_MS;
+const ADMISSION_RECOVERY_NS: u64 = 2_600 * NS_PER_MS;
+const FIRMWARE_ANESTHESIA_NS: u64 = 1_200 * NS_PER_MS;
+const FIRMWARE_WAKE_NS: u64 = 2_400 * NS_PER_MS;
+const FAULT_RECOVERY_NS: u64 = 1_400 * NS_PER_MS;
+const GOODNIGHT_NS: u64 = 1_800 * NS_PER_MS;
+const LIFECYCLE_RELEASE_NS: u64 = 1_200 * NS_PER_MS;
 const NEVER_RUN: u64 = u64::MAX;
 
 /// Dimensionless signed character displacement scale.
@@ -242,6 +249,7 @@ pub struct PreparedCharacterFrame {
     eye: PreparedEyeIntent,
     tracking_gaze: Option<TrackingEyeGaze>,
     head: CharacterHeadOverlay,
+    body: CharacterBodyState,
     mode: CharacterMode,
     act: Option<CharacterAct>,
 }
@@ -252,6 +260,7 @@ impl PreparedCharacterFrame {
             eye,
             tracking_gaze: None,
             head: CharacterHeadOverlay::NATURAL,
+            body: CharacterBodyState::UNAVAILABLE,
             mode: CharacterMode::Idle,
             act: None,
         }
@@ -261,6 +270,7 @@ impl PreparedCharacterFrame {
         eye: PreparedEyeIntent,
         tracking_gaze: Option<TrackingEyeGaze>,
         head: CharacterHeadOverlay,
+        body: CharacterBodyState,
         mode: CharacterMode,
         act: Option<CharacterAct>,
     ) -> Self {
@@ -268,6 +278,7 @@ impl PreparedCharacterFrame {
             eye,
             tracking_gaze,
             head,
+            body,
             mode,
             act,
         }
@@ -327,6 +338,12 @@ impl PreparedCharacterFrame {
 
     pub const fn head(self) -> CharacterHeadOverlay {
         self.head
+    }
+
+    /// Exact body facts used to produce this frame. This is behavior-trace
+    /// evidence, not proof that the requested eye pixels or head pose applied.
+    pub const fn body(self) -> CharacterBodyState {
+        self.body
     }
 
     pub const fn mode(self) -> CharacterMode {
@@ -590,6 +607,78 @@ pub enum CharacterBaseMotionState {
     Faulted,
 }
 
+/// Microcontroller whose maintenance state was published to the character
+/// engine. This is identity at the product-role boundary, not a USB path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterFirmwareTarget {
+    EyeController,
+    BaseController,
+}
+
+/// Evidence-bearing phase of one externally coordinated firmware operation.
+///
+/// `InProgress` for the eye controller does not imply the eyes can render:
+/// while RP2350 BOOTSEL owns the device, the application is not executing.
+/// The canonical eye image supplies its own Matrix boot cue after a successful
+/// upload and before KEP2 enumeration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterFirmwarePhase {
+    Preparing,
+    InProgress,
+    Recovering,
+}
+
+/// Current product-lifecycle fact consumed by standing character reflexes.
+///
+/// Subsystems publish facts; they never select an animation. The character
+/// engine alone maps these states to wake, recovery, maintenance, fault, and
+/// parking presentation. `NotApplicable` keeps non-robot renderers explicit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterLifecycleState {
+    NotApplicable,
+    Booting,
+    AdmissionRecovery,
+    Operational,
+    FirmwareMaintenance {
+        target: CharacterFirmwareTarget,
+        phase: CharacterFirmwarePhase,
+    },
+    FaultRecovery,
+    Parking,
+}
+
+impl CharacterLifecycleState {
+    pub const fn permits_ambient_character(self) -> bool {
+        matches!(self, Self::NotApplicable | Self::Operational)
+    }
+
+    /// Time required for the character engine to reach this state's first
+    /// exact presentation endpoint. This is not the duration of the state:
+    /// firmware `InProgress`, fault recovery, and parking may persist after
+    /// their entry transition settles.
+    pub const fn presentation_transition_duration(self) -> Duration {
+        Duration::from_nanos(match self {
+            Self::Booting => WAKE_RITUAL_NS,
+            Self::AdmissionRecovery => ADMISSION_RECOVERY_NS,
+            Self::FirmwareMaintenance {
+                phase: CharacterFirmwarePhase::Preparing,
+                ..
+            } => FIRMWARE_ANESTHESIA_NS,
+            Self::FirmwareMaintenance {
+                phase: CharacterFirmwarePhase::InProgress,
+                ..
+            } => FIRMWARE_ANESTHESIA_NS / 2,
+            Self::FirmwareMaintenance {
+                phase: CharacterFirmwarePhase::Recovering,
+                ..
+            } => FIRMWARE_WAKE_NS,
+            Self::FaultRecovery => FAULT_RECOVERY_NS,
+            Self::Parking => GOODNIGHT_NS,
+            Self::NotApplicable | Self::Operational => LIFECYCLE_RELEASE_NS,
+        })
+    }
+}
+
 impl CharacterBaseMotionState {
     pub const fn permits_character_head_motion(self) -> bool {
         matches!(self, Self::NotApplicable | Self::ConfirmedStationary)
@@ -607,12 +696,14 @@ impl CharacterThermalState {
 pub struct CharacterBodyState {
     thermal: CharacterThermalState,
     base_motion: CharacterBaseMotionState,
+    lifecycle: CharacterLifecycleState,
 }
 
 impl CharacterBodyState {
     pub const UNAVAILABLE: Self = Self {
         thermal: CharacterThermalState::Unavailable,
         base_motion: CharacterBaseMotionState::NotApplicable,
+        lifecycle: CharacterLifecycleState::NotApplicable,
     };
 
     pub const fn new(
@@ -622,6 +713,19 @@ impl CharacterBodyState {
         Self {
             thermal,
             base_motion,
+            lifecycle: CharacterLifecycleState::NotApplicable,
+        }
+    }
+
+    pub const fn new_with_lifecycle(
+        thermal: CharacterThermalState,
+        base_motion: CharacterBaseMotionState,
+        lifecycle: CharacterLifecycleState,
+    ) -> Self {
+        Self {
+            thermal,
+            base_motion,
+            lifecycle,
         }
     }
 
@@ -631,6 +735,10 @@ impl CharacterBodyState {
 
     pub const fn base_motion(self) -> CharacterBaseMotionState {
         self.base_motion
+    }
+
+    pub const fn lifecycle(self) -> CharacterLifecycleState {
+        self.lifecycle
     }
 }
 
@@ -1032,7 +1140,7 @@ struct RunningAct {
     energy_milli: u16,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EyeFields {
     gaze_x: i32,
     gaze_y: i32,
@@ -1042,6 +1150,29 @@ struct EyeFields {
     expression: Expression,
     blink: bool,
     color_rgb: [u8; 3],
+}
+
+impl EyeFields {
+    const fn lifecycle(
+        gaze_x: i32,
+        gaze_y: i32,
+        lid: i32,
+        pupil: i32,
+        brightness: i32,
+        expression: Expression,
+        color_rgb: [u8; 3],
+    ) -> Self {
+        Self {
+            gaze_x,
+            gaze_y,
+            lid,
+            pupil,
+            brightness,
+            expression,
+            blink: false,
+            color_rgb,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1128,6 +1259,10 @@ pub struct AutonomicCharacterEngine {
     thermal_visual_to_milli: i32,
     thermal_visual_started_ns: u64,
     thermal_visual_duration_ns: u64,
+    lifecycle_state: CharacterLifecycleState,
+    lifecycle_started_ns: u64,
+    lifecycle_from_fields: Option<EyeFields>,
+    last_rendered_fields: Option<EyeFields>,
 }
 
 impl AutonomicCharacterEngine {
@@ -1174,6 +1309,10 @@ impl AutonomicCharacterEngine {
             thermal_visual_to_milli: 0,
             thermal_visual_started_ns: 0,
             thermal_visual_duration_ns: 1,
+            lifecycle_state: CharacterLifecycleState::NotApplicable,
+            lifecycle_started_ns: 0,
+            lifecycle_from_fields: None,
+            last_rendered_fields: None,
         }
     }
 
@@ -1252,18 +1391,28 @@ impl AutonomicCharacterEngine {
         inputs: CharacterInputs,
         prepared: PreparedEyeIntent,
     ) -> PreparedCharacterFrame {
-        let tracking_gaze = inputs
-            .attention()
-            .face()
-            .map(|_| TrackingEyeGaze::from_intent(prepared.intent()));
         let now_ns = now.nanos_since_epoch();
         self.initialize_if_needed(now_ns);
         self.decay_playfulness(now_ns);
         self.update_pet_state(inputs.pet(), now_ns);
         self.update_thermal_state(inputs.body().thermal(), now_ns);
-        self.update_mode(inputs.attention().is_present(), now_ns);
-        let head_motion_permitted = inputs.body().base_motion().permits_character_head_motion();
-        if inputs.pet().suppresses_expression_motion() {
+        let mut fields = EyeFields::from(prepared.intent());
+        self.update_lifecycle_state(inputs.body().lifecycle(), now_ns, fields);
+        let ambient_character = inputs.body().lifecycle().permits_ambient_character();
+        if ambient_character {
+            self.update_mode(inputs.attention().is_present(), now_ns);
+        }
+        let tracking_gaze = if ambient_character {
+            inputs
+                .attention()
+                .face()
+                .map(|_| TrackingEyeGaze::from_intent(prepared.intent()))
+        } else {
+            None
+        };
+        let head_motion_permitted =
+            ambient_character && inputs.body().base_motion().permits_character_head_motion();
+        if inputs.pet().suppresses_expression_motion() || !ambient_character {
             self.saccade_peak_x = 0;
             self.saccade_peak_y = 0;
             self.saccade_x = 0;
@@ -1277,20 +1426,27 @@ impl AutonomicCharacterEngine {
             );
         }
 
-        let mut fields = EyeFields::from(prepared.intent());
         // The static bridge style is the fallback used when this director is
         // absent. Once enabled, blink becomes a timed event; carrying a static
         // blink bit into every refreshed frame would retrigger it continuously.
         fields.blink = false;
-        self.apply_mode(&mut fields, now_ns);
-        if !inputs.pet().suppresses_expression_motion() {
-            self.apply_act(&mut fields, now_ns);
-            self.apply_blink(&mut fields, now_ns);
+        if ambient_character {
+            self.apply_mode(&mut fields, now_ns);
+            if !inputs.pet().suppresses_expression_motion() {
+                self.apply_act(&mut fields, now_ns);
+                self.apply_blink(&mut fields, now_ns);
+            }
+            self.apply_pet_state(&mut fields, now_ns);
+            self.apply_thermal_state(&mut fields, now_ns);
+            self.apply_lifecycle_release(&mut fields, now_ns);
+        } else {
+            self.apply_lifecycle_state(&mut fields, now_ns);
         }
-        self.apply_pet_state(&mut fields, now_ns);
-        self.apply_thermal_state(&mut fields, now_ns);
         let mut head = HeadFields::default();
-        if !inputs.pet().suppresses_expression_motion() && head_motion_permitted {
+        if ambient_character
+            && !inputs.pet().suppresses_expression_motion()
+            && head_motion_permitted
+        {
             self.apply_head_mode(&mut head, now_ns);
             self.apply_head_act(&mut head, now_ns);
         }
@@ -1302,14 +1458,18 @@ impl AutonomicCharacterEngine {
             head.curl = 0;
         }
         let rest_envelope = self.rest_envelope(now_ns);
-        head.bow = head.bow * rest_envelope / SCALE;
-        head.curl = head.curl * rest_envelope / SCALE;
-        head.yaw = head.yaw * rest_envelope / SCALE;
-        head.roll = head.roll * rest_envelope / SCALE;
+        let lifecycle_envelope = self.lifecycle_head_envelope(now_ns);
+        let head_envelope = rest_envelope * lifecycle_envelope / SCALE;
+        head.bow = head.bow * head_envelope / SCALE;
+        head.curl = head.curl * head_envelope / SCALE;
+        head.yaw = head.yaw * head_envelope / SCALE;
+        head.roll = head.roll * head_envelope / SCALE;
+        self.last_rendered_fields = Some(fields);
         PreparedCharacterFrame::new(
             prepared.with_intent(fields.into_intent()),
             tracking_gaze,
             CharacterHeadOverlay::from_clamped(head),
+            inputs.body(),
             self.mode,
             self.active_act(),
         )
@@ -1472,6 +1632,177 @@ impl AutonomicCharacterEngine {
         if amount >= 650 {
             fields.expression = Expression::Sleepy;
         }
+    }
+
+    fn update_lifecycle_state(
+        &mut self,
+        state: CharacterLifecycleState,
+        now_ns: u64,
+        seed_fields: EyeFields,
+    ) {
+        if state == self.lifecycle_state {
+            return;
+        }
+
+        let previous_was_ambient = self.lifecycle_state.permits_ambient_character();
+        let next_is_ambient = state.permits_ambient_character();
+        self.lifecycle_state = state;
+        self.lifecycle_started_ns = now_ns;
+
+        // `Operational` and `NotApplicable` are both ambient presentations.
+        // Crossing that type boundary must not manufacture a visual event.
+        if previous_was_ambient && next_is_ambient {
+            self.lifecycle_from_fields = None;
+            return;
+        }
+
+        self.lifecycle_from_fields = Some(
+            self.last_rendered_fields
+                .unwrap_or_else(|| Self::initial_lifecycle_fields(state, seed_fields)),
+        );
+    }
+
+    fn initial_lifecycle_fields(
+        state: CharacterLifecycleState,
+        seed_fields: EyeFields,
+    ) -> EyeFields {
+        match state {
+            CharacterLifecycleState::Booting => {
+                EyeFields::lifecycle(0, 260, 920, 260, 24, Expression::Sleepy, [0, 28, 4])
+            }
+            CharacterLifecycleState::AdmissionRecovery => {
+                EyeFields::lifecycle(0, 300, 680, 380, 180, Expression::Sleepy, [145, 78, 38])
+            }
+            CharacterLifecycleState::FirmwareMaintenance {
+                phase: CharacterFirmwarePhase::Recovering,
+                ..
+            } => EyeFields::lifecycle(0, 260, 940, 250, 18, Expression::Sleepy, [0, 24, 4]),
+            _ => seed_fields,
+        }
+    }
+
+    fn lifecycle_transition_duration(state: CharacterLifecycleState) -> u64 {
+        u64::try_from(state.presentation_transition_duration().as_nanos())
+            .expect("bounded lifecycle transition duration fits u64 nanoseconds")
+    }
+
+    fn lifecycle_target_fields(&self, state: CharacterLifecycleState, now_ns: u64) -> EyeFields {
+        let elapsed_ns = now_ns.saturating_sub(self.lifecycle_started_ns);
+        match state {
+            CharacterLifecycleState::Booting => {
+                EyeFields::lifecycle(0, -30, 70, 690, 680, Expression::Greet, [92, 255, 118])
+            }
+            CharacterLifecycleState::AdmissionRecovery => {
+                EyeFields::lifecycle(0, 30, 110, 610, 560, Expression::Greet, [255, 205, 126])
+            }
+            CharacterLifecycleState::FirmwareMaintenance {
+                phase: CharacterFirmwarePhase::Preparing,
+                ..
+            } => EyeFields::lifecycle(0, 260, 940, 250, 18, Expression::Sleepy, [0, 24, 4]),
+            CharacterLifecycleState::FirmwareMaintenance {
+                target: CharacterFirmwareTarget::EyeController,
+                phase: CharacterFirmwarePhase::InProgress,
+            } => {
+                // This is the last renderable anesthesia state, not a claim
+                // that KEP2 remains available while BOOTSEL owns the RP2350.
+                EyeFields::lifecycle(0, 280, 980, 220, 8, Expression::Sleepy, [0, 18, 2])
+            }
+            CharacterLifecycleState::FirmwareMaintenance {
+                target: CharacterFirmwareTarget::BaseController,
+                phase: CharacterFirmwarePhase::InProgress,
+            } => {
+                // The eyes can remain alive while another controller flashes.
+                // KEP2 has no falling-character primitive, so this is a green
+                // dream, deliberately distinct from the literal Matrix boot
+                // renderer owned by the eye firmware.
+                EyeFields::lifecycle(
+                    scale_wave(elapsed_ns, 1_600 * NS_PER_MS, 180),
+                    210 + scale_wave(
+                        saturating_add(elapsed_ns, 320 * NS_PER_MS),
+                        2_200 * NS_PER_MS,
+                        90,
+                    ),
+                    680,
+                    300 + scale_wave(elapsed_ns, 1_300 * NS_PER_MS, 55).abs(),
+                    105 + scale_wave(elapsed_ns, 1_900 * NS_PER_MS, 35).abs(),
+                    Expression::Sleepy,
+                    [8, 230, 42],
+                )
+            }
+            CharacterLifecycleState::FirmwareMaintenance {
+                target,
+                phase: CharacterFirmwarePhase::Recovering,
+            } => {
+                let color_rgb = match target {
+                    CharacterFirmwareTarget::EyeController => [84, 255, 112],
+                    CharacterFirmwareTarget::BaseController => [170, 255, 126],
+                };
+                EyeFields::lifecycle(0, -20, 80, 680, 650, Expression::Greet, color_rgb)
+            }
+            CharacterLifecycleState::FaultRecovery => EyeFields::lifecycle(
+                scale_wave(elapsed_ns, 5_200 * NS_PER_MS, 75),
+                125,
+                260,
+                500,
+                330 + scale_wave(elapsed_ns, 4_400 * NS_PER_MS, 35).abs(),
+                Expression::Concerned,
+                [224, 118, 142],
+            ),
+            CharacterLifecycleState::Parking => {
+                EyeFields::lifecycle(0, 330, 980, 260, 18, Expression::Sleepy, [12, 28, 78])
+            }
+            CharacterLifecycleState::NotApplicable | CharacterLifecycleState::Operational => {
+                // Ambient states are rendered by the ordinary character path.
+                self.lifecycle_from_fields.unwrap_or(EyeFields::lifecycle(
+                    0,
+                    0,
+                    0,
+                    500,
+                    500,
+                    Expression::Neutral,
+                    [255, 255, 255],
+                ))
+            }
+        }
+    }
+
+    fn apply_lifecycle_state(&self, fields: &mut EyeFields, now_ns: u64) {
+        debug_assert!(!self.lifecycle_state.permits_ambient_character());
+        let duration_ns = Self::lifecycle_transition_duration(self.lifecycle_state);
+        let amount = minimum_jerk_ramp(normalized_phase(
+            now_ns.saturating_sub(self.lifecycle_started_ns),
+            duration_ns,
+        ));
+        let from = self.lifecycle_from_fields.unwrap_or(*fields);
+        let target = self.lifecycle_target_fields(self.lifecycle_state, now_ns);
+        *fields = interpolate_eye_fields(from, target, amount);
+    }
+
+    fn apply_lifecycle_release(&mut self, fields: &mut EyeFields, now_ns: u64) {
+        debug_assert!(self.lifecycle_state.permits_ambient_character());
+        let Some(from) = self.lifecycle_from_fields else {
+            return;
+        };
+        let elapsed_ns = now_ns.saturating_sub(self.lifecycle_started_ns);
+        if elapsed_ns >= LIFECYCLE_RELEASE_NS {
+            self.lifecycle_from_fields = None;
+            return;
+        }
+        let amount = minimum_jerk_ramp(normalized_phase(elapsed_ns, LIFECYCLE_RELEASE_NS));
+        *fields = interpolate_eye_fields(from, *fields, amount);
+    }
+
+    fn lifecycle_head_envelope(&self, now_ns: u64) -> i32 {
+        if !self.lifecycle_state.permits_ambient_character() {
+            return 0;
+        }
+        if self.lifecycle_from_fields.is_none() {
+            return SCALE;
+        }
+        minimum_jerk_ramp(normalized_phase(
+            now_ns.saturating_sub(self.lifecycle_started_ns),
+            LIFECYCLE_RELEASE_NS,
+        ))
     }
 
     fn rest_envelope(&self, now_ns: u64) -> i32 {
@@ -2292,6 +2623,27 @@ fn blend_color(from: [u8; 3], to: [u8; 3], amount: i32) -> [u8; 3] {
     })
 }
 
+fn interpolate_eye_fields(from: EyeFields, to: EyeFields, amount: i32) -> EyeFields {
+    let amount = amount.clamp(0, SCALE);
+    let interpolate = |start: i32, end: i32| start + (end - start) * amount / SCALE;
+    EyeFields {
+        gaze_x: interpolate(from.gaze_x, to.gaze_x),
+        gaze_y: interpolate(from.gaze_y, to.gaze_y),
+        lid: interpolate(from.lid, to.lid),
+        pupil: interpolate(from.pupil, to.pupil),
+        brightness: interpolate(from.brightness, to.brightness),
+        expression: if amount < SCALE / 2 {
+            from.expression
+        } else {
+            to.expression
+        },
+        // Lifecycle transitions suppress edge-triggered blinks. A target
+        // blink is admitted only once the transition has fully completed.
+        blink: amount == SCALE && to.blink,
+        color_rgb: blend_color(from.color_rgb, to.color_rgb, amount),
+    }
+}
+
 fn clamp_signed(value: i32) -> i16 {
     i16::try_from(value.clamp(-SCALE, SCALE)).expect("normalized signed range fits i16")
 }
@@ -2531,6 +2883,22 @@ mod tests {
             }),
             CharacterPetState::Inactive,
             CharacterBodyState::UNAVAILABLE,
+        )
+    }
+
+    fn lifecycle_inputs(
+        face_present: bool,
+        now_ns: u64,
+        lifecycle: CharacterLifecycleState,
+    ) -> CharacterInputs {
+        CharacterInputs::new(
+            character_inputs(face_present, now_ns).attention(),
+            CharacterPetState::Inactive,
+            CharacterBodyState::new_with_lifecycle(
+                CharacterThermalState::Nominal,
+                CharacterBaseMotionState::NotApplicable,
+                lifecycle,
+            ),
         )
     }
 
@@ -3009,6 +3377,277 @@ mod tests {
         assert_eq!(output.eye().intent().gaze_x().get(), 0);
         assert_eq!(output.eye().intent().gaze_y().get(), 0);
         assert_eq!((engine.saccade_x, engine.saccade_y), (0, 0));
+    }
+
+    #[test]
+    fn wake_lifecycle_is_exact_preemptive_and_releases_without_a_pose_jump() {
+        let start = 9 * NS_PER_SECOND;
+        let booting = CharacterLifecycleState::Booting;
+        let mut engine = AutonomicCharacterEngine::new(83);
+
+        let first = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start),
+            lifecycle_inputs(true, start, booting),
+            prepared(start),
+        );
+        assert_eq!(first.body().lifecycle(), booting);
+        assert!(first.head().is_natural());
+        assert_eq!(first.tracking_gaze(), None);
+        assert_eq!(first.act(), None);
+        assert_eq!(first.eye().intent().expression(), Expression::Sleepy);
+        assert_eq!(first.eye().intent().lid().get(), 920);
+        assert_eq!(first.eye().intent().brightness().get(), 24);
+        assert_eq!(first.eye().intent().color_rgb(), [0, 28, 4]);
+
+        let halfway_at = start + WAKE_RITUAL_NS / 2;
+        let halfway = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(halfway_at),
+            lifecycle_inputs(true, halfway_at, booting),
+            prepared(halfway_at),
+        );
+        assert!(halfway.head().is_natural());
+        assert_eq!(halfway.eye().intent().lid().get(), 495);
+        assert_eq!(halfway.eye().intent().brightness().get(), 352);
+        assert!(!halfway.eye().intent().flags().requests_blink());
+
+        let awake_at = start + WAKE_RITUAL_NS;
+        let awake = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(awake_at),
+            lifecycle_inputs(true, awake_at, booting),
+            prepared(awake_at),
+        );
+        assert_eq!(awake.eye().intent().expression(), Expression::Greet);
+        assert_eq!(awake.eye().intent().gaze_y().get(), -30);
+        assert_eq!(awake.eye().intent().lid().get(), 70);
+        assert_eq!(awake.eye().intent().pupil().get(), 690);
+        assert_eq!(awake.eye().intent().brightness().get(), 680);
+        assert_eq!(awake.eye().intent().color_rgb(), [92, 255, 118]);
+        let repeated = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(awake_at),
+            lifecycle_inputs(true, awake_at, booting),
+            prepared(awake_at),
+        );
+        assert_eq!(awake, repeated, "same time cannot advance the wake ritual");
+
+        let operational_at = awake_at + NS_PER_MS;
+        let operational = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(operational_at),
+            lifecycle_inputs(true, operational_at, CharacterLifecycleState::Operational),
+            prepared(operational_at),
+        );
+        assert_eq!(
+            operational.eye().intent(),
+            awake.eye().intent(),
+            "the first ambient frame starts at the last lifecycle presentation"
+        );
+        assert!(operational.head().is_natural());
+        assert_eq!(engine.lifecycle_head_envelope(operational_at), 0);
+        assert_eq!(
+            engine.lifecycle_head_envelope(operational_at + LIFECYCLE_RELEASE_NS / 2),
+            SCALE / 2
+        );
+        assert_eq!(
+            engine.lifecycle_head_envelope(operational_at + LIFECYCLE_RELEASE_NS),
+            SCALE
+        );
+
+        let released_at = operational_at + LIFECYCLE_RELEASE_NS;
+        let released = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(released_at),
+            lifecycle_inputs(true, released_at, CharacterLifecycleState::Operational),
+            prepared(released_at),
+        );
+        assert_eq!(
+            released.body().lifecycle(),
+            CharacterLifecycleState::Operational
+        );
+        assert!(engine.lifecycle_from_fields.is_none());
+    }
+
+    #[test]
+    fn firmware_lifecycle_distinguishes_anesthesia_green_dream_and_recovery() {
+        let start = 13 * NS_PER_SECOND;
+        let preparing = CharacterLifecycleState::FirmwareMaintenance {
+            target: CharacterFirmwareTarget::EyeController,
+            phase: CharacterFirmwarePhase::Preparing,
+        };
+        let eye_in_progress = CharacterLifecycleState::FirmwareMaintenance {
+            target: CharacterFirmwareTarget::EyeController,
+            phase: CharacterFirmwarePhase::InProgress,
+        };
+        let eye_recovering = CharacterLifecycleState::FirmwareMaintenance {
+            target: CharacterFirmwareTarget::EyeController,
+            phase: CharacterFirmwarePhase::Recovering,
+        };
+        let mut eye_engine = AutonomicCharacterEngine::new(89);
+        let ambient = eye_engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start),
+            lifecycle_inputs(false, start, CharacterLifecycleState::Operational),
+            prepared(start),
+        );
+
+        let prepare_at = start + NS_PER_MS;
+        let prepare_start = eye_engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(prepare_at),
+            lifecycle_inputs(true, prepare_at, preparing),
+            prepared(prepare_at),
+        );
+        assert_eq!(prepare_start.eye().intent(), ambient.eye().intent());
+        assert!(prepare_start.head().is_natural());
+        assert_eq!(prepare_start.tracking_gaze(), None);
+
+        let anesthetized_at = prepare_at + FIRMWARE_ANESTHESIA_NS;
+        let anesthetized = eye_engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(anesthetized_at),
+            lifecycle_inputs(true, anesthetized_at, preparing),
+            prepared(anesthetized_at),
+        );
+        assert_eq!(anesthetized.eye().intent().lid().get(), 940);
+        assert_eq!(anesthetized.eye().intent().brightness().get(), 18);
+        assert_eq!(anesthetized.eye().intent().color_rgb(), [0, 24, 4]);
+
+        let flash_at = anesthetized_at + NS_PER_MS;
+        let flash_start = eye_engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(flash_at),
+            lifecycle_inputs(false, flash_at, eye_in_progress),
+            prepared(flash_at),
+        );
+        assert_eq!(flash_start.eye().intent(), anesthetized.eye().intent());
+        let flash_settled_at = flash_at + FIRMWARE_ANESTHESIA_NS / 2;
+        let flash_settled = eye_engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(flash_settled_at),
+            lifecycle_inputs(false, flash_settled_at, eye_in_progress),
+            prepared(flash_settled_at),
+        );
+        assert_eq!(flash_settled.eye().intent().lid().get(), 980);
+        assert_eq!(flash_settled.eye().intent().brightness().get(), 8);
+        assert_eq!(flash_settled.eye().intent().color_rgb(), [0, 18, 2]);
+
+        let recover_at = flash_settled_at + NS_PER_MS;
+        let recover_start = eye_engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(recover_at),
+            lifecycle_inputs(false, recover_at, eye_recovering),
+            prepared(recover_at),
+        );
+        assert_eq!(recover_start.eye().intent(), flash_settled.eye().intent());
+        let recovered_at = recover_at + FIRMWARE_WAKE_NS;
+        let recovered = eye_engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(recovered_at),
+            lifecycle_inputs(false, recovered_at, eye_recovering),
+            prepared(recovered_at),
+        );
+        assert_eq!(recovered.eye().intent().expression(), Expression::Greet);
+        assert_eq!(recovered.eye().intent().lid().get(), 80);
+        assert_eq!(recovered.eye().intent().brightness().get(), 650);
+        assert_eq!(recovered.eye().intent().color_rgb(), [84, 255, 112]);
+
+        let base_dream = CharacterLifecycleState::FirmwareMaintenance {
+            target: CharacterFirmwareTarget::BaseController,
+            phase: CharacterFirmwarePhase::InProgress,
+        };
+        let mut base_engine = AutonomicCharacterEngine::new(97);
+        base_engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start),
+            lifecycle_inputs(false, start, base_dream),
+            prepared(start),
+        );
+        let first_dream_at = start + FIRMWARE_ANESTHESIA_NS / 2 + 200 * NS_PER_MS;
+        let second_dream_at = first_dream_at + 400 * NS_PER_MS;
+        let first_dream = base_engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(first_dream_at),
+            lifecycle_inputs(false, first_dream_at, base_dream),
+            prepared(first_dream_at),
+        );
+        let second_dream = base_engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(second_dream_at),
+            lifecycle_inputs(false, second_dream_at, base_dream),
+            prepared(second_dream_at),
+        );
+        assert_eq!(first_dream.eye().intent().color_rgb(), [8, 230, 42]);
+        assert_eq!(second_dream.eye().intent().color_rgb(), [8, 230, 42]);
+        assert_ne!(first_dream.eye().intent(), second_dream.eye().intent());
+        assert!(first_dream.head().is_natural());
+        assert!(second_dream.head().is_natural());
+    }
+
+    #[test]
+    fn fault_and_parking_reflexes_override_attention_touch_and_scripted_motion() {
+        let start = 17 * NS_PER_SECOND;
+        let mut engine = AutonomicCharacterEngine::new(101);
+        engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start),
+            lifecycle_inputs(true, start, CharacterLifecycleState::Operational),
+            prepared(start),
+        );
+        engine.active_act = Some(RunningAct {
+            act: CharacterAct::PlayBow,
+            started_ns: start,
+            duration_ns: 4 * NS_PER_SECOND,
+            side: 1,
+            style: 0,
+            energy_milli: 500,
+        });
+
+        let fault_at = start + NS_PER_MS;
+        let fault = CharacterLifecycleState::FaultRecovery;
+        let fault_frame = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(fault_at),
+            lifecycle_inputs(true, fault_at, fault),
+            prepared(fault_at),
+        );
+        assert!(fault_frame.head().is_natural());
+        assert_eq!(fault_frame.tracking_gaze(), None);
+        assert_eq!(fault_frame.act(), None);
+        assert_eq!(engine.active_act(), None);
+
+        let fault_settled_at = fault_at + FAULT_RECOVERY_NS;
+        let fault_settled = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(fault_settled_at),
+            lifecycle_inputs(true, fault_settled_at, fault),
+            prepared(fault_settled_at),
+        );
+        assert_eq!(
+            fault_settled.eye().intent().expression(),
+            Expression::Concerned
+        );
+        assert_eq!(fault_settled.body().lifecycle(), fault);
+
+        let parking = CharacterLifecycleState::Parking;
+        let park_at = fault_settled_at + NS_PER_MS;
+        let parking_inputs = CharacterInputs::new(
+            character_inputs(true, park_at).attention(),
+            CharacterPetState::Resting {
+                at_rest_target: true,
+            },
+            CharacterBodyState::new_with_lifecycle(
+                CharacterThermalState::PitchDerated,
+                CharacterBaseMotionState::Faulted,
+                parking,
+            ),
+        );
+        let park_start = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(park_at),
+            parking_inputs,
+            prepared(park_at),
+        );
+        assert_eq!(park_start.eye().intent(), fault_settled.eye().intent());
+        assert!(park_start.head().is_natural());
+        assert_eq!(park_start.tracking_gaze(), None);
+
+        let parked_at = park_at + GOODNIGHT_NS;
+        let parked = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(parked_at),
+            parking_inputs,
+            prepared(parked_at),
+        );
+        assert_eq!(parked.body(), parking_inputs.body());
+        assert!(parked.head().is_natural());
+        assert_eq!(parked.eye().intent().expression(), Expression::Sleepy);
+        assert_eq!(parked.eye().intent().gaze_y().get(), 330);
+        assert_eq!(parked.eye().intent().lid().get(), 980);
+        assert_eq!(parked.eye().intent().brightness().get(), 18);
+        assert_eq!(parked.eye().intent().color_rgb(), [12, 28, 78]);
+        assert!(!parked.eye().intent().flags().requests_blink());
     }
 
     #[test]

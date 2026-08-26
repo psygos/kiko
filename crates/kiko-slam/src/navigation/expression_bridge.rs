@@ -26,11 +26,12 @@ use kiko_expression_core::{
 use kiko_expression_runtime::{
     AdaptError, AutonomicCharacterEngine, CameraForwardDepthMeters, CameraToHeadGazeExtrinsics,
     CharacterAttention, CharacterBaseMotionState, CharacterBodyState, CharacterInputs,
-    CharacterPetEpisode, CharacterPetReaction, CharacterPetState, CharacterThermalState,
-    EyeRenderStyle, FaceTrackingUpdate, HeadGazeProjectionError, HeadRelativeGaze,
-    MonotonicLatestAdmission, MonotonicLatestGap, OakCameraTargetPoint, OakCameraTargetRay,
-    PreparedCharacterFrame, PreparedEyeIntent, RayHeadGazeProjectionError, SceneAnalysis,
-    SceneMotionConfig, SceneMotionError, SceneMotionExtractor, adapt_reaction_output,
+    CharacterLifecycleState, CharacterPetEpisode, CharacterPetReaction, CharacterPetState,
+    CharacterThermalState, EyeRenderStyle, FaceTrackingUpdate, HeadGazeProjectionError,
+    HeadRelativeGaze, MonotonicLatestAdmission, MonotonicLatestGap, OakCameraTargetPoint,
+    OakCameraTargetRay, PreparedCharacterFrame, PreparedEyeIntent, RayHeadGazeProjectionError,
+    SceneAnalysis, SceneMotionConfig, SceneMotionError, SceneMotionExtractor,
+    adapt_reaction_output,
 };
 use kiko_eye_runtime::{ClockError, MonotonicClock};
 use oak_sys::{ImageFrame, StreamId};
@@ -147,6 +148,7 @@ pub enum RgbExpressionBridgeError {
     },
     FaceAttentionFreshness(TimeError),
     Adapt(AdaptError),
+    LifecycleCharacterUnavailable,
 }
 
 impl fmt::Display for RgbExpressionBridgeError {
@@ -170,7 +172,8 @@ impl std::error::Error for RgbExpressionBridgeError {
             Self::NotRgbStream { .. }
             | Self::NonTightBgrLayout { .. }
             | Self::DeviceCaptureClockNotIncreasing { .. }
-            | Self::FaceObservationMismatch { .. } => None,
+            | Self::FaceObservationMismatch { .. }
+            | Self::LifecycleCharacterUnavailable => None,
         }
     }
 }
@@ -282,6 +285,7 @@ pub struct RgbExpressionBridge<C> {
     pet_state: CharacterPetState,
     thermal_state: CharacterThermalState,
     base_motion_state: CharacterBaseMotionState,
+    lifecycle_state: CharacterLifecycleState,
     last_device_timestamp_ns: Option<i64>,
 }
 
@@ -325,6 +329,7 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
             pet_state: CharacterPetState::Inactive,
             thermal_state: CharacterThermalState::Unavailable,
             base_motion_state: CharacterBaseMotionState::NotApplicable,
+            lifecycle_state: CharacterLifecycleState::NotApplicable,
             last_device_timestamp_ns: None,
         }
     }
@@ -372,6 +377,45 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
     /// to mean stationary.
     pub fn note_base_motion_state(&mut self, state: CharacterBaseMotionState) {
         self.base_motion_state = state;
+    }
+
+    /// Retain one product-lifecycle fact for the next coherent character
+    /// sample. Callers publish state; only the character engine selects its
+    /// wake, recovery, maintenance, fault, or parking presentation.
+    pub fn note_lifecycle_state(&mut self, state: CharacterLifecycleState) {
+        self.lifecycle_state = state;
+    }
+
+    /// Prepare a lifecycle-only character sample without consuming or
+    /// fabricating an RGB observation. This is the narrow path used while the
+    /// camera lane is not producing frames, for example during coordinated
+    /// park or firmware maintenance. It does not advance scene continuity.
+    pub fn prepare_lifecycle_reflex(
+        &mut self,
+        state: CharacterLifecycleState,
+    ) -> Result<PreparedCharacterFrame, RgbExpressionBridgeError> {
+        let now = self.clock.now().map_err(RgbExpressionBridgeError::Clock)?;
+        let reaction = self.mixer.mix(now, ReactionInputs::empty());
+        let prepared = adapt_reaction_output(reaction, ExpressionKind::Neutral, self.style, now)
+            .map_err(RgbExpressionBridgeError::Adapt)?;
+        self.lifecycle_state = state;
+        let character = self
+            .character
+            .as_mut()
+            .ok_or(RgbExpressionBridgeError::LifecycleCharacterUnavailable)?;
+        Ok(character.render_character(
+            now,
+            CharacterInputs::new(
+                CharacterAttention::Absent,
+                self.pet_state,
+                CharacterBodyState::new_with_lifecycle(
+                    self.thermal_state,
+                    self.base_motion_state,
+                    self.lifecycle_state,
+                ),
+            ),
+            prepared,
+        ))
     }
 
     /// Project one already-parsed positive-depth OAK point into neutral-head
@@ -551,7 +595,11 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
                 CharacterInputs::new(
                     attention,
                     self.pet_state,
-                    CharacterBodyState::new(self.thermal_state, self.base_motion_state),
+                    CharacterBodyState::new_with_lifecycle(
+                        self.thermal_state,
+                        self.base_motion_state,
+                        self.lifecycle_state,
+                    ),
                 ),
                 prepared,
             ),
@@ -1001,6 +1049,42 @@ mod tests {
         );
         assert!(frame.head().is_natural());
         assert_eq!(frame.act(), Some(CharacterAct::StartleBoop));
+    }
+
+    #[test]
+    fn lifecycle_fact_reaches_rgb_and_rgb_independent_character_samples() {
+        let clock = TestClock::new(10);
+        let mut decorated = bridge(clock.clone());
+        decorated.character = Some(AutonomicCharacterEngine::new(stream_epoch().get()));
+        decorated.note_lifecycle_state(CharacterLifecycleState::Booting);
+
+        let boot = decorated
+            .process_borrowed(rgb(1, 1, &[0; 12]))
+            .expect("boot lifecycle on RGB frame")
+            .into_character();
+        assert_eq!(boot.body().lifecycle(), CharacterLifecycleState::Booting);
+        assert!(boot.head().is_natural());
+        assert_eq!(boot.tracking_gaze(), None);
+
+        clock.set(20);
+        let parked = decorated
+            .prepare_lifecycle_reflex(CharacterLifecycleState::Parking)
+            .expect("camera-independent parking sample");
+        assert_eq!(parked.body().lifecycle(), CharacterLifecycleState::Parking);
+        assert_eq!(parked.eye().generated_at().nanos_since_epoch(), 20);
+        assert!(parked.head().is_natural());
+
+        clock.set(30);
+        let next = decorated
+            .process_borrowed(rgb(2, 2, &[0; 12]))
+            .expect("lifecycle sample does not consume RGB continuity");
+        assert!(matches!(next, RgbExpressionBridgeOutcome::Consecutive(_)));
+
+        let mut undecorated = bridge(clock);
+        assert_eq!(
+            undecorated.prepare_lifecycle_reflex(CharacterLifecycleState::Parking),
+            Err(RgbExpressionBridgeError::LifecycleCharacterUnavailable)
+        );
     }
 
     #[test]
