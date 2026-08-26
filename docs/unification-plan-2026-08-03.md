@@ -63,10 +63,22 @@ remaining work; a passing host test is never presented as physical evidence.
   quintic envelope reaches exact natural and remains there through `Sleepy`;
   face return wakes immediately. Intent: make the bow/base a living joint while
   guaranteeing a real, stable rest state.
+- `1883a76`: the physical gaze controller now owns a deterministic fixed-point
+  spring prefilter with per-axis response, damping, velocity, acceleration,
+  jerk, and transient attack dynamics. Its state participates in the same
+  prepare/commit transaction as the safety planner; gaps service one declared
+  tick, bounds are exact, and expiry settles the hidden spring and commanded
+  pose at natural. Intent: replace constant-speed target feel without weakening
+  actor readback, lateness, or motion-envelope guarantees.
+- `29ebc94`: the strict head-policy boundary parses Fable's SI-rate dynamics,
+  binds them once to the exact control period, and rejects a policy whose
+  attacked acceleration or velocity can outrun the downstream planner. Intent:
+  keep tuning legible in physical units while the runtime remains fixed-point
+  and deterministic.
 
 Host evidence at this checkpoint is 90/90 `kiko-expression-runtime` unit
 tests plus its compile-fail doctest, warning-free expression and Nano
-compile-only Clippy, 163 `kiko-head-runtime` library tests plus 11 binary
+compile-only Clippy, 170 `kiko-head-runtime` library tests plus 11 binary
 tests, 1,365 `kiko-slam` Nano-commissioning library tests, and 82/82 Python
 behavior tests. Native OAK linking and physical feel are deliberately not
 claimed by those results.
@@ -77,17 +89,13 @@ claimed by those results.
    commanded-head feedback, thermal/body state, and base-motion facts. Then
    port dynamic bow/curl recruitment, turn-dip weight shift, pet-state eye
    choreography, formal bow greeting, and the remaining interoceptive acts.
-2. Put a typed jerk-bounded, clamped-gap organic prefilter ahead of the
-   transactional head planner. Keep its fixed-tick lateness and commit/abort
-   semantics underneath. Prove bounds, clock regression, long gaps, target
-   jumps, exact settling, and actor abort behavior on the deterministic plant.
-3. Add accessory-loop heartbeat, `sd_notify` watchdog, bounded restart/backoff
+2. Add accessory-loop heartbeat, `sd_notify` watchdog, bounded restart/backoff
    policy, and failure-latched ownership admission. A watchdog must never
    create a competing camera, eye, head, or STM32 owner.
-4. Add format-compatible behavior/pet NDJSON evidence and replay comparisons;
+3. Add format-compatible behavior/pet NDJSON evidence and replay comparisons;
    retain the Python lane as a non-booted behavior lab until the Rust owner has
    attended physical parity evidence.
-5. Re-audit the current navigation graph, make live SLAM rate/backend/fallback
+4. Re-audit the current navigation graph, make live SLAM rate/backend/fallback
    observable, verify the manual/emergency-stop GUI and autonomous MPC share
    one authority path, and close every wheels-off gate before requesting wheel
    attachment. Only an attended wheels-on session can calibrate the
