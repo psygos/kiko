@@ -63,6 +63,10 @@
         "roll_ticks_per_radian": 0.0
       }
     },
+    "dynamic_pitch_recruitment": {
+      "maximum_bow_share_permille": 600,
+      "full_recruitment_total_pitch_demand_ticks": 140
+    },
     "character_positive_full_scale_encoder_offsets_ticks": {
       "bow_ticks": 110,
       "curl_ticks": -180,

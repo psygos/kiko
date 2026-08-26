@@ -16,11 +16,11 @@ use std::{fmt, num::NonZeroU8, time::Duration};
 
 use kiko_expression_runtime::{
     CameraToHeadGazeExtrinsicsInput, CharacterHeadMappingDeclaration,
-    CharacterHeadMappingDeclarationParseError, HeadGazeMappingDeclaration,
-    HeadGazeMappingDeclarationInput, HeadGazeMappingDeclarationParseError,
-    HeadGazeTickOffsetsPerRadianInput, HeadTickEnvelope, HeadTickEnvelopeInput,
-    NamedCharacterHeadFullScaleTickOffsetsInput, NamedHeadTickEnvelopesInput,
-    NamedHeadTickOffsetsPerRadianInput, NamedNaturalHeadTicksInput,
+    CharacterHeadMappingDeclarationParseError, DynamicPitchRecruitmentInput,
+    HeadGazeMappingDeclaration, HeadGazeMappingDeclarationInput,
+    HeadGazeMappingDeclarationParseError, HeadGazeTickOffsetsPerRadianInput, HeadTickEnvelope,
+    HeadTickEnvelopeInput, NamedCharacterHeadFullScaleTickOffsetsInput,
+    NamedHeadTickEnvelopesInput, NamedHeadTickOffsetsPerRadianInput, NamedNaturalHeadTicksInput,
 };
 use kiko_head_protocol::{
     FrameBuildError, HeadJoint, HeadTorqueLimits, JointCalibrationError, PositionStepLimit,
@@ -515,6 +515,9 @@ fn parse_mapping(
             pitch_down: offsets.pitch_down_rad.into_domain(),
             yaw_right: offsets.yaw_right_rad.into_domain(),
         },
+        dynamic_pitch_recruitment: dto
+            .dynamic_pitch_recruitment
+            .map(DynamicPitchRecruitmentDto::into_domain),
     })
     .map_err(HeadGazePolicyParseError::Mapping)?;
     let character_mapping = character_offsets
@@ -1208,8 +1211,26 @@ struct HeadGazeMappingDeclarationDto {
     natural_encoder_position_ticks: NamedNaturalHeadTicksDto,
     hard_encoder_envelopes_ticks: NamedHeadTickEnvelopesDto,
     encoder_tick_offsets_per_radian: HeadGazeTickOffsetsPerRadianDto,
+    dynamic_pitch_recruitment: Option<DynamicPitchRecruitmentDto>,
     character_positive_full_scale_encoder_offsets_ticks:
         Option<NamedCharacterHeadFullScaleTickOffsetsDto>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DynamicPitchRecruitmentDto {
+    maximum_bow_share_permille: u16,
+    full_recruitment_total_pitch_demand_ticks: u16,
+}
+
+impl DynamicPitchRecruitmentDto {
+    const fn into_domain(self) -> DynamicPitchRecruitmentInput {
+        DynamicPitchRecruitmentInput {
+            maximum_bow_share_permille: self.maximum_bow_share_permille,
+            full_recruitment_total_pitch_demand_ticks: self
+                .full_recruitment_total_pitch_demand_ticks,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -1752,6 +1773,41 @@ mod tests {
                     joint: HeadJoint::Roll
                 }
             ))
+        ));
+    }
+
+    #[test]
+    fn optional_dynamic_pitch_recruitment_is_typed_and_fail_closed() {
+        let mut value = valid_value();
+        value["mapping_declaration"]["dynamic_pitch_recruitment"] = json!({
+            "maximum_bow_share_permille": 600,
+            "full_recruitment_total_pitch_demand_ticks": 140
+        });
+        let policy = parse(&value).expect("dynamic pitch recruitment");
+        let recruitment = policy
+            .mapping()
+            .dynamic_pitch_recruitment()
+            .expect("optional declaration was present");
+        assert_eq!(recruitment.maximum_bow_share_permille(), 600);
+        assert_eq!(recruitment.full_recruitment_total_pitch_demand_ticks(), 140);
+
+        value["mapping_declaration"]["dynamic_pitch_recruitment"]["full_recruitment_total_pitch_demand_ticks"] =
+            json!(0);
+        assert!(matches!(
+            parse(&value),
+            Err(HeadGazePolicyParseError::Mapping(
+                HeadGazeMappingDeclarationParseError::DynamicPitchRecruitment(_)
+            ))
+        ));
+
+        value["mapping_declaration"]["dynamic_pitch_recruitment"] = json!({
+            "maximum_bow_share_permille": 600,
+            "full_recruitment_total_pitch_demand_ticks": 140,
+            "ambiguous_ticks": 1
+        });
+        assert!(matches!(
+            parse(&value),
+            Err(HeadGazePolicyParseError::JsonDecode(_))
         ));
     }
 

@@ -541,6 +541,9 @@ impl NanoAccessoryWorkerConfig {
         if policy.character_mapping().is_none() {
             return Err(NanoPhysicalHeadGazeConfigError::CharacterMappingRequired);
         }
+        if policy.mapping().dynamic_pitch_recruitment().is_none() {
+            return Err(NanoPhysicalHeadGazeConfigError::DynamicPitchRecruitmentRequired);
+        }
         if policy.compliant_hold().is_none() {
             return Err(NanoPhysicalHeadGazeConfigError::CompliantHoldRequired);
         }
@@ -570,6 +573,7 @@ struct NanoPhysicalHeadGazeConfig {
 pub enum NanoPhysicalHeadGazeConfigError {
     AlreadyConfigured,
     CharacterMappingRequired,
+    DynamicPitchRecruitmentRequired,
     CompliantHoldRequired,
     ThermalDerateRequired,
     Admission(EvidenceBoundPhysicalHeadGazePolicyError),
@@ -592,6 +596,7 @@ impl std::error::Error for NanoPhysicalHeadGazeConfigError {
             Self::Admission(source) => Some(source),
             Self::AlreadyConfigured
             | Self::CharacterMappingRequired
+            | Self::DynamicPitchRecruitmentRequired
             | Self::CompliantHoldRequired
             | Self::ThermalDerateRequired => None,
         }

@@ -316,6 +316,11 @@ fn rendered_contract_is_typed_proposal_only_with_exact_known_geometry() {
         ],
         [-93.0, 465.0, -1050.0]
     );
+    let recruitment = mapping
+        .dynamic_pitch_recruitment()
+        .expect("template carries Fable's dynamic serial-pitch recruitment");
+    assert_eq!(recruitment.maximum_bow_share_permille(), 600);
+    assert_eq!(recruitment.full_recruitment_total_pitch_demand_ticks(), 140);
     let character = policy
         .character_mapping()
         .expect("template retains an explicit proposal-only four-joint mapping");
