@@ -7,7 +7,7 @@ the single explicit handoff demanded by
 `docs/nano-integrated-readiness-2026-07-31.md:182-191` ("running both is not
 integration").
 
-## 0. Implementation ledger (updated 2026-08-26)
+## 0. Implementation ledger (updated 2026-08-27)
 
 This is the durable handoff between Fable's field behavior work and the
 canonical Rust owner. It distinguishes source behavior, ported behavior, and
@@ -205,10 +205,22 @@ remaining work; a passing host test is never presented as physical evidence.
   KEP2 release. Generation or eye-apply failures retain their typed cause,
   latch the owner fault, close both actors, and cannot report false readiness.
   A terminal fault publishes `FaultRecovery` immediately without delaying the
-  existing stop latch; the terminal branch does not yet stream fresh fault-eye
-  samples, because secondary presentation failure still needs durable evidence
-  without replacing the primary fault. Intent: make startup and park observable
-  consequences of lifecycle facts without weakening fault ordering.
+  existing stop latch. At this historical step the terminal branch did not yet
+  stream fresh fault-eye samples, because secondary presentation failure still
+  needed durable evidence without replacing the primary fault. Intent: make
+  startup and park observable consequences of lifecycle facts without weakening
+  fault ordering.
+- `626f764`: every terminal path reached after eye and head admission now
+  publishes the first fault and latches both base-facing stop boundaries before
+  attempting the 1.4-second character-owned `FaultRecovery` eye transition.
+  Shutdown evidence distinguishes not-required, completed with a nonzero exact
+  acknowledged-frame count, and failed after an exact partial-frame count.
+  Bridge, face, eye, missing-duration, and counter-domain failures remain typed
+  secondary evidence; they are surfaced by the live owner but can never replace
+  the first stop fault. Admission-recovery failure, readiness-observer loss,
+  ordinary runtime faults, and goodnight failure share this ordering. Intent:
+  close the last host-side lifecycle presentation gap while preserving the
+  safety authority and causal identity of the primary fault.
 - `8704e50`: the retained Python lab now generates a strict, source-hashed
   schema-V1 semantic behavior trace. Rust rejects unknown and duplicate fields,
   checks all 24 distinct acts against Fable's exact duration, cooldown, and
@@ -248,17 +260,25 @@ remaining work; a passing host test is never presented as physical evidence.
   OAK traffic.
 
 Host evidence at this checkpoint is 112/112 `kiko-expression-runtime` unit
-tests plus its compile-fail doctest, warning-free expression, head, and Nano
-compile-only Clippy, 177 `kiko-head-runtime` library tests plus 11 binary
-tests, 1,464/1,464 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
-binary tests, 7/7 offline-qualifier tests, 36/36 immutable-renderer tests,
-all 6 deployment-gate tests, the 13 focused base-commissioning tests, and
-85/85 Python behavior tests. The standalone KEP2 firmware passed all 8
-renderer tests, including literal Matrix dynamics and maximum-time totality.
-The complete Nano-agent library suite was run
-outside the filesystem sandbox because 23 otherwise-green local socket and
-loopback-listener tests are denied binding by that sandbox; the unrestricted
-run passed all 1,464 tests.
+tests plus its compile-fail doctest, 177/177 `kiko-head-runtime` library tests
+plus 11/11 commissioning-binary tests, 36/36 immutable-renderer tests, and
+85/85 retained Python behavior tests. The complete attended Nano feature union
+passed 1,571/1,571 library tests, 3/3 base-commissioning tests, 7/7 offline
+qualifier tests, 102/102 CLI tests, both integration suites at 4/4 and 3/3,
+and its compile-fail doctest; its second doctest remains deliberately ignored.
+Strict all-target Clippy passed for the same union. The standalone KEP2
+firmware passed all 8 renderer tests, including literal Matrix dynamics and
+maximum-time totality, plus all 14 host-protocol contract tests and strict
+Clippy. The operator-console syntax and all 8 browser safety tests passed. The
+complete offline cold-boot/fault acceptance script returned
+`acceptance_result=pass`.
+
+The complete Nano union ran outside the filesystem sandbox because its local
+socket and loopback-listener tests are denied binding by that sandbox; the
+unrestricted run passed. The acceptance script explicitly leaves installation,
+PID-1 execution, cold power boot, hardware presence, physical watchdog and
+emergency stop, motor stop distance, head torque, camera stream, SLAM accuracy,
+MPC tracking, and performance unclaimed.
 The Linux-aarch64 standard-library abstract notify-socket API was compiled
 directly. A complete Linux-aarch64 dependency cross-check remains unclaimed
 because this Mac does not have `aarch64-linux-gnu-gcc`; native OAK linking,
@@ -272,10 +292,10 @@ claimed by these host results.
    continuous pet-state eyes, the formal bow, startup recovery, firmware
    anesthesia/wake semantics, and normal goodnight are complete in the typed
    owner. Add metric proximity only when depth has valid face-association
-   evidence. Wire firmware-maintenance facts when a canonical firmware
-   coordinator exists, and add durable secondary-fault evidence before the
-   terminal branch streams fault-recovery eyes; do not replace the primary
-   stop fault or call apparent width metric range.
+   evidence. Post-latch fault-recovery presentation and its durable secondary
+   evidence are complete in `626f764`. Wire firmware-maintenance facts when a
+   canonical firmware coordinator exists; do not replace the primary stop fault
+   or call apparent width metric range.
 2. Pet NDJSON compatibility, durable production recording, reaction replay,
    and general source-hashed semantic behavior-trace replay are complete.
    Retain the Python lane as a non-booted behavior lab until the Rust owner has
