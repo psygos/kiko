@@ -151,6 +151,19 @@ a head offset is still rejected: this crate owns no head actor. The production
 default remains `ReactionMixer::default()` → `HeadIntention::NaturalHold`;
 the separate typed character overlay cannot grant actuation authority.
 
+When the evidence-bound physical head path is active, face tracking is no
+longer an open-loop eye command. The proposal seam retains the desired
+neutral-head yaw/pitch in radians, and the sole head actor returns its exact
+verified committed target. The reviewed sparse encoder mapping is inverted
+with a scale-stable least-squares projection across bow and curl, then the
+desired-minus-commanded angular residual is mapped to logical KEP2 gaze. Only
+the original face-gaze contribution is replaced: autonomic saccades, act gaze,
+lids, pupil, colour, blink, and reaction freshness remain untouched. Bounded
+tracker coasting retains the last typed angular target without resubmitting a
+stale head proposal, preventing raw-image/residual alternation on detector
+gaps. This is command/readback evidence, not optical proof that the physical
+head reached the commanded target.
+
 ## Eye ownership session
 
 `EyeSession` yields and consumes KEP2 `Message` values; a transport owns byte

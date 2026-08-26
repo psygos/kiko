@@ -147,17 +147,30 @@ remaining work; a passing host test is never presented as physical evidence.
   continue; only confirmed stationary or a non-physical renderer permits head
   choreography. Intent: make interoception a fact-driven core reflex and make
   expression/base exclusion structural rather than an ordering convention.
+- `e561c97`: the current face proposal now retains its desired neutral-head
+  angles, while the sole servo actor returns the exact target it actually
+  committed. The reviewed sparse mapping reconstructs commanded optical gaze
+  through a scale-stable bow/curl least-squares inverse; desired minus
+  commanded gaze replaces only the original face contribution before KEP2
+  application. Character saccades, act offsets, lids, colour, blink, and
+  freshness remain intact. Bounded tracker coasting retains the last typed
+  angular target without reissuing a stale head command, so detector gaps
+  cannot alternate raw image gaze with residual gaze. Invalid mapping,
+  nonfinite residual, missing committed state, and impossible composition are
+  typed terminal faults. Intent: close Fable's eye/head feedback loop in the
+  canonical owner without reconstructing radians from normalized image
+  coordinates or weakening head authority.
 
-Host evidence at this checkpoint is 97/97 `kiko-expression-runtime` unit
+Host evidence at this checkpoint is 101/101 `kiko-expression-runtime` unit
 tests plus its compile-fail doctest, warning-free expression, head, and Nano
 compile-only Clippy, 177 `kiko-head-runtime` library tests plus 11 binary
-tests, 1,453/1,453 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
+tests, 1,454/1,454 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
 binary tests, 7/7 offline-qualifier tests, 36/36 immutable-renderer tests,
 all 6 deployment-gate tests, the 13 focused base-commissioning tests, and
 82/82 Python behavior tests. The complete Nano-agent library suite was run
 outside the filesystem sandbox because 23 otherwise-green local socket and
 loopback-listener tests are denied binding by that sandbox; the unrestricted
-run passed all 1,453 tests.
+run passed all 1,454 tests.
 The Linux-aarch64 standard-library abstract notify-socket API was compiled
 directly. A complete Linux-aarch64 dependency cross-check remains unclaimed
 because this Mac does not have `aarch64-linux-gnu-gcc`; native OAK linking,
@@ -166,13 +179,13 @@ claimed by these host results.
 
 ### Remaining before the single-owner handoff is complete
 
-1. Complete the now-typed character boundary with commanded-head feedback and
-   metric proximity when depth has valid association evidence. Thermal/body
-   state and base-motion exclusion facts are complete. Then port dynamic
-   bow/curl recruitment, turn-dip weight shift, and the remaining interoceptive
-   acts. Image-plane face bearing, apparent-width proximity cue, continuous
-   pet-state eye choreography, and the formal bow greeting are complete;
-   apparent width is not relabeled as metric range.
+1. Commanded-head feedback and residual-driven eyes are complete. Add metric
+   proximity only when depth has valid face-association evidence, then port
+   dynamic bow/curl recruitment, turn-dip weight shift, and the remaining
+   interoceptive acts. Thermal/body state, base-motion exclusion, image-plane
+   face bearing, apparent-width proximity cue, continuous pet-state eye
+   choreography, and the formal bow greeting are complete; apparent width is
+   not relabeled as metric range.
 2. Pet NDJSON compatibility, durable production recording, and reaction replay
    are complete. Add the remaining general behavior-trace replay comparison;
    retain the Python lane as a non-booted behavior lab until the Rust owner has
