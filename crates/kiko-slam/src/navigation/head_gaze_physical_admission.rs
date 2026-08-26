@@ -18,7 +18,7 @@ use kiko_expression_runtime::{
     CharacterHeadMappingDeclaration, CharacterHeadOverlay, CharacterHeadOverlayMappingError,
     CommandedHeadGaze, CommandedHeadGazeEstimateError, FaceTrackingUpdate,
 };
-use kiko_head_protocol::ExactHeadTargetPose;
+use kiko_head_protocol::{ExactHeadTargetPose, HeadJoint, PositionTicks};
 use kiko_head_runtime::{
     HeadGazeActuationConfig, HeadGazeActuationConfigError, ReturnToTargetConfig,
     gaze_control::{HeadGazeControlConfig, HeadGazeControlConfigError},
@@ -27,8 +27,8 @@ use kiko_head_runtime::{
 use super::{
     HeadGazeFaceProposal, HeadGazeFaceProposalAdapter, HeadGazeFaceProposalAdapterError,
     HeadGazeFaceProposalError, HeadGazeFaceProposalOutcome, HeadGazeFaceProposalWithheld,
-    HeadGazePolicyLifecycleClaim, HeadGazePolicyV1, OperatorClaimedHeadGazePhysicalReview,
-    RgbFacePinholeProjection,
+    HeadGazePolicyLifecycleClaim, HeadGazePolicyV1, HeadTurnDipPosturePolicy,
+    OperatorClaimedHeadGazePhysicalReview, RgbFacePinholeProjection,
 };
 
 /// Exact retained identity of the physical-review evidence used at admission.
@@ -93,6 +93,38 @@ pub enum CharacterHeadOverlayDisposition {
     },
 }
 
+/// Truthful outcome of Fable's equal-tick serial-neck turn posture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnDipPostureDisposition {
+    Disabled,
+    Natural,
+    Applied {
+        offset_ticks: i16,
+    },
+    WithheldOutsideHardEnvelope {
+        requested_offset_ticks: i16,
+        source: TurnDipPostureMappingError,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnDipPostureMappingError {
+    OutsideHardEnvelope {
+        joint: HeadJoint,
+        proposed_ticks: i32,
+        minimum: PositionTicks,
+        maximum: PositionTicks,
+    },
+}
+
+impl fmt::Display for TurnDipPostureMappingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "cannot map turn-dip posture: {self:?}")
+    }
+}
+
+impl std::error::Error for TurnDipPostureMappingError {}
+
 /// One admitted physical target after optional face gaze and character
 /// overlay composition.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,6 +133,7 @@ pub struct AdmittedPhysicalCharacterHeadProposal {
     face_withheld: Option<HeadGazeFaceProposalWithheld>,
     command_target: ExactHeadTargetPose,
     overlay: CharacterHeadOverlayDisposition,
+    turn_dip: TurnDipPostureDisposition,
 }
 
 impl AdmittedPhysicalCharacterHeadProposal {
@@ -121,6 +154,10 @@ impl AdmittedPhysicalCharacterHeadProposal {
     pub const fn overlay(self) -> CharacterHeadOverlayDisposition {
         self.overlay
     }
+
+    pub const fn turn_dip(self) -> TurnDipPostureDisposition {
+        self.turn_dip
+    }
 }
 
 /// Character evaluation can produce a target without a face (an autonomic
@@ -131,7 +168,180 @@ pub enum PhysicalCharacterHeadOutcome {
     Withheld {
         face: HeadGazeFaceProposalWithheld,
         overlay: CharacterHeadOverlayDisposition,
+        turn_dip: TurnDipPostureDisposition,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadTurnDipPostureError {
+    ObservationClockNotIncreasing {
+        previous: MonotonicTimestamp,
+        actual: MonotonicTimestamp,
+    },
+}
+
+impl fmt::Display for HeadTurnDipPostureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "cannot advance head turn-dip posture: {self:?}")
+    }
+}
+
+impl std::error::Error for HeadTurnDipPostureError {}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PhysicalCharacterHeadEvaluationError {
+    Face(HeadGazeFaceProposalError),
+    TurnDip(HeadTurnDipPostureError),
+}
+
+impl fmt::Display for PhysicalCharacterHeadEvaluationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot evaluate physical character head: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for PhysicalCharacterHeadEvaluationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Face(source) => Some(source),
+            Self::TurnDip(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HeadTurnDipController {
+    policy: HeadTurnDipPosturePolicy,
+    previous_heading: Option<(i32, MonotonicTimestamp)>,
+    decay_anchor: Option<(i64, MonotonicTimestamp)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreparedHeadTurnDip {
+    controller: HeadTurnDipController,
+    offset_ticks: i16,
+}
+
+impl HeadTurnDipController {
+    const fn new(policy: HeadTurnDipPosturePolicy) -> Self {
+        Self {
+            policy,
+            previous_heading: None,
+            decay_anchor: None,
+        }
+    }
+
+    fn prepare(
+        self,
+        heading_ticks: i32,
+        observed_at: MonotonicTimestamp,
+    ) -> Result<PreparedHeadTurnDip, HeadTurnDipPostureError> {
+        let Some((previous_heading, previous_at)) = self.previous_heading else {
+            return Ok(PreparedHeadTurnDip {
+                controller: Self {
+                    previous_heading: Some((heading_ticks, observed_at)),
+                    ..self
+                },
+                offset_ticks: 0,
+            });
+        };
+        if observed_at <= previous_at {
+            return Err(HeadTurnDipPostureError::ObservationClockNotIncreasing {
+                previous: previous_at,
+                actual: observed_at,
+            });
+        }
+
+        let elapsed_ns = observed_at.nanos_since_epoch() - previous_at.nanos_since_epoch();
+        let decayed_dip_milliticks = self
+            .decay_anchor
+            .map(|(anchor_milliticks, anchor_at)| {
+                decay_turn_dip_milliticks(
+                    anchor_milliticks,
+                    observed_at.nanos_since_epoch() - anchor_at.nanos_since_epoch(),
+                    self.policy,
+                )
+            })
+            .unwrap_or(0);
+        let raw_dip_milliticks = if elapsed_ns
+            < u64::try_from(self.policy.maximum_rate_interval().as_nanos())
+                .expect("parsed maximum rate interval fits u64 nanoseconds")
+        {
+            let heading_delta = i64::from(heading_ticks) - i64::from(previous_heading);
+            let motion_rate_numerator = u128::from(heading_delta.unsigned_abs()) * 1_000_000_000;
+            let deadband_rate_numerator =
+                u128::from(self.policy.turn_rate_deadband_ticks_per_second())
+                    * u128::from(elapsed_ns);
+            let excess_rate_numerator =
+                motion_rate_numerator.saturating_sub(deadband_rate_numerator);
+            let dip_milliticks = excess_rate_numerator
+                * u128::from(self.policy.excess_turn_rate_to_dip_milliseconds())
+                / u128::from(elapsed_ns);
+            let bounded = dip_milliticks.min(u128::from(self.policy.maximum_dip_ticks()) * 1_000);
+            -i64::try_from(bounded).expect("bounded turn dip fits i64")
+        } else {
+            0
+        };
+        let dip_milliticks = raw_dip_milliticks.min(decayed_dip_milliticks);
+        let decay_anchor = if raw_dip_milliticks < decayed_dip_milliticks {
+            Some((raw_dip_milliticks, observed_at))
+        } else if dip_milliticks == 0 {
+            None
+        } else {
+            self.decay_anchor
+        };
+        let rounded_magnitude = dip_milliticks.unsigned_abs().saturating_add(500) / 1_000;
+        let offset_ticks = -i16::try_from(rounded_magnitude)
+            .expect("parsed maximum turn dip fits the physical encoder domain");
+        Ok(PreparedHeadTurnDip {
+            controller: Self {
+                previous_heading: Some((heading_ticks, observed_at)),
+                decay_anchor,
+                ..self
+            },
+            offset_ticks,
+        })
+    }
+}
+
+const TURN_DIP_DECAY_SCALE: u128 = 1_000_000_000_000;
+
+fn decay_turn_dip_milliticks(
+    anchor_milliticks: i64,
+    elapsed_ns: u64,
+    policy: HeadTurnDipPosturePolicy,
+) -> i64 {
+    debug_assert!(anchor_milliticks < 0);
+    let reference_ns = u64::try_from(policy.decay_reference_period().as_nanos())
+        .expect("parsed decay reference period fits u64 nanoseconds");
+    let complete_periods = elapsed_ns / reference_ns;
+    let remainder_ns = elapsed_ns % reference_ns;
+    let retention = u128::from(policy.decay_retention_permille()) * TURN_DIP_DECAY_SCALE / 1_000;
+    let complete_factor = fixed_point_power(retention, complete_periods);
+    let one_period_loss = TURN_DIP_DECAY_SCALE - retention;
+    let fractional_factor = TURN_DIP_DECAY_SCALE
+        - one_period_loss * u128::from(remainder_ns) / u128::from(reference_ns);
+    let combined_factor = complete_factor * fractional_factor / TURN_DIP_DECAY_SCALE;
+    let decayed_magnitude =
+        u128::from(anchor_milliticks.unsigned_abs()) * combined_factor / TURN_DIP_DECAY_SCALE;
+    -i64::try_from(decayed_magnitude).expect("decay cannot increase the bounded turn dip")
+}
+
+fn fixed_point_power(mut base: u128, mut exponent: u64) -> u128 {
+    let mut result = TURN_DIP_DECAY_SCALE;
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            result = result * base / TURN_DIP_DECAY_SCALE;
+        }
+        exponent >>= 1;
+        if exponent != 0 {
+            base = base * base / TURN_DIP_DECAY_SCALE;
+        }
+    }
+    result
 }
 
 /// Sole owner of a head-gaze policy that crossed every static activation
@@ -144,6 +354,7 @@ pub enum PhysicalCharacterHeadOutcome {
 pub struct EvidenceBoundPhysicalHeadGazePolicy {
     adapter: HeadGazeFaceProposalAdapter,
     character_mapping: Option<CharacterHeadMappingDeclaration>,
+    turn_dip: Option<HeadTurnDipController>,
     actuation: HeadGazeActuationConfig,
     review: OperatorClaimedHeadGazePhysicalReview,
     evidence: BoundHeadGazeReviewEvidence,
@@ -186,6 +397,7 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
 
         let declaration = *policy.controller();
         let character_mapping = policy.character_mapping();
+        let turn_dip = policy.turn_dip_posture().map(HeadTurnDipController::new);
         let compliant_hold = policy.compliant_hold();
         let mut controller = HeadGazeControlConfig::try_new(
             declaration.timing(),
@@ -230,6 +442,7 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
         Ok(Self {
             adapter,
             character_mapping,
+            turn_dip,
             actuation,
             review,
             evidence: BoundHeadGazeReviewEvidence {
@@ -299,82 +512,183 @@ impl EvidenceBoundPhysicalHeadGazePolicy {
     /// clamps. Face gaze may still proceed while the returned disposition
     /// records that the overlay was withheld.
     pub fn evaluate_character(
-        &self,
+        &mut self,
         update: FaceTrackingUpdate,
         evaluated_at: MonotonicTimestamp,
         projection: RgbFacePinholeProjection,
         overlay: CharacterHeadOverlay,
-    ) -> Result<PhysicalCharacterHeadOutcome, HeadGazeFaceProposalError> {
-        match self.adapter.evaluate(update, evaluated_at, projection)? {
-            HeadGazeFaceProposalOutcome::Proposed(face) => {
-                let base = face.target();
-                let (target, overlay_disposition) = if overlay.is_natural() {
-                    (base, CharacterHeadOverlayDisposition::Natural)
-                } else if let Some(mapping) = self.character_mapping {
-                    match mapping.proposal_for_base_overlay(base, overlay) {
-                        Ok(target) => (target, CharacterHeadOverlayDisposition::Applied(overlay)),
-                        Err(source) => (
+    ) -> Result<PhysicalCharacterHeadOutcome, PhysicalCharacterHeadEvaluationError> {
+        let face_outcome = self
+            .adapter
+            .evaluate(update, evaluated_at, projection)
+            .map_err(PhysicalCharacterHeadEvaluationError::Face)?;
+        let natural_positions = self.adapter.mapping().natural_declaration().positions();
+        let (face, face_withheld, positions, overlay_disposition, base_commands) =
+            match face_outcome {
+                HeadGazeFaceProposalOutcome::Proposed(face) => {
+                    let base = face.target();
+                    let (target, overlay_disposition) = if overlay.is_natural() {
+                        (base, CharacterHeadOverlayDisposition::Natural)
+                    } else if let Some(mapping) = self.character_mapping {
+                        match mapping.proposal_for_base_overlay(base, overlay) {
+                            Ok(target) => {
+                                (target, CharacterHeadOverlayDisposition::Applied(overlay))
+                            }
+                            Err(source) => (
+                                base,
+                                CharacterHeadOverlayDisposition::WithheldOutsideHardEnvelope {
+                                    requested: overlay,
+                                    source,
+                                },
+                            ),
+                        }
+                    } else {
+                        (
                             base,
-                            CharacterHeadOverlayDisposition::WithheldOutsideHardEnvelope {
-                                requested: overlay,
-                                source,
-                            },
-                        ),
-                    }
-                } else {
+                            CharacterHeadOverlayDisposition::WithheldNoMapping(overlay),
+                        )
+                    };
                     (
-                        base,
-                        CharacterHeadOverlayDisposition::WithheldNoMapping(overlay),
+                        Some(face),
+                        None,
+                        target.positions(),
+                        overlay_disposition,
+                        true,
                     )
-                };
-                let [bow, curl, yaw, roll] = target.positions();
-                Ok(PhysicalCharacterHeadOutcome::Proposed(
-                    AdmittedPhysicalCharacterHeadProposal {
-                        face: Some(face),
-                        face_withheld: None,
-                        command_target: ExactHeadTargetPose::from_positions(bow, curl, yaw, roll),
-                        overlay: overlay_disposition,
-                    },
-                ))
-            }
-            HeadGazeFaceProposalOutcome::Withheld(face) => {
-                if overlay.is_natural() {
-                    return Ok(PhysicalCharacterHeadOutcome::Withheld {
-                        face,
-                        overlay: CharacterHeadOverlayDisposition::Natural,
-                    });
                 }
-                let Some(mapping) = self.character_mapping else {
-                    return Ok(PhysicalCharacterHeadOutcome::Withheld {
-                        face,
-                        overlay: CharacterHeadOverlayDisposition::WithheldNoMapping(overlay),
-                    });
-                };
-                match mapping.proposal_for_natural_overlay(overlay) {
-                    Ok(target) => {
-                        let [bow, curl, yaw, roll] = target.positions();
-                        Ok(PhysicalCharacterHeadOutcome::Proposed(
-                            AdmittedPhysicalCharacterHeadProposal {
-                                face: None,
-                                face_withheld: Some(face),
-                                command_target: ExactHeadTargetPose::from_positions(
-                                    bow, curl, yaw, roll,
-                                ),
-                                overlay: CharacterHeadOverlayDisposition::Applied(overlay),
-                            },
-                        ))
+                HeadGazeFaceProposalOutcome::Withheld(face) => {
+                    if overlay.is_natural() {
+                        (
+                            None,
+                            Some(face),
+                            natural_positions,
+                            CharacterHeadOverlayDisposition::Natural,
+                            false,
+                        )
+                    } else if let Some(mapping) = self.character_mapping {
+                        match mapping.proposal_for_natural_overlay(overlay) {
+                            Ok(target) => (
+                                None,
+                                Some(face),
+                                target.positions(),
+                                CharacterHeadOverlayDisposition::Applied(overlay),
+                                true,
+                            ),
+                            Err(source) => (
+                                None,
+                                Some(face),
+                                natural_positions,
+                                CharacterHeadOverlayDisposition::WithheldOutsideHardEnvelope {
+                                    requested: overlay,
+                                    source,
+                                },
+                                false,
+                            ),
+                        }
+                    } else {
+                        (
+                            None,
+                            Some(face),
+                            natural_positions,
+                            CharacterHeadOverlayDisposition::WithheldNoMapping(overlay),
+                            false,
+                        )
                     }
-                    Err(source) => Ok(PhysicalCharacterHeadOutcome::Withheld {
-                        face,
-                        overlay: CharacterHeadOverlayDisposition::WithheldOutsideHardEnvelope {
-                            requested: overlay,
+                }
+            };
+
+        let heading_ticks = i32::from(positions[2].get())
+            - i32::from(
+                self.adapter
+                    .mapping()
+                    .natural_declaration()
+                    .position(HeadJoint::Yaw)
+                    .get(),
+            );
+        let prepared_turn_dip = self
+            .turn_dip
+            .map(|controller| controller.prepare(heading_ticks, evaluated_at))
+            .transpose()
+            .map_err(PhysicalCharacterHeadEvaluationError::TurnDip)?;
+        let (positions, turn_dip_disposition, posture_commands) = match prepared_turn_dip {
+            None => (positions, TurnDipPostureDisposition::Disabled, false),
+            Some(prepared) if prepared.offset_ticks == 0 => {
+                (positions, TurnDipPostureDisposition::Natural, false)
+            }
+            Some(prepared) => {
+                match apply_turn_dip_posture(
+                    self.adapter.mapping(),
+                    positions,
+                    prepared.offset_ticks,
+                ) {
+                    Ok(positions) => (
+                        positions,
+                        TurnDipPostureDisposition::Applied {
+                            offset_ticks: prepared.offset_ticks,
+                        },
+                        true,
+                    ),
+                    Err(source) => (
+                        positions,
+                        TurnDipPostureDisposition::WithheldOutsideHardEnvelope {
+                            requested_offset_ticks: prepared.offset_ticks,
                             source,
                         },
-                    }),
+                        false,
+                    ),
                 }
             }
+        };
+        if let Some(prepared) = prepared_turn_dip {
+            self.turn_dip = Some(prepared.controller);
+        }
+
+        if base_commands || posture_commands {
+            let [bow, curl, yaw, roll] = positions;
+            Ok(PhysicalCharacterHeadOutcome::Proposed(
+                AdmittedPhysicalCharacterHeadProposal {
+                    face,
+                    face_withheld,
+                    command_target: ExactHeadTargetPose::from_positions(bow, curl, yaw, roll),
+                    overlay: overlay_disposition,
+                    turn_dip: turn_dip_disposition,
+                },
+            ))
+        } else {
+            Ok(PhysicalCharacterHeadOutcome::Withheld {
+                face: face_withheld.expect("a proposed face always produces a base command"),
+                overlay: overlay_disposition,
+                turn_dip: turn_dip_disposition,
+            })
         }
     }
+}
+
+fn apply_turn_dip_posture(
+    mapping: &kiko_expression_runtime::HeadGazeMappingDeclaration,
+    mut positions: [PositionTicks; 4],
+    offset_ticks: i16,
+) -> Result<[PositionTicks; 4], TurnDipPostureMappingError> {
+    debug_assert!(offset_ticks < 0);
+    for (index, joint) in [(0, HeadJoint::Bow), (1, HeadJoint::Curl)] {
+        let proposed_ticks = i32::from(positions[index].get()) + i32::from(offset_ticks);
+        let envelope = mapping.hard_envelope(joint);
+        if proposed_ticks < i32::from(envelope.minimum().get())
+            || proposed_ticks > i32::from(envelope.maximum().get())
+        {
+            return Err(TurnDipPostureMappingError::OutsideHardEnvelope {
+                joint,
+                proposed_ticks,
+                minimum: envelope.minimum(),
+                maximum: envelope.maximum(),
+            });
+        }
+        positions[index] = PositionTicks::try_new(
+            u16::try_from(proposed_ticks).expect("hard-envelope admission proves nonnegative"),
+        )
+        .expect("hard-envelope admission proves physical encoder range");
+    }
+    Ok(positions)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -623,6 +937,18 @@ mod tests {
             .expect("parse policy")
     }
 
+    fn with_turn_dip(mut value: Value) -> Value {
+        value["mapping_declaration"]["turn_dip_posture"] = json!({
+            "turn_rate_deadband_ticks_per_second": 120,
+            "maximum_dip_ticks": 26,
+            "excess_turn_rate_to_dip_milliseconds": 80,
+            "decay_retention_permille": 850,
+            "decay_reference_period_ns": 50_000_000,
+            "maximum_rate_interval_ns": 500_000_000
+        });
+        value
+    }
+
     fn with_compliance(mut value: Value, control_period_ns: u64) -> Value {
         value["controller_declaration"]["timing"]["maximum_tick_lateness_ns"] = json!(20_000_000);
         value["compliant_hold_declaration"] = json!({
@@ -698,6 +1024,234 @@ mod tests {
             crate::PinholeIntrinsics::try_new(400.0, 400.0, 319.5, 199.5).unwrap(),
             layout,
         )
+    }
+
+    #[test]
+    fn turn_dip_controller_matches_field_threshold_saturation_and_timed_decay() {
+        let value = with_turn_dip(policy_value(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            100_000_000,
+        ));
+        let policy = parse_policy(&value).turn_dip_posture().unwrap();
+        let controller = HeadTurnDipController::new(policy);
+        let first = controller
+            .prepare(0, MonotonicTimestamp::from_nanos_since_epoch(1))
+            .unwrap();
+        assert_eq!(first.offset_ticks, 0);
+
+        // 20 ticks in 50 ms is 400 ticks/s. Above the 120 deadband,
+        // 280 * 80 ms = 22.4 ticks of dip, rounded to -22.
+        let turning = first
+            .controller
+            .prepare(20, MonotonicTimestamp::from_nanos_since_epoch(50_000_001))
+            .unwrap();
+        assert_eq!(turning.offset_ticks, -22);
+
+        // At rest, exactly one reference period retains 850 permille:
+        // 22.4 * 0.85 = 19.04 ticks.
+        let decaying = turning
+            .controller
+            .prepare(20, MonotonicTimestamp::from_nanos_since_epoch(100_000_001))
+            .unwrap();
+        assert_eq!(decaying.offset_ticks, -19);
+
+        let saturated = decaying
+            .controller
+            .prepare(
+                -200,
+                MonotonicTimestamp::from_nanos_since_epoch(150_000_001),
+            )
+            .unwrap();
+        assert_eq!(saturated.offset_ticks, -26);
+        assert!(matches!(
+            saturated.controller.prepare(
+                -200,
+                MonotonicTimestamp::from_nanos_since_epoch(150_000_001)
+            ),
+            Err(HeadTurnDipPostureError::ObservationClockNotIncreasing { .. })
+        ));
+    }
+
+    #[test]
+    fn turn_dip_decay_is_frame_segmentation_invariant_and_rate_window_is_open() {
+        let value = with_turn_dip(policy_value(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            100_000_000,
+        ));
+        let policy = parse_policy(&value).turn_dip_posture().unwrap();
+
+        let initial = HeadTurnDipController::new(policy)
+            .prepare(0, MonotonicTimestamp::from_nanos_since_epoch(1))
+            .unwrap();
+        // Exactly 120 ticks/s is the deadband, not an expressive turn.
+        let threshold = initial
+            .controller
+            .prepare(6, MonotonicTimestamp::from_nanos_since_epoch(50_000_001))
+            .unwrap();
+        assert_eq!(threshold.offset_ticks, 0);
+        let saturated = threshold
+            .controller
+            .prepare(
+                -200,
+                MonotonicTimestamp::from_nanos_since_epoch(100_000_001),
+            )
+            .unwrap();
+        assert_eq!(saturated.offset_ticks, -26);
+
+        let direct = saturated
+            .controller
+            .prepare(
+                -200,
+                MonotonicTimestamp::from_nanos_since_epoch(150_000_001),
+            )
+            .unwrap();
+        let half = saturated
+            .controller
+            .prepare(
+                -200,
+                MonotonicTimestamp::from_nanos_since_epoch(125_000_001),
+            )
+            .unwrap();
+        assert_eq!(half.offset_ticks, -24);
+        let segmented = half
+            .controller
+            .prepare(
+                -200,
+                MonotonicTimestamp::from_nanos_since_epoch(150_000_001),
+            )
+            .unwrap();
+        assert_eq!(segmented.offset_ticks, direct.offset_ticks);
+        assert_eq!(direct.offset_ticks, -22);
+
+        let maximum_interval = HeadTurnDipController::new(policy)
+            .prepare(0, MonotonicTimestamp::from_nanos_since_epoch(1))
+            .unwrap()
+            .controller
+            .prepare(
+                1_000,
+                MonotonicTimestamp::from_nanos_since_epoch(500_000_001),
+            )
+            .unwrap();
+        assert_eq!(maximum_interval.offset_ticks, 0);
+    }
+
+    #[test]
+    fn turn_dip_mapping_withholds_composed_targets_outside_either_joint_envelope() {
+        let value = with_turn_dip(policy_value(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            100_000_000,
+        ));
+        let policy = parse_policy(&value);
+        let mapping = policy.mapping();
+        let mut positions = mapping.natural_declaration().positions();
+        positions[0] = mapping.hard_envelope(HeadJoint::Bow).minimum();
+        assert_eq!(
+            apply_turn_dip_posture(mapping, positions, -1),
+            Err(TurnDipPostureMappingError::OutsideHardEnvelope {
+                joint: HeadJoint::Bow,
+                proposed_ticks: 1_973,
+                minimum: PositionTicks::try_new(1_974).unwrap(),
+                maximum: PositionTicks::try_new(2_374).unwrap(),
+            })
+        );
+
+        let mut positions = mapping.natural_declaration().positions();
+        positions[1] = mapping.hard_envelope(HeadJoint::Curl).minimum();
+        assert_eq!(
+            apply_turn_dip_posture(mapping, positions, -1),
+            Err(TurnDipPostureMappingError::OutsideHardEnvelope {
+                joint: HeadJoint::Curl,
+                proposed_ticks: 2_369,
+                minimum: PositionTicks::try_new(2_370).unwrap(),
+                maximum: PositionTicks::try_new(2_770).unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn turn_dip_is_equal_tick_gaze_neutral_and_can_finish_without_a_face() {
+        let (_root, evidence) = load_evidence(b"retained turn-dip review evidence");
+        let digest = lowercase_hex(evidence.content_sha256().as_bytes());
+        let mut admitted = EvidenceBoundPhysicalHeadGazePolicy::admit(
+            parse_policy(&with_turn_dip(policy_value(&digest, 100_000_000))),
+            &evidence,
+            &reviewed_return(),
+        )
+        .unwrap();
+
+        let right = CharacterHeadOverlay::try_new(0, 0, 500, 0).unwrap();
+        let left = CharacterHeadOverlay::try_new(0, 0, -500, 0).unwrap();
+        let first = admitted
+            .evaluate_character(
+                no_target_update(1),
+                MonotonicTimestamp::from_nanos_since_epoch(1),
+                projection(),
+                right,
+            )
+            .unwrap();
+        let PhysicalCharacterHeadOutcome::Proposed(first) = first else {
+            panic!("yaw overlay must propose");
+        };
+        assert_eq!(first.turn_dip(), TurnDipPostureDisposition::Natural);
+
+        let turn = admitted
+            .evaluate_character(
+                no_target_update(2),
+                MonotonicTimestamp::from_nanos_since_epoch(50_000_001),
+                projection(),
+                left,
+            )
+            .unwrap();
+        let PhysicalCharacterHeadOutcome::Proposed(turn) = turn else {
+            panic!("fast yaw reversal must propose");
+        };
+        assert_eq!(
+            turn.turn_dip(),
+            TurnDipPostureDisposition::Applied { offset_ticks: -26 }
+        );
+        assert_eq!(
+            turn.command_target().positions().map(PositionTicks::get),
+            [2_148, 2_544, 1_547, 3_047]
+        );
+        let reconstructed = admitted
+            .estimate_commanded_gaze(turn.command_target())
+            .unwrap();
+        assert_eq!(reconstructed.pitch_down_rad(), 0.0);
+
+        // Returning yaw to natural is another fast turn and keeps the dip at
+        // saturation; the next stationary frame decays it to 22 ticks. With
+        // no face and a natural overlay, that posture alone remains a truthful
+        // command rather than snapping directly to natural.
+        admitted
+            .evaluate_character(
+                no_target_update(3),
+                MonotonicTimestamp::from_nanos_since_epoch(100_000_001),
+                projection(),
+                CharacterHeadOverlay::NATURAL,
+            )
+            .unwrap();
+        let recovery = admitted
+            .evaluate_character(
+                no_target_update(4),
+                MonotonicTimestamp::from_nanos_since_epoch(150_000_001),
+                projection(),
+                CharacterHeadOverlay::NATURAL,
+            )
+            .unwrap();
+        let PhysicalCharacterHeadOutcome::Proposed(recovery) = recovery else {
+            panic!("decaying turn posture must finish without a face");
+        };
+        assert_eq!(
+            recovery.turn_dip(),
+            TurnDipPostureDisposition::Applied { offset_ticks: -22 }
+        );
+        assert_eq!(
+            recovery
+                .command_target()
+                .positions()
+                .map(PositionTicks::get),
+            [2_152, 2_548, 1_637, 3_047]
+        );
     }
 
     #[test]
@@ -786,7 +1340,7 @@ mod tests {
     fn reviewed_character_overlay_can_drive_all_four_without_a_face() {
         let (_root, evidence) = load_evidence(b"retained physical review evidence");
         let digest = lowercase_hex(evidence.content_sha256().as_bytes());
-        let admitted = EvidenceBoundPhysicalHeadGazePolicy::admit(
+        let mut admitted = EvidenceBoundPhysicalHeadGazePolicy::admit(
             parse_policy(&policy_value(&digest, 100_000_000)),
             &evidence,
             &reviewed_return(),
@@ -816,6 +1370,7 @@ mod tests {
             proposal.overlay(),
             CharacterHeadOverlayDisposition::Applied(overlay)
         );
+        assert_eq!(proposal.turn_dip(), TurnDipPostureDisposition::Disabled);
     }
 
     #[test]
@@ -827,7 +1382,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("character_positive_full_scale_encoder_offsets_ticks");
-        let admitted = EvidenceBoundPhysicalHeadGazePolicy::admit(
+        let mut admitted = EvidenceBoundPhysicalHeadGazePolicy::admit(
             parse_policy(&value),
             &evidence,
             &reviewed_return(),
@@ -846,6 +1401,7 @@ mod tests {
             PhysicalCharacterHeadOutcome::Withheld {
                 face: HeadGazeFaceProposalWithheld::NoTarget,
                 overlay: CharacterHeadOverlayDisposition::WithheldNoMapping(overlay),
+                turn_dip: TurnDipPostureDisposition::Disabled,
             }
         );
     }

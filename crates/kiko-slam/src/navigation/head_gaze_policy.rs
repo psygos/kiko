@@ -61,6 +61,189 @@ const SHA256_BYTES: usize = 32;
 const MAX_CONTROL_PERIOD_NS: u64 = 1_000_000_000;
 const MAX_TICK_LATENESS_NS: u64 = 1_000_000_000;
 const MAX_PROPOSAL_TTL_NS: u64 = 5_000_000_000;
+const MAX_TURN_DIP_DECAY_REFERENCE_PERIOD_NS: u64 = 1_000_000_000;
+const MAX_TURN_DIP_RATE_INTERVAL_NS: u64 = 5_000_000_000;
+const MAX_TURN_DIP_GAIN_MILLISECONDS: u16 = 1_000;
+
+/// Parsed Fable-compatible, gaze-neutral serial-neck turn posture.
+///
+/// Heading and rate are measured in physical yaw encoder ticks. The gain is a
+/// time because `(ticks / second) * seconds = posture ticks`. Bow and curl
+/// receive the same negative physical offset, which is gaze-neutral only for
+/// an admitted mapping whose pitch encoder signs oppose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadTurnDipPosturePolicy {
+    turn_rate_deadband_ticks_per_second: u32,
+    maximum_dip_ticks: u16,
+    excess_turn_rate_to_dip_milliseconds: u16,
+    decay_retention_permille: u16,
+    decay_reference_period: Duration,
+    maximum_rate_interval: Duration,
+}
+
+impl HeadTurnDipPosturePolicy {
+    fn parse(
+        dto: HeadTurnDipPostureDto,
+        mapping: &HeadGazeMappingDeclaration,
+    ) -> Result<Self, HeadTurnDipPosturePolicyParseError> {
+        if dto.turn_rate_deadband_ticks_per_second == 0 {
+            return Err(HeadTurnDipPosturePolicyParseError::ZeroTurnRateDeadband);
+        }
+        if dto.maximum_dip_ticks == 0 {
+            return Err(HeadTurnDipPosturePolicyParseError::ZeroMaximumDip);
+        }
+        if !(1..=MAX_TURN_DIP_GAIN_MILLISECONDS).contains(&dto.excess_turn_rate_to_dip_milliseconds)
+        {
+            return Err(HeadTurnDipPosturePolicyParseError::GainOutsideDomain {
+                actual_milliseconds: dto.excess_turn_rate_to_dip_milliseconds,
+                maximum_milliseconds: MAX_TURN_DIP_GAIN_MILLISECONDS,
+            });
+        }
+        if !(1..1_000).contains(&dto.decay_retention_permille) {
+            return Err(
+                HeadTurnDipPosturePolicyParseError::DecayRetentionOutsideOpenUnit {
+                    actual_permille: dto.decay_retention_permille,
+                },
+            );
+        }
+        if dto.decay_reference_period_ns == 0
+            || dto.decay_reference_period_ns > MAX_TURN_DIP_DECAY_REFERENCE_PERIOD_NS
+        {
+            return Err(
+                HeadTurnDipPosturePolicyParseError::DecayReferencePeriodOutsideDomain {
+                    actual_ns: dto.decay_reference_period_ns,
+                    maximum_ns: MAX_TURN_DIP_DECAY_REFERENCE_PERIOD_NS,
+                },
+            );
+        }
+        if dto.maximum_rate_interval_ns == 0
+            || dto.maximum_rate_interval_ns > MAX_TURN_DIP_RATE_INTERVAL_NS
+        {
+            return Err(
+                HeadTurnDipPosturePolicyParseError::MaximumRateIntervalOutsideDomain {
+                    actual_ns: dto.maximum_rate_interval_ns,
+                    maximum_ns: MAX_TURN_DIP_RATE_INTERVAL_NS,
+                },
+            );
+        }
+        if dto.maximum_rate_interval_ns <= dto.decay_reference_period_ns {
+            return Err(
+                HeadTurnDipPosturePolicyParseError::MaximumRateIntervalNotAboveDecayPeriod {
+                    maximum_rate_interval_ns: dto.maximum_rate_interval_ns,
+                    decay_reference_period_ns: dto.decay_reference_period_ns,
+                },
+            );
+        }
+
+        let bow_coefficient = mapping.tick_offset_per_radian(
+            kiko_expression_runtime::HeadGazeCoordinate::PitchDown,
+            HeadJoint::Bow,
+        );
+        let curl_coefficient = mapping.tick_offset_per_radian(
+            kiko_expression_runtime::HeadGazeCoordinate::PitchDown,
+            HeadJoint::Curl,
+        );
+        if bow_coefficient.is_sign_negative() == curl_coefficient.is_sign_negative() {
+            return Err(
+                HeadTurnDipPosturePolicyParseError::PitchEncoderSignsDoNotOppose {
+                    bow_is_negative: bow_coefficient.is_sign_negative(),
+                    curl_is_negative: curl_coefficient.is_sign_negative(),
+                },
+            );
+        }
+        for joint in [HeadJoint::Bow, HeadJoint::Curl] {
+            let natural = mapping.natural_declaration().position(joint);
+            let minimum = mapping.hard_envelope(joint).minimum();
+            let available_negative_ticks = natural.get() - minimum.get();
+            if dto.maximum_dip_ticks > available_negative_ticks {
+                return Err(
+                    HeadTurnDipPosturePolicyParseError::InsufficientNegativePostureTravel {
+                        joint,
+                        natural,
+                        minimum,
+                        required_ticks: dto.maximum_dip_ticks,
+                    },
+                );
+            }
+        }
+
+        Ok(Self {
+            turn_rate_deadband_ticks_per_second: dto.turn_rate_deadband_ticks_per_second,
+            maximum_dip_ticks: dto.maximum_dip_ticks,
+            excess_turn_rate_to_dip_milliseconds: dto.excess_turn_rate_to_dip_milliseconds,
+            decay_retention_permille: dto.decay_retention_permille,
+            decay_reference_period: Duration::from_nanos(dto.decay_reference_period_ns),
+            maximum_rate_interval: Duration::from_nanos(dto.maximum_rate_interval_ns),
+        })
+    }
+
+    pub const fn turn_rate_deadband_ticks_per_second(self) -> u32 {
+        self.turn_rate_deadband_ticks_per_second
+    }
+
+    pub const fn maximum_dip_ticks(self) -> u16 {
+        self.maximum_dip_ticks
+    }
+
+    pub const fn excess_turn_rate_to_dip_milliseconds(self) -> u16 {
+        self.excess_turn_rate_to_dip_milliseconds
+    }
+
+    pub const fn decay_retention_permille(self) -> u16 {
+        self.decay_retention_permille
+    }
+
+    pub const fn decay_reference_period(self) -> Duration {
+        self.decay_reference_period
+    }
+
+    pub const fn maximum_rate_interval(self) -> Duration {
+        self.maximum_rate_interval
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadTurnDipPosturePolicyParseError {
+    ZeroTurnRateDeadband,
+    ZeroMaximumDip,
+    GainOutsideDomain {
+        actual_milliseconds: u16,
+        maximum_milliseconds: u16,
+    },
+    DecayRetentionOutsideOpenUnit {
+        actual_permille: u16,
+    },
+    DecayReferencePeriodOutsideDomain {
+        actual_ns: u64,
+        maximum_ns: u64,
+    },
+    MaximumRateIntervalOutsideDomain {
+        actual_ns: u64,
+        maximum_ns: u64,
+    },
+    MaximumRateIntervalNotAboveDecayPeriod {
+        maximum_rate_interval_ns: u64,
+        decay_reference_period_ns: u64,
+    },
+    PitchEncoderSignsDoNotOppose {
+        bow_is_negative: bool,
+        curl_is_negative: bool,
+    },
+    InsufficientNegativePostureTravel {
+        joint: HeadJoint,
+        natural: kiko_head_protocol::PositionTicks,
+        minimum: kiko_head_protocol::PositionTicks,
+        required_ticks: u16,
+    },
+}
+
+impl fmt::Display for HeadTurnDipPosturePolicyParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid head turn-dip posture policy: {self:?}")
+    }
+}
+
+impl std::error::Error for HeadTurnDipPosturePolicyParseError {}
 
 /// Parsed schema-V1 mapping, lifecycle claim, and non-activating controller
 /// declaration.
@@ -68,6 +251,7 @@ const MAX_PROPOSAL_TTL_NS: u64 = 5_000_000_000;
 pub struct HeadGazePolicyV1 {
     mapping: HeadGazeMappingDeclaration,
     character_mapping: Option<CharacterHeadMappingDeclaration>,
+    turn_dip_posture: Option<HeadTurnDipPosturePolicy>,
     controller: HeadGazeControllerDeclaration,
     compliant_hold: Option<HeadCompliantHoldConfig>,
     thermal_derate: Option<HeadThermalDeratePolicy>,
@@ -101,7 +285,8 @@ impl HeadGazePolicyV1 {
             });
         }
 
-        let (mapping, character_mapping) = parse_mapping(dto.mapping_declaration)?;
+        let (mapping, character_mapping, turn_dip_posture) =
+            parse_mapping(dto.mapping_declaration)?;
         let controller = HeadGazeControllerDeclaration::parse(dto.controller_declaration, &mapping)
             .map_err(HeadGazePolicyParseError::Controller)?;
         let compliant_hold = dto
@@ -120,6 +305,7 @@ impl HeadGazePolicyV1 {
         Ok(Self {
             mapping,
             character_mapping,
+            turn_dip_posture,
             controller,
             compliant_hold,
             thermal_derate,
@@ -138,6 +324,11 @@ impl HeadGazePolicyV1 {
     /// document. Absence preserves the older gaze-only behavior.
     pub const fn character_mapping(&self) -> Option<CharacterHeadMappingDeclaration> {
         self.character_mapping
+    }
+
+    /// Optional gaze-neutral physical posture recruited by rapid yaw demand.
+    pub const fn turn_dip_posture(&self) -> Option<HeadTurnDipPosturePolicy> {
+        self.turn_dip_posture
     }
 
     /// Typed timing, hysteresis, and motion-limit declaration.
@@ -478,6 +669,7 @@ fn parse_mapping(
     (
         HeadGazeMappingDeclaration,
         Option<CharacterHeadMappingDeclaration>,
+        Option<HeadTurnDipPosturePolicy>,
     ),
     HeadGazePolicyParseError,
 > {
@@ -489,6 +681,7 @@ fn parse_mapping(
     let offsets = dto.encoder_tick_offsets_per_radian;
 
     let character_offsets = dto.character_positive_full_scale_encoder_offsets_ticks;
+    let turn_dip_posture = dto.turn_dip_posture;
     let mapping = HeadGazeMappingDeclaration::parse(HeadGazeMappingDeclarationInput {
         assembly_id: &dto.assembly_id,
         calibration_provenance_id: &dto.calibration_provenance_id,
@@ -534,7 +727,11 @@ fn parse_mapping(
         })
         .transpose()
         .map_err(HeadGazePolicyParseError::CharacterMapping)?;
-    Ok((mapping, character_mapping))
+    let turn_dip_posture = turn_dip_posture
+        .map(|declaration| HeadTurnDipPosturePolicy::parse(declaration, &mapping))
+        .transpose()
+        .map_err(HeadGazePolicyParseError::TurnDipPosture)?;
+    Ok((mapping, character_mapping, turn_dip_posture))
 }
 
 fn parse_timing(
@@ -908,6 +1105,7 @@ pub enum HeadGazePolicyParseError {
     },
     Mapping(HeadGazeMappingDeclarationParseError),
     CharacterMapping(CharacterHeadMappingDeclarationParseError),
+    TurnDipPosture(HeadTurnDipPosturePolicyParseError),
     Controller(HeadGazeControllerDeclarationParseError),
     CompliantHold(HeadCompliantHoldDeclarationParseError),
     ThermalDerate(HeadThermalDerateDeclarationParseError),
@@ -926,6 +1124,7 @@ impl std::error::Error for HeadGazePolicyParseError {
             Self::JsonDecode(source) | Self::JsonTrailingData(source) => Some(source),
             Self::Mapping(source) => Some(source),
             Self::CharacterMapping(source) => Some(source),
+            Self::TurnDipPosture(source) => Some(source),
             Self::Controller(source) => Some(source),
             Self::CompliantHold(source) => Some(source),
             Self::ThermalDerate(source) => Some(source),
@@ -1212,8 +1411,20 @@ struct HeadGazeMappingDeclarationDto {
     hard_encoder_envelopes_ticks: NamedHeadTickEnvelopesDto,
     encoder_tick_offsets_per_radian: HeadGazeTickOffsetsPerRadianDto,
     dynamic_pitch_recruitment: Option<DynamicPitchRecruitmentDto>,
+    turn_dip_posture: Option<HeadTurnDipPostureDto>,
     character_positive_full_scale_encoder_offsets_ticks:
         Option<NamedCharacterHeadFullScaleTickOffsetsDto>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeadTurnDipPostureDto {
+    turn_rate_deadband_ticks_per_second: u32,
+    maximum_dip_ticks: u16,
+    excess_turn_rate_to_dip_milliseconds: u16,
+    decay_retention_permille: u16,
+    decay_reference_period_ns: u64,
+    maximum_rate_interval_ns: u64,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -1808,6 +2019,67 @@ mod tests {
         assert!(matches!(
             parse(&value),
             Err(HeadGazePolicyParseError::JsonDecode(_))
+        ));
+    }
+
+    #[test]
+    fn optional_turn_dip_posture_parses_physical_units_and_cross_fields_once() {
+        let mut value = valid_value();
+        value["mapping_declaration"]["turn_dip_posture"] = json!({
+            "turn_rate_deadband_ticks_per_second": 120,
+            "maximum_dip_ticks": 26,
+            "excess_turn_rate_to_dip_milliseconds": 80,
+            "decay_retention_permille": 850,
+            "decay_reference_period_ns": 50_000_000,
+            "maximum_rate_interval_ns": 500_000_000
+        });
+        let policy = parse(&value).expect("typed turn-dip posture");
+        let turn_dip = policy
+            .turn_dip_posture()
+            .expect("optional declaration was present");
+        assert_eq!(turn_dip.turn_rate_deadband_ticks_per_second(), 120);
+        assert_eq!(turn_dip.maximum_dip_ticks(), 26);
+        assert_eq!(turn_dip.excess_turn_rate_to_dip_milliseconds(), 80);
+        assert_eq!(turn_dip.decay_retention_permille(), 850);
+        assert_eq!(turn_dip.decay_reference_period(), Duration::from_millis(50));
+        assert_eq!(turn_dip.maximum_rate_interval(), Duration::from_millis(500));
+
+        for (field, invalid) in [
+            ("turn_rate_deadband_ticks_per_second", json!(0)),
+            ("maximum_dip_ticks", json!(0)),
+            ("excess_turn_rate_to_dip_milliseconds", json!(0)),
+            ("decay_retention_permille", json!(1_000)),
+            ("decay_reference_period_ns", json!(0)),
+            ("maximum_rate_interval_ns", json!(50_000_000)),
+        ] {
+            let mut malformed = value.clone();
+            malformed["mapping_declaration"]["turn_dip_posture"][field] = invalid;
+            assert!(matches!(
+                parse(&malformed),
+                Err(HeadGazePolicyParseError::TurnDipPosture(_))
+            ));
+        }
+
+        let mut same_sign = value.clone();
+        same_sign["mapping_declaration"]["encoder_tick_offsets_per_radian"]["pitch_down_rad"]["bow_ticks_per_radian"] =
+            json!(100.0);
+        assert!(matches!(
+            parse(&same_sign),
+            Err(HeadGazePolicyParseError::TurnDipPosture(
+                HeadTurnDipPosturePolicyParseError::PitchEncoderSignsDoNotOppose { .. }
+            ))
+        ));
+
+        let mut excessive = value;
+        excessive["mapping_declaration"]["turn_dip_posture"]["maximum_dip_ticks"] = json!(201);
+        assert!(matches!(
+            parse(&excessive),
+            Err(HeadGazePolicyParseError::TurnDipPosture(
+                HeadTurnDipPosturePolicyParseError::InsufficientNegativePostureTravel {
+                    joint: HeadJoint::Bow,
+                    ..
+                }
+            ))
         ));
     }
 

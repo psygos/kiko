@@ -67,6 +67,14 @@
       "maximum_bow_share_permille": 600,
       "full_recruitment_total_pitch_demand_ticks": 140
     },
+    "turn_dip_posture": {
+      "turn_rate_deadband_ticks_per_second": 120,
+      "maximum_dip_ticks": 26,
+      "excess_turn_rate_to_dip_milliseconds": 80,
+      "decay_retention_permille": 850,
+      "decay_reference_period_ns": 50000000,
+      "maximum_rate_interval_ns": 500000000
+    },
     "character_positive_full_scale_encoder_offsets_ticks": {
       "bow_ticks": 110,
       "curl_ticks": -180,

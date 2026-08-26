@@ -321,6 +321,21 @@ fn rendered_contract_is_typed_proposal_only_with_exact_known_geometry() {
         .expect("template carries Fable's dynamic serial-pitch recruitment");
     assert_eq!(recruitment.maximum_bow_share_permille(), 600);
     assert_eq!(recruitment.full_recruitment_total_pitch_demand_ticks(), 140);
+    let turn_dip = policy
+        .turn_dip_posture()
+        .expect("template carries Fable's gaze-neutral turn posture");
+    assert_eq!(turn_dip.turn_rate_deadband_ticks_per_second(), 120);
+    assert_eq!(turn_dip.maximum_dip_ticks(), 26);
+    assert_eq!(turn_dip.excess_turn_rate_to_dip_milliseconds(), 80);
+    assert_eq!(turn_dip.decay_retention_permille(), 850);
+    assert_eq!(
+        turn_dip.decay_reference_period(),
+        std::time::Duration::from_millis(50)
+    );
+    assert_eq!(
+        turn_dip.maximum_rate_interval(),
+        std::time::Duration::from_millis(500)
+    );
     let character = policy
         .character_mapping()
         .expect("template retains an explicit proposal-only four-joint mapping");

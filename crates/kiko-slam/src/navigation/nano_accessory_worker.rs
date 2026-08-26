@@ -113,7 +113,8 @@ use super::{
     EvidenceBoundPhysicalHeadGazePolicy, EvidenceBoundPhysicalHeadGazePolicyError,
     HeadGazeFaceProposalAdapter, HeadGazeFaceProposalAdapterError, HeadGazeFaceProposalError,
     HeadGazeFaceProposalOutcome, HeadGazeFaceProposalWithheld, HeadGazePolicyLifecycleClaim,
-    HeadGazePolicyV1, PhysicalCharacterHeadOutcome, RgbFacePinholeProjection,
+    HeadGazePolicyV1, PhysicalCharacterHeadEvaluationError, PhysicalCharacterHeadOutcome,
+    RgbFacePinholeProjection,
 };
 use super::{
     ManifestBoundNanoAgentPolicyConfigV3, NanoRgbExpressionConfig, RgbExpressionBridge,
@@ -544,6 +545,9 @@ impl NanoAccessoryWorkerConfig {
         if policy.mapping().dynamic_pitch_recruitment().is_none() {
             return Err(NanoPhysicalHeadGazeConfigError::DynamicPitchRecruitmentRequired);
         }
+        if policy.turn_dip_posture().is_none() {
+            return Err(NanoPhysicalHeadGazeConfigError::TurnDipPostureRequired);
+        }
         if policy.compliant_hold().is_none() {
             return Err(NanoPhysicalHeadGazeConfigError::CompliantHoldRequired);
         }
@@ -574,6 +578,7 @@ pub enum NanoPhysicalHeadGazeConfigError {
     AlreadyConfigured,
     CharacterMappingRequired,
     DynamicPitchRecruitmentRequired,
+    TurnDipPostureRequired,
     CompliantHoldRequired,
     ThermalDerateRequired,
     Admission(EvidenceBoundPhysicalHeadGazePolicyError),
@@ -597,6 +602,7 @@ impl std::error::Error for NanoPhysicalHeadGazeConfigError {
             Self::AlreadyConfigured
             | Self::CharacterMappingRequired
             | Self::DynamicPitchRecruitmentRequired
+            | Self::TurnDipPostureRequired
             | Self::CompliantHoldRequired
             | Self::ThermalDerateRequired => None,
         }
@@ -1948,7 +1954,7 @@ pub enum NanoPhysicalHeadGazeRuntimeError {
         intrinsic_height_px: u32,
     },
     Intrinsics(IntrinsicsError),
-    Proposal(HeadGazeFaceProposalError),
+    Proposal(PhysicalCharacterHeadEvaluationError),
     ProposalSequenceExhausted {
         detector_result_sequence: u64,
     },
@@ -4560,7 +4566,7 @@ impl SerialReviewedNaturalHeadPort {
             .active
             .as_mut()
             .expect("gaze frames are processed only after head readiness");
-        let Some(physical) = active.physical_gaze.as_ref() else {
+        let Some(physical) = active.physical_gaze.as_mut() else {
             return Ok(None);
         };
         let Some(issuer) = physical.lease_issuer.get() else {
