@@ -791,14 +791,34 @@ impl CharacterPetEpisode {
         self.tap
     }
 
+    /// Fable records the mean maximum residual delta rounded to two decimal
+    /// places before applying the `>= 6.00` play threshold. Compute that
+    /// decimal exactly from the retained integer evidence, including
+    /// round-half-to-even ties, instead of routing the decision through a
+    /// platform floating-point conversion.
+    pub const fn mean_delta_hundredths(self) -> u64 {
+        if self.delta_samples == 0 {
+            return 0;
+        }
+        let scaled = self.accumulated_max_delta_ticks as u128 * 100;
+        let divisor = self.delta_samples as u128;
+        let quotient = scaled / divisor;
+        let remainder = scaled % divisor;
+        let complement = divisor - remainder;
+        let round_up = remainder > complement || (remainder == complement && quotient % 2 == 1);
+        let rounded = quotient + if round_up { 1 } else { 0 };
+        if rounded > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            rounded as u64
+        }
+    }
+
     pub const fn reaction(self) -> CharacterPetReaction {
         if self.tap {
             return CharacterPetReaction::Boop;
         }
-        let playful = match self.delta_samples.checked_mul(6) {
-            Some(threshold) => self.accumulated_max_delta_ticks >= threshold,
-            None => false,
-        };
+        let playful = self.mean_delta_hundredths() >= 600;
         if playful && !self.reached_comfy {
             CharacterPetReaction::Play
         } else {
@@ -2829,12 +2849,20 @@ mod tests {
                 .expect("valid delta evidence");
         let play = CharacterPetEpisode::try_new(Duration::from_secs(2), 18, 3, false, false)
             .expect("valid delta evidence");
+        let fable_rounding_boundary =
+            CharacterPetEpisode::try_new(Duration::from_secs(2), 1_199, 200, false, false)
+                .expect("valid exact Fable rounding boundary");
         let comfy = CharacterPetEpisode::try_new(Duration::from_secs(6), 18, 3, true, false)
             .expect("valid comfy evidence");
 
         assert_eq!(boop.reaction(), CharacterPetReaction::Boop);
         assert_eq!(just_below_play.reaction(), CharacterPetReaction::Affection);
         assert_eq!(play.reaction(), CharacterPetReaction::Play);
+        assert_eq!(fable_rounding_boundary.mean_delta_hundredths(), 600);
+        assert_eq!(
+            fable_rounding_boundary.reaction(),
+            CharacterPetReaction::Play
+        );
         assert_eq!(comfy.reaction(), CharacterPetReaction::Affection);
     }
 

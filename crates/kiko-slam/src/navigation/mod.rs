@@ -75,6 +75,8 @@ mod nano_map_persistence;
 mod nano_observed_inventory;
 #[cfg(all(feature = "nano-agent", unix))]
 mod nano_operator_console_service;
+#[cfg(feature = "agent-runtime")]
+mod nano_pet_evidence;
 #[cfg(all(feature = "nano-plant-promotion", unix))]
 pub mod nano_plant_promotion;
 #[cfg(all(
@@ -370,6 +372,12 @@ pub use nano_observed_inventory::{
 };
 #[cfg(all(feature = "nano-agent", unix))]
 pub use nano_operator_console_service::*;
+#[cfg(feature = "agent-runtime")]
+pub use nano_pet_evidence::{
+    FABLE_PET_LOG_SCHEMA_LEGACY, MAX_NANO_PET_EVIDENCE_RECORD_BYTES, NANO_PET_EVIDENCE_SCHEMA_V1,
+    NanoPetEpisodeEvidence, NanoPetEvidenceDecodeError, NanoPetEvidenceEncodeError,
+    NanoPetEvidenceFormat, NanoPetReplayComparison,
+};
 #[cfg(all(
     feature = "agent-runtime",
     feature = "actuation",
