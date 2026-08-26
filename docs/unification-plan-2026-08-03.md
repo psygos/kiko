@@ -294,6 +294,12 @@ claimed by these host results.
    is now connected; no native OAK, systemd, or physical-motion claim follows
    from the host evidence above.
 
+The read-only 2026-08-27 Orin checkpoint is retained in
+`docs/nano-single-owner-handoff-audit-2026-08-27.md`. It confirms that Fable's
+Python owner remains active on OAK/head/eyes at USB3 while STM32 is idle, but
+no canonical service, current bundle, online SLAM, occupancy, GUI, MPC, or
+navigation owner is running. This is the safe pre-handoff state, not completion.
+
 ## 1. Original situation recorded 2026-08-03
 
 The recorded target (`docs/nano-agent-architecture.md`,
