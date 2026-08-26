@@ -75,20 +75,33 @@ remaining work; a passing host test is never presented as physical evidence.
   attacked acceleration or velocity can outrun the downstream planner. Intent:
   keep tuning legible in physical units while the runtime remains fixed-point
   and deterministic.
+- `94e529d`: the character boundary no longer collapses an established face to
+  a boolean. One parsed value now retains track identity, normalized image
+  bearing, non-metric apparent width, freshness, and
+  observed/switched/coasting provenance. Every committed compliant phase also
+  crosses a typed feedback edge: candidate, yielding, release dwell, resting,
+  and recovery progress drive a minimum-jerk soften/shrink/look-down eye
+  envelope while scripted head overlays are suppressed. Completed episodes
+  remain a separate edge that selects the later social act. Intent: let Kiko
+  visibly receive touch while it is happening and preserve the face facts
+  required by later character policy without inventing range or servo facts.
 
-Host evidence at this checkpoint is 90/90 `kiko-expression-runtime` unit
+Host evidence at this checkpoint is 93/93 `kiko-expression-runtime` unit
 tests plus its compile-fail doctest, warning-free expression and Nano
 compile-only Clippy, 170 `kiko-head-runtime` library tests plus 11 binary
-tests, 1,365 `kiko-slam` Nano-commissioning library tests, and 82/82 Python
+tests, 1,366 `kiko-slam` Nano-commissioning library tests, and 82/82 Python
 behavior tests. Native OAK linking and physical feel are deliberately not
 claimed by those results.
 
 ### Remaining before the single-owner handoff is complete
 
-1. Widen the character input boundary to typed face bearing, proximity,
-   commanded-head feedback, thermal/body state, and base-motion facts. Then
-   port dynamic bow/curl recruitment, turn-dip weight shift, pet-state eye
-   choreography, formal bow greeting, and the remaining interoceptive acts.
+1. Complete the now-typed character boundary with commanded-head feedback,
+   metric proximity when depth has valid association evidence, thermal/body
+   state, and base-motion facts. Then port dynamic bow/curl recruitment,
+   turn-dip weight shift, formal bow greeting, and the remaining interoceptive
+   acts. Image-plane face bearing, apparent-width proximity cue, and continuous
+   pet-state eye choreography are complete; apparent width is not relabeled as
+   metric range.
 2. Add accessory-loop heartbeat, `sd_notify` watchdog, bounded restart/backoff
    policy, and failure-latched ownership admission. A watchdog must never
    create a competing camera, eye, head, or STM32 owner.
