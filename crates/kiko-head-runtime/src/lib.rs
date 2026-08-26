@@ -10,6 +10,8 @@ mod framing;
 pub mod gaze_control;
 mod motion;
 mod probe;
+#[cfg(test)]
+mod servo_plant;
 mod transport;
 
 pub use actor::{
