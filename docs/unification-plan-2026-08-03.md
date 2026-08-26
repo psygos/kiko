@@ -101,12 +101,29 @@ remaining work; a passing host test is never presented as physical evidence.
   15-second failure backoff plus a five-in-ten-minute start limiter. Intent:
   retire the shell guardian's reason to exist without ever starting a second
   hardware owner alongside a retained first one.
+- `0a174e4`: production render-input V2 and launch V4 make the physically
+  reviewed expression policy and its separate attended-review record mandatory
+  launch assets. The renderer rejects missing, unresolved, aliased, oversized,
+  or non-JSON inputs; offline qualification and runtime bootstrap exact-load
+  both before hardware, parse the policy once, cross-bind its claimed evidence
+  digest, and reject production policy without Fable's four-axis character
+  mapping or compliant hold. The same V4 filename is now fixed across the
+  renderer, offline marker, base-commissioning live graph, CLI, deployment
+  gate, and systemd service. Intent: close the discovered boot-path gap where
+  the typed physical controller existed but production always left it
+  unconfigured, without treating a JSON operator claim as authenticated or
+  physically proven evidence.
 
 Host evidence at this checkpoint is 95/95 `kiko-expression-runtime` unit
 tests plus its compile-fail doctest, warning-free expression and Nano
 compile-only Clippy, 170 `kiko-head-runtime` library tests plus 11 binary
-tests, 1,367 `kiko-slam` Nano-commissioning library tests, 80/80 Nano-agent
-binary tests, all 6 deployment-gate tests, and 82/82 Python behavior tests.
+tests, 1,438/1,438 `kiko-slam` Nano-agent library tests, 80/80 Nano-agent
+binary tests, 7/7 offline-qualifier tests, 36/36 immutable-renderer tests,
+all 6 deployment-gate tests, the 13 focused base-commissioning tests, and
+82/82 Python behavior tests. The complete Nano-agent library suite was run
+outside the filesystem sandbox because 23 otherwise-green local socket and
+loopback-listener tests are denied binding by that sandbox; the unrestricted
+run passed all 1,438 tests.
 The Linux-aarch64 standard-library abstract notify-socket API was compiled
 directly. A complete Linux-aarch64 dependency cross-check remains unclaimed
 because this Mac does not have `aarch64-linux-gnu-gcc`; native OAK linking,
@@ -130,6 +147,11 @@ claimed by these host results.
    one authority path, and close every wheels-off gate before requesting wheel
    attachment. Only an attended wheels-on session can calibrate the
    encoderless plant and prove mapping/navigation on the robot.
+4. Materialize launch V4's policy/review pair from a fresh attended Nano
+   session, run the exact offline gate, and then prove detector, head, eye,
+   compliance, watchdog, and shutdown behavior under PID 1. The software path
+   is now connected; no native OAK, systemd, or physical-motion claim follows
+   from the host evidence above.
 
 ## 1. Original situation recorded 2026-08-03
 
