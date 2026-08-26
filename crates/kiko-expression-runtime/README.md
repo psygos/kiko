@@ -90,18 +90,24 @@ calibrated polarity from silently crossing builds.
 `AutonomicCharacterEngine` decorates each fresh, already typed reaction without
 extending or replacing its host freshness. It is a fixed-size state machine
 with no allocation, I/O, wall clock, or background task. One stream epoch seeds
-its local xorshift sequence, so the same seed, monotonic samples, face-presence
-sequence, and base intentions produce identical output.
+its local xorshift sequence, so the same seed, monotonic samples, typed
+character inputs, and base intentions produce identical output. The character
+input does not accept a loose face-present boolean: an established face
+carries track identity, normalized image bearing, non-metric apparent width,
+freshness, and observed/switched/coasting provenance. Acquisition and expired
+tracks are absent by construction.
 
 The retained modes are idle, greeting, tracking, lost, searching, and sleepy.
-The finite act vocabulary preserves all 19 named behaviors from the prior
-Nano expression process: curious tilt, double take, excited wiggle, lean in,
-nod, soft nod, happy squint, puppy eyes, shy dip, sparkle, blink flourish,
-look around, perk up, daydream, stretch, sweep scan, head bob, sneeze, and
-dance. Cooldowns, bounded durations, timed blinks, and micro-saccades are
-state, not sleeps. All output is reconstructed through KEP2's signed/unit
-domain constructors after explicit saturation to `[-1000,1000]` or
-`[0,1000]`; the frame path retains no untyped eye values.
+The finite act vocabulary preserves the prior Nano behaviors and the retained
+pet responses. Cooldowns, bounded durations, timed blinks, and micro-saccades
+are state, not sleeps. Live compliant phases also cross a typed feedback edge:
+candidate, yielding, release dwell, resting, and controller-progress recovery
+drive one minimum-jerk eye envelope before the completed episode selects its
+social act. This lets the eyes soften, shrink, and look down while touch is
+still happening; expressive head scripts are suppressed while the compliant
+controller owns motion. All output is reconstructed through KEP2's
+signed/unit domain constructors after explicit saturation to `[-1000,1000]`
+or `[0,1000]`; the frame path retains no untyped eye values.
 
 `render_character` returns one `PreparedCharacterFrame`: the KEP2 eye intent,
 mode, optional named act, and a semantic overlay for bow, curl, yaw, and roll.

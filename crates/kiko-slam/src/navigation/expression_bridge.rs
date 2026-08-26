@@ -19,17 +19,18 @@ use std::fmt;
 
 use kiko_expression_core::{
     ChannelOrder, ExpressionIntent, ExpressionKind, ExpressionPriority, FrameId, FreshnessWindow,
-    GazeTarget, HeadMotionPolicy, ImageLayout, ImageLayoutError, MonotonicTimestamp,
-    NonZeroDuration, PositiveUnitAmount, ReactionInputs, ReactionMixer, RgbFrameView,
-    RgbObservation, StreamEpochId, TimeError,
+    HeadMotionPolicy, ImageLayout, ImageLayoutError, MonotonicTimestamp, NonZeroDuration,
+    PositiveUnitAmount, ReactionInputs, ReactionMixer, RgbFrameView, RgbObservation, StreamEpochId,
+    TimeError,
 };
 use kiko_expression_runtime::{
     AdaptError, AutonomicCharacterEngine, CameraForwardDepthMeters, CameraToHeadGazeExtrinsics,
-    CharacterPetEpisode, CharacterPetReaction, EyeRenderStyle, FaceTargetState, FaceTrackingUpdate,
-    HeadGazeProjectionError, HeadRelativeGaze, MonotonicLatestAdmission, MonotonicLatestGap,
-    OakCameraTargetPoint, OakCameraTargetRay, PreparedCharacterFrame, PreparedEyeIntent,
-    RayHeadGazeProjectionError, SceneAnalysis, SceneMotionConfig, SceneMotionError,
-    SceneMotionExtractor, adapt_reaction_output,
+    CharacterAttention, CharacterInputs, CharacterPetEpisode, CharacterPetReaction,
+    CharacterPetState, EyeRenderStyle, FaceTrackingUpdate, HeadGazeProjectionError,
+    HeadRelativeGaze, MonotonicLatestAdmission, MonotonicLatestGap, OakCameraTargetPoint,
+    OakCameraTargetRay, PreparedCharacterFrame, PreparedEyeIntent, RayHeadGazeProjectionError,
+    SceneAnalysis, SceneMotionConfig, SceneMotionError, SceneMotionExtractor,
+    adapt_reaction_output,
 };
 use kiko_eye_runtime::{ClockError, MonotonicClock};
 use oak_sys::{ImageFrame, StreamId};
@@ -278,6 +279,7 @@ pub struct RgbExpressionBridge<C> {
     extractor: SceneMotionExtractor,
     mixer: ReactionMixer,
     character: Option<AutonomicCharacterEngine>,
+    pet_state: CharacterPetState,
     last_device_timestamp_ns: Option<i64>,
 }
 
@@ -318,6 +320,7 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
             extractor: SceneMotionExtractor::new(scene_motion),
             mixer: ReactionMixer::new(RGB_EXPRESSION_HEAD_POLICY),
             character: None,
+            pet_state: CharacterPetState::Inactive,
             last_device_timestamp_ns: None,
         }
     }
@@ -344,6 +347,14 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         self.character
             .as_mut()
             .map(|character| character.note_pet_episode(completed_at, episode))
+    }
+
+    /// Retain the latest semantic compliant-contact phase for the next RGB
+    /// character sample. This is intentionally separate from a completed
+    /// episode edge: eyes can receive touch while the head is yielding, while
+    /// the social act is still selected only from completed evidence.
+    pub fn note_pet_state(&mut self, state: CharacterPetState) {
+        self.pet_state = state;
     }
 
     /// Project one already-parsed positive-depth OAK point into neutral-head
@@ -499,19 +510,12 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         self.last_device_timestamp_ns = Some(frame.device_timestamp_ns);
 
         let scene = analysis.observation();
-        let face_present = face.is_some_and(|update| {
-            matches!(
-                update.state(),
-                FaceTargetState::Tracked(_)
-                    | FaceTargetState::Switched(_)
-                    | FaceTargetState::Coasting(_)
-            )
-        });
-        let face_intent = face
-            .map(face_attention_intent)
+        let attention = face
+            .map(CharacterAttention::try_from_tracking)
             .transpose()
             .map_err(RgbExpressionBridgeError::FaceAttentionFreshness)?
-            .flatten();
+            .unwrap_or(CharacterAttention::Absent);
+        let face_intent = face_attention_intent(attention);
         let intents = face_intent.as_slice();
         let reaction = self.mixer.mix(
             now,
@@ -525,7 +529,11 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         let prepared = adapt_reaction_output(reaction, ExpressionKind::Curious, self.style, now)
             .map_err(RgbExpressionBridgeError::Adapt)?;
         let prepared = match self.character.as_mut() {
-            Some(character) => character.render_character(now, face_present, prepared),
+            Some(character) => character.render_character(
+                now,
+                CharacterInputs::new(attention, self.pet_state),
+                prepared,
+            ),
             None => PreparedCharacterFrame::eyes_only(prepared),
         };
 
@@ -565,39 +573,15 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
     }
 }
 
-fn face_attention_intent(
-    update: FaceTrackingUpdate,
-) -> Result<Option<ExpressionIntent>, TimeError> {
-    let (target, freshness) = match update.state() {
-        FaceTargetState::Tracked(observation) => (observation, observation.freshness()),
-        FaceTargetState::Switched(switched) => {
-            let observation = switched.observation();
-            (observation, observation.freshness())
-        }
-        FaceTargetState::Coasting(coasting) => {
-            let observation = coasting.last_observation();
-            let current = update.observation().freshness();
-            let current_deadline = current.valid_until_exclusive();
-            let loss_deadline = coasting.loss_deadline();
-            let deadline = if current_deadline <= loss_deadline {
-                current_deadline
-            } else {
-                loss_deadline
-            };
-            let freshness = FreshnessWindow::try_new(current.observed_at(), deadline)?;
-            (observation, freshness)
-        }
-        FaceTargetState::NoTarget | FaceTargetState::Acquiring(_) | FaceTargetState::Lost(_) => {
-            return Ok(None);
-        }
-    };
-    Ok(Some(ExpressionIntent::new(
+fn face_attention_intent(attention: CharacterAttention) -> Option<ExpressionIntent> {
+    let face = attention.face()?;
+    Some(ExpressionIntent::new(
         ExpressionKind::Attentive,
         FACE_ATTENTION_STRENGTH,
         ExpressionPriority::Important,
-        Some(GazeTarget::new(target.center())),
-        freshness,
-    )))
+        Some(face.gaze_target()),
+        face.freshness(),
+    ))
 }
 
 fn parse_tight_bgr_layout(
@@ -911,6 +895,36 @@ mod tests {
     }
 
     #[test]
+    fn live_pet_state_shapes_the_next_eye_frames_before_episode_completion() {
+        let clock = TestClock::new(10);
+        let mut decorated = bridge(clock.clone());
+        decorated.character = Some(AutonomicCharacterEngine::new(stream_epoch().get()));
+        decorated
+            .process_borrowed(rgb(1, 1, &[0; 12]))
+            .expect("prime character frame");
+
+        decorated.note_pet_state(CharacterPetState::Resting {
+            at_rest_target: true,
+        });
+        clock.set(20);
+        let entered = decorated
+            .process_borrowed(rgb(2, 2, &[0; 12]))
+            .expect("pet-state entry frame")
+            .into_character();
+        assert!(entered.head().is_natural());
+
+        clock.set(20 + 350_000_000);
+        let received = decorated
+            .process_borrowed(rgb(3, 3, &[0; 12]))
+            .expect("settled pet-state frame")
+            .into_character();
+        assert!(received.head().is_natural());
+        assert_eq!(received.eye().intent().pupil().get(), 420);
+        assert_eq!(received.eye().intent().color_rgb(), [255, 145, 92]);
+        assert!(received.eye().intent().gaze_y().get() >= 430);
+    }
+
+    #[test]
     fn consecutive_frame_uses_borrowed_rgb_and_scene_reaction_inputs() {
         let clock = TestClock::new(10);
         let mut bridge = bridge(clock.clone());
@@ -943,6 +957,11 @@ mod tests {
         let first_face = tracker
             .update(&first_batch, MonotonicTimestamp::from_nanos_since_epoch(10))
             .expect("acquisition result");
+        assert_eq!(
+            CharacterAttention::try_from_tracking(first_face).unwrap(),
+            CharacterAttention::Absent,
+            "unconfirmed acquisition is not character attention"
+        );
         let first = bridge
             .process_ingress_observed_borrowed_with_face(
                 queued_rgb(4, 1_000, 10, &[0; 12]),
@@ -963,6 +982,21 @@ mod tests {
                 MonotonicTimestamp::from_nanos_since_epoch(20),
             )
             .expect("tracked result");
+        let character_face = CharacterAttention::try_from_tracking(second_face)
+            .expect("tracked attention facts")
+            .face()
+            .expect("two results establish a face");
+        assert_eq!(
+            character_face.state(),
+            kiko_expression_runtime::CharacterFaceAttentionState::Observed
+        );
+        assert_eq!(character_face.bearing_x_right().basis_points(), 5_000);
+        assert_eq!(character_face.bearing_y_down().basis_points(), -5_000);
+        assert_eq!(character_face.apparent_width().basis_points(), 5_000);
+        assert_eq!(
+            character_face.freshness(),
+            second_batch.observation().freshness()
+        );
         let second = bridge
             .process_ingress_observed_borrowed_with_face(
                 queued_rgb(5, 2_000, 20, &[0; 12]),
@@ -999,9 +1033,13 @@ mod tests {
         let coasted = tracker
             .update(&empty, MonotonicTimestamp::from_nanos_since_epoch(30))
             .expect("coasted result");
-        let intent = face_attention_intent(coasted)
-            .expect("valid coast freshness")
-            .expect("coasting retains attention");
+        let attention =
+            CharacterAttention::try_from_tracking(coasted).expect("valid coasting character facts");
+        assert_eq!(
+            attention.face().unwrap().state(),
+            kiko_expression_runtime::CharacterFaceAttentionState::Coasting
+        );
+        let intent = face_attention_intent(attention).expect("coasting retains attention");
         assert_eq!(intent.kind(), ExpressionKind::Attentive);
         assert_eq!(intent.strength(), FACE_ATTENTION_STRENGTH);
         assert_eq!(intent.priority(), ExpressionPriority::Important);

@@ -13,14 +13,18 @@
 //! convert it into a physical target.
 
 use core::fmt;
-use core::num::NonZeroU64;
+use core::num::{NonZeroU8, NonZeroU64};
 use core::time::Duration;
-use kiko_expression_core::MonotonicTimestamp;
+use kiko_expression_core::{
+    FreshnessWindow, GazeTarget, MonotonicTimestamp, PersonTrackId, PositiveUnitAmount,
+    SignedUnitAmount, TimeError, UnitAmount as CoreUnitAmount,
+};
 use kiko_eye_protocol::{
     Expression, EyeFlags, EyeIntent, NORMALIZED_SCALE, SignedUnit, UnitAmount,
 };
 
 use crate::PreparedEyeIntent;
+use crate::face_tracking::{FaceTargetState, FaceTrackingUpdate, TrackedFaceObservation};
 
 const SCALE: i32 = NORMALIZED_SCALE as i32;
 const NS_PER_MS: u64 = 1_000_000;
@@ -49,6 +53,8 @@ const SACCADE_DECAY_NS: u64 = 280 * NS_PER_MS;
 const HEAD_EYE_LEAD_NS: u64 = 120 * NS_PER_MS;
 const REST_AFTER_IDLE_NS: u64 = 20 * NS_PER_SECOND;
 const REST_EASE_NS: u64 = 6 * NS_PER_SECOND;
+const PET_VISUAL_ATTACK_NS: u64 = 350 * NS_PER_MS;
+const PET_VISUAL_RELEASE_NS: u64 = 900 * NS_PER_MS;
 const NEVER_RUN: u64 = u64::MAX;
 
 /// Dimensionless signed character displacement scale.
@@ -292,6 +298,227 @@ pub enum CharacterMode {
     Lost,
     Searching,
     Sleepy,
+}
+
+/// Provenance of one established face-attention target.
+///
+/// A coasting target is explicitly different from a current-frame
+/// observation: it retains the last associated face only until the smaller of
+/// the current RGB freshness deadline and the tracker's loss deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterFaceAttentionState {
+    Observed,
+    Switched,
+    Coasting,
+}
+
+/// Typed character facts derived from one established face track.
+///
+/// `bearing_*` is a normalized image-plane bearing, not an angle. Its exact
+/// convention is `-1` at the left/top edge, zero at image centre, and `+1` at
+/// the right/bottom edge. `apparent_width` is the face rectangle width divided
+/// by image width; it is useful as a qualitative proximity cue but is never a
+/// metric range claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CharacterFaceAttention {
+    track_id: PersonTrackId,
+    gaze_target: GazeTarget,
+    bearing_x_right: SignedUnitAmount,
+    bearing_y_down: SignedUnitAmount,
+    apparent_width: PositiveUnitAmount,
+    freshness: FreshnessWindow,
+    state: CharacterFaceAttentionState,
+}
+
+impl CharacterFaceAttention {
+    fn from_observation(
+        observation: TrackedFaceObservation,
+        freshness: FreshnessWindow,
+        state: CharacterFaceAttentionState,
+    ) -> Self {
+        let centre = observation.center();
+        let rectangle = observation.detection().rectangle();
+        let image_width = rectangle.layout().width_px();
+        let numerator = u64::from(rectangle.width_px()) * 10_000;
+        // Round a positive rectangle upward at the 1/10,000 character
+        // resolution. This keeps a real one-pixel face representably positive
+        // even for unusually wide admitted layouts; the overestimate is less
+        // than one basis point and is explicitly non-metric.
+        let apparent_width_basis_points = numerator.div_ceil(u64::from(image_width));
+        let apparent_width_basis_points = u16::try_from(apparent_width_basis_points)
+            .expect("a face rectangle cannot be wider than its image");
+        let apparent_width = PositiveUnitAmount::try_from_basis_points(apparent_width_basis_points)
+            .expect("a checked non-zero face rectangle has positive normalized width");
+        Self {
+            track_id: observation.track_id(),
+            gaze_target: GazeTarget::new(centre),
+            bearing_x_right: centred_image_bearing(centre.x_right().basis_points()),
+            bearing_y_down: centred_image_bearing(centre.y_down().basis_points()),
+            apparent_width,
+            freshness,
+            state,
+        }
+    }
+
+    pub const fn track_id(self) -> PersonTrackId {
+        self.track_id
+    }
+
+    pub const fn gaze_target(self) -> GazeTarget {
+        self.gaze_target
+    }
+
+    pub const fn bearing_x_right(self) -> SignedUnitAmount {
+        self.bearing_x_right
+    }
+
+    pub const fn bearing_y_down(self) -> SignedUnitAmount {
+        self.bearing_y_down
+    }
+
+    pub const fn apparent_width(self) -> PositiveUnitAmount {
+        self.apparent_width
+    }
+
+    pub const fn freshness(self) -> FreshnessWindow {
+        self.freshness
+    }
+
+    pub const fn state(self) -> CharacterFaceAttentionState {
+        self.state
+    }
+}
+
+/// Character attention parsed once from a tracker update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterAttention {
+    Absent,
+    Face(CharacterFaceAttention),
+}
+
+impl CharacterAttention {
+    /// Project a provenance-bearing face-tracker result into character facts.
+    ///
+    /// Acquisition and expired/lost tracks are deliberately absent. Coasting
+    /// freshness is reconstructed from current-frame evidence and may fail
+    /// only if those already-typed deadlines are inconsistent.
+    pub fn try_from_tracking(update: FaceTrackingUpdate) -> Result<Self, TimeError> {
+        let (observation, freshness, state) = match update.state() {
+            FaceTargetState::Tracked(observation) => (
+                observation,
+                observation.freshness(),
+                CharacterFaceAttentionState::Observed,
+            ),
+            FaceTargetState::Switched(switched) => {
+                let observation = switched.observation();
+                (
+                    observation,
+                    observation.freshness(),
+                    CharacterFaceAttentionState::Switched,
+                )
+            }
+            FaceTargetState::Coasting(coasting) => {
+                let observation = coasting.last_observation();
+                let current = update.observation().freshness();
+                let current_deadline = current.valid_until_exclusive();
+                let loss_deadline = coasting.loss_deadline();
+                let deadline = if current_deadline <= loss_deadline {
+                    current_deadline
+                } else {
+                    loss_deadline
+                };
+                (
+                    observation,
+                    FreshnessWindow::try_new(current.observed_at(), deadline)?,
+                    CharacterFaceAttentionState::Coasting,
+                )
+            }
+            FaceTargetState::NoTarget
+            | FaceTargetState::Acquiring(_)
+            | FaceTargetState::Lost(_) => return Ok(Self::Absent),
+        };
+        Ok(Self::Face(CharacterFaceAttention::from_observation(
+            observation,
+            freshness,
+            state,
+        )))
+    }
+
+    pub const fn face(self) -> Option<CharacterFaceAttention> {
+        match self {
+            Self::Absent => None,
+            Self::Face(face) => Some(face),
+        }
+    }
+
+    pub const fn is_present(self) -> bool {
+        matches!(self, Self::Face(_))
+    }
+}
+
+/// Current compliant-contact phase exposed to the character engine.
+///
+/// This contains only semantic controller evidence. Servo registers, encoder
+/// polarity, torque authority, and physical commands remain outside the
+/// character layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterPetState {
+    Inactive,
+    Ready,
+    ContactCandidate { consecutive_samples: NonZeroU8 },
+    Yielding,
+    ReleaseDwell,
+    Resting { at_rest_target: bool },
+    Recovering { progress: CoreUnitAmount },
+}
+
+impl CharacterPetState {
+    pub const fn suppresses_expression_motion(self) -> bool {
+        !matches!(self, Self::Inactive | Self::Ready)
+    }
+
+    const fn visual_target_milli(self) -> i32 {
+        match self {
+            Self::Inactive | Self::Ready => 0,
+            Self::ContactCandidate { .. } => 260,
+            Self::Yielding => 820,
+            Self::ReleaseDwell => 900,
+            Self::Resting {
+                at_rest_target: false,
+            } => 920,
+            Self::Resting {
+                at_rest_target: true,
+            } => SCALE,
+            // Recovery is driven by the controller's explicit progress below.
+            Self::Recovering { .. } => 0,
+        }
+    }
+}
+
+/// Complete typed context for one character sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CharacterInputs {
+    attention: CharacterAttention,
+    pet: CharacterPetState,
+}
+
+impl CharacterInputs {
+    pub const UNATTENDED: Self = Self {
+        attention: CharacterAttention::Absent,
+        pet: CharacterPetState::Inactive,
+    };
+
+    pub const fn new(attention: CharacterAttention, pet: CharacterPetState) -> Self {
+        Self { attention, pet }
+    }
+
+    pub const fn attention(self) -> CharacterAttention {
+        self.attention
+    }
+
+    pub const fn pet(self) -> CharacterPetState {
+        self.pet
+    }
 }
 
 /// Finite retained character-act vocabulary.
@@ -694,6 +921,12 @@ pub struct AutonomicCharacterEngine {
     playfulness_milli: u16,
     playfulness_updated_ns: u64,
     playfulness_decay_remainder: u64,
+    pet_state: CharacterPetState,
+    pet_visual_from_milli: i32,
+    pet_visual_to_milli: i32,
+    pet_visual_started_ns: u64,
+    pet_visual_duration_ns: u64,
+    pet_recovery_start_milli: i32,
 }
 
 impl AutonomicCharacterEngine {
@@ -729,6 +962,12 @@ impl AutonomicCharacterEngine {
             playfulness_milli: 0,
             playfulness_updated_ns: 0,
             playfulness_decay_remainder: 0,
+            pet_state: CharacterPetState::Inactive,
+            pet_visual_from_milli: 0,
+            pet_visual_to_milli: 0,
+            pet_visual_started_ns: 0,
+            pet_visual_duration_ns: 1,
+            pet_recovery_start_milli: 0,
         }
     }
 
@@ -788,31 +1027,40 @@ impl AutonomicCharacterEngine {
 
     /// Apply one autonomic sample without changing the reaction's freshness.
     ///
-    /// This compatibility entrypoint discards the semantic head overlay. New
-    /// integrated callers should use [`Self::render_character`] so the eyes
-    /// and all four head joints retain their shared timing.
+    /// This entrypoint discards the semantic head overlay. Integrated callers
+    /// should use [`Self::render_character`] so the eyes and all four head
+    /// joints retain their shared timing.
     pub fn render(
         &mut self,
         now: MonotonicTimestamp,
-        face_present: bool,
+        inputs: CharacterInputs,
         prepared: PreparedEyeIntent,
     ) -> PreparedEyeIntent {
-        self.render_character(now, face_present, prepared).eye()
+        self.render_character(now, inputs, prepared).eye()
     }
 
     /// Prepare one coherent eye plus four-joint character sample.
     pub fn render_character(
         &mut self,
         now: MonotonicTimestamp,
-        face_present: bool,
+        inputs: CharacterInputs,
         prepared: PreparedEyeIntent,
     ) -> PreparedCharacterFrame {
         let now_ns = now.nanos_since_epoch();
         self.initialize_if_needed(now_ns);
         self.decay_playfulness(now_ns);
-        self.update_mode(face_present, now_ns);
-        self.update_saccade(now_ns);
-        self.update_act(now_ns);
+        self.update_pet_state(inputs.pet(), now_ns);
+        self.update_mode(inputs.attention().is_present(), now_ns);
+        if inputs.pet().suppresses_expression_motion() {
+            self.saccade_peak_x = 0;
+            self.saccade_peak_y = 0;
+            self.saccade_x = 0;
+            self.saccade_y = 0;
+            self.active_act = None;
+        } else {
+            self.update_saccade(now_ns);
+            self.update_act(now_ns);
+        }
 
         let mut fields = EyeFields::from(prepared.intent());
         // The static bridge style is the fallback used when this director is
@@ -820,11 +1068,16 @@ impl AutonomicCharacterEngine {
         // blink bit into every refreshed frame would retrigger it continuously.
         fields.blink = false;
         self.apply_mode(&mut fields, now_ns);
-        self.apply_act(&mut fields, now_ns);
-        self.apply_blink(&mut fields, now_ns);
+        if !inputs.pet().suppresses_expression_motion() {
+            self.apply_act(&mut fields, now_ns);
+            self.apply_blink(&mut fields, now_ns);
+        }
+        self.apply_pet_state(&mut fields, now_ns);
         let mut head = HeadFields::default();
-        self.apply_head_mode(&mut head, now_ns);
-        self.apply_head_act(&mut head, now_ns);
+        if !inputs.pet().suppresses_expression_motion() {
+            self.apply_head_mode(&mut head, now_ns);
+            self.apply_head_act(&mut head, now_ns);
+        }
         let rest_envelope = self.rest_envelope(now_ns);
         head.bow = head.bow * rest_envelope / SCALE;
         head.curl = head.curl * rest_envelope / SCALE;
@@ -883,6 +1136,74 @@ impl AutonomicCharacterEngine {
             .expect("bounded playfulness decay fits u16");
         self.playfulness_milli = self.playfulness_milli.saturating_sub(decrease);
         self.playfulness_updated_ns = now_ns;
+    }
+
+    fn update_pet_state(&mut self, state: CharacterPetState, now_ns: u64) {
+        let same_progressing_phase =
+            (matches!(self.pet_state, CharacterPetState::ContactCandidate { .. })
+                && matches!(state, CharacterPetState::ContactCandidate { .. }))
+                || (matches!(self.pet_state, CharacterPetState::Recovering { .. })
+                    && matches!(state, CharacterPetState::Recovering { .. }));
+        if same_progressing_phase {
+            self.pet_state = state;
+            return;
+        }
+        if state == self.pet_state {
+            return;
+        }
+
+        let current = self.pet_visual_milli(now_ns);
+        self.pet_state = state;
+        self.pet_visual_from_milli = current;
+        self.pet_visual_started_ns = now_ns;
+        if matches!(state, CharacterPetState::Recovering { .. }) {
+            self.pet_recovery_start_milli = current;
+            self.pet_visual_to_milli = 0;
+            self.pet_visual_duration_ns = 1;
+            return;
+        }
+
+        let target = state.visual_target_milli();
+        self.pet_visual_to_milli = target;
+        self.pet_visual_duration_ns = if target >= current {
+            PET_VISUAL_ATTACK_NS
+        } else {
+            PET_VISUAL_RELEASE_NS
+        };
+    }
+
+    fn pet_visual_milli(&self, now_ns: u64) -> i32 {
+        if let CharacterPetState::Recovering { progress } = self.pet_state {
+            let progress = i32::from(progress.basis_points()) * SCALE / 10_000;
+            return self.pet_recovery_start_milli * (SCALE - minimum_jerk_ramp(progress)) / SCALE;
+        }
+        let phase = normalized_phase(
+            now_ns.saturating_sub(self.pet_visual_started_ns),
+            self.pet_visual_duration_ns,
+        );
+        let eased = minimum_jerk_ramp(phase);
+        self.pet_visual_from_milli
+            + (self.pet_visual_to_milli - self.pet_visual_from_milli) * eased / SCALE
+    }
+
+    fn apply_pet_state(&self, fields: &mut EyeFields, now_ns: u64) {
+        let amount = self.pet_visual_milli(now_ns).clamp(0, SCALE);
+        if amount == 0 {
+            return;
+        }
+
+        // One continuous envelope makes entering touch, settling into it, and
+        // the controller-driven recovery feel like one response instead of a
+        // sequence of discrete eye presets. Positive image Y means looking
+        // down toward the person touching the head.
+        fields.gaze_y += amount * 430 / SCALE;
+        fields.lid += amount * 310 / SCALE;
+        fields.pupil -= amount * 130 / SCALE;
+        fields.brightness -= amount * 120 / SCALE;
+        fields.color_rgb = blend_color(fields.color_rgb, [255, 145, 92], amount);
+        if amount >= 420 {
+            fields.expression = Expression::Greet;
+        }
     }
 
     fn rest_envelope(&self, now_ns: u64) -> i32 {
@@ -1664,6 +1985,23 @@ const fn saturating_add(left: u64, right: u64) -> u64 {
     left.saturating_add(right)
 }
 
+fn centred_image_bearing(coordinate_basis_points: u16) -> SignedUnitAmount {
+    let centred = i32::from(coordinate_basis_points) * 2 - 10_000;
+    let centred = i16::try_from(centred).expect("centred unit coordinate fits i16");
+    SignedUnitAmount::try_from_basis_points(centred)
+        .expect("a checked image coordinate has a normalized centred bearing")
+}
+
+fn blend_color(from: [u8; 3], to: [u8; 3], amount: i32) -> [u8; 3] {
+    let amount = amount.clamp(0, SCALE);
+    core::array::from_fn(|index| {
+        let from = i32::from(from[index]);
+        let delta = i32::from(to[index]) - from;
+        u8::try_from((from + delta * amount / SCALE).clamp(0, 255))
+            .expect("blended color channel is clamped")
+    })
+}
+
 fn clamp_signed(value: i32) -> i16 {
     i16::try_from(value.clamp(-SCALE, SCALE)).expect("normalized signed range fits i16")
 }
@@ -1850,7 +2188,10 @@ fn dance_palette(phase: i32, style: u8) -> [u8; 3] {
 mod tests {
     extern crate std;
 
-    use kiko_expression_core::{Deadline, MonotonicTimestamp};
+    use kiko_expression_core::{
+        Deadline, FreshnessWindow, GazeTarget, ImagePoint, MonotonicTimestamp, PersonTrackId,
+        PositiveUnitAmount, SignedUnitAmount, UnitAmount as CoreUnitAmount,
+    };
     use kiko_eye_protocol::{EyeFlags, SignedUnit};
 
     use super::*;
@@ -1875,13 +2216,40 @@ mod tests {
         PreparedEyeIntent::from_parts(intent, generated_at, Some(deadline))
     }
 
+    fn character_inputs(face_present: bool, now_ns: u64) -> CharacterInputs {
+        if !face_present {
+            return CharacterInputs::UNATTENDED;
+        }
+        let observed_at = MonotonicTimestamp::from_nanos_since_epoch(now_ns);
+        let freshness = FreshnessWindow::from_ttl(
+            observed_at,
+            kiko_expression_core::NonZeroDuration::try_from_nanos(NS_PER_SECOND).unwrap(),
+        )
+        .unwrap();
+        CharacterInputs::new(
+            CharacterAttention::Face(CharacterFaceAttention {
+                track_id: PersonTrackId::try_new(1).unwrap(),
+                gaze_target: GazeTarget::new(ImagePoint::new(
+                    CoreUnitAmount::try_from_basis_points(5_000).unwrap(),
+                    CoreUnitAmount::try_from_basis_points(5_000).unwrap(),
+                )),
+                bearing_x_right: SignedUnitAmount::ZERO,
+                bearing_y_down: SignedUnitAmount::ZERO,
+                apparent_width: PositiveUnitAmount::try_from_basis_points(2_000).unwrap(),
+                freshness,
+                state: CharacterFaceAttentionState::Observed,
+            }),
+            CharacterPetState::Inactive,
+        )
+    }
+
     #[test]
     fn first_face_greets_then_tracks_and_loss_searches_idles_and_sleeps() {
         let mut engine = AutonomicCharacterEngine::new(7);
         let start = 10 * NS_PER_SECOND;
         engine.render(
             MonotonicTimestamp::from_nanos_since_epoch(start),
-            true,
+            character_inputs(true, start),
             prepared(start),
         );
         assert_eq!(engine.mode(), CharacterMode::Greeting);
@@ -1889,7 +2257,7 @@ mod tests {
         let tracked_at = start + GREETING_MAX_NS + 1;
         engine.render(
             MonotonicTimestamp::from_nanos_since_epoch(tracked_at),
-            true,
+            character_inputs(true, tracked_at),
             prepared(tracked_at),
         );
         assert_eq!(engine.mode(), CharacterMode::Tracking);
@@ -1897,7 +2265,7 @@ mod tests {
         let lost_at = tracked_at + NS_PER_MS;
         engine.render(
             MonotonicTimestamp::from_nanos_since_epoch(lost_at),
-            false,
+            character_inputs(false, lost_at),
             prepared(lost_at),
         );
         assert_eq!(engine.mode(), CharacterMode::Lost);
@@ -1905,7 +2273,7 @@ mod tests {
         let search_at = lost_at + LOST_DURATION_NS;
         engine.render(
             MonotonicTimestamp::from_nanos_since_epoch(search_at),
-            false,
+            character_inputs(false, search_at),
             prepared(search_at),
         );
         assert_eq!(engine.mode(), CharacterMode::Searching);
@@ -1913,7 +2281,7 @@ mod tests {
         let idle_at = search_at + SEARCH_MAX_NS + 1;
         engine.render(
             MonotonicTimestamp::from_nanos_since_epoch(idle_at),
-            false,
+            character_inputs(false, idle_at),
             prepared(idle_at),
         );
         assert_eq!(engine.mode(), CharacterMode::Idle);
@@ -1921,7 +2289,7 @@ mod tests {
         let sleepy_at = tracked_at + SLEEPY_AFTER_IDLE_NS + SEARCH_MAX_NS + NS_PER_SECOND;
         engine.render(
             MonotonicTimestamp::from_nanos_since_epoch(sleepy_at),
-            false,
+            character_inputs(false, sleepy_at),
             prepared(sleepy_at),
         );
         assert_eq!(engine.mode(), CharacterMode::Sleepy);
@@ -1951,7 +2319,7 @@ mod tests {
                 let now_ns = start + step * 50 * NS_PER_MS;
                 let output = engine.render_character(
                     MonotonicTimestamp::from_nanos_since_epoch(now_ns),
-                    engine.mode == CharacterMode::Tracking,
+                    character_inputs(engine.mode == CharacterMode::Tracking, now_ns),
                     prepared(now_ns),
                 );
                 let intent = output.eye().intent();
@@ -2018,7 +2386,7 @@ mod tests {
             let now_ns = start + step * 50 * NS_PER_MS;
             let frame = engine.render_character(
                 MonotonicTimestamp::from_nanos_since_epoch(now_ns),
-                false,
+                character_inputs(false, now_ns),
                 prepared(now_ns),
             );
             for (axis_moved, amount) in moved.iter_mut().zip(frame.head().amounts()) {
@@ -2030,7 +2398,7 @@ mod tests {
         let rested_at = start + REST_AFTER_IDLE_NS + REST_EASE_NS;
         let rested = engine.render_character(
             MonotonicTimestamp::from_nanos_since_epoch(rested_at),
-            false,
+            character_inputs(false, rested_at),
             prepared(rested_at),
         );
         assert!(rested.head().is_natural());
@@ -2038,7 +2406,7 @@ mod tests {
         let sleepy_at = start + SLEEPY_AFTER_IDLE_NS + NS_PER_SECOND;
         let still_rested = engine.render_character(
             MonotonicTimestamp::from_nanos_since_epoch(sleepy_at),
-            false,
+            character_inputs(false, sleepy_at),
             prepared(sleepy_at),
         );
         assert_eq!(still_rested.mode(), CharacterMode::Sleepy);
@@ -2047,13 +2415,13 @@ mod tests {
         let wake_at = sleepy_at + NS_PER_MS;
         engine.render_character(
             MonotonicTimestamp::from_nanos_since_epoch(wake_at),
-            true,
+            character_inputs(true, wake_at),
             prepared(wake_at),
         );
         let moving_at = wake_at + HEAD_EYE_LEAD_NS + 200 * NS_PER_MS;
         let awake = engine.render_character(
             MonotonicTimestamp::from_nanos_since_epoch(moving_at),
-            true,
+            character_inputs(true, moving_at),
             prepared(moving_at),
         );
         assert_eq!(awake.mode(), CharacterMode::Greeting);
@@ -2156,7 +2524,7 @@ mod tests {
         let input = prepared(1_000);
         let output = engine.render(
             MonotonicTimestamp::from_nanos_since_epoch(1_000),
-            false,
+            character_inputs(false, 1_000),
             input,
         );
         assert_eq!(output.generated_at(), input.generated_at());
@@ -2172,13 +2540,13 @@ mod tests {
         let start = NS_PER_SECOND;
         let first = engine.render(
             MonotonicTimestamp::from_nanos_since_epoch(start),
-            true,
+            character_inputs(true, start),
             prepared(start),
         );
         let second_at = start + 50 * NS_PER_MS;
         let second = engine.render(
             MonotonicTimestamp::from_nanos_since_epoch(second_at),
-            true,
+            character_inputs(true, second_at),
             prepared(second_at),
         );
 
@@ -2232,12 +2600,133 @@ mod tests {
 
         let output = engine.render_character(
             MonotonicTimestamp::from_nanos_since_epoch(start),
-            true,
+            character_inputs(true, start),
             prepared(start),
         );
         assert_eq!(output.eye().intent().gaze_x().get(), 0);
         assert_eq!(output.eye().intent().gaze_y().get(), 0);
         assert_eq!((engine.saccade_x, engine.saccade_y), (0, 0));
+    }
+
+    #[test]
+    fn pet_visual_envelope_accepts_touch_and_recovers_with_exact_endpoints() {
+        let start = 11 * NS_PER_SECOND;
+        let mut engine = AutonomicCharacterEngine::new(31);
+        engine.initialize_if_needed(start);
+        engine.update_pet_state(CharacterPetState::Yielding, start);
+
+        assert_eq!(engine.pet_visual_milli(start), 0);
+        assert_eq!(
+            engine.pet_visual_milli(start + PET_VISUAL_ATTACK_NS / 2),
+            410,
+            "minimum jerk is exactly half-way at half phase"
+        );
+        assert_eq!(engine.pet_visual_milli(start + PET_VISUAL_ATTACK_NS), 820);
+        let mut previous = 0;
+        for step in 0..=100_u64 {
+            let now_ns = start + PET_VISUAL_ATTACK_NS * step / 100;
+            let current = engine.pet_visual_milli(now_ns);
+            assert!(current >= previous);
+            previous = current;
+        }
+
+        let recovery_at = start + PET_VISUAL_ATTACK_NS;
+        engine.update_pet_state(
+            CharacterPetState::Recovering {
+                progress: CoreUnitAmount::ZERO,
+            },
+            recovery_at,
+        );
+        assert_eq!(engine.pet_visual_milli(recovery_at), 820);
+        engine.update_pet_state(
+            CharacterPetState::Recovering {
+                progress: CoreUnitAmount::try_from_basis_points(5_000).unwrap(),
+            },
+            recovery_at + 1,
+        );
+        assert_eq!(engine.pet_visual_milli(recovery_at + 1), 410);
+        engine.update_pet_state(
+            CharacterPetState::Recovering {
+                progress: CoreUnitAmount::ONE,
+            },
+            recovery_at + 2,
+        );
+        assert_eq!(engine.pet_visual_milli(recovery_at + 2), 0);
+
+        let mut candidate = AutonomicCharacterEngine::new(32);
+        candidate.initialize_if_needed(start);
+        candidate.update_pet_state(
+            CharacterPetState::ContactCandidate {
+                consecutive_samples: NonZeroU8::new(1).unwrap(),
+            },
+            start,
+        );
+        let half_at = start + PET_VISUAL_ATTACK_NS / 2;
+        let half = candidate.pet_visual_milli(half_at);
+        candidate.update_pet_state(
+            CharacterPetState::ContactCandidate {
+                consecutive_samples: NonZeroU8::new(2).unwrap(),
+            },
+            half_at,
+        );
+        assert_eq!(candidate.pet_visual_milli(half_at), half);
+        assert_eq!(
+            candidate.pet_visual_milli(start + PET_VISUAL_ATTACK_NS),
+            260,
+            "candidate evidence updates cannot restart the visual transition"
+        );
+    }
+
+    #[test]
+    fn resting_pet_choreography_looks_down_softly_and_suppresses_head_scripts() {
+        let start = 12 * NS_PER_SECOND;
+        let mut engine = AutonomicCharacterEngine::new(37);
+        engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start),
+            character_inputs(false, start),
+            prepared(start),
+        );
+        let pet_inputs = CharacterInputs::new(
+            CharacterAttention::Absent,
+            CharacterPetState::Resting {
+                at_rest_target: true,
+            },
+        );
+        let entered = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(start),
+            pet_inputs,
+            prepared(start),
+        );
+        assert!(entered.head().is_natural());
+
+        let settled_at = start + PET_VISUAL_ATTACK_NS;
+        let settled = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(settled_at),
+            pet_inputs,
+            prepared(settled_at),
+        );
+        assert!(settled.head().is_natural());
+        assert_eq!(settled.eye().intent().expression(), Expression::Greet);
+        assert!(settled.eye().intent().gaze_y().get() >= 430);
+        assert_eq!(settled.eye().intent().pupil().get(), 420);
+        assert_eq!(settled.eye().intent().color_rgb(), [255, 145, 92]);
+
+        let repeated = engine.render_character(
+            MonotonicTimestamp::from_nanos_since_epoch(settled_at),
+            pet_inputs,
+            prepared(settled_at),
+        );
+        assert_eq!(
+            settled, repeated,
+            "same timestamp cannot advance choreography"
+        );
+    }
+
+    #[test]
+    fn centred_image_bearing_has_exact_edge_and_centre_conventions() {
+        assert_eq!(centred_image_bearing(0), SignedUnitAmount::MIN);
+        assert_eq!(centred_image_bearing(5_000), SignedUnitAmount::ZERO);
+        assert_eq!(centred_image_bearing(10_000), SignedUnitAmount::MAX);
     }
 
     #[test]
@@ -2308,12 +2797,12 @@ mod tests {
             let face = (step / 100) % 3 != 0;
             let left_output = left.render(
                 MonotonicTimestamp::from_nanos_since_epoch(now_ns),
-                face,
+                character_inputs(face, now_ns),
                 prepared(now_ns),
             );
             let right_output = right.render(
                 MonotonicTimestamp::from_nanos_since_epoch(now_ns),
-                face,
+                character_inputs(face, now_ns),
                 prepared(now_ns),
             );
             assert_eq!(left.mode(), right.mode());

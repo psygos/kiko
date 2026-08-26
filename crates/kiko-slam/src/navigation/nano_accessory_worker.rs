@@ -19,6 +19,8 @@
 //! worker is deliberately not an implicit physical shutdown.
 
 use std::fmt;
+#[cfg(feature = "nano-agent")]
+use std::num::NonZeroU8;
 use std::num::NonZeroU64;
 #[cfg(feature = "nano-agent")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -43,10 +45,13 @@ use kiko_device_inventory::{
     ArtifactRelativePath, DeploymentAssetContentSha256, LoadedDeploymentAsset,
 };
 #[cfg(feature = "nano-agent")]
+use kiko_expression_core::UnitAmount as CoreUnitAmount;
+#[cfg(feature = "nano-agent")]
 use kiko_expression_core::{Deadline, NonZeroDuration};
 use kiko_expression_core::{MonotonicTimestamp, StreamEpochId};
 use kiko_expression_runtime::{
-    CharacterHeadOverlay, CharacterPetEpisode, PreparedCharacterFrame, PreparedEyeIntent,
+    CharacterHeadOverlay, CharacterPetEpisode, CharacterPetState, PreparedCharacterFrame,
+    PreparedEyeIntent,
 };
 #[cfg(feature = "nano-agent")]
 use kiko_expression_runtime::{CharacterPetEpisodeError, FaceTrackingConfig, MAX_FACE_DETECTIONS};
@@ -59,7 +64,7 @@ use kiko_eye_runtime::{
     StaticEyeRuntimeConfig,
 };
 #[cfg(feature = "nano-agent")]
-use kiko_head_runtime::compliant_hold::CompliantPetEpisodeSummary;
+use kiko_head_runtime::compliant_hold::{CompliantHoldDisposition, CompliantPetEpisodeSummary};
 #[cfg(feature = "nano-agent")]
 use kiko_head_runtime::gaze_control::{
     HeadGazeProposal, HeadGazeProposalId, HeadGazeProposalIdError,
@@ -1888,6 +1893,10 @@ pub enum NanoPhysicalHeadGazeRuntimeError {
     PetEpisodeTimestampOutOfRange {
         completed_at_ns: u128,
     },
+    PetContactCandidateHasZeroSamples,
+    PetRecoveryProgressOutOfRange {
+        progress_millionths: u32,
+    },
 }
 
 #[cfg(feature = "nano-agent")]
@@ -1912,7 +1921,9 @@ impl std::error::Error for NanoPhysicalHeadGazeRuntimeError {
             Self::PetEpisode(source) => Some(source),
             Self::ProjectionGridMismatch { .. }
             | Self::ProposalSequenceExhausted { .. }
-            | Self::PetEpisodeTimestampOutOfRange { .. } => None,
+            | Self::PetEpisodeTimestampOutOfRange { .. }
+            | Self::PetContactCandidateHasZeroSamples
+            | Self::PetRecoveryProgressOutOfRange { .. } => None,
         }
     }
 }
@@ -3653,6 +3664,12 @@ struct AccessoryPetEpisode {
     episode: CharacterPetEpisode,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccessoryPetFeedback {
+    state: CharacterPetState,
+    completed_episode: Option<AccessoryPetEpisode>,
+}
+
 #[cfg(feature = "nano-agent")]
 fn adapt_pet_episode(
     summary: CompliantPetEpisodeSummary,
@@ -3675,6 +3692,68 @@ fn adapt_pet_episode(
     })
 }
 
+#[cfg(feature = "nano-agent")]
+fn adapt_pet_state(
+    disposition: CompliantHoldDisposition,
+) -> Result<CharacterPetState, NanoPhysicalHeadGazeRuntimeError> {
+    match disposition {
+        CompliantHoldDisposition::FollowingExpression
+        | CompliantHoldDisposition::ReturnedToExpression => Ok(CharacterPetState::Ready),
+        CompliantHoldDisposition::ContactCandidate {
+            consecutive_samples,
+        } => Ok(CharacterPetState::ContactCandidate {
+            consecutive_samples: NonZeroU8::new(consecutive_samples)
+                .ok_or(NanoPhysicalHeadGazeRuntimeError::PetContactCandidateHasZeroSamples)?,
+        }),
+        CompliantHoldDisposition::Yielding { .. } => Ok(CharacterPetState::Yielding),
+        CompliantHoldDisposition::ReleaseDwell => Ok(CharacterPetState::ReleaseDwell),
+        CompliantHoldDisposition::Resting { at_rest_target, .. } => {
+            Ok(CharacterPetState::Resting { at_rest_target })
+        }
+        CompliantHoldDisposition::Recovering {
+            progress_millionths,
+            ..
+        } => {
+            if progress_millionths > 1_000_000 {
+                return Err(
+                    NanoPhysicalHeadGazeRuntimeError::PetRecoveryProgressOutOfRange {
+                        progress_millionths,
+                    },
+                );
+            }
+            // Floor rather than round: the character layer must not claim an
+            // exact completed recovery before the compliant controller does.
+            let progress_basis_points = u64::from(progress_millionths) / 100;
+            let progress_basis_points = u16::try_from(progress_basis_points).map_err(|_| {
+                NanoPhysicalHeadGazeRuntimeError::PetRecoveryProgressOutOfRange {
+                    progress_millionths,
+                }
+            })?;
+            let progress =
+                CoreUnitAmount::try_from_basis_points(progress_basis_points).map_err(|_| {
+                    NanoPhysicalHeadGazeRuntimeError::PetRecoveryProgressOutOfRange {
+                        progress_millionths,
+                    }
+                })?;
+            Ok(CharacterPetState::Recovering { progress })
+        }
+    }
+}
+
+#[cfg(feature = "nano-agent")]
+fn adapt_pet_feedback(
+    evidence: &kiko_head_runtime::VerifiedHeadCompliantHoldStep,
+) -> Result<AccessoryPetFeedback, NanoPhysicalHeadGazeRuntimeError> {
+    let controller = evidence.controller();
+    Ok(AccessoryPetFeedback {
+        state: adapt_pet_state(controller.disposition())?,
+        completed_episode: controller
+            .completed_episode()
+            .map(adapt_pet_episode)
+            .transpose()?,
+    })
+}
+
 trait ReviewedNaturalHeadPort<F> {
     type Ready;
     type StartError;
@@ -3689,7 +3768,7 @@ trait ReviewedNaturalHeadPort<F> {
         &mut self,
         _frame: &F,
         _character_head: CharacterHeadOverlay,
-    ) -> Result<Option<AccessoryPetEpisode>, Self::GazeError> {
+    ) -> Result<Option<AccessoryPetFeedback>, Self::GazeError> {
         Ok(None)
     }
     async fn shutdown(&mut self) -> Self::Shutdown;
@@ -3711,6 +3790,8 @@ trait RgbBridgePort<F> {
     type Error: Clone;
 
     fn process(&mut self, frame: &F) -> Result<Self::Intent, Self::Error>;
+
+    fn note_pet_state(&mut self, _state: CharacterPetState) {}
 
     fn note_pet_episode(&mut self, _episode: AccessoryPetEpisode) {}
 }
@@ -3886,9 +3967,12 @@ where
                                 .await
                             {
                                 Err(source) => Some(CoreTerminalFault::HeadGaze(source)),
-                                Ok(pet_episode) => {
-                                    if let Some(pet_episode) = pet_episode {
-                                        bridge.note_pet_episode(pet_episode);
+                                Ok(pet_feedback) => {
+                                    if let Some(pet_feedback) = pet_feedback {
+                                        bridge.note_pet_state(pet_feedback.state);
+                                        if let Some(pet_episode) = pet_feedback.completed_episode {
+                                            bridge.note_pet_episode(pet_episode);
+                                        }
                                     }
                                     match eye.apply(intent.into_eye()).await {
                                     Ok(()) => match channel.counters.record_processed_successfully() {
@@ -4158,7 +4242,7 @@ impl SerialReviewedNaturalHeadPort {
         &self,
         frame: &NanoFaceTrackedRgbFrame,
         character_head: CharacterHeadOverlay,
-    ) -> Result<Option<AccessoryPetEpisode>, NanoPhysicalHeadGazeRuntimeError> {
+    ) -> Result<Option<AccessoryPetFeedback>, NanoPhysicalHeadGazeRuntimeError> {
         let active = self
             .active
             .as_ref()
@@ -4223,11 +4307,7 @@ impl SerialReviewedNaturalHeadPort {
             .map_err(NanoPhysicalHeadGazeRuntimeError::ServiceCommand)?
             .map_err(|source| NanoPhysicalHeadGazeRuntimeError::Service(Box::new(source)))?;
         match outcome {
-            HeadGazeServiceOutcome::Compliant(evidence) => evidence
-                .controller()
-                .completed_episode()
-                .map(adapt_pet_episode)
-                .transpose(),
+            HeadGazeServiceOutcome::Compliant(evidence) => adapt_pet_feedback(&evidence).map(Some),
             HeadGazeServiceOutcome::BeforeScheduledTick { .. }
             | HeadGazeServiceOutcome::CompliantTemperatureDeferred(_)
             | HeadGazeServiceOutcome::Applied(_) => Ok(None),
@@ -4405,7 +4485,7 @@ impl<F: NanoHeadGazeFrame> ReviewedNaturalHeadPort<F> for SerialReviewedNaturalH
         &mut self,
         frame: &F,
         character_head: CharacterHeadOverlay,
-    ) -> Result<Option<AccessoryPetEpisode>, Self::GazeError> {
+    ) -> Result<Option<AccessoryPetFeedback>, Self::GazeError> {
         #[cfg(feature = "nano-agent")]
         {
             let Some(frame) = frame.tracked_face_frame() else {
@@ -4452,6 +4532,10 @@ impl RgbBridgePort<IngressObservedRgbFrame<ImageFrame>>
             .map(|outcome| outcome.into_character())
     }
 
+    fn note_pet_state(&mut self, state: CharacterPetState) {
+        RgbExpressionBridge::note_pet_state(self, state);
+    }
+
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
         let _reaction =
             RgbExpressionBridge::note_pet_episode(self, feedback.completed_at, feedback.episode);
@@ -4477,6 +4561,10 @@ impl RgbBridgePort<NanoAccessoryRgbWork> for RgbExpressionBridge<NanoAccessoryCl
 
     fn process(&mut self, work: &NanoAccessoryRgbWork) -> Result<Self::Intent, Self::Error> {
         process_rgb_work(self, work)
+    }
+
+    fn note_pet_state(&mut self, state: CharacterPetState) {
+        RgbExpressionBridge::note_pet_state(self, state);
     }
 
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
@@ -4507,6 +4595,10 @@ impl RgbBridgePort<NanoAccessoryRgbWork> for ProductionSceneRgbBridge {
             .map_err(NanoAccessoryRgbProcessingError::Bridge)
     }
 
+    fn note_pet_state(&mut self, state: CharacterPetState) {
+        self.0.note_pet_state(state);
+    }
+
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
         let _reaction = self
             .0
@@ -4530,6 +4622,10 @@ impl RgbBridgePort<NanoFacePerceptionWork> for ProductionFaceRgbBridge {
             .process_queued_oak_frame_with_face(&frame.frame, frame.output.tracking())
             .map(|outcome| outcome.into_character())
             .map_err(NanoAccessoryRgbProcessingError::Bridge)
+    }
+
+    fn note_pet_state(&mut self, state: CharacterPetState) {
+        self.0.note_pet_state(state);
     }
 
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
@@ -4850,6 +4946,88 @@ mod tests {
         assert_eq!(
             config.maximum_retained_detections(),
             u32::try_from(MAX_FACE_DETECTIONS).unwrap()
+        );
+    }
+
+    #[cfg(feature = "nano-agent")]
+    #[test]
+    fn compliant_dispositions_cross_the_character_boundary_without_lossy_fallbacks() {
+        assert_eq!(
+            adapt_pet_state(CompliantHoldDisposition::FollowingExpression).unwrap(),
+            CharacterPetState::Ready
+        );
+        assert_eq!(
+            adapt_pet_state(CompliantHoldDisposition::ContactCandidate {
+                consecutive_samples: 2,
+            })
+            .unwrap(),
+            CharacterPetState::ContactCandidate {
+                consecutive_samples: NonZeroU8::new(2).unwrap(),
+            }
+        );
+        assert_eq!(
+            adapt_pet_state(CompliantHoldDisposition::Yielding {
+                envelope_limited: [false; 4],
+                command_step_limited: [true; 4],
+            })
+            .unwrap(),
+            CharacterPetState::Yielding
+        );
+        assert_eq!(
+            adapt_pet_state(CompliantHoldDisposition::ReleaseDwell).unwrap(),
+            CharacterPetState::ReleaseDwell
+        );
+        assert_eq!(
+            adapt_pet_state(CompliantHoldDisposition::Resting {
+                command_step_limited: [false; 4],
+                at_rest_target: true,
+            })
+            .unwrap(),
+            CharacterPetState::Resting {
+                at_rest_target: true,
+            }
+        );
+        assert_eq!(
+            adapt_pet_state(CompliantHoldDisposition::Recovering {
+                progress_millionths: 500_000,
+                command_step_limited: [false; 4],
+            })
+            .unwrap(),
+            CharacterPetState::Recovering {
+                progress: CoreUnitAmount::try_from_basis_points(5_000).unwrap(),
+            }
+        );
+        assert_eq!(
+            adapt_pet_state(CompliantHoldDisposition::ReturnedToExpression).unwrap(),
+            CharacterPetState::Ready
+        );
+        assert_eq!(
+            adapt_pet_state(CompliantHoldDisposition::Recovering {
+                progress_millionths: 999_999,
+                command_step_limited: [false; 4],
+            })
+            .unwrap(),
+            CharacterPetState::Recovering {
+                progress: CoreUnitAmount::try_from_basis_points(9_999).unwrap(),
+            },
+            "character recovery cannot become exact before controller recovery"
+        );
+        assert_eq!(
+            adapt_pet_state(CompliantHoldDisposition::ContactCandidate {
+                consecutive_samples: 0,
+            }),
+            Err(NanoPhysicalHeadGazeRuntimeError::PetContactCandidateHasZeroSamples)
+        );
+        assert_eq!(
+            adapt_pet_state(CompliantHoldDisposition::Recovering {
+                progress_millionths: 1_000_001,
+                command_step_limited: [false; 4],
+            }),
+            Err(
+                NanoPhysicalHeadGazeRuntimeError::PetRecoveryProgressOutOfRange {
+                    progress_millionths: 1_000_001,
+                }
+            )
         );
     }
 
@@ -5816,21 +5994,24 @@ mod tests {
             &mut self,
             _frame: &F,
             _character_head: CharacterHeadOverlay,
-        ) -> Result<Option<AccessoryPetEpisode>, Self::GazeError> {
+        ) -> Result<Option<AccessoryPetFeedback>, Self::GazeError> {
             if self.fail_gaze {
                 self.log.lock().unwrap().push("head_gaze");
                 Err("head_gaze")
             } else if self.emit_pet_episode {
-                Ok(Some(AccessoryPetEpisode {
-                    completed_at: MonotonicTimestamp::from_nanos_since_epoch(10),
-                    episode: CharacterPetEpisode::try_new(
-                        Duration::from_millis(600),
-                        0,
-                        0,
-                        false,
-                        true,
-                    )
-                    .expect("valid fake tap"),
+                Ok(Some(AccessoryPetFeedback {
+                    state: CharacterPetState::Ready,
+                    completed_episode: Some(AccessoryPetEpisode {
+                        completed_at: MonotonicTimestamp::from_nanos_since_epoch(10),
+                        episode: CharacterPetEpisode::try_new(
+                            Duration::from_millis(600),
+                            0,
+                            0,
+                            false,
+                            true,
+                        )
+                        .expect("valid fake tap"),
+                    }),
                 }))
             } else {
                 Ok(None)
@@ -5891,6 +6072,10 @@ mod tests {
         fn process(&mut self, frame: &u64) -> Result<Self::Intent, Self::Error> {
             self.log.lock().unwrap().push("bridge");
             if self.fail { Err("bridge") } else { Ok(*frame) }
+        }
+
+        fn note_pet_state(&mut self, _state: CharacterPetState) {
+            self.log.lock().unwrap().push("pet_state");
         }
 
         fn note_pet_episode(&mut self, _episode: AccessoryPetEpisode) {
@@ -6121,6 +6306,7 @@ mod tests {
                 "head_start",
                 "head_return",
                 "bridge",
+                "pet_state",
                 "pet_episode",
                 "eye_apply",
             ]

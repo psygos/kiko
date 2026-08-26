@@ -31,10 +31,11 @@ pub use adapter::{
     map_expression,
 };
 pub use autonomic::{
-    AutonomicCharacterEngine, CHARACTER_HEAD_SCALE, CharacterAct, CharacterHeadAmount,
+    AutonomicCharacterEngine, CHARACTER_HEAD_SCALE, CharacterAct, CharacterAttention,
+    CharacterFaceAttention, CharacterFaceAttentionState, CharacterHeadAmount,
     CharacterHeadAmountError, CharacterHeadAxis, CharacterHeadOverlay,
-    CharacterHeadOverlayParseError, CharacterMode, CharacterPetEpisode, CharacterPetEpisodeError,
-    CharacterPetReaction, PreparedCharacterFrame,
+    CharacterHeadOverlayParseError, CharacterInputs, CharacterMode, CharacterPetEpisode,
+    CharacterPetEpisodeError, CharacterPetReaction, CharacterPetState, PreparedCharacterFrame,
 };
 pub use face_tracking::{
     AcquiringFaceTarget, CloserFaceWidthRatio, CoastingFaceTarget, ConsecutiveFaceResults,
