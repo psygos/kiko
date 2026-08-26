@@ -52,9 +52,9 @@ use kiko_expression_core::UnitAmount as CoreUnitAmount;
 use kiko_expression_core::{Deadline, NonZeroDuration};
 use kiko_expression_core::{MonotonicTimestamp, StreamEpochId};
 use kiko_expression_runtime::{
-    CharacterBaseMotionState, CharacterHeadOverlay, CharacterPetEpisode, CharacterPetState,
-    CharacterThermalState, PreparedCharacterFrame, PreparedEyeIntent, TrackingEyeGaze,
-    TrackingEyeGazeReplacementError,
+    CharacterBaseMotionState, CharacterHeadOverlay, CharacterLifecycleState, CharacterPetEpisode,
+    CharacterPetState, CharacterThermalState, PreparedCharacterFrame, PreparedEyeIntent,
+    TrackingEyeGaze, TrackingEyeGazeReplacementError,
 };
 #[cfg(feature = "nano-agent")]
 use kiko_expression_runtime::{
@@ -4041,6 +4041,17 @@ trait RgbBridgePort<F> {
 
     fn note_base_motion_state(&mut self, _state: CharacterBaseMotionState) {}
 
+    fn note_lifecycle_state(&mut self, _state: CharacterLifecycleState) {}
+
+    fn prepare_lifecycle_reflex(
+        &mut self,
+        state: CharacterLifecycleState,
+    ) -> Result<Self::Intent, Self::Error>;
+
+    fn lifecycle_reflex_duration(&self, _state: CharacterLifecycleState) -> Duration {
+        Duration::ZERO
+    }
+
     fn note_pet_episode(&mut self, _episode: AccessoryPetEpisode) {}
 }
 
@@ -4131,6 +4142,45 @@ struct CoreObservers<Ready, RecordHealth, PublishFault, LatchFault> {
     latch_fault: LatchFault,
 }
 
+enum LifecyclePresentationFault<B, E> {
+    Bridge(B),
+    EyeApply(E),
+}
+
+async fn present_lifecycle_reflex<F, E, B>(
+    bridge: &mut B,
+    eye: &mut E,
+    state: CharacterLifecycleState,
+) -> Result<(), LifecyclePresentationFault<B::Error, E::ApplyError>>
+where
+    E: Kep2EyePort<<B::Intent as AccessoryCharacterIntent>::EyeIntent>,
+    B: RgbBridgePort<F>,
+    B::Intent: AccessoryCharacterIntent,
+{
+    let duration = bridge.lifecycle_reflex_duration(state);
+    bridge.note_lifecycle_state(state);
+    if duration.is_zero() {
+        return Ok(());
+    }
+
+    let started = Instant::now();
+    loop {
+        let intent = bridge
+            .prepare_lifecycle_reflex(state)
+            .map_err(LifecyclePresentationFault::Bridge)?;
+        eye.apply(intent.into_eye())
+            .await
+            .map_err(LifecyclePresentationFault::EyeApply)?;
+
+        let elapsed = started.elapsed();
+        if elapsed >= duration {
+            return Ok(());
+        }
+        let remaining = duration.saturating_sub(elapsed);
+        tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+    }
+}
+
 async fn run_accessory_core<F, H, E, B, Ready, RecordHealth, PublishFault, LatchFault>(
     mut head: H,
     mut eye: E,
@@ -4166,6 +4216,7 @@ where
         mut publish_fault,
         mut latch_fault,
     } = observers;
+    bridge.note_lifecycle_state(CharacterLifecycleState::Booting);
     // Start eyes first: a failed eye admission never leaves a successfully
     // energized natural-hold head with no returned owner.
     let eye_ready = match eye.start().await {
@@ -4182,6 +4233,30 @@ where
             };
         }
     };
+
+    if let Err(source) = present_lifecycle_reflex::<F, _, _>(
+        &mut bridge,
+        &mut eye,
+        CharacterLifecycleState::AdmissionRecovery,
+    )
+    .await
+    {
+        let fault = match source {
+            LifecyclePresentationFault::Bridge(source) => CoreTerminalFault::Bridge(source),
+            LifecyclePresentationFault::EyeApply(source) => CoreTerminalFault::EyeApply(source),
+        };
+        publish_fault(fault.clone());
+        latch_fault();
+        channel.latch_terminal_fault();
+        let eye_shutdown = eye.shutdown().await;
+        let head_shutdown = head.shutdown().await;
+        return CoreExit::Shutdown {
+            terminal_fault: Some(fault),
+            eye_shutdown,
+            head_shutdown,
+        };
+    }
+    bridge.note_lifecycle_state(CharacterLifecycleState::Operational);
 
     let mut terminal_fault = if ready(head_ready, eye_ready) {
         None
@@ -4316,11 +4391,30 @@ where
             }
         };
         if let Some(fault) = fault {
+            bridge.note_lifecycle_state(CharacterLifecycleState::FaultRecovery);
             publish_fault(fault.clone());
             latch_fault();
             channel.latch_terminal_fault();
             terminal_fault = Some(fault);
         }
+    }
+
+    if terminal_fault.is_none()
+        && let Err(source) = present_lifecycle_reflex::<F, _, _>(
+            &mut bridge,
+            &mut eye,
+            CharacterLifecycleState::Parking,
+        )
+        .await
+    {
+        let fault = match source {
+            LifecyclePresentationFault::Bridge(source) => CoreTerminalFault::Bridge(source),
+            LifecyclePresentationFault::EyeApply(source) => CoreTerminalFault::EyeApply(source),
+        };
+        publish_fault(fault.clone());
+        latch_fault();
+        channel.latch_terminal_fault();
+        terminal_fault = Some(fault);
     }
 
     // Explicit coordinated shutdown releases eyes first, then preserves the
@@ -4942,6 +5036,21 @@ impl RgbBridgePort<IngressObservedRgbFrame<ImageFrame>>
         RgbExpressionBridge::note_base_motion_state(self, state);
     }
 
+    fn note_lifecycle_state(&mut self, state: CharacterLifecycleState) {
+        RgbExpressionBridge::note_lifecycle_state(self, state);
+    }
+
+    fn prepare_lifecycle_reflex(
+        &mut self,
+        state: CharacterLifecycleState,
+    ) -> Result<Self::Intent, Self::Error> {
+        RgbExpressionBridge::prepare_lifecycle_reflex(self, state)
+    }
+
+    fn lifecycle_reflex_duration(&self, state: CharacterLifecycleState) -> Duration {
+        state.presentation_transition_duration()
+    }
+
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
         let _reaction =
             RgbExpressionBridge::note_pet_episode(self, feedback.completed_at, feedback.episode);
@@ -4979,6 +5088,21 @@ impl RgbBridgePort<NanoAccessoryRgbWork> for RgbExpressionBridge<NanoAccessoryCl
 
     fn note_base_motion_state(&mut self, state: CharacterBaseMotionState) {
         RgbExpressionBridge::note_base_motion_state(self, state);
+    }
+
+    fn note_lifecycle_state(&mut self, state: CharacterLifecycleState) {
+        RgbExpressionBridge::note_lifecycle_state(self, state);
+    }
+
+    fn prepare_lifecycle_reflex(
+        &mut self,
+        state: CharacterLifecycleState,
+    ) -> Result<Self::Intent, Self::Error> {
+        RgbExpressionBridge::prepare_lifecycle_reflex(self, state)
+    }
+
+    fn lifecycle_reflex_duration(&self, state: CharacterLifecycleState) -> Duration {
+        state.presentation_transition_duration()
     }
 
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
@@ -5021,6 +5145,23 @@ impl RgbBridgePort<NanoAccessoryRgbWork> for ProductionSceneRgbBridge {
         self.0.note_base_motion_state(state);
     }
 
+    fn note_lifecycle_state(&mut self, state: CharacterLifecycleState) {
+        self.0.note_lifecycle_state(state);
+    }
+
+    fn prepare_lifecycle_reflex(
+        &mut self,
+        state: CharacterLifecycleState,
+    ) -> Result<Self::Intent, Self::Error> {
+        self.0
+            .prepare_lifecycle_reflex(state)
+            .map_err(NanoAccessoryRgbProcessingError::Bridge)
+    }
+
+    fn lifecycle_reflex_duration(&self, state: CharacterLifecycleState) -> Duration {
+        state.presentation_transition_duration()
+    }
+
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
         let _reaction = self
             .0
@@ -5056,6 +5197,23 @@ impl RgbBridgePort<NanoFacePerceptionWork> for ProductionFaceRgbBridge {
 
     fn note_base_motion_state(&mut self, state: CharacterBaseMotionState) {
         self.0.note_base_motion_state(state);
+    }
+
+    fn note_lifecycle_state(&mut self, state: CharacterLifecycleState) {
+        self.0.note_lifecycle_state(state);
+    }
+
+    fn prepare_lifecycle_reflex(
+        &mut self,
+        state: CharacterLifecycleState,
+    ) -> Result<Self::Intent, Self::Error> {
+        self.0
+            .prepare_lifecycle_reflex(state)
+            .map_err(NanoAccessoryRgbProcessingError::Bridge)
+    }
+
+    fn lifecycle_reflex_duration(&self, state: CharacterLifecycleState) -> Duration {
+        state.presentation_transition_duration()
     }
 
     fn note_pet_episode(&mut self, feedback: AccessoryPetEpisode) {
@@ -6660,8 +6818,53 @@ mod tests {
             self.log.lock().unwrap().push("thermal_state");
         }
 
+        fn prepare_lifecycle_reflex(
+            &mut self,
+            _state: CharacterLifecycleState,
+        ) -> Result<Self::Intent, Self::Error> {
+            Ok(0)
+        }
+
         fn note_pet_episode(&mut self, _episode: AccessoryPetEpisode) {
             self.log.lock().unwrap().push("pet_episode");
+        }
+    }
+
+    struct LifecycleBridge {
+        states: Arc<Mutex<Vec<CharacterLifecycleState>>>,
+        fail_prepare_for: Option<CharacterLifecycleState>,
+    }
+
+    impl RgbBridgePort<u64> for LifecycleBridge {
+        type Intent = u64;
+        type Error = &'static str;
+
+        fn process(&mut self, frame: &u64) -> Result<Self::Intent, Self::Error> {
+            Ok(*frame)
+        }
+
+        fn note_lifecycle_state(&mut self, state: CharacterLifecycleState) {
+            self.states.lock().unwrap().push(state);
+        }
+
+        fn prepare_lifecycle_reflex(
+            &mut self,
+            state: CharacterLifecycleState,
+        ) -> Result<Self::Intent, Self::Error> {
+            if self.fail_prepare_for == Some(state) {
+                Err("lifecycle")
+            } else {
+                Ok(99)
+            }
+        }
+
+        fn lifecycle_reflex_duration(&self, state: CharacterLifecycleState) -> Duration {
+            match state {
+                CharacterLifecycleState::AdmissionRecovery | CharacterLifecycleState::Parking => {
+                    Duration::from_millis(2)
+                }
+                _ => Duration::ZERO,
+            }
         }
     }
 
@@ -6677,6 +6880,13 @@ mod tests {
             self.log.lock().unwrap().push("clock_bridge_frame");
             Ok(*frame)
         }
+
+        fn prepare_lifecycle_reflex(
+            &mut self,
+            _state: CharacterLifecycleState,
+        ) -> Result<Self::Intent, Self::Error> {
+            Ok(0)
+        }
     }
 
     impl RgbBridgePort<Result<u64, ClockError>> for ClockWorkBridge {
@@ -6685,6 +6895,13 @@ mod tests {
 
         fn process(&mut self, work: &Result<u64, ClockError>) -> Result<Self::Intent, Self::Error> {
             process_rgb_work(self, work)
+        }
+
+        fn prepare_lifecycle_reflex(
+            &mut self,
+            _state: CharacterLifecycleState,
+        ) -> Result<Self::Intent, Self::Error> {
+            Ok(0)
         }
     }
 
@@ -6776,6 +6993,190 @@ mod tests {
                 "head_return",
                 "eye_shutdown",
                 "head_shutdown"
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lifecycle_facts_reach_operational_then_stream_goodnight_before_eye_release() {
+        let (head, eye, _, log, _) = fakes(false, false, false, false, None);
+        let states = Arc::new(Mutex::new(Vec::new()));
+        let bridge = LifecycleBridge {
+            states: Arc::clone(&states),
+            fail_prepare_for: None,
+        };
+        let channel = Arc::new(LatestFrameChannel::new());
+        let task_channel = Arc::clone(&channel);
+        let task = tokio::spawn(async move {
+            run_accessory_core(
+                head,
+                eye,
+                bridge,
+                task_channel,
+                health_period(1),
+                None,
+                CoreObservers {
+                    ready: |_, _| true,
+                    record_health: |_| true,
+                    publish_fault: |_| {},
+                    latch_fault: || {},
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if states
+                    .lock()
+                    .unwrap()
+                    .contains(&CharacterLifecycleState::Operational)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed admission recovery publishes operational");
+        channel.request_shutdown();
+        let exit = task.await.unwrap();
+        assert!(matches!(
+            exit,
+            CoreExit::Shutdown {
+                terminal_fault: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            &*states.lock().unwrap(),
+            &[
+                CharacterLifecycleState::Booting,
+                CharacterLifecycleState::AdmissionRecovery,
+                CharacterLifecycleState::Operational,
+                CharacterLifecycleState::Parking,
+            ]
+        );
+        let log = log.lock().unwrap();
+        let apply = log
+            .iter()
+            .position(|entry| *entry == "eye_apply")
+            .expect("goodnight applies at least one eye frame");
+        let release = log
+            .iter()
+            .position(|entry| *entry == "eye_shutdown")
+            .expect("eye session releases");
+        assert!(apply < release);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn goodnight_generation_failure_is_retained_as_a_terminal_fault() {
+        let (head, eye, _, _, _) = fakes(false, false, false, false, None);
+        let states = Arc::new(Mutex::new(Vec::new()));
+        let bridge = LifecycleBridge {
+            states,
+            fail_prepare_for: Some(CharacterLifecycleState::Parking),
+        };
+        let channel = Arc::new(LatestFrameChannel::new());
+        let task_channel = Arc::clone(&channel);
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let published_for_task = Arc::clone(&published);
+        let latched = Arc::new(AtomicBool::new(false));
+        let latched_for_task = Arc::clone(&latched);
+        let task = tokio::spawn(async move {
+            run_accessory_core(
+                head,
+                eye,
+                bridge,
+                task_channel,
+                health_period(50),
+                None,
+                CoreObservers {
+                    ready: |_, _| true,
+                    record_health: |_| true,
+                    publish_fault: move |fault| published_for_task.lock().unwrap().push(fault),
+                    latch_fault: move || latched_for_task.store(true, Ordering::SeqCst),
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        channel.request_shutdown();
+
+        let exit = task.await.unwrap();
+        assert!(matches!(
+            exit,
+            CoreExit::Shutdown {
+                terminal_fault: Some(CoreTerminalFault::Bridge("lifecycle")),
+                ..
+            }
+        ));
+        assert_eq!(
+            &*published.lock().unwrap(),
+            &[CoreTerminalFault::Bridge("lifecycle")]
+        );
+        assert!(latched.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admission_recovery_failure_prevents_false_readiness_and_closes_both_actors() {
+        let (head, eye, _, log, _) = fakes(false, false, false, false, None);
+        let states = Arc::new(Mutex::new(Vec::new()));
+        let bridge = LifecycleBridge {
+            states: Arc::clone(&states),
+            fail_prepare_for: Some(CharacterLifecycleState::AdmissionRecovery),
+        };
+        let channel = Arc::new(LatestFrameChannel::new());
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_for_task = Arc::clone(&ready);
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let published_for_task = Arc::clone(&published);
+        let exit = run_accessory_core(
+            head,
+            eye,
+            bridge,
+            channel,
+            health_period(50),
+            None,
+            CoreObservers {
+                ready: move |_, _| {
+                    ready_for_task.store(true, Ordering::SeqCst);
+                    true
+                },
+                record_health: |_| true,
+                publish_fault: move |fault| published_for_task.lock().unwrap().push(fault),
+                latch_fault: || {},
+            },
+        )
+        .await;
+
+        assert!(!ready.load(Ordering::SeqCst));
+        assert!(matches!(
+            exit,
+            CoreExit::Shutdown {
+                terminal_fault: Some(CoreTerminalFault::Bridge("lifecycle")),
+                ..
+            }
+        ));
+        assert_eq!(
+            &*states.lock().unwrap(),
+            &[
+                CharacterLifecycleState::Booting,
+                CharacterLifecycleState::AdmissionRecovery,
+            ]
+        );
+        assert_eq!(
+            &*published.lock().unwrap(),
+            &[CoreTerminalFault::Bridge("lifecycle")]
+        );
+        assert_eq!(
+            &*log.lock().unwrap(),
+            &[
+                "eye_start",
+                "head_start",
+                "head_return",
+                "eye_shutdown",
+                "head_shutdown",
             ]
         );
     }
