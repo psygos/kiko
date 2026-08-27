@@ -3172,6 +3172,33 @@ struct StereoBootstrap {
     rectified_left_intrinsics: OakIntrinsics,
 }
 
+/// Whether stereo bootstrap must acquire the optional raw EEPROM matrices.
+///
+/// Raw IMU recording deliberately omits this evidence: its stream metadata is
+/// `uncalibrated_unknown`, and the navigation calibration assembler separately
+/// requires source-bound IMU-to-base calibration. Requiring a vendor EEPROM
+/// IMU extrinsic there would both overstate its meaning and make raw capture
+/// depend on data that some supported OAK devices do not expose.
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OakEepromEvidencePolicy {
+    Omit,
+    Require,
+}
+
+#[cfg(feature = "record")]
+impl OakEepromEvidencePolicy {
+    fn acquire(
+        self,
+        device: &Device,
+    ) -> Result<Option<OakEepromCalibrationEvidence>, OakCalibrationError> {
+        match self {
+            Self::Omit => Ok(None),
+            Self::Require => device.eeprom_calibration_evidence().map(Some),
+        }
+    }
+}
+
 #[cfg(feature = "record")]
 fn require_bootstrap_frame_contract(
     side: StereoSide,
@@ -3207,7 +3234,7 @@ fn require_bootstrap_frame_contract(
 fn bootstrap_stereo(
     device: &mut Device,
     config: &MonoConfig,
-    require_oak_eeprom_evidence: bool,
+    oak_eeprom_evidence_policy: OakEepromEvidencePolicy,
     running: &AtomicBool,
     pairer: &mut StereoPairer,
 ) -> Result<StereoBootstrap, StereoBootstrapError> {
@@ -3257,9 +3284,8 @@ fn bootstrap_stereo(
     let baseline_m = device
         .stereo_baseline_m()
         .map_err(|source| StereoBootstrapError::Calibration { source })?;
-    let oak_eeprom = require_oak_eeprom_evidence
-        .then(|| device.eeprom_calibration_evidence())
-        .transpose()
+    let oak_eeprom = oak_eeprom_evidence_policy
+        .acquire(device)
         .map_err(|source| StereoBootstrapError::Calibration { source })?;
     let calibration = build_calibration(
         left_intrinsics,
@@ -3838,7 +3864,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         } = bootstrap_stereo(
             &mut device,
             &mono_config,
-            imu_config.is_some(),
+            OakEepromEvidencePolicy::Omit,
             running.as_ref(),
             &mut pairer,
         )?;
@@ -16130,7 +16156,11 @@ fn prepare_compatibility_live_session(
     // EEPROM IMU-to-camera evidence is persisted by an enabled navigation
     // dataset. A compatibility live session with navigation disabled neither
     // consumes nor persists it, so it must not gain a new EEPROM failure mode.
-    let require_oak_eeprom_evidence = imu_config.is_some() && navigation_request.is_enabled();
+    let oak_eeprom_evidence_policy = if imu_config.is_some() && navigation_request.is_enabled() {
+        OakEepromEvidencePolicy::Require
+    } else {
+        OakEepromEvidencePolicy::Omit
+    };
     // This command does not reconnect. One invocation is therefore one
     // explicitly delimited device-clock session.
     let device_session = DeviceSessionId::try_new(1)?;
@@ -16176,7 +16206,7 @@ fn prepare_compatibility_live_session(
     } = bootstrap_stereo(
         &mut device,
         &mono_config,
-        require_oak_eeprom_evidence,
+        oak_eeprom_evidence_policy,
         running,
         &mut pairer,
     )?;

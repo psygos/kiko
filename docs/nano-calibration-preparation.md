@@ -235,6 +235,15 @@ dataset, invocation, log, source revision, executable SHA-256, `meta.json`,
 writer-failed, unfinalized, or device-close-failed capture is evidence of that
 failure, not calibration input.
 
+Raw IMU capture does not require or infer an EEPROM IMU-to-camera extrinsic.
+The dataset declares its raw IMU extrinsic provenance as
+`uncalibrated_unknown`, and `calibration.json` may therefore omit `oak_eeprom`
+even when the dataset contains IMU reports. This is the truthful state for a
+supported device whose vendor API reports that IMU calibration data is not
+available. The separately sourced native-IMU-to-base proper rotation and
+Basalt calibration remain mandatory preparer inputs; successful raw capture
+must never be relabelled as either one.
+
 Map the retained `calibration.json` into `rectified_stereo` exactly once:
 
 - `left.{fx,fy,cx,cy,width,height}` becomes
@@ -244,9 +253,10 @@ Map the retained `calibration.json` into `rectified_stereo` exactly once:
 - the SHA-256 of those exact `calibration.json` bytes is
   `rectified_stereo.provenance.source_sha256_hex`.
 
-The embedded `oak_eeprom` matrices remain raw vendor-API evidence. In
-particular, `imu_to_camera_b_m` is not a native-IMU-to-base rotation and the raw
-left-rectification matrix has no asserted transform direction. Neither may be
+When present, the embedded `oak_eeprom` matrices remain raw vendor-API
+evidence. In particular, `imu_to_camera_b_m` is not a native-IMU-to-base
+rotation and the raw left-rectification matrix has no asserted transform
+direction. Their absence is not filled with a default, and neither may be
 silently relabelled into the two physical transforms required by the
 preparer.
 
