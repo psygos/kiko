@@ -18346,6 +18346,13 @@ fn build_calibration(
     oak_eeprom: Option<OakEepromCalibrationEvidence>,
     rectified: bool,
 ) -> Calibration {
+    // The OAK graph fixes StereoDepth alignment to rectified-left. On RVC2,
+    // `rectifiedRight` can retain CAM_C's source intrinsic metadata even
+    // though its pixels have been remapped into the common rectified-left
+    // projection. Persist the projection of the delivered pixels, not that
+    // stale source-camera metadata. Unrectified camera outputs keep their
+    // independent projections.
+    let right_projection = if rectified { left } else { right };
     Calibration {
         left: CameraIntrinsics {
             fx: left.fx(),
@@ -18356,12 +18363,12 @@ fn build_calibration(
             height: left.height(),
         },
         right: CameraIntrinsics {
-            fx: right.fx(),
-            fy: right.fy(),
-            cx: right.cx(),
-            cy: right.cy(),
-            width: right.width(),
-            height: right.height(),
+            fx: right_projection.fx(),
+            fy: right_projection.fy(),
+            cx: right_projection.cx(),
+            cy: right_projection.cy(),
+            width: right_projection.width(),
+            height: right_projection.height(),
         },
         baseline_m,
         rectified,
@@ -20112,7 +20119,7 @@ mod tests {
 
     #[cfg(feature = "record")]
     #[test]
-    fn calibration_is_derived_only_from_delivered_projection_types() {
+    fn rectified_calibration_uses_the_common_rectified_left_projection() {
         let left = oak_intrinsics(400.0, 640, 480);
         let right = oak_intrinsics(402.0, 640, 480);
         let oak_eeprom = oak_eeprom_calibration();
@@ -20131,7 +20138,12 @@ mod tests {
             (calibration.left.width, calibration.left.height),
             (left.width(), left.height())
         );
-        assert_eq!(calibration.right.fx, right.fx());
+        assert_eq!(calibration.right.fx, left.fx());
+        assert_eq!(calibration.right.fy, left.fy());
+        assert_eq!(calibration.right.cx, left.cx());
+        assert_eq!(calibration.right.cy, left.cy());
+        assert_eq!(calibration.right.width, left.width());
+        assert_eq!(calibration.right.height, left.height());
         assert_eq!(calibration.baseline_m, 0.075);
         assert!(calibration.rectified);
         assert_eq!(
@@ -20144,6 +20156,19 @@ mod tests {
                     .stereo_left_rectification_rotation_raw(),
             })
         );
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn unrectified_calibration_retains_each_camera_projection() {
+        let left = oak_intrinsics(400.0, 640, 480);
+        let right = oak_intrinsics(402.0, 640, 480);
+        let calibration = build_calibration(left, right, 0.075, None, false);
+
+        assert_eq!(calibration.left.fx, left.fx());
+        assert_eq!(calibration.right.fx, right.fx());
+        assert_ne!(calibration.left.fx, calibration.right.fx);
+        assert!(!calibration.rectified);
     }
 
     #[cfg(feature = "record")]
