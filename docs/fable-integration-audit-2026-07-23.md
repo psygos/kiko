@@ -1,5 +1,10 @@
 # Fable expression and Nano integration audit
 
+> Historical source/evidence audit. Replacement-servo calibration, completed
+> host merge-back, and the current attended transaction are superseded by
+> `docs/unification-plan-2026-08-03.md` and
+> `docs/nano-gate-a-live-qualification-2026-08-30.md`.
+
 Date: 2026-07-23
 Scope: read-only source and evidence review; no device I/O, process changes,
 firmware changes, or physical claims were made by this audit.

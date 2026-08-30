@@ -1,13 +1,14 @@
 # Unification plan — merging the field-proven expression engine into `kiko-slam nano-agent`
 
 Date: 2026-08-03. Author: Fable (attended session with operator).
-Status: active merge-back; the dated ledger below is authoritative and the
-remaining sections retain Fable's original plan for provenance. The target is
-the single explicit handoff demanded by
+Status: host merge-back complete; attended single-owner qualification active.
+The dated ledger below is authoritative and the remaining sections retain
+Fable's original plan for provenance. The target is the single explicit
+handoff demanded by
 `docs/nano-integrated-readiness-2026-07-31.md:182-191` ("running both is not
 integration").
 
-## 0. Implementation ledger (updated 2026-08-27)
+## 0. Implementation ledger (updated 2026-08-30)
 
 This is the durable handoff between Fable's field behavior work and the
 canonical Rust owner. It distinguishes source behavior, ported behavior, and
@@ -16,7 +17,7 @@ remaining work; a passing host test is never presented as physical evidence.
 ### Retained from Fable as an executable specification
 
 - `deploy/expression/` remains the behavior laboratory and incident corpus.
-  Its 82 Python tests are a required CI job (`3e11c8f`); it is not a second
+  Its 85 Python tests are a required CI job (`3e11c8f`); it is not a second
   production owner.
 - The touch-observation envelope fix was merged into the Rust compliant hold
   in `a4c8213`. Its intent is to let a yielding head be *observed* outside the
@@ -308,23 +309,24 @@ claimed by these host results.
    arbitrator. The attended wheels-off gates remain open. Only an attended
    wheels-on session can calibrate the encoderless plant and prove
    mapping/navigation on the robot.
-4. Materialize launch V4's policy/review pair from a fresh attended Nano
-   session, run the exact offline gate, and then prove detector, head, eye,
-   compliance, watchdog, and shutdown behavior under PID 1. The software path
-   is now connected; no native OAK, systemd, or physical-motion claim follows
-   from the host evidence above.
+4. A fresh OAK capture, calibration/navigation preparation, immutable wheels-off
+   launch V4 bundle, and exact native executable are now installed for the
+   foreground Gate A transaction. The qualification bundle intentionally omits
+   expressive physical gaze; the separate production policy/review pair and
+   PID-1 production admission remain open. The preserved qualifier must still
+   prove detector, natural hold, eyes, compliance boundaries, live SLAM,
+   occupancy, console/MPC shadow, watchdog, fault, and shutdown behavior. See
+   `docs/nano-gate-a-live-qualification-2026-08-30.md`.
 
-The read-only 2026-08-27 Orin checkpoint is retained in
-`docs/nano-single-owner-handoff-audit-2026-08-27.md`. It confirms that Fable's
-Python owner remains active on OAK/head/eyes at USB3 while STM32 is idle, but
-no canonical service, current bundle, online SLAM, occupancy, GUI, MPC, or
-navigation owner is running. This is the safe pre-handoff state, not completion.
-The exact source archives, isolated native AArch64 build evidence, reusable
-native/model/cascade leaves, unresolved V4 calibration inputs, and ordered next
-transaction are consolidated in
-`docs/nano-current-candidate-readiness-2026-08-27.md`. The hardened candidate
-is staged privately on the Orin but is neither installed nor running; Fable
-remains the live owner.
+The read-only 2026-08-27 Orin checkpoint is retained as historical evidence in
+`docs/nano-single-owner-handoff-audit-2026-08-27.md`; it describes the safe
+pre-handoff Fable owner, not the current operational state. The source archives,
+isolated native AArch64 candidate work, and then-unresolved calibration inputs
+remain in `docs/nano-current-candidate-readiness-2026-08-27.md`. The superseding
+current state is `docs/nano-gate-a-live-qualification-2026-08-30.md`: Fable has
+been handed off, an immutable qualifier is installed, and one preserved
+foreground Gate A process is waiting before device acquisition for its first
+fresh human physical attestation.
 
 ## 1. Original situation recorded 2026-08-03
 
