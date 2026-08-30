@@ -1632,7 +1632,9 @@ struct InferenceConfig {
     superpoint_left: SuperPoint,
     superpoint_right: SuperPoint,
     lightglue: LightGlue,
+    #[cfg(feature = "record")]
     superpoint_requested_backend: InferenceBackend,
+    #[cfg(feature = "record")]
     lightglue_requested_backend: InferenceBackend,
     key_limit: KeypointLimit,
     downscale: DownscaleFactor,
@@ -1681,7 +1683,9 @@ impl InferenceConfig {
             superpoint_left,
             superpoint_right,
             lightglue,
+            #[cfg(feature = "record")]
             superpoint_requested_backend: superpoint_backend,
+            #[cfg(feature = "record")]
             lightglue_requested_backend: lightglue_backend,
             key_limit,
             downscale,
@@ -2356,10 +2360,9 @@ fn run_viz_odometry(
         superpoint_left,
         superpoint_right,
         lightglue,
-        superpoint_requested_backend: _,
-        lightglue_requested_backend: _,
         key_limit,
         downscale,
+        ..
     } = inference;
 
     let tracker_config = build_tracker_config(
@@ -14089,7 +14092,9 @@ fn prepare_nano_common_live_software(
         superpoint_left,
         superpoint_right,
         lightglue,
+        #[cfg(feature = "record")]
         superpoint_requested_backend: superpoint_backend,
+        #[cfg(feature = "record")]
         lightglue_requested_backend: lightglue_backend,
         key_limit: KeypointLimit::try_from(usize::try_from(
             input.inference_policy.maximum_keypoints(),
@@ -16386,10 +16391,9 @@ fn run_prepared_live_session(
             superpoint_left,
             superpoint_right,
             lightglue,
-            superpoint_requested_backend: _,
-            lightglue_requested_backend: _,
             key_limit,
             downscale,
+            ..
         } = inference;
 
         let tracker_defaults = TrackerDefaults {
