@@ -84,7 +84,9 @@ pub use map::{
 };
 pub use math::{Pose64, Pose64Error, PoseNarrowingError};
 #[cfg(feature = "record")]
-pub use oak::{oak_to_depth_image, oak_to_frame, oak_to_imu_report};
+pub use oak::{
+    oak_stereo_calibration_from_frame_metadata, oak_to_depth_image, oak_to_frame, oak_to_imu_report,
+};
 pub use pairing::{
     PairingConfigError, PairingInputError, PairingStats, PairingWindowNs, StereoPairer,
 };

@@ -78,9 +78,9 @@ use kiko_slam::{CameraPoint3, DepthImageError, Frame, FrameError, Raw, ReconStat
 use kiko_slam::HostMonotonicTimestamp;
 #[cfg(feature = "record")]
 use kiko_slam::dataset::{
-    Backpressure, Calibration, CameraIntrinsics, DatasetWriteError, DatasetWriter,
-    DatasetWriterConfig, DatasetWriterHandle, DepthMeta, ImuExtrinsicProvenance, ImuMeta,
-    ImuStreamMetadata, Meta, MonoMeta, OakCalibrationCameraSocket,
+    Backpressure, Calibration, DatasetWriteError, DatasetWriter, DatasetWriterConfig,
+    DatasetWriterHandle, DepthMeta, ImuExtrinsicProvenance, ImuMeta, ImuStreamMetadata, Meta,
+    MonoMeta, OakCalibrationCameraSocket,
     OakEepromCalibrationEvidence as DatasetOakEepromCalibrationEvidence, PairedDatasetWriter,
     WriteOutcome,
 };
@@ -195,8 +195,9 @@ use kiko_slam::{
     HostMonotonicTimestamp, ImuReport, InertialOrderingError, InertialValueError,
     PairingConfigError, PairingInputError, PairingWindowNs, SendOutcome, SensorId,
     StereoObservation, StereoObservationError, StereoPairer, TrackerOutput, VizConfigError,
-    bounded_channel, dense_command_channel, depth_router, imu_report_router, oak_to_depth_image,
-    oak_to_frame, oak_to_imu_report,
+    bounded_channel, dense_command_channel, depth_router, imu_report_router,
+    oak_stereo_calibration_from_frame_metadata, oak_to_depth_image, oak_to_frame,
+    oak_to_imu_report,
 };
 #[cfg(all(feature = "nano-agent", unix))]
 use nano_systemd::{
@@ -18346,33 +18347,11 @@ fn build_calibration(
     oak_eeprom: Option<OakEepromCalibrationEvidence>,
     rectified: bool,
 ) -> Calibration {
-    // The OAK graph fixes StereoDepth alignment to rectified-left. On RVC2,
-    // `rectifiedRight` can retain CAM_C's source intrinsic metadata even
-    // though its pixels have been remapped into the common rectified-left
-    // projection. Persist the projection of the delivered pixels, not that
-    // stale source-camera metadata. Unrectified camera outputs keep their
-    // independent projections.
-    let right_projection = if rectified { left } else { right };
-    Calibration {
-        left: CameraIntrinsics {
-            fx: left.fx(),
-            fy: left.fy(),
-            cx: left.cx(),
-            cy: left.cy(),
-            width: left.width(),
-            height: left.height(),
-        },
-        right: CameraIntrinsics {
-            fx: right_projection.fx(),
-            fy: right_projection.fy(),
-            cx: right_projection.cx(),
-            cy: right_projection.cy(),
-            width: right_projection.width(),
-            height: right_projection.height(),
-        },
+    oak_stereo_calibration_from_frame_metadata(
+        left,
+        right,
         baseline_m,
-        rectified,
-        oak_eeprom: oak_eeprom.map(|evidence| DatasetOakEepromCalibrationEvidence {
+        oak_eeprom.map(|evidence| DatasetOakEepromCalibrationEvidence {
             stereo_left_camera_socket: dataset_oak_camera_socket(
                 evidence.stereo_left_camera_socket(),
             ),
@@ -18383,7 +18362,8 @@ fn build_calibration(
             stereo_left_rectification_rotation_raw: evidence
                 .stereo_left_rectification_rotation_raw(),
         }),
-    }
+        rectified,
+    )
 }
 
 #[cfg(feature = "record")]

@@ -1,9 +1,46 @@
+use crate::dataset::{Calibration, CameraIntrinsics, OakEepromCalibrationEvidence};
 use crate::{
     AccelSample, DepthImage, DepthImageError, DequeueSequence, DeviceSessionId, DeviceTimestamp,
     Frame, FrameError, FrameId, GyroSample, HostMonotonicTimestamp, ImuReport, InertialValueError,
     OakImuAcceleration, OakImuAngularVelocity, SensorAccuracy, SensorId, Timestamp,
 };
-use oak_sys::{DepthFrame, ImageFrame, ImuAccuracy, ImuSample};
+use oak_sys::{DepthFrame, ImageFrame, ImuAccuracy, ImuSample, Intrinsics};
+
+/// Build the projection contract for one admitted OAK stereo graph.
+///
+/// DepthAI RVC2 `StereoDepth` rectified-right frames can retain CAM_C's source
+/// intrinsic metadata even though the delivered pixels have been remapped to
+/// the common rectified-left projection. A rectified graph therefore binds
+/// both delivered images to `left`; a direct, unrectified graph retains each
+/// camera's independent projection. Callers must first verify that both
+/// frames came from the configured stereo streams and dimensions.
+pub fn oak_stereo_calibration_from_frame_metadata(
+    left: Intrinsics,
+    right: Intrinsics,
+    baseline_m: f32,
+    oak_eeprom: Option<OakEepromCalibrationEvidence>,
+    rectified: bool,
+) -> Calibration {
+    let right_projection = if rectified { left } else { right };
+    Calibration {
+        left: camera_intrinsics(left),
+        right: camera_intrinsics(right_projection),
+        baseline_m,
+        rectified,
+        oak_eeprom,
+    }
+}
+
+fn camera_intrinsics(intrinsics: Intrinsics) -> CameraIntrinsics {
+    CameraIntrinsics {
+        fx: intrinsics.fx(),
+        fy: intrinsics.fy(),
+        cx: intrinsics.cx(),
+        cy: intrinsics.cy(),
+        width: intrinsics.width(),
+        height: intrinsics.height(),
+    }
+}
 
 pub fn oak_to_frame(oak_frame: ImageFrame, sensor: SensorId) -> Result<Frame, FrameError> {
     let frame_id = FrameId::new(oak_frame.device_capture_sequence.as_u64());
@@ -78,6 +115,7 @@ fn map_oak_accuracy(accuracy: ImuAccuracy) -> Result<SensorAccuracy, InertialVal
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RectifiedStereo;
     use oak_sys::{Timestamp as OakTimestamp, Vec3};
 
     fn session() -> DeviceSessionId {
@@ -102,6 +140,52 @@ mod tests {
             },
             gyro_accuracy: ImuAccuracy::High,
         }
+    }
+
+    fn intrinsics(fx: f32, fy: f32, cx: f32, cy: f32) -> Intrinsics {
+        Intrinsics::try_from_projection_matrix(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            640,
+            400,
+        )
+        .expect("valid test intrinsics")
+    }
+
+    #[test]
+    fn rectified_oak_metadata_uses_one_delivered_left_projection() {
+        // Exact matrices observed from the qualification OAK-D S2. The
+        // right values describe CAM_C's source metadata, not a second
+        // projection for the already-remapped rectified-right pixels.
+        let left = intrinsics(398.1716, 398.1898, 308.64267, 199.88481);
+        let right_source = intrinsics(396.992, 397.00247, 326.84726, 194.88861);
+
+        let calibration =
+            oak_stereo_calibration_from_frame_metadata(left, right_source, 0.07503394, None, true);
+
+        assert_eq!(calibration.left.fx.to_bits(), left.fx().to_bits());
+        assert_eq!(calibration.left.fy.to_bits(), left.fy().to_bits());
+        assert_eq!(calibration.left.cx.to_bits(), left.cx().to_bits());
+        assert_eq!(calibration.left.cy.to_bits(), left.cy().to_bits());
+        assert_eq!(calibration.right.fx.to_bits(), left.fx().to_bits());
+        assert_eq!(calibration.right.fy.to_bits(), left.fy().to_bits());
+        assert_eq!(calibration.right.cx.to_bits(), left.cx().to_bits());
+        assert_eq!(calibration.right.cy.to_bits(), left.cy().to_bits());
+        RectifiedStereo::from_calibration(&calibration)
+            .expect("common rectified projection must parse without tolerance inflation");
+    }
+
+    #[test]
+    fn unrectified_oak_metadata_retains_both_source_projections() {
+        let left = intrinsics(398.0, 398.0, 309.0, 200.0);
+        let right = intrinsics(397.0, 397.0, 327.0, 195.0);
+
+        let calibration =
+            oak_stereo_calibration_from_frame_metadata(left, right, 0.075, None, false);
+
+        assert_eq!(calibration.left.fx.to_bits(), left.fx().to_bits());
+        assert_eq!(calibration.right.fx.to_bits(), right.fx().to_bits());
+        assert_eq!(calibration.right.cx.to_bits(), right.cx().to_bits());
+        assert!(!calibration.rectified);
     }
 
     #[test]

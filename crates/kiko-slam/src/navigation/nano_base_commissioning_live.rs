@@ -40,7 +40,7 @@ use super::{
 };
 #[cfg(feature = "nano-attended-navigation-trial")]
 use super::{NanoBootstrapStereoEvidence, ParsedNanoLiveConfiguration, ShadowNavigationConfigV2};
-use crate::dataset::{Calibration, CameraIntrinsics};
+use crate::dataset::Calibration;
 #[cfg(feature = "nano-attended-navigation-trial")]
 use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
 use crate::{
@@ -48,7 +48,8 @@ use crate::{
     LoopSubsystemConfig, OakImuAngularVelocity, PairingInputError, PairingWindowNs, Pose64,
     Pose64Error, RansacConfig, RectifiedStereo, SensorId, SlamTracker, StereoPairer, SuperPoint,
     TrackerConfig, TrackerError, TrackerInitError, TrackerRuntimePolicy, TriangulationConfig,
-    VisualIncrement, oak_to_frame, pin_ort_runtime_from_memory,
+    VisualIncrement, oak_stereo_calibration_from_frame_metadata, oak_to_frame,
+    pin_ort_runtime_from_memory,
 };
 
 const OAK_POLL_TIMEOUT_MS: u32 = 10;
@@ -544,27 +545,13 @@ fn bootstrap_stereo(
     let baseline_m = device
         .stereo_baseline_m()
         .map_err(CommissioningLiveOpenPrimaryError::OakStereoCalibration)?;
-    let observed = Calibration {
-        left: CameraIntrinsics {
-            fx: left_intrinsics.fx(),
-            fy: left_intrinsics.fy(),
-            cx: left_intrinsics.cx(),
-            cy: left_intrinsics.cy(),
-            width: left_intrinsics.width(),
-            height: left_intrinsics.height(),
-        },
-        right: CameraIntrinsics {
-            fx: right_intrinsics.fx(),
-            fy: right_intrinsics.fy(),
-            cx: right_intrinsics.cx(),
-            cy: right_intrinsics.cy(),
-            width: right_intrinsics.width(),
-            height: right_intrinsics.height(),
-        },
+    let observed = oak_stereo_calibration_from_frame_metadata(
+        left_intrinsics,
+        right_intrinsics,
         baseline_m,
-        rectified: true,
-        oak_eeprom: None,
-    };
+        None,
+        true,
+    );
     Ok((left, right, observed))
 }
 

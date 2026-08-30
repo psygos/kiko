@@ -84,10 +84,13 @@ use super::{
     ProductionNavigationControllerContractV1, ShadowNavigationConfigParseError,
     ShadowNavigationConfigV2, load_nano_agent_launch_v4,
 };
-use crate::dataset::{Calibration, CameraIntrinsics};
+use crate::dataset::Calibration;
 use crate::dense::occupancy::{DepthCameraModel, DepthToTrackingCamera};
 use crate::live_runtime::LiveOccupancyHostPolicy;
-use crate::{FrameDimensions, HostMonotonicTimestamp, RectifiedStereo, RectifiedStereoError};
+use crate::{
+    FrameDimensions, HostMonotonicTimestamp, RectifiedStereo, RectifiedStereoError,
+    oak_stereo_calibration_from_frame_metadata,
+};
 
 const MAX_NANO_BOOTSTRAP_ROOT_BYTES: usize = 1_024;
 const STEREO_POLL_TIMEOUT_MS: u32 = 50;
@@ -1575,27 +1578,13 @@ fn bootstrap_stereo_while(
         .map_err(NanoBootstrapPrimaryError::StereoCalibration)?;
     let left_intrinsics = left.intrinsics();
     let right_intrinsics = right.intrinsics();
-    let calibration = Calibration {
-        left: CameraIntrinsics {
-            fx: left_intrinsics.fx(),
-            fy: left_intrinsics.fy(),
-            cx: left_intrinsics.cx(),
-            cy: left_intrinsics.cy(),
-            width: left_intrinsics.width(),
-            height: left_intrinsics.height(),
-        },
-        right: CameraIntrinsics {
-            fx: right_intrinsics.fx(),
-            fy: right_intrinsics.fy(),
-            cx: right_intrinsics.cx(),
-            cy: right_intrinsics.cy(),
-            width: right_intrinsics.width(),
-            height: right_intrinsics.height(),
-        },
+    let calibration = oak_stereo_calibration_from_frame_metadata(
+        left_intrinsics,
+        right_intrinsics,
         baseline_m,
-        rectified: true,
-        oak_eeprom: None,
-    };
+        None,
+        true,
+    );
     let rectified = RectifiedStereo::from_calibration(&calibration)
         .map_err(NanoBootstrapPrimaryError::Stereo)?;
     let runtime_depth_camera = DepthCameraModel::new(
