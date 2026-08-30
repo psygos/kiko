@@ -1,5 +1,9 @@
 # Current Nano candidate readiness — 2026-08-27
 
+> Historical candidate-selection ledger. The current immutable bundle,
+> executable-equivalence proof, and preserved attended run are recorded in
+> `nano-gate-a-live-qualification-2026-08-30.md`.
+
 This ledger identifies the exact canonical source candidate and the evidence
 available for the next attended wheels-off qualification. It prevents the live
 Fable worktree, an old Nano binary, retained native libraries, or historical
