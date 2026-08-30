@@ -1632,21 +1632,7 @@ struct InferenceConfig {
     superpoint_left: SuperPoint,
     superpoint_right: SuperPoint,
     lightglue: LightGlue,
-    #[cfg_attr(
-        not(feature = "record"),
-        allow(
-            dead_code,
-            reason = "requested-backend provenance is emitted only by recording builds"
-        )
-    )]
     superpoint_requested_backend: InferenceBackend,
-    #[cfg_attr(
-        not(feature = "record"),
-        allow(
-            dead_code,
-            reason = "requested-backend provenance is emitted only by recording builds"
-        )
-    )]
     lightglue_requested_backend: InferenceBackend,
     key_limit: KeypointLimit,
     downscale: DownscaleFactor,

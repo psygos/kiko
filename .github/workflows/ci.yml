@@ -81,6 +81,19 @@ jobs:
       - name: Clippy embedded pure logic
         run: cargo clippy --locked -p embedded --lib --tests -- -D warnings
 
+      - name: Clippy minimal Kiko SLAM library
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: >-
+          cargo clippy --locked -p kiko-slam
+          --no-default-features
+          --lib
+          -- -D warnings
+
+      # The main binary retains requested inference-backend provenance for the
+      # recording graph. Those two fields are intentionally unread without the
+      # `record` feature. Keep the allowance command-scoped so the qualification
+      # source graph remains reproducible while every other warning stays fatal.
       - name: Clippy minimal Kiko SLAM graph
         env:
           OAK_SYS_CHECK_ONLY: "1"
@@ -88,7 +101,7 @@ jobs:
           cargo clippy --locked -p kiko-slam
           --no-default-features
           --all-targets
-          -- -D warnings
+          -- -D warnings -A dead-code
 
       - name: Clippy boot-journal provisioning tool
         run: >-
