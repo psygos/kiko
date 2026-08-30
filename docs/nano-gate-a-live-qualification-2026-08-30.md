@@ -35,6 +35,15 @@ Neither `kiko-nano-agent.service` nor `kiko-robot-server.service` is active.
 The production service is not installed. The qualifier is not a boot service
 and has not been promoted to production.
 
+A read-only owner refresh at `2026-08-30T16:58:37+05:30` found all three exact
+serial-by-id endpoints present and no `fuser` owner for the STM32, head, or eye
+endpoint. The user crontab contained no Kiko, Fable, expression, or guardian
+entry. Before firmware upload, the unopened MyriadX appeared on the USB2
+companion bus at 480 Mbit/s; that bootloader enumeration is not a runtime OAK
+transport result and does not supersede the capture's direct `SUPER` readback.
+The qualifier must request and verify `SUPER` again after it opens the exact
+MXID.
+
 ## Exact executable provenance
 
 The immutable installed qualifier is:
