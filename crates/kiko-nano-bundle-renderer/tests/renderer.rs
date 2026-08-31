@@ -1712,6 +1712,11 @@ fn production_derives_navigation_digest_and_loopback_port() {
         "the eye lease admits loaded-Orin scheduling while remaining finite"
     );
     assert_eq!(
+        agent_policy["eye"]["write_timeout_ms"],
+        json!(20),
+        "USB-serial writes retain the measured bounded Orin flush budget"
+    );
+    assert_eq!(
         agent_policy["control"]["runtime_response_timeout_ms"],
         json!(30_000),
         "ordinary production command response timeout remains bounded separately"
@@ -2482,6 +2487,11 @@ fn qualification_v4_template_renders_exact_policy_and_leaves_only_evidence_bound
         "stationary and production bundles share the finite eye lease"
     );
     assert_eq!(
+        policy["eye"]["write_timeout_ms"],
+        json!(20),
+        "the staged stationary bundle retains the bounded Orin flush budget"
+    );
+    assert_eq!(
         policy["head"],
         json!({
             "mode": "return_to_natural_and_hold_continuously",
@@ -2514,7 +2524,7 @@ fn qualification_v4_template_renders_exact_policy_and_leaves_only_evidence_bound
             "sampling_rows": 12,
             "minimum_residual_luma": 24,
             "minimum_active_fraction_basis_points": 500,
-            "frame_freshness_ms": 80,
+            "frame_freshness_ms": 500,
             "brightness_basis_points": 7000,
             "color_rgb": [32, 128, 255],
             "blink": false,

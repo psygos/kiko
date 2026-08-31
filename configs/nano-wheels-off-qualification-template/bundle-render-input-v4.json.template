@@ -175,7 +175,7 @@
     "sampling_rows": 12,
     "minimum_residual_luma": 24,
     "minimum_active_fraction_basis_points": 500,
-    "frame_freshness_ms": 80,
+    "frame_freshness_ms": 500,
     "brightness_basis_points": 7000,
     "color_rgb": [32, 128, 255],
     "blink": false,

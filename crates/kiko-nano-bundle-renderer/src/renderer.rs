@@ -38,6 +38,11 @@ const QUALIFICATION_EXECUTABLE_RELATIVE_PATH: &str = "bin/kiko-nano-wheels-off-q
 const HEAD_GAZE_POLICY_RELATIVE_PATH: &str = "head-gaze-policy-v1.json";
 const HEAD_GAZE_REVIEW_EVIDENCE_RELATIVE_PATH: &str = "evidence/head-gaze-physical-review-v1.json";
 const NANO_EYE_INTENT_LEASE_MS: u16 = 500;
+/// Five milliseconds proved shorter than an occasional successful USB-serial
+/// flush on the installed Orin. Twenty milliseconds remains bounded and
+/// matches the KEP2 response budget, while avoiding ambiguous-write faults
+/// after every byte has already reached the kernel.
+const NANO_EYE_WRITE_TIMEOUT_MS: u8 = 20;
 const QUALIFICATION_GATE_A_PLANT_ARTIFACT_ID: &str =
     "qualification-shadow-only-synthetic-unvalidated-v2";
 const QUALIFICATION_GATE_A_PLANT_RELATIVE_PATH: &str =
@@ -1117,7 +1122,7 @@ fn render_agent_policy(
                 "device_path": discovery.eye.serial_by_id_path,
                 "baud_rate_bps": 115200,
                 "response_timeout_ms": 20,
-                "write_timeout_ms": 5,
+                "write_timeout_ms": NANO_EYE_WRITE_TIMEOUT_MS,
                 "write_attempts": 2,
                 "empty_delimiter_budget": 2,
                 "expected_device_uid": discovery.eye.device_uid,

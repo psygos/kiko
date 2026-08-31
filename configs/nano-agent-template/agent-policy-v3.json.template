@@ -40,7 +40,7 @@
     "device_path": "${EYE_SERIAL_BY_ID_PATH}",
     "baud_rate_bps": 115200,
     "response_timeout_ms": 20,
-    "write_timeout_ms": 5,
+    "write_timeout_ms": 20,
     "write_attempts": 2,
     "empty_delimiter_budget": 2,
     "expected_device_uid": [${EYE_DEVICE_UID_U8_ARRAY}],

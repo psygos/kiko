@@ -35,7 +35,11 @@ pub const HEAD_PRE_ENABLE_SETTLE_POLL_PERIOD: Duration = Duration::from_millis(2
 /// A goal, torque-limit, or torque-on write can briefly reassert the raw moving
 /// bit. Verification may re-observe only that exact condition; status,
 /// telemetry-safety, and position failures remain immediately fatal.
-pub const HEAD_READBACK_SETTLE_ATTEMPTS: u8 = 5;
+/// The installed Kiko head can retain the raw moving flag across a clean
+/// owner handoff even though repeated position telemetry remains inside the
+/// reviewed hold corridor. Keep the flag authoritative, but allow it a
+/// bounded three-second settling window before rejecting startup.
+pub const HEAD_READBACK_SETTLE_ATTEMPTS: u8 = 121;
 pub const HEAD_READBACK_SETTLE_POLL_PERIOD: Duration = Duration::from_millis(25);
 pub const MAX_HEAD_RETURN_TRAVEL_TICKS: u16 = 512;
 /// Conservative Kiko-specific raw register gates retained from the deployed
