@@ -4307,6 +4307,30 @@ fn route_visual_admission(
     classify_lossless_send(sender.send_timeout(admission, LIVE_NAVIGATION_VISUAL_SEND_TIMEOUT))
 }
 
+#[cfg(any(feature = "record", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveVisualRouteDisposition {
+    Delivered,
+    ShutdownInProgress,
+}
+
+#[cfg(any(feature = "record", test))]
+fn classify_visual_route_during_shutdown(
+    outcome: Result<(), LiveLosslessRouteError>,
+    process_running: bool,
+) -> Result<LiveVisualRouteDisposition, LiveLosslessRouteError> {
+    if process_running {
+        outcome.map(|()| LiveVisualRouteDisposition::Delivered)
+    } else {
+        // Navigation must stop actuation as soon as the process shutdown flag
+        // clears. Its lossless receiver may therefore close while inference is
+        // finishing one observation that capture admitted before shutdown.
+        // That causal tail is an expected stop boundary, regardless of whether
+        // its send won or lost the race with receiver closure.
+        Ok(LiveVisualRouteDisposition::ShutdownInProgress)
+    }
+}
+
 #[cfg(feature = "record")]
 struct LiveVizMsg {
     left: Frame,
@@ -17004,7 +17028,7 @@ fn run_prepared_live_session(
                 let mut viz_tx = Some(viz_tx);
                 let navigation_visual_tx = navigation_visual_tx;
 
-                for observation in pair_rx.iter() {
+                'inference: for observation in pair_rx.iter() {
                     let pending_visual = if navigation_visual_tx.is_some() {
                         Some(
                             PendingVisualAttemptIngress::from_observation(
@@ -17084,9 +17108,18 @@ fn run_prepared_live_session(
                                 .map_err(|source| LiveThreadError::VisualAdmissionBuild {
                                     source,
                                 })?;
-                                route_visual_admission(sender, admission).map_err(|source| {
+                                match classify_visual_route_during_shutdown(
+                                    route_visual_admission(sender, admission),
+                                    inference_running.load(Ordering::Acquire),
+                                )
+                                .map_err(|source| {
                                     LiveThreadError::VisualAdmissionRoute { source }
-                                })?;
+                                })? {
+                                    LiveVisualRouteDisposition::Delivered => {}
+                                    LiveVisualRouteDisposition::ShutdownInProgress => {
+                                        break 'inference;
+                                    }
+                                }
                             }
                             // Map tracker output to dense commands.
                             let pose_updates = tracker.take_pending_dense_pose_updates();
@@ -17218,9 +17251,23 @@ fn run_prepared_live_session(
                                 .map_err(|source| LiveThreadError::VisualAdmissionBuild {
                                     source: LiveVisualAdmissionBuildError::Admission(source),
                                 })?;
-                                route_visual_admission(sender, admission).map_err(|source| {
+                                match classify_visual_route_during_shutdown(
+                                    route_visual_admission(sender, admission),
+                                    inference_running.load(Ordering::Acquire),
+                                )
+                                .map_err(|source| {
                                     LiveThreadError::VisualAdmissionRoute { source }
-                                })?;
+                                })? {
+                                    LiveVisualRouteDisposition::Delivered => {}
+                                    LiveVisualRouteDisposition::ShutdownInProgress => {
+                                        if requires_pipeline_shutdown {
+                                            return Err(LiveThreadError::InferenceUnavailable {
+                                                source: err,
+                                            });
+                                        }
+                                        break 'inference;
+                                    }
+                                }
                             }
                             if dense_active {
                                 let pose_updates = tracker.take_pending_dense_pose_updates();
@@ -17307,7 +17354,11 @@ fn run_prepared_live_session(
                                 .map_err(|source| LiveThreadError::VisualAdmissionBuild {
                                     source: LiveVisualAdmissionBuildError::Admission(source),
                                 })?;
-                                route_visual_admission(sender, admission).map_err(|source| {
+                                classify_visual_route_during_shutdown(
+                                    route_visual_admission(sender, admission),
+                                    inference_running.load(Ordering::Acquire),
+                                )
+                                .map_err(|source| {
                                     LiveThreadError::VisualAdmissionRoute { source }
                                 })?;
                             }
@@ -18789,11 +18840,12 @@ mod tests {
     use super::{
         BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, LiveDecisionVizKind,
         LiveDenseCommandClass, LiveDenseRouteContext, LiveDenseRouteDisposition,
-        LiveDenseRouteError, LiveLosslessRouteError, LiveThreadExitGuard, LiveVisualShape,
-        OccupancyProjectionContractError, OdometryVizProcessingError, OfflineDepthSelector,
-        OfflineFatalDenseError, OfflineFatalTrackerError, RerunDestination, RerunDestinationError,
-        RerunFinishTimeout, RerunSessionError, build_ba_config_from_values,
-        classify_live_dense_route, classify_live_visual_shape, classify_lossless_send,
+        LiveDenseRouteError, LiveLosslessRouteError, LiveThreadExitGuard,
+        LiveVisualRouteDisposition, LiveVisualShape, OccupancyProjectionContractError,
+        OdometryVizProcessingError, OfflineDepthSelector, OfflineFatalDenseError,
+        OfflineFatalTrackerError, RerunDestination, RerunDestinationError, RerunFinishTimeout,
+        RerunSessionError, build_ba_config_from_values, classify_live_dense_route,
+        classify_live_visual_shape, classify_lossless_send, classify_visual_route_during_shutdown,
         combine_rerun_results, live_decision_viz_status, navigation_dataset_may_publish,
         occupancy_depth_camera, reject_removed_ba_motion_prior, require_level_optical_world,
         resolve_model_path, take_deferred_offline_snapshot_error,
@@ -20195,6 +20247,32 @@ mod tests {
             classify_lossless_send(Err(crossbeam_channel::SendTimeoutError::Disconnected(1_u8))),
             Err(LiveLosslessRouteError::Disconnected)
         );
+    }
+
+    #[test]
+    fn visual_route_suppresses_only_the_causal_tail_of_process_shutdown() {
+        assert_eq!(
+            classify_visual_route_during_shutdown(Ok(()), true),
+            Ok(LiveVisualRouteDisposition::Delivered)
+        );
+        assert_eq!(
+            classify_visual_route_during_shutdown(Err(LiveLosslessRouteError::Disconnected), true,),
+            Err(LiveLosslessRouteError::Disconnected)
+        );
+        assert_eq!(
+            classify_visual_route_during_shutdown(Err(LiveLosslessRouteError::TimedOut), true,),
+            Err(LiveLosslessRouteError::TimedOut)
+        );
+        for outcome in [
+            Ok(()),
+            Err(LiveLosslessRouteError::Disconnected),
+            Err(LiveLosslessRouteError::TimedOut),
+        ] {
+            assert_eq!(
+                classify_visual_route_during_shutdown(outcome, false),
+                Ok(LiveVisualRouteDisposition::ShutdownInProgress)
+            );
+        }
     }
 
     #[test]
