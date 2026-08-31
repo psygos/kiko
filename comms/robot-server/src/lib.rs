@@ -9,11 +9,11 @@ mod controller_owner;
 mod deadline;
 
 pub use actuation_v2::{
-    ActuationActorError, ActuationOutputEvidence, ActuationSnapshot, ActuationStartError,
-    ActuationStartupPhase, ActuationTelemetry, NoopActuationTelemetry, ObservedActuationOutput,
-    SerialResynchronizationOutcome, SerialTransmitError, SerialTransmitInterruption,
-    SerialTransmitPhase, ShutdownForceStopOutcome, ShutdownInterruptedTransmitRecovery,
-    UdpServiceError,
+    ActuationActorError, ActuationFaultEvidence, ActuationOutputEvidence, ActuationSnapshot,
+    ActuationStartError, ActuationStartupPhase, ActuationTelemetry, NoopActuationTelemetry,
+    ObservedActuationOutput, SerialResynchronizationOutcome, SerialTransmitError,
+    SerialTransmitInterruption, SerialTransmitPhase, ShutdownForceStopOutcome,
+    ShutdownInterruptedTransmitRecovery, UdpServiceError,
 };
 #[cfg(feature = "qualification-fault-injection")]
 pub use actuation_v2::{

@@ -137,6 +137,7 @@ fn qualification_partial_uart_record_error(
 pub struct ActuationSnapshot {
     pub status: StatusCode,
     pub startup_phase: ActuationStartupPhase,
+    pub fault: Option<ActuationFaultEvidence>,
     pub observed_boot_id: TargetBootId,
     pub control_epoch: Option<ControlEpoch>,
     pub output: ActuationOutputEvidence,
@@ -151,6 +152,29 @@ pub enum ActuationStartupPhase {
     AwaitingStoppedHeartbeat,
     ReadyStopped,
     Faulted,
+}
+
+/// Typed, retained evidence for the first protocol condition that faulted the
+/// current controller admission attempt.
+///
+/// This is deliberately part of the telemetry snapshot rather than a log-only
+/// string: startup callers must be able to report why a controller was not
+/// admitted even after their bounded cleanup stop changes the actor state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActuationFaultEvidence {
+    ControllerHelloRejected(ControllerHello),
+    ControllerReadyRejected(ControllerReady),
+    PreSessionHeartbeatRejected(Heartbeat),
+    SessionHeartbeatRejected(Heartbeat),
+    SessionHeartbeatDidNotProgress(Heartbeat),
+    HeartbeatAuthorityConflict(Heartbeat),
+    ObservationalOdometryIdentityMismatch(ObservationalOdometry),
+    UnexpectedControllerMessage(MessageKind),
+    UnexpectedStopResult(HostStopResult),
+    StartupStopNotConfirmed(HostStopResult),
+    SerialFraming(UartStreamError),
+    HeartbeatFreshnessExpired,
+    Protocol(ForceStopReason),
 }
 
 /// Current controller-output knowledge exposed to telemetry and UI adapters.
@@ -1500,6 +1524,7 @@ struct SerialActor<Transport> {
     startup_begin_after_stop: Option<BeginSession>,
     next_internal_request_id: Option<RequestId>,
     faulted: bool,
+    last_fault: Option<ActuationFaultEvidence>,
     priority_stop: Option<Arc<PriorityStopCoordinator>>,
     priority_stop_generation: u64,
     shutdown: Option<Arc<ActuationShutdownSignal>>,
@@ -1534,6 +1559,7 @@ where
             startup_begin_after_stop: None,
             next_internal_request_id: Some(RequestId::new(0)),
             faulted: false,
+            last_fault: None,
             priority_stop: None,
             priority_stop_generation: 0,
             shutdown: None,
@@ -1808,6 +1834,8 @@ where
             self.heartbeat = None;
             self.owner = None;
             self.faulted = true;
+            self.last_fault
+                .get_or_insert(ActuationFaultEvidence::HeartbeatFreshnessExpired);
             self.publish_snapshot(now);
         }
         Ok(())
@@ -2303,10 +2331,17 @@ where
                 if self.odometry_identity_matches(value) {
                     self.telemetry.observe_odometry(value, received_at);
                 } else {
+                    self.last_fault =
+                        Some(ActuationFaultEvidence::ObservationalOdometryIdentityMismatch(value));
                     self.protocol_fault(ForceStopReason::SessionReset).await?;
                 }
             }
-            _ => self.protocol_fault(ForceStopReason::TransportFault).await?,
+            unexpected => {
+                self.last_fault = Some(ActuationFaultEvidence::UnexpectedControllerMessage(
+                    unexpected.kind(),
+                ));
+                self.protocol_fault(ForceStopReason::TransportFault).await?;
+            }
         }
         self.publish_snapshot(received_at);
         Ok(())
@@ -2333,6 +2368,7 @@ where
 
         if !self.hello_is_exact(hello) {
             self.faulted = true;
+            self.last_fault = Some(ActuationFaultEvidence::ControllerHelloRejected(hello));
             self.issue_stop_for(
                 hello.controller_uid,
                 TargetBootId::Exact(hello.boot_id),
@@ -2344,6 +2380,7 @@ where
 
         self.hello = Some(timed);
         self.faulted = false;
+        self.last_fault = None;
         self.issue_stop_for(
             hello.controller_uid,
             TargetBootId::Exact(hello.boot_id),
@@ -2384,6 +2421,7 @@ where
                 && ready.faults.is_clear()
         });
         if !exact {
+            self.last_fault = Some(ActuationFaultEvidence::ControllerReadyRejected(ready));
             self.protocol_fault(ForceStopReason::SessionReset).await?;
             return Ok(());
         }
@@ -2400,6 +2438,7 @@ where
         });
         self.heartbeat = None;
         self.faulted = false;
+        self.last_fault = None;
         Ok(())
     }
 
@@ -2414,6 +2453,9 @@ where
                 || !heartbeat.output_state.is_safe()
                 || !heartbeat.faults.is_clear()
             {
+                self.last_fault = Some(ActuationFaultEvidence::PreSessionHeartbeatRejected(
+                    heartbeat,
+                ));
                 self.protocol_fault(ForceStopReason::ControllerFault)
                     .await?;
             }
@@ -2426,11 +2468,22 @@ where
             && heartbeat.boot_id == ready.message.boot_id
             && self.heartbeat_state_is_exact(heartbeat, ready)
             && heartbeat.faults.is_clear();
-        if !exact_session || !self.heartbeat_progresses(heartbeat) {
+        if !exact_session {
+            self.last_fault = Some(ActuationFaultEvidence::SessionHeartbeatRejected(heartbeat));
+            self.protocol_fault(ForceStopReason::SessionReset).await?;
+            return Ok(());
+        }
+        if !self.heartbeat_progresses(heartbeat) {
+            self.last_fault = Some(ActuationFaultEvidence::SessionHeartbeatDidNotProgress(
+                heartbeat,
+            ));
             self.protocol_fault(ForceStopReason::SessionReset).await?;
             return Ok(());
         }
         if !self.heartbeat_matches_authority(heartbeat) {
+            self.last_fault = Some(ActuationFaultEvidence::HeartbeatAuthorityConflict(
+                heartbeat,
+            ));
             self.protocol_fault(ForceStopReason::SequenceConflict)
                 .await?;
             return Ok(());
@@ -2440,6 +2493,7 @@ where
             received_at,
         });
         self.faulted = false;
+        self.last_fault = None;
         if let Some(startup_ready) = self.startup_ready.take() {
             let _ = startup_ready.send(());
         }
@@ -2826,6 +2880,7 @@ where
         {
             return Ok(());
         }
+        self.last_fault = Some(ActuationFaultEvidence::UnexpectedStopResult(result));
         self.protocol_fault(ForceStopReason::SequenceConflict).await
     }
 
@@ -2856,6 +2911,7 @@ where
             self.send_serial(Message::BeginSession(begin)).await?;
         } else if !stop_is_exact {
             self.faulted = true;
+            self.last_fault = Some(ActuationFaultEvidence::StartupStopNotConfirmed(result));
         }
         Ok(true)
     }
@@ -2865,6 +2921,7 @@ where
         error: UartStreamError,
     ) -> Result<(), ActuationActorError> {
         log::error!("V2 controller framing fault: {error}");
+        self.last_fault = Some(ActuationFaultEvidence::SerialFraming(error));
         self.fail_all_pending(
             HostCommandResultCode::ForceStopped,
             StopResultCode::ControllerFaulted,
@@ -2878,6 +2935,8 @@ where
     }
 
     async fn protocol_fault(&mut self, reason: ForceStopReason) -> Result<(), ActuationActorError> {
+        self.last_fault
+            .get_or_insert(ActuationFaultEvidence::Protocol(reason));
         self.fail_all_pending(
             HostCommandResultCode::ForceStopped,
             StopResultCode::ControllerFaulted,
@@ -3545,6 +3604,7 @@ where
         ActuationSnapshot {
             status: status.status,
             startup_phase: self.startup_phase(),
+            fault: self.last_fault,
             observed_boot_id: status.observed_boot_id,
             control_epoch: status.control_epoch,
             output,
@@ -7563,6 +7623,37 @@ mod tests {
         assert_eq!(
             actor.snapshot(stale_at).output,
             ActuationOutputEvidence::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_startup_claim_is_retained_as_typed_snapshot_evidence() {
+        let (actor_stream, _controller_stream) = tokio::io::duplex(256);
+        let (startup_ready, _startup_ready_rx) = oneshot::channel();
+        let mut actor = SerialActor::new(
+            actor_stream,
+            UartStreamDecoder::new(),
+            actor_config(),
+            Arc::new(NoopActuationTelemetry),
+            startup_ready,
+        );
+        let mut rejected = hello_with(uid(), boot(7));
+        rejected.firmware_build_id = rejected.firmware_build_id.wrapping_add(1);
+
+        actor
+            .handle_hello(rejected, Instant::now())
+            .await
+            .expect("fault stop remains serializable");
+
+        let snapshot = actor.snapshot(Instant::now());
+        assert_eq!(snapshot.startup_phase, ActuationStartupPhase::Faulted);
+        assert_eq!(
+            snapshot.fault,
+            Some(ActuationFaultEvidence::ControllerHelloRejected(rejected))
+        );
+        assert_eq!(
+            snapshot.observed_boot_id,
+            TargetBootId::Exact(rejected.boot_id)
         );
     }
 
