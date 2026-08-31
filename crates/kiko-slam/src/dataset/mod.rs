@@ -5001,8 +5001,17 @@ mod tests {
         let finalized = journal
             .finish_with_descriptor()
             .expect("finalize empty quota-bound journal");
-        let (file, descriptor) = finalized.into_parts();
+        let (mut file, descriptor) = finalized.into_parts();
         file.sync_all().expect("sync journal");
+        file.seek(std::io::SeekFrom::Start(0))
+            .expect("seek finalized quota journal");
+        let reader = NavigationIngressReader::new(
+            &mut file,
+            descriptor.recording_id(),
+            navigation_capacity(1),
+        )
+        .expect("reread finalized quota journal header");
+        assert_eq!(reader.declared_count(), 0);
         drop(file);
         drop(writer);
         handle

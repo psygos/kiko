@@ -1003,7 +1003,7 @@ fn descriptor_relative_create(directory_fd: RawFd, name: &OsStr) -> io::Result<F
         libc::openat(
             directory_fd,
             name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             0o600,
         )
     };
