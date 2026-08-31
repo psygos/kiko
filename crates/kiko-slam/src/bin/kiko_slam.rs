@@ -13432,6 +13432,7 @@ struct NanoPostNavigationSetupGuard {
     navigation:
         Option<thread::JoinHandle<Result<LiveNavigationWorkerSuccess, LiveNavigationWorkerError>>>,
     accessory: Option<NanoAccessoryWorker>,
+    cleanup_armed: bool,
 }
 
 #[cfg(all(feature = "nano-agent", unix))]
@@ -13447,6 +13448,7 @@ impl NanoPostNavigationSetupGuard {
             running,
             navigation,
             accessory,
+            cleanup_armed: true,
         }
     }
 
@@ -13458,6 +13460,11 @@ impl NanoPostNavigationSetupGuard {
     ) {
         let navigation = self.navigation.take();
         let accessory = self.accessory.take();
+        // All fallible thread creation is complete and both owners have been
+        // transferred to the live loop. Defuse the early-return cleanup before
+        // this consumed guard is dropped; otherwise a successful handoff would
+        // falsely stop the shared runtime before its first camera frame.
+        self.cleanup_armed = false;
         (navigation, accessory)
     }
 }
@@ -13465,6 +13472,9 @@ impl NanoPostNavigationSetupGuard {
 #[cfg(all(feature = "nano-agent", unix))]
 impl Drop for NanoPostNavigationSetupGuard {
     fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
         self.running.store(false, Ordering::SeqCst);
         if let Some(handle) = self.navigation.take() {
             match handle.join() {
@@ -18701,8 +18711,9 @@ mod tests {
     use super::{LiveSensorStream, LiveSensorStreamHealth};
     #[cfg(all(feature = "nano-agent", unix))]
     use super::{
-        MAX_NANO_STREAM_EPOCH_ATTEMPTS, NanoOperationAndControllerOwnerError, NanoStreamEpochError,
-        TrackerDefaults, V2ControllerOwnerTerminationError, build_canonical_nano_tracker_config,
+        MAX_NANO_STREAM_EPOCH_ATTEMPTS, NanoOperationAndControllerOwnerError,
+        NanoPostNavigationSetupGuard, NanoStreamEpochError, TrackerDefaults,
+        V2ControllerOwnerTerminationError, build_canonical_nano_tracker_config,
         finish_nano_controller_owner, fresh_nano_stream_epoch_from,
     };
     use clap::{Parser as _, error::ErrorKind};
@@ -21083,6 +21094,31 @@ mod tests {
             let _guard = LiveThreadExitGuard::new(Arc::clone(&running));
             assert!(running.load(Ordering::SeqCst));
         }
+        assert!(!running.load(Ordering::SeqCst));
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[test]
+    fn post_navigation_setup_guard_preserves_running_after_successful_handoff() {
+        let running = Arc::new(AtomicBool::new(true));
+        let guard = NanoPostNavigationSetupGuard::new(Arc::clone(&running), None, None);
+
+        let (navigation, accessory) = guard.into_parts();
+
+        assert!(navigation.is_none());
+        assert!(accessory.is_none());
+        assert!(running.load(Ordering::SeqCst));
+    }
+
+    #[cfg(all(feature = "nano-agent", unix))]
+    #[test]
+    fn post_navigation_setup_guard_stops_running_on_early_drop() {
+        let running = Arc::new(AtomicBool::new(true));
+        {
+            let _guard = NanoPostNavigationSetupGuard::new(Arc::clone(&running), None, None);
+            assert!(running.load(Ordering::SeqCst));
+        }
+
         assert!(!running.load(Ordering::SeqCst));
     }
 
