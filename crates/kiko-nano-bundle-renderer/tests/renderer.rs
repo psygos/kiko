@@ -1707,6 +1707,11 @@ fn production_derives_navigation_digest_and_loopback_port() {
     let agent_policy: Value =
         serde_json::from_slice(&agent_policy_bytes).expect("production agent policy JSON");
     assert_eq!(
+        agent_policy["eye"]["intent_lease_ms"],
+        json!(500),
+        "the eye lease admits loaded-Orin scheduling while remaining finite"
+    );
+    assert_eq!(
         agent_policy["control"]["runtime_response_timeout_ms"],
         json!(30_000),
         "ordinary production command response timeout remains bounded separately"
@@ -2471,6 +2476,11 @@ fn qualification_v4_template_renders_exact_policy_and_leaves_only_evidence_bound
         fs::read(destination.join("agent-policy-v3.json")).expect("rendered agent policy");
     NanoAgentPolicyConfigV3::parse_json(&policy_bytes).expect("typed rendered agent policy");
     let policy: Value = serde_json::from_slice(&policy_bytes).expect("rendered agent policy JSON");
+    assert_eq!(
+        policy["eye"]["intent_lease_ms"],
+        json!(500),
+        "stationary and production bundles share the finite eye lease"
+    );
     assert_eq!(
         policy["head"],
         json!({

@@ -48,7 +48,7 @@
     "expected_device_uid": [${EYE_DEVICE_UID_U8_ARRAY}],
     "expected_firmware_build_id": [${EYE_FIRMWARE_BUILD_ID_U8_ARRAY}],
     "expected_capabilities_bits": 255,
-    "intent_lease_ms": 100
+    "intent_lease_ms": 500
   },
   "head": {
     "mode": "return_to_natural_and_hold_continuously",

@@ -4111,6 +4111,7 @@ trait Kep2EyePort<I> {
     type Shutdown;
 
     async fn start(&mut self) -> Result<Self::Ready, Self::StartError>;
+    fn session_refresh_period(&self) -> Duration;
     async fn apply(&mut self, intent: I) -> Result<(), Self::ApplyError>;
     async fn shutdown(&mut self) -> Self::Shutdown;
 }
@@ -4290,6 +4291,30 @@ where
     }
 }
 
+async fn apply_one_lifecycle_reflex<F, E, B>(
+    bridge: &mut B,
+    eye: &mut E,
+    state: CharacterLifecycleState,
+) -> Result<(), LifecyclePresentationFault<B::Error, E::ApplyError>>
+where
+    E: Kep2EyePort<<B::Intent as AccessoryCharacterIntent>::EyeIntent>,
+    B: RgbBridgePort<F>,
+    B::Intent: AccessoryCharacterIntent,
+{
+    let intent = bridge.prepare_lifecycle_reflex(state).map_err(|source| {
+        LifecyclePresentationFault::Bridge {
+            frames_applied: 0,
+            source,
+        }
+    })?;
+    eye.apply(intent.into_eye())
+        .await
+        .map_err(|source| LifecyclePresentationFault::EyeApply {
+            frames_applied: 0,
+            source,
+        })
+}
+
 async fn present_fault_recovery_after_stop_latch<F, E, B>(
     bridge: &mut B,
     eye: &mut E,
@@ -4411,6 +4436,9 @@ where
     } else {
         CoreFaultRecoveryPresentationEvidence::NotRequired
     };
+    let eye_refresh_period = eye.session_refresh_period();
+    let eye_refresh = tokio::time::sleep(eye_refresh_period);
+    tokio::pin!(eye_refresh);
     let period = health_period.get();
     let first_health = tokio::time::Instant::now() + period;
     let mut health = tokio::time::interval_at(first_health, period);
@@ -4426,12 +4454,59 @@ where
                         let _status_retained = record_health(evidence);
                     }
                 }
+                refresh = async {
+                    (&mut eye_refresh).await;
+                    apply_one_lifecycle_reflex::<F, _, _>(
+                        &mut bridge,
+                        &mut eye,
+                        CharacterLifecycleState::FaultRecovery,
+                    )
+                    .await
+                } => {
+                    match refresh {
+                        Ok(()) => eye_refresh
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + eye_refresh_period),
+                        Err(source) => {
+                            fault_recovery_presentation =
+                                CoreFaultRecoveryPresentationEvidence::Failed(source);
+                            break;
+                        }
+                    }
+                }
                 () = channel.wait_for_shutdown() => break,
             }
             continue;
         }
 
         let fault = tokio::select! {
+            refresh = async {
+                (&mut eye_refresh).await;
+                apply_one_lifecycle_reflex::<F, _, _>(
+                    &mut bridge,
+                    &mut eye,
+                    CharacterLifecycleState::Operational,
+                )
+                .await
+            } => {
+                match refresh {
+                    Ok(()) => {
+                        eye_refresh
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + eye_refresh_period);
+                        None
+                    }
+                    Err(LifecyclePresentationFault::Bridge { source, .. }) => {
+                        Some(CoreTerminalFault::Bridge(source))
+                    }
+                    Err(LifecyclePresentationFault::EyeApply { source, .. }) => {
+                        Some(CoreTerminalFault::EyeApply(source))
+                    }
+                    Err(LifecyclePresentationFault::FrameCountExhausted { .. }) => {
+                        unreachable!("one lifecycle refresh cannot exhaust a frame counter")
+                    }
+                }
+            }
             health_result = async {
                 health.tick().await;
                 head.check_health().await
@@ -4506,7 +4581,11 @@ where
                                                     bridge.note_pet_episode(pet_episode);
                                                 }
                                                 match eye.apply(intent.into_eye()).await {
-                                                    Ok(()) => match channel.counters.record_processed_successfully() {
+                                                    Ok(()) => {
+                                                        eye_refresh
+                                                            .as_mut()
+                                                            .reset(tokio::time::Instant::now() + eye_refresh_period);
+                                                        match channel.counters.record_processed_successfully() {
                                                         Ok(()) => None,
                                                         Err(
                                                             NanoAccessoryHealthStatusError::Poisoned
@@ -4514,7 +4593,8 @@ where
                                                             | NanoAccessoryHealthStatusError::IngressDisconnected
                                                             | NanoAccessoryHealthStatusError::ChannelPoisoned,
                                                         ) => Some(CoreTerminalFault::RgbHealthStatusPoisoned),
-                                                    },
+                                                        }
+                                                    }
                                                     Err(source) => Some(CoreTerminalFault::EyeApply(source)),
                                                 }
                                             }
@@ -4541,6 +4621,9 @@ where
             terminal_fault = Some(fault);
             fault_recovery_presentation =
                 present_fault_recovery_after_stop_latch::<F, _, _>(&mut bridge, &mut eye).await;
+            eye_refresh
+                .as_mut()
+                .reset(tokio::time::Instant::now() + eye_refresh_period);
         }
     }
 
@@ -4590,14 +4673,18 @@ struct ActiveEyeActor {
 struct SerialKep2EyePort {
     config: Option<EyeRuntimeConfig>,
     clock: Option<NanoAccessoryClock>,
+    session_refresh_period: Duration,
     active: Option<ActiveEyeActor>,
 }
 
 impl SerialKep2EyePort {
     fn new(config: EyeRuntimeConfig, clock: NanoAccessoryClock) -> Self {
+        let lease_ms = u64::from(config.intent_lease().get());
+        let session_refresh_period = Duration::from_millis(lease_ms.div_ceil(2));
         Self {
             config: Some(config),
             clock: Some(clock),
+            session_refresh_period,
             active: None,
         }
     }
@@ -4640,6 +4727,10 @@ impl Kep2EyePort<PreparedEyeIntent> for SerialKep2EyePort {
             serial,
             actor: startup,
         })
+    }
+
+    fn session_refresh_period(&self) -> Duration {
+        self.session_refresh_period
     }
 
     async fn apply(&mut self, intent: PreparedEyeIntent) -> Result<(), Self::ApplyError> {
@@ -6970,6 +7061,7 @@ mod tests {
         log: Arc<Mutex<Vec<&'static str>>>,
         fail_start: bool,
         fail_apply: bool,
+        session_refresh_period: Duration,
         require_terminal_latch_for_fault_reflex: Option<Arc<LatestFrameChannel<u64>>>,
     }
 
@@ -6988,6 +7080,10 @@ mod tests {
             }
         }
 
+        fn session_refresh_period(&self) -> Duration {
+            self.session_refresh_period
+        }
+
         async fn apply(&mut self, intent: u64) -> Result<(), Self::ApplyError> {
             if intent == 92
                 && let Some(channel) = self.require_terminal_latch_for_fault_reflex.as_ref()
@@ -7000,6 +7096,8 @@ mod tests {
             }
             self.log.lock().unwrap().push(if intent == 1_777 {
                 "eye_apply_coordinated"
+            } else if intent == 99 {
+                "eye_apply_operational_idle"
             } else {
                 "eye_apply"
             });
@@ -7169,6 +7267,7 @@ mod tests {
                 log: Arc::clone(&log),
                 fail_start: fail_eye_start,
                 fail_apply: fail_eye_apply,
+                session_refresh_period: Duration::from_secs(60),
                 require_terminal_latch_for_fault_reflex: None,
             },
             FakeBridge {
@@ -7300,6 +7399,55 @@ mod tests {
             .position(|entry| *entry == "eye_shutdown")
             .expect("eye session releases");
         assert!(apply < release);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operational_idle_refreshes_the_eye_session_without_rgb_frames() {
+        let (head, mut eye, _, log, _) = fakes(false, false, false, false, None);
+        eye.session_refresh_period = Duration::from_millis(2);
+        let bridge = LifecycleBridge {
+            states: Arc::new(Mutex::new(Vec::new())),
+            fail_process: false,
+            fail_prepare_for: None,
+        };
+        let channel = Arc::new(LatestFrameChannel::new());
+        let task_channel = Arc::clone(&channel);
+        let task = tokio::spawn(async move {
+            run_accessory_core(
+                head,
+                eye,
+                bridge,
+                task_channel,
+                health_period(50),
+                None,
+                CoreObservers {
+                    ready: |_, _| true,
+                    record_health: |_| true,
+                    publish_fault: |_| {},
+                    latch_fault: || {},
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if log.lock().unwrap().contains(&"eye_apply_operational_idle") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operational idle emits a bounded lifecycle-only session refresh");
+        channel.request_shutdown();
+        assert!(matches!(
+            task.await.unwrap(),
+            CoreExit::Shutdown {
+                terminal_fault: None,
+                ..
+            }
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

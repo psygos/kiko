@@ -37,6 +37,7 @@ const RENDER_EVIDENCE_PATH: &str = "evidence/render-evidence-v1.json";
 const QUALIFICATION_EXECUTABLE_RELATIVE_PATH: &str = "bin/kiko-nano-wheels-off-qualification";
 const HEAD_GAZE_POLICY_RELATIVE_PATH: &str = "head-gaze-policy-v1.json";
 const HEAD_GAZE_REVIEW_EVIDENCE_RELATIVE_PATH: &str = "evidence/head-gaze-physical-review-v1.json";
+const NANO_EYE_INTENT_LEASE_MS: u16 = 500;
 const QUALIFICATION_GATE_A_PLANT_ARTIFACT_ID: &str =
     "qualification-shadow-only-synthetic-unvalidated-v2";
 const QUALIFICATION_GATE_A_PLANT_RELATIVE_PATH: &str =
@@ -1122,7 +1123,7 @@ fn render_agent_policy(
                 "expected_device_uid": discovery.eye.device_uid,
                 "expected_firmware_build_id": discovery.eye.firmware_build_id,
                 "expected_capabilities_bits": discovery.eye.capabilities_bits,
-                "intent_lease_ms": 100,
+                "intent_lease_ms": NANO_EYE_INTENT_LEASE_MS,
             },
             "head": {
                 "mode": "return_to_natural_and_hold_continuously",
