@@ -277,6 +277,15 @@ The exact attended installation and operation procedure is
 [`docs/nano-wheels-off-qualification.md`](../../docs/nano-wheels-off-qualification.md).
 There is intentionally no qualification systemd unit.
 
+The same launch-bound executable also exposes `nano-stationary-lab` for
+non-actuating integrated bring-up. That entry point skips the attended
+dialogue because it permanently closes the nonzero motion gate and latches the
+process-lifetime software safety stop before the first runtime tick. It still
+requires the exact controller identity and applied zero/disarm receipts, but
+it cannot perform raw-PWM qualification or fault injection and produces no
+physical qualification claim. See `docs/nano-wheels-off-qualification.md` for
+the exact foreground command and evidence boundary.
+
 Use the offline
 [`kiko-nano-bundle-renderer`](../../crates/kiko-nano-bundle-renderer/README.md)
 for this order. Its `check` mode creates nothing; its `stage` mode accepts

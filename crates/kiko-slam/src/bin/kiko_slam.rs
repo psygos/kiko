@@ -328,6 +328,8 @@ enum Command {
     NanoAgent(NanoAgentArgs),
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     NanoWheelsOffQualification(NanoWheelsOffQualificationArgs),
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    NanoStationaryLab(NanoStationaryLabArgs),
     #[cfg(all(feature = "nano-attended-navigation-trial", unix))]
     NanoAttendedNavigationTrial(NanoAttendedNavigationTrialArgs),
     Viz(VizArgs),
@@ -864,6 +866,26 @@ struct NanoWheelsOffQualificationArgs {
     /// One typed, one-shot fault on the first nonzero candidate command.
     #[arg(long, value_name = "QUALIFICATION_FAULT")]
     fault_injection: Option<kiko_slam::navigation::WheelsOffQualificationFaultInjection>,
+}
+
+/// Foreground integrated bring-up with base motion structurally disabled.
+///
+/// This path uses the launch-bound wheels-off hardware graph, establishes
+/// exact applied zero and disarm on the STM32, then permanently closes its
+/// nonzero motion boundary. It deliberately has no physical-attestation
+/// input, no fault-injection input, and no production-authority claim.
+#[derive(Args, Clone, Debug)]
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+struct NanoStationaryLabArgs {
+    /// Root-owned directory containing the launch and every bound asset.
+    #[arg(long, value_name = "ABSOLUTE_DIRECTORY")]
+    deployment_root: PathBuf,
+    /// Canonical deployment-relative wheels-off launch document.
+    #[arg(long, value_name = "RELATIVE_JSON")]
+    launch_config: String,
+    /// Persistent state root for the lab dataset and diagnostics.
+    #[arg(long, value_name = "ABSOLUTE_DIRECTORY")]
+    state_root: PathBuf,
 }
 
 /// Foreground-only wheel-on trial. The commissioning launch binds the
@@ -1754,6 +1776,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::NanoAgent(args) => run_nano_agent(args),
         #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
         Command::NanoWheelsOffQualification(args) => run_nano_wheels_off_qualification(args),
+        #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+        Command::NanoStationaryLab(args) => run_nano_stationary_lab(args),
         #[cfg(all(feature = "nano-attended-navigation-trial", unix))]
         Command::NanoAttendedNavigationTrial(args) => run_nano_attended_navigation_trial(args),
         Command::Viz(args) => run_viz(args),
@@ -6630,13 +6654,20 @@ impl LiveProductionMotionInput {
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+#[derive(Debug)]
+enum WheelsOffMotionAccess {
+    Attended(AttendedWheelsOffPreflight),
+    StationaryLab,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 struct LiveWheelsOffQualificationMotionInput {
     stopped_controller: Option<kiko_slam::navigation::StoppedWheelsOffCandidateController>,
     initial_zero: Option<AppliedCommandReceipt>,
     initial_stop: Option<DisarmReceipt>,
     limits: kiko_slam::navigation::WheelsOffCandidateLimits,
     runtime_service_interval: kiko_slam::navigation::WheelsOffCandidateRuntimeServiceInterval,
-    preflight: Option<AttendedWheelsOffPreflight>,
+    motion_access: Option<WheelsOffMotionAccess>,
     profile: kiko_slam::navigation::WheelsOffQualificationControlProfile,
     frontend_config: kiko_slam::navigation::WheelsOffQualificationFrontendConfig,
     initial_health: ConsoleSubsystemHealth,
@@ -6654,7 +6685,7 @@ impl LiveWheelsOffQualificationMotionInput {
         initial_stop: DisarmReceipt,
         limits: kiko_slam::navigation::WheelsOffCandidateLimits,
         runtime_service_interval: kiko_slam::navigation::WheelsOffCandidateRuntimeServiceInterval,
-        preflight: AttendedWheelsOffPreflight,
+        motion_access: WheelsOffMotionAccess,
         profile: kiko_slam::navigation::WheelsOffQualificationControlProfile,
         frontend_config: kiko_slam::navigation::WheelsOffQualificationFrontendConfig,
         initial_health: ConsoleSubsystemHealth,
@@ -6668,7 +6699,7 @@ impl LiveWheelsOffQualificationMotionInput {
             initial_stop: Some(initial_stop),
             limits,
             runtime_service_interval,
-            preflight: Some(preflight),
+            motion_access: Some(motion_access),
             profile,
             frontend_config,
             initial_health,
@@ -6687,7 +6718,7 @@ impl LiveWheelsOffQualificationMotionInput {
         DisarmReceipt,
         kiko_slam::navigation::WheelsOffCandidateLimits,
         kiko_slam::navigation::WheelsOffCandidateRuntimeServiceInterval,
-        AttendedWheelsOffPreflight,
+        WheelsOffMotionAccess,
         kiko_slam::navigation::WheelsOffQualificationControlProfile,
         kiko_slam::navigation::WheelsOffQualificationFrontendConfig,
         ConsoleSubsystemHealth,
@@ -6707,9 +6738,9 @@ impl LiveWheelsOffQualificationMotionInput {
                 .expect("qualification initial stop transfers once"),
             self.limits,
             self.runtime_service_interval,
-            self.preflight
+            self.motion_access
                 .take()
-                .expect("qualification motion starts only after attended preflight"),
+                .expect("wheels-off runtime motion policy transfers exactly once"),
             self.profile,
             self.frontend_config.clone(),
             self.initial_health,
@@ -9017,7 +9048,7 @@ fn start_wheels_off_qualification_motion_runtime(
         initial_stop,
         limits,
         admitted_runtime_service_interval,
-        preflight,
+        motion_access,
         profile,
         frontend_config,
         initial_health,
@@ -9084,14 +9115,21 @@ fn start_wheels_off_qualification_motion_runtime(
             ));
         }
     };
-    eprintln!(
-        "wheels-off qualification console ready but motion-attestation-pending on {}; capability={}; raw_timer_pwm_cap={} test_magnitude={} deadman_ms={}; autonomous actuation disabled (SLAM/MPC shadow only)",
-        frontend.bound_address(),
-        frontend_config.capability_path().display(),
-        limits.effective_max_abs_pwm_percent(),
-        limits.manual_test_magnitude_timer_pwm_percent(),
-        limits.manual_deadman().as_millis(),
-    );
+    match &motion_access {
+        WheelsOffMotionAccess::Attended(_) => eprintln!(
+            "wheels-off qualification console ready but motion-attestation-pending on {}; capability={}; raw_timer_pwm_cap={} test_magnitude={} deadman_ms={}; autonomous actuation disabled (SLAM/MPC shadow only)",
+            frontend.bound_address(),
+            frontend_config.capability_path().display(),
+            limits.effective_max_abs_pwm_percent(),
+            limits.manual_test_magnitude_timer_pwm_percent(),
+            limits.manual_deadman().as_millis(),
+        ),
+        WheelsOffMotionAccess::StationaryLab => eprintln!(
+            "stationary lab console ready on {}; capability={}; base motion permanently disabled; SLAM/MPC diagnostics are shadow-only",
+            frontend.bound_address(),
+            frontend_config.capability_path().display(),
+        ),
+    }
     if let Some(frontend_shutdown) = frontend.poll_unexpected_exit() {
         return Err(fail_wheels_off_qualification_before_runtime(
             coordinator,
@@ -9138,16 +9176,33 @@ fn start_wheels_off_qualification_motion_runtime(
             },
         )));
     }
-    let attestation_gate = FreshAttendedMotionAttestationGate::AwaitingReadOnlyCycle(
-        FreshAttendedMotionAttestationInput {
-            preflight,
-            console: console.clone(),
-            process_running: Arc::clone(&process_running),
-        },
-    );
-    eprintln!(
-        "wheels-off qualification stopped runtime is live; OAK SLAM, occupancy, Rerun, accessories, console, and exact applied-zero STM32 evidence are starting while fresh attended motion attestation remains locked"
-    );
+    let attestation_gate = match motion_access {
+        WheelsOffMotionAccess::Attended(preflight) => {
+            eprintln!(
+                "wheels-off qualification stopped runtime is live; OAK SLAM, occupancy, Rerun, accessories, console, and exact applied-zero STM32 evidence are starting while fresh attended motion attestation remains locked"
+            );
+            FreshAttendedMotionAttestationGate::AwaitingReadOnlyCycle(
+                FreshAttendedMotionAttestationInput {
+                    preflight,
+                    console: console.clone(),
+                    process_running: Arc::clone(&process_running),
+                },
+            )
+        }
+        WheelsOffMotionAccess::StationaryLab => {
+            // Publish the existing one-way software stop before the first
+            // runtime tick. The closed gate has no token, worker, or state
+            // transition capable of enabling candidate PWM. The controller
+            // remains useful only for exact zero/disarm and health evidence.
+            controller.signal_internal_fail_closed(None);
+            eprintln!(
+                "stationary lab runtime is live: base nonzero authority is permanently disabled; exact STM32 zero/disarm, OAK SLAM, occupancy, Rerun, accessories, and the loopback console are starting without an attestation dialog"
+            );
+            FreshAttendedMotionAttestationGate::Closed(
+                FreshAttendedMotionAttestationClosure::StationaryLabMode,
+            )
+        }
+    };
     Ok(LiveWheelsOffQualificationMotionRuntime {
         coordinator,
         controller: Some(controller),
@@ -10209,6 +10264,9 @@ fn advance_wheels_off_qualification_motion_attestation_after_read_only_tick(
         .software_safety_stop_latched
     {
         let already_closed = runtime.attestation_gate_mut().is_closed();
+        if already_closed {
+            return Ok(());
+        }
         runtime
             .attestation_gate_mut()
             .close_without_enablement(
@@ -10217,11 +10275,9 @@ fn advance_wheels_off_qualification_motion_attestation_after_read_only_tick(
             .map_err(|source| {
                 LiveNavigationWorkerError::WheelsOffQualificationAttestationCleanup { source }
             })?;
-        if !already_closed {
-            eprintln!(
-                "wheels-off qualification motion-attestation gate closed without enablement because the process-lifetime software safety stop is latched"
-            );
-        }
+        eprintln!(
+            "wheels-off qualification motion-attestation gate closed without enablement because the process-lifetime software safety stop is latched"
+        );
         return Ok(());
     }
     let prompt_observed_at = snapshot_clock
@@ -14486,6 +14542,7 @@ struct FreshAttendedMotionAttestationInput {
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FreshAttendedMotionAttestationClosure {
+    StationaryLabMode,
     SoftwareSafetyStopLatched,
     ProcessNotRunning,
     ReadinessLost(WheelsOffQualificationAttestationReadinessBlocker),
@@ -15212,7 +15269,7 @@ fn finish_attended_wheels_off_qualification(
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 fn prepare_nano_wheels_off_qualification_live_session(
     bootstrap: kiko_slam::navigation::PreparedNanoWheelsOffQualificationBootstrap,
-    preflight: AttendedWheelsOffPreflight,
+    motion_access: WheelsOffMotionAccess,
     stream_epoch: StreamEpochId,
     capture_clock_origin: Instant,
     running: &AtomicBool,
@@ -15396,7 +15453,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
                 initial_stop,
                 limits,
                 runtime_service_interval,
-                preflight,
+                motion_access,
                 profile,
                 frontend_config,
                 initial_health,
@@ -15814,57 +15871,89 @@ fn run_nano_wheels_off_qualification(
     // Every return after this point—successful or failed—reaches the final
     // attended physical-disconnect confirmation. The closure scope also makes
     // all bootstrap/runtime owners drop before that final prompt is issued.
-    let operation = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let capture_clock_origin = Instant::now();
-        let navigation_clock_epoch =
-            NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(0));
-        let stream_epoch = fresh_nano_stream_epoch()?;
-        let request = kiko_slam::navigation::QualificationBootstrapRequest::try_new(
-            args.deployment_root,
-            args.state_root,
-            args.launch_config,
-            capture_clock_origin,
-            args.fault_injection,
-            running.as_ref(),
-        )?;
-        let async_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()?;
-        let owned_bootstrap = async_runtime
-            .block_on(kiko_slam::navigation::bootstrap_nano_wheels_off_qualification(request))?;
-        let (bootstrap, controller_owner, controller_owner_shutdown_timeout) =
-            owned_bootstrap.into_parts();
-        let (request_controller_shutdown, controller_shutdown) = tokio::sync::oneshot::channel();
-        let controller_running = Arc::clone(&running);
-        let controller_task = async_runtime.spawn(async move {
-            let _exit_guard = NanoControllerOwnerExitGuard::new(controller_running);
-            controller_owner
-                .run_until_shutdown(controller_shutdown, controller_owner_shutdown_timeout)
-                .await
-        });
-
-        let operation = prepare_nano_wheels_off_qualification_live_session(
-            bootstrap,
-            preflight,
-            stream_epoch,
-            capture_clock_origin,
-            running.as_ref(),
-        )
-        .and_then(|prepared| {
-            run_prepared_live_session(
-                prepared,
-                running,
-                capture_clock_origin,
-                navigation_clock_epoch,
-            )
-        });
-        let _ = request_controller_shutdown.send(());
-        let controller = async_runtime.block_on(controller_task);
-        drop(async_runtime);
-        finish_nano_controller_owner(operation, controller)
-    })();
+    let operation = run_nano_wheels_off_runtime(
+        args.deployment_root,
+        args.state_root,
+        args.launch_config,
+        args.fault_injection,
+        running,
+        WheelsOffMotionAccess::Attended(preflight),
+    );
     finish_attended_wheels_off_qualification(operation, require_post_run_motor_power_disconnected())
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn run_nano_stationary_lab(args: NanoStationaryLabArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let running = install_live_shutdown_handler()?;
+    eprintln!(
+        "stationary lab selected: no physical-attestation dialog will run; base nonzero authority and qualification fault injection are structurally unavailable"
+    );
+    run_nano_wheels_off_runtime(
+        args.deployment_root,
+        args.state_root,
+        args.launch_config,
+        None,
+        running,
+        WheelsOffMotionAccess::StationaryLab,
+    )
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn run_nano_wheels_off_runtime(
+    deployment_root: PathBuf,
+    state_root: PathBuf,
+    launch_config: String,
+    fault_injection: Option<kiko_slam::navigation::WheelsOffQualificationFaultInjection>,
+    running: Arc<AtomicBool>,
+    motion_access: WheelsOffMotionAccess,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let capture_clock_origin = Instant::now();
+    let navigation_clock_epoch = NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(0));
+    let stream_epoch = fresh_nano_stream_epoch()?;
+    let request = kiko_slam::navigation::QualificationBootstrapRequest::try_new(
+        deployment_root,
+        state_root,
+        launch_config,
+        capture_clock_origin,
+        fault_injection,
+        running.as_ref(),
+    )?;
+    let async_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    let owned_bootstrap = async_runtime
+        .block_on(kiko_slam::navigation::bootstrap_nano_wheels_off_qualification(request))?;
+    let (bootstrap, controller_owner, controller_owner_shutdown_timeout) =
+        owned_bootstrap.into_parts();
+    let (request_controller_shutdown, controller_shutdown) = tokio::sync::oneshot::channel();
+    let controller_running = Arc::clone(&running);
+    let controller_task = async_runtime.spawn(async move {
+        let _exit_guard = NanoControllerOwnerExitGuard::new(controller_running);
+        controller_owner
+            .run_until_shutdown(controller_shutdown, controller_owner_shutdown_timeout)
+            .await
+    });
+
+    let operation = prepare_nano_wheels_off_qualification_live_session(
+        bootstrap,
+        motion_access,
+        stream_epoch,
+        capture_clock_origin,
+        running.as_ref(),
+    )
+    .and_then(|prepared| {
+        run_prepared_live_session(
+            prepared,
+            running,
+            capture_clock_origin,
+            navigation_clock_epoch,
+        )
+    });
+    let _ = request_controller_shutdown.send(());
+    let controller = async_runtime.block_on(controller_task);
+    drop(async_runtime);
+    finish_nano_controller_owner(operation, controller)
 }
 
 #[cfg(all(feature = "nano-attended-navigation-trial", unix))]
@@ -21319,6 +21408,59 @@ mod tests {
 
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
     #[test]
+    fn stationary_lab_cli_has_no_motion_or_physical_claim_inputs() {
+        let cli = Cli::try_parse_from([
+            "kiko-slam",
+            "nano-stationary-lab",
+            "--deployment-root",
+            "/opt/kiko/qualification",
+            "--launch-config",
+            "nano-wheels-off-qualification-launch-v4.json",
+            "--state-root",
+            "/var/lib/kiko-nano-stationary-lab",
+        ])
+        .expect("stationary lab has only immutable deployment and state boundaries");
+        let Command::NanoStationaryLab(args) = cli.command else {
+            panic!("expected stationary lab command");
+        };
+        assert_eq!(args.deployment_root, Path::new("/opt/kiko/qualification"));
+        assert_eq!(
+            args.launch_config,
+            "nano-wheels-off-qualification-launch-v4.json"
+        );
+        assert_eq!(
+            args.state_root,
+            Path::new("/var/lib/kiko-nano-stationary-lab")
+        );
+
+        for forbidden in [
+            "--wheels-removed",
+            "--head-supported",
+            "--motor-power-disconnected",
+            "--power-cut-reachable",
+            "--fault-injection",
+            "--enable-motion",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "kiko-slam",
+                    "nano-stationary-lab",
+                    "--deployment-root",
+                    "/opt/kiko/qualification",
+                    "--launch-config",
+                    "nano-wheels-off-qualification-launch-v4.json",
+                    "--state-root",
+                    "/var/lib/kiko-nano-stationary-lab",
+                    forbidden,
+                ])
+                .is_err(),
+                "stationary lab override {forbidden} must not exist"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
     fn qualification_tty_line_parser_is_exact_bounded_and_crlf_aware() {
         let mut exact = std::io::Cursor::new(b"WHEELS REMOVED\r\nnext\n".to_vec());
         assert_eq!(
@@ -21525,6 +21667,30 @@ mod tests {
             Some(FreshAttendedMotionAttestationClosure::ReadinessLost(
                 blocker
             ))
+        );
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn stationary_lab_gate_is_terminal_without_an_attestation_worker() {
+        let mut gate = FreshAttendedMotionAttestationGate::Closed(
+            FreshAttendedMotionAttestationClosure::StationaryLabMode,
+        );
+        assert!(gate.is_closed());
+        assert_eq!(
+            gate.closure(),
+            Some(FreshAttendedMotionAttestationClosure::StationaryLabMode)
+        );
+        assert!(!gate.has_started_prompt());
+        assert_eq!(
+            gate.advance_after_read_only_runtime_tick(&AtomicBool::new(true))
+                .expect("stationary gate remains closed"),
+            FreshAttendedMotionAttestationWorkerPoll::Completed
+        );
+        assert_eq!(
+            gate.cancel_and_join()
+                .expect("stationary gate has no worker to cancel"),
+            FreshAttendedMotionAttestationWorkerShutdown::AlreadyJoined
         );
     }
 

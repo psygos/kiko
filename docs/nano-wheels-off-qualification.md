@@ -250,6 +250,36 @@ sudo install -d -o root -g root -m 0700 /run/kiko
 Do not edit the installed tree in place. A changed byte requires a new staging
 render and a new launch hash.
 
+## Stationary integrated lab mode
+
+Use `nano-stationary-lab` when the immediate task is integrated expression,
+camera, SLAM, occupancy, Rerun, or console bring-up and no base-motion test is
+needed. This mode deliberately has no physical-attestation dialogue. It uses
+the same launch-bound device identities and native assets, establishes the
+STM32's exact applied zero and disarm receipts, then latches the console's
+process-lifetime software safety stop before the first runtime tick. Its
+motion-attestation gate starts terminal and contains no worker or token, so no
+HTTP, agent, flag, or later readiness transition can enable candidate PWM.
+
+Run it in the foreground:
+
+```bash
+sudo /usr/bin/env LD_LIBRARY_PATH=/opt/kiko/qualification/lib \
+  /opt/kiko/qualification/bin/kiko-nano-wheels-off-qualification \
+  nano-stationary-lab \
+  --deployment-root /opt/kiko/qualification \
+  --launch-config nano-wheels-off-qualification-launch-v4.json \
+  --state-root /var/lib/kiko-nano-stationary-lab
+```
+
+The mode still owns and supervises the exact STM32 serial endpoint because an
+applied zero/disarm receipt and exclusive ownership are useful integration
+evidence. It does not reconnect motor power, issue a nonzero command, run a
+qualification fault injection, or ask for a post-run motor-power statement.
+It is not Gate-A motion evidence, physical stop evidence, plant calibration,
+or production authority. An attended motion or wheel-on run remains a
+separate later operation.
+
 ## Preflight
 
 Confirm no automatic or standalone motor/camera owner is active. Inspect
