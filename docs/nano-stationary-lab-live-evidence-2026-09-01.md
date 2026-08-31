@@ -179,3 +179,108 @@ SLAM health is degraded by measured CPU inference latency, and a stationary
 camera cannot create a useful map or current localization. This deployment
 does not establish wheel signs, plant calibration, MPC tracking, or
 click-to-goal navigation.
+
+## Exact fast-geometry candidate and shutdown evidence
+
+The final stationary refresh was built from source commit
+`b3d7edaab62fc984ec538cf88cd17e2922586050`. Its source archive was transferred
+to the Orin and matched SHA-256
+`c325833a8b53cb598db3b3cea2f2b7d0aa1f405a06ae2c784476d15acf186733`
+before extraction. The locked native Linux aarch64 build produced:
+
+- qualifier executable: `31,400,296` bytes, SHA-256
+  `7111a847b599ba595335539eca89ee888e401c8d88770a3d060dccff294cbc6f`;
+- bundle renderer: `2,971,440` bytes, SHA-256
+  `e4cfbc39587a60b058fe8b307da8d19a885614fa408ae6d465466f0a936956c6`;
+- render input SHA-256
+  `039d30b405d9b4203f50ef6a0b543d7df0e352cf7aa993a120383012a0e3ed9c`;
+- render evidence SHA-256
+  `028cbc1428d6ad904873a366af7ca2022975baa2ff5418a6b7517599d73e708b`;
+  and
+- launch record SHA-256
+  `51350a640d8d3afcf8e9b7f6dda682e7114c78a8f354a43101e69a99b1e8d7e9`.
+
+Renderer `check` and `stage` both passed. The staging tree contains 23 bound
+files, its launch-bound `ldd` closure has no missing library, the installed
+root matched staging under `diff -qr`, and the installed executable is
+`root:root` mode `0555`. The previous working bundle remains intact at
+`/opt/kiko/qualification-retired-feb02a1-cpu-d8-k128-final` for rollback.
+
+### Inference admission and measurements
+
+The tracked SuperPoint model contract now has one shared source of truth: each
+admitted downscale factor must divide both 640 by 400 rectified axes, each
+resulting model axis must be at least the graph's eight-pixel stride, and the
+requested keypoint ceiling cannot exceed the graph's 512-element TopK output.
+The installed stationary profile requests CPU for both models, downscale 8,
+and at most 128 keypoints. These are parsed launch values, not ambient tuning
+defaults.
+
+Intermediate runs were retained as negative or comparative evidence rather
+than promoted:
+
+- strict CUDA failed closed because the tracked SuperPoint graph retained CPU
+  nodes while CPU fallback was explicitly disabled;
+- CUDA-plus-CPU hybrid stayed operational but its observed 64-completion
+  window was `0.439467 Hz`, so no acceleration claim is made;
+- CPU downscale 4 with 256 keypoints observed `1.544239 Hz` over its retained
+  window; and
+- downscale 6 was discovered to be geometrically invalid for 640 by 400 after
+  318 recoverable runtime failures. The launch parser now rejects that input
+  before device ownership instead of repeating invalid inference.
+
+Those observations were functional qualification runs under different load
+and scene conditions, not GPU benchmarks, power-mode tests, or thermal tests.
+They support rejecting unsuitable configurations; they do not establish a
+general performance comparison.
+
+### Exact live result
+
+After more than five minutes, the authenticated schema-5 snapshot reported:
+
+- runtime `ready_stopped`, `authority_kind: stationary_lab`, and no requested
+  owner, actual authority, manual command envelope, requested command, or
+  requested actuation;
+- STM32, head, eyes, OAK, and SLAM all `ready`;
+- exact applied stop with requested/applied PWM `0/0`, output disabled,
+  controller fault bits zero, and controller-reported safe stop certainty;
+- 2,438 started stereo pairs, 2,436 successful pairs, one recoverable startup
+  triangulation miss, and zero fatal failures;
+- a latest 64-success window spanning `7,896,418,413 ns`, equal to
+  `7.978300630 Hz` over its 63 completion intervals; and
+- no map, pose, path, goal, MPC prediction, or solver-duration claim.
+
+The state root was exactly `8,135,808,633` bytes before and after the run. The
+OAK was again enumerated at 5,000 Mbit/s beneath the 10,000 Mbit/s Tegra hub.
+An authenticated same-origin POST to the removed qualification-intent route
+returned HTTP 404 with `{"error":"not_found"}`. The stationary surface has no
+qualifier/manual controls and cannot acquire nonzero base authority.
+
+The absent map is expected and material: the camera and robot remained
+stationary, so this run cannot prove representative-motion localization or
+occupancy quality. It proves that the live graph, bounded routes, diagnostics,
+accessory ownership, and typed zero owner remain operational; it does not turn
+stationary frames into mapping evidence.
+
+The predecessor candidate exposed a deliberate-stop race: navigation closed
+its lossless receiver immediately while one already-admitted inference result
+was still completing, and that expected causal tail was mislabeled as a
+`VisualAdmissionRoute::Disconnected` failure. Commit `da88d4f` distinguishes
+only the already-requested shutdown tail; live-process timeout and disconnect
+remain failures, and fatal tracker or panic outcomes remain authoritative. A
+live Ctrl-C of the exact candidate then ended with pipeline state `Closed`,
+2,645 successful of 2,646 started pairs, the same one recoverable startup miss,
+zero fatal failures, and no `LiveRunError`. The exact candidate was restarted
+after that test and left running in stationary mode.
+
+Current-source host evidence is 1,551 exact-feature library tests, 110
+exact-feature runtime-binary tests, and all 36 renderer tests passing. Strict
+all-target/all-feature Clippy for `kiko-slam` and the renderer passed, as did
+the renderer's default-feature release check, formatting, and
+`git diff --check`.
+
+This closes the prompt-free stationary runtime refresh, not Gate A. The
+attended candidate fault matrix, shaft/body sign evidence with motor power
+available and wheels absent, final disarmed power-cut handoff, wheel-on plant
+identification, map-quality acceptance, MPC tracking, and click-to-goal
+qualification remain separate physical gates.
