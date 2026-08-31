@@ -10159,7 +10159,7 @@ fn publish_wheels_off_qualification_snapshot(
     };
     let mut snapshot = OperatorConsoleSnapshot::unknown(
         revision,
-        ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+        runtime.telemetry.console_mode().authority_kind(),
     );
     snapshot.runtime = Some(match (
         runtime.controller().state(),

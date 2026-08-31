@@ -162,7 +162,6 @@ impl std::error::Error for WheelsOffQualificationFrontendConfigError {
 
 #[derive(Debug)]
 struct QualificationTelemetryState {
-    mode: WheelsOffQualificationConsoleMode,
     profile: WheelsOffQualificationControlProfile,
     base: OperatorConsoleSnapshot,
     base_source_revision: ConsoleSnapshotRevision,
@@ -174,6 +173,7 @@ struct QualificationTelemetryState {
 
 #[derive(Clone, Debug)]
 pub struct WheelsOffQualificationTelemetryStore {
+    mode: WheelsOffQualificationConsoleMode,
     state: Arc<Mutex<QualificationTelemetryState>>,
     poison_latched: Arc<AtomicBool>,
 }
@@ -212,8 +212,8 @@ impl WheelsOffQualificationTelemetryStore {
             return Err(WheelsOffQualificationTelemetryError::ProfileMismatch);
         }
         Ok(Self {
+            mode,
             state: Arc::new(Mutex::new(QualificationTelemetryState {
-                mode,
                 profile,
                 base_source_revision: initial_base.revision,
                 base: initial_base,
@@ -258,10 +258,8 @@ impl WheelsOffQualificationTelemetryStore {
         Ok(self.lock_state()?.profile)
     }
 
-    pub fn console_mode(
-        &self,
-    ) -> Result<WheelsOffQualificationConsoleMode, WheelsOffQualificationTelemetryError> {
-        Ok(self.lock_state()?.mode)
+    pub const fn console_mode(&self) -> WheelsOffQualificationConsoleMode {
+        self.mode
     }
 
     /// Publish navigation/SLAM observations only. Production authority,
@@ -271,8 +269,8 @@ impl WheelsOffQualificationTelemetryStore {
         &self,
         snapshot: OperatorConsoleSnapshot,
     ) -> Result<(), WheelsOffQualificationTelemetryError> {
+        validate_observational_base(&snapshot, self.mode)?;
         let mut state = self.lock_state()?;
-        validate_observational_base(&snapshot, state.mode)?;
         if snapshot.revision <= state.base_source_revision {
             return Err(
                 WheelsOffQualificationTelemetryError::BaseRevisionNotIncreasing {
@@ -355,7 +353,7 @@ impl WheelsOffQualificationTelemetryStore {
             ConsoleSnapshotRevision::parse(state.projection_revision.get())
                 .map_err(|_| WheelsOffQualificationTelemetryError::ProjectionRevisionExhausted)?;
         let signal_state = qualification_signal_state(&qualification);
-        let (control_profile, wheels_off_qualification) = match state.mode {
+        let (control_profile, wheels_off_qualification) = match self.mode {
             WheelsOffQualificationConsoleMode::AttendedQualification => {
                 (Some(state.profile), Some(&qualification))
             }
@@ -1857,13 +1855,8 @@ impl WheelsOffQualificationFrontend {
                 return Err(WheelsOffQualificationFrontendStartError::Telemetry(source));
             }
         }
-        match telemetry.console_mode() {
-            Ok(telemetry_mode) if telemetry_mode == mode => {}
-            Ok(_) => return Err(WheelsOffQualificationFrontendStartError::ProfileMismatch),
-            Err(source) => {
-                console.signal_internal_fail_closed(None);
-                return Err(WheelsOffQualificationFrontendStartError::Telemetry(source));
-            }
+        if telemetry.console_mode() != mode {
+            return Err(WheelsOffQualificationFrontendStartError::ProfileMismatch);
         }
         let capability =
             OperatorConsoleAccessCapability::generate_and_persist_new(config.capability_path())
@@ -2553,6 +2546,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn stationary_lab_omits_and_rejects_raw_control_surface() {
         let (context, mut receiver) = stationary_test_context();
+        let mut advanced = OperatorConsoleSnapshot::unknown(
+            ConsoleSnapshotRevision::parse(2).unwrap(),
+            context.telemetry.console_mode().authority_kind(),
+        );
+        advanced.runtime = Some(super::super::AgentRuntimeStateV1::ReadyStopped);
+        context
+            .telemetry
+            .publish_observational_base(advanced)
+            .unwrap();
         let snapshot = handle_qualification_request_inner(
             api_request(Method::GET, "/api/v1/snapshot", Body::empty()),
             Arc::clone(&context),
