@@ -269,8 +269,12 @@ sudo /usr/bin/env LD_LIBRARY_PATH=/opt/kiko/qualification/lib \
   nano-stationary-lab \
   --deployment-root /opt/kiko/qualification \
   --launch-config nano-wheels-off-qualification-launch-v4.json \
-  --state-root /var/lib/kiko-nano-stationary-lab
+  --state-root /var/lib/kiko-nano-qualification
 ```
+
+The state root remains launch-bound even though this entry point is not a
+qualification run: the rendered policy names its absolute map destination.
+Stationary-lab datasets carry no motion or physical-qualification claim.
 
 The mode still owns and supervises the exact STM32 serial endpoint because an
 applied zero/disarm receipt and exclusive ownership are useful integration

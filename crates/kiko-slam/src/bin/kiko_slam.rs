@@ -883,7 +883,8 @@ struct NanoStationaryLabArgs {
     /// Canonical deployment-relative wheels-off launch document.
     #[arg(long, value_name = "RELATIVE_JSON")]
     launch_config: String,
-    /// Persistent state root for the lab dataset and diagnostics.
+    /// Launch-bound persistent state root for lab datasets and diagnostics.
+    /// It must match the absolute map-persistence paths in the rendered policy.
     #[arg(long, value_name = "ABSOLUTE_DIRECTORY")]
     state_root: PathBuf,
 }
