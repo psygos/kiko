@@ -1184,6 +1184,28 @@ impl<F> LatestFrameChannel<F> {
         }
     }
 
+    /// Wait until [`Self::next_event`] can complete without consuming the
+    /// event. This is cancellation-safe and may therefore participate in a
+    /// `tokio::select!`; the selected branch must call `next_event` after the
+    /// selection boundary to claim the value.
+    async fn wait_until_event_available(&self) {
+        loop {
+            let notified = self.notify.notified();
+            let available = {
+                let slot = self.lock_slot_recovering_poison();
+                slot.first_terminal.is_some()
+                    || self.poisoned.load(Ordering::Acquire)
+                    || self.shutdown_requested.load(Ordering::Acquire)
+                    || slot.latest.is_some()
+                    || !self.ingress_alive.load(Ordering::Acquire)
+            };
+            if available {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     async fn wait_for_shutdown(&self) {
         loop {
             let notified = self.notify.notified();
@@ -4475,26 +4497,41 @@ where
     let mut health = tokio::time::interval_at(first_health, period);
     health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    enum OperationalTrigger {
+        EyeRefresh,
+        Health,
+        FrameEvent,
+    }
+
+    enum FaultLatchedTrigger {
+        EyeRefresh,
+        Health,
+        Shutdown,
+    }
+
     loop {
         if terminal_fault.is_some() {
-            tokio::select! {
-                _ = health.tick() => {
+            let trigger = tokio::select! {
+                _ = health.tick() => FaultLatchedTrigger::Health,
+                _ = &mut eye_refresh => FaultLatchedTrigger::EyeRefresh,
+                () = channel.wait_for_shutdown() => FaultLatchedTrigger::Shutdown,
+            };
+            match trigger {
+                FaultLatchedTrigger::Health => {
                     // Retain bus ownership and keep making bounded observations.
                     // The first fault stays latched even if this later succeeds.
                     if let Ok(evidence) = head.check_health().await {
                         let _status_retained = record_health(evidence);
                     }
                 }
-                refresh = async {
-                    (&mut eye_refresh).await;
-                    apply_one_lifecycle_reflex::<F, _, _>(
+                FaultLatchedTrigger::EyeRefresh => {
+                    match apply_one_lifecycle_reflex::<F, _, _>(
                         &mut bridge,
                         &mut eye,
                         CharacterLifecycleState::FaultRecovery,
                     )
                     .await
-                } => {
-                    match refresh {
+                    {
                         Ok(()) => eye_refresh
                             .as_mut()
                             .reset(tokio::time::Instant::now() + eye_refresh_period),
@@ -4505,22 +4542,29 @@ where
                         }
                     }
                 }
-                () = channel.wait_for_shutdown() => break,
+                FaultLatchedTrigger::Shutdown => break,
             }
             continue;
         }
 
-        let fault = tokio::select! {
-            refresh = async {
-                (&mut eye_refresh).await;
-                apply_one_lifecycle_reflex::<F, _, _>(
+        // Selection is restricted to cancellation-safe, observation-only
+        // trigger waits. Head and eye transactions run to a typed completion
+        // only after their trigger wins; dropping a losing select branch can
+        // therefore never abandon an admitted actuator command.
+        let trigger = tokio::select! {
+            _ = &mut eye_refresh => OperationalTrigger::EyeRefresh,
+            _ = health.tick() => OperationalTrigger::Health,
+            () = channel.wait_until_event_available() => OperationalTrigger::FrameEvent,
+        };
+        let fault = match trigger {
+            OperationalTrigger::EyeRefresh => {
+                match apply_one_lifecycle_reflex::<F, _, _>(
                     &mut bridge,
                     &mut eye,
                     CharacterLifecycleState::Operational,
                 )
                 .await
-            } => {
-                match refresh {
+                {
                     Ok(()) => {
                         eye_refresh
                             .as_mut()
@@ -4538,10 +4582,8 @@ where
                     }
                 }
             }
-            health_result = async {
-                health.tick().await;
-                head.check_health().await
-            } => {
+            OperationalTrigger::Health => {
+                let health_result = head.check_health().await;
                 let health_fault = match health_result {
                     Ok(evidence) => {
                         if record_health(evidence) {
@@ -4563,60 +4605,66 @@ where
                 };
                 health_fault
             }
-            event = channel.next_event() => {
+            OperationalTrigger::FrameEvent => {
+                let event = channel.next_event().await;
                 match event {
                     LatestFrameEvent::Frame(frame) => {
                         bridge.note_base_motion_state(head.character_base_motion_state());
                         match bridge.process(&frame) {
                             Err(source) => Some(CoreTerminalFault::Bridge(source)),
-                            Ok(intent) => match head
-                                .process_gaze_frame(&frame, intent.head_overlay())
-                                .await
-                            {
-                                Err(source) => Some(CoreTerminalFault::HeadGaze(source)),
-                                Ok(head_feedback) => {
-                                    let mut completed_episode = None;
-                                    let mut tracking_eye_gaze = None;
-                                    if let Some(head_feedback) = head_feedback {
-                                        if let Some(state) = head_feedback.state {
-                                            bridge.note_pet_state(state);
+                            Ok(intent) => {
+                                match head.process_gaze_frame(&frame, intent.head_overlay()).await {
+                                    Err(source) => Some(CoreTerminalFault::HeadGaze(source)),
+                                    Ok(head_feedback) => {
+                                        let mut completed_episode = None;
+                                        let mut tracking_eye_gaze = None;
+                                        if let Some(head_feedback) = head_feedback {
+                                            if let Some(state) = head_feedback.state {
+                                                bridge.note_pet_state(state);
+                                            }
+                                            if let Some(state) = head_feedback.thermal_state {
+                                                bridge.note_thermal_state(state);
+                                            }
+                                            completed_episode = head_feedback.completed_episode;
+                                            tracking_eye_gaze = head_feedback.tracking_eye_gaze;
                                         }
-                                        if let Some(state) = head_feedback.thermal_state {
-                                            bridge.note_thermal_state(state);
-                                        }
-                                        completed_episode = head_feedback.completed_episode;
-                                        tracking_eye_gaze = head_feedback.tracking_eye_gaze;
-                                    }
-                                    let intent = match tracking_eye_gaze {
-                                        Some(gaze) => intent.replace_tracking_gaze(gaze),
-                                        None => Ok(intent),
-                                    };
-                                    match intent {
-                                        Err(source) => Some(CoreTerminalFault::CharacterCoordination(source)),
-                                        Ok(intent) => {
-                                            #[cfg(feature = "nano-agent")]
-                                            let pet_evidence_fault = completed_episode
-                                                .and_then(|episode| {
-                                                    pet_evidence_journal.as_deref_mut().map(|journal| {
-                                                        episode.controller_evidence.try_append(journal)
+                                        let intent = match tracking_eye_gaze {
+                                            Some(gaze) => intent.replace_tracking_gaze(gaze),
+                                            None => Ok(intent),
+                                        };
+                                        match intent {
+                                            Err(source) => Some(
+                                                CoreTerminalFault::CharacterCoordination(source),
+                                            ),
+                                            Ok(intent) => {
+                                                #[cfg(feature = "nano-agent")]
+                                                let pet_evidence_fault = completed_episode
+                                                    .and_then(|episode| {
+                                                        pet_evidence_journal.as_deref_mut().map(
+                                                            |journal| {
+                                                                episode
+                                                                    .controller_evidence
+                                                                    .try_append(journal)
+                                                            },
+                                                        )
                                                     })
-                                                })
-                                                .and_then(Result::err)
-                                                .map(CoreTerminalFault::PetEvidence);
-                                            #[cfg(not(feature = "nano-agent"))]
-                                            let pet_evidence_fault = None;
-                                            if let Some(fault) = pet_evidence_fault {
-                                                Some(fault)
-                                            } else {
-                                                if let Some(pet_episode) = completed_episode {
-                                                    bridge.note_pet_episode(pet_episode);
-                                                }
-                                                match eye.apply(intent.into_eye()).await {
-                                                    Ok(()) => {
-                                                        eye_refresh
-                                                            .as_mut()
-                                                            .reset(tokio::time::Instant::now() + eye_refresh_period);
-                                                        match channel.counters.record_processed_successfully() {
+                                                    .and_then(Result::err)
+                                                    .map(CoreTerminalFault::PetEvidence);
+                                                #[cfg(not(feature = "nano-agent"))]
+                                                let pet_evidence_fault = None;
+                                                if let Some(fault) = pet_evidence_fault {
+                                                    Some(fault)
+                                                } else {
+                                                    if let Some(pet_episode) = completed_episode {
+                                                        bridge.note_pet_episode(pet_episode);
+                                                    }
+                                                    match eye.apply(intent.into_eye()).await {
+                                                        Ok(()) => {
+                                                            eye_refresh.as_mut().reset(
+                                                                tokio::time::Instant::now()
+                                                                    + eye_refresh_period,
+                                                            );
+                                                            match channel.counters.record_processed_successfully() {
                                                         Ok(()) => None,
                                                         Err(
                                                             NanoAccessoryHealthStatusError::Poisoned
@@ -4625,23 +4673,24 @@ where
                                                             | NanoAccessoryHealthStatusError::ChannelPoisoned,
                                                         ) => Some(CoreTerminalFault::RgbHealthStatusPoisoned),
                                                         }
+                                                        }
+                                                        Err(source) => Some(
+                                                            CoreTerminalFault::EyeApply(source),
+                                                        ),
                                                     }
-                                                    Err(source) => Some(CoreTerminalFault::EyeApply(source)),
                                                 }
                                             }
                                         }
                                     }
                                 }
-                            },
+                            }
                         }
                     }
                     LatestFrameEvent::ShutdownRequested => break,
                     LatestFrameEvent::IngressDisconnected => {
                         Some(CoreTerminalFault::IngressDisconnected)
                     }
-                    LatestFrameEvent::ChannelPoisoned => {
-                        Some(CoreTerminalFault::ChannelPoisoned)
-                    }
+                    LatestFrameEvent::ChannelPoisoned => Some(CoreTerminalFault::ChannelPoisoned),
                 }
             }
         };
@@ -7123,6 +7172,7 @@ mod tests {
         log: Arc<Mutex<Vec<&'static str>>>,
         fail_start: bool,
         fail_apply: bool,
+        apply_delay: Duration,
         session_refresh_period: Duration,
         require_terminal_latch_for_fault_reflex: Option<Arc<LatestFrameChannel<u64>>>,
     }
@@ -7163,6 +7213,7 @@ mod tests {
             } else {
                 "eye_apply"
             });
+            tokio::time::sleep(self.apply_delay).await;
             if self.fail_apply {
                 Err("eye_apply")
             } else {
@@ -7329,6 +7380,7 @@ mod tests {
                 log: Arc::clone(&log),
                 fail_start: fail_eye_start,
                 fail_apply: fail_eye_apply,
+                apply_delay: Duration::ZERO,
                 session_refresh_period: Duration::from_secs(60),
                 require_terminal_latch_for_fault_reflex: None,
             },
@@ -7885,6 +7937,57 @@ mod tests {
         assert_eq!(failed_channel.counters.snapshot().processed_successfully, 0);
         failed_channel.request_shutdown();
         assert!(matches!(task.await.unwrap(), CoreExit::Shutdown { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_tick_cannot_cancel_an_admitted_eye_transaction() {
+        let (head, mut eye, bridge, _, health_calls) = fakes(false, false, false, false, None);
+        eye.apply_delay = Duration::from_millis(20);
+        let channel = Arc::new(LatestFrameChannel::new());
+        let task_channel = Arc::clone(&channel);
+        let task = tokio::spawn(async move {
+            run_accessory_core(
+                head,
+                eye,
+                bridge,
+                task_channel,
+                health_period(1),
+                None,
+                CoreObservers {
+                    ready: |_, _| true,
+                    record_health: |_| true,
+                    publish_fault: |_| {},
+                    latch_fault: || {},
+                },
+            )
+            .await
+        });
+
+        assert_eq!(
+            channel.submit(7_u64),
+            NanoAccessoryFrameSubmitOutcome::Enqueued
+        );
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while channel.counters.snapshot().processed_successfully == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow eye acknowledgement survives intervening health deadlines");
+        assert_eq!(channel.counters.snapshot().processed_successfully, 1);
+        assert!(
+            health_calls.load(Ordering::SeqCst) >= 1,
+            "an overdue health transaction runs after the admitted eye write completes"
+        );
+
+        channel.request_shutdown();
+        assert!(matches!(
+            task.await.unwrap(),
+            CoreExit::Shutdown {
+                terminal_fault: None,
+                ..
+            }
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
