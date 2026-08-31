@@ -609,7 +609,7 @@ fn source_fixture() -> (TempDir, Value) {
                 "superpoint_backend": "cuda_cpu_hybrid",
                 "lightglue_backend": "cuda_cpu_hybrid",
                 "downscale_factor": 2,
-                "maximum_keypoints": 1024
+                "maximum_keypoints": 512
             },
             "rerun": {
                 "decimation": 2,
@@ -2405,10 +2405,10 @@ fn qualification_v4_template_renders_exact_policy_and_leaves_only_evidence_bound
                 "snapshot_every_keyframes": 20
             },
             "inference": {
-                "superpoint_backend": "cuda_cpu_hybrid",
-                "lightglue_backend": "cuda_cpu_hybrid",
-                "downscale_factor": 2,
-                "maximum_keypoints": 512
+                "superpoint_backend": "cpu",
+                "lightglue_backend": "cpu",
+                "downscale_factor": 8,
+                "maximum_keypoints": 128
             },
             "rerun": {
                 "decimation": 2,
@@ -2600,10 +2600,10 @@ fn qualification_v4_template_renders_exact_policy_and_leaves_only_evidence_bound
             "navigation_dataset_terminal_reserve_bytes": 268435456
         })
     );
-    assert_eq!(launch["inference"]["superpoint_backend"], "cuda_cpu_hybrid");
-    assert_eq!(launch["inference"]["lightglue_backend"], "cuda_cpu_hybrid");
-    assert_eq!(launch["inference"]["downscale_factor"], 2);
-    assert_eq!(launch["inference"]["maximum_keypoints"], 512);
+    assert_eq!(launch["inference"]["superpoint_backend"], "cpu");
+    assert_eq!(launch["inference"]["lightglue_backend"], "cpu");
+    assert_eq!(launch["inference"]["downscale_factor"], 8);
+    assert_eq!(launch["inference"]["maximum_keypoints"], 128);
     assert_eq!(
         launch["inference"]["superpoint_model_asset"]["relative_path"],
         "models/sp.onnx"

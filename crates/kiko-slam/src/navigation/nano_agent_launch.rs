@@ -69,7 +69,7 @@ pub const MAX_OAK_FRAME_RATE_HZ: u32 = 240;
 pub const MAX_OAK_IMU_RATE_HZ: u32 = 2_000;
 pub const MAX_OAK_QUEUE_SIZE: u32 = 64;
 pub const MAX_INFERENCE_DOWNSCALE_FACTOR: u32 = 16;
-pub const MAX_INFERENCE_KEYPOINTS: u32 = 65_535;
+pub const MAX_INFERENCE_KEYPOINTS: u32 = crate::inference::SUPERPOINT_MAXIMUM_OUTPUT_KEYPOINTS;
 pub const MAX_RERUN_DECIMATION: u32 = 10_000;
 pub const MAX_RERUN_MEMORY_BYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
 pub const MAX_RERUN_FLUSH_TIMEOUT_MS: u64 = 120_000;
@@ -785,6 +785,7 @@ impl NanoAgentLaunchV2 {
         let oak = parse_oak(dto.oak)?;
         let occupancy = parse_occupancy(dto.occupancy)?;
         let inference = parse_inference(dto.inference)?;
+        ensure_inference_matches_oak(&oak, &inference)?;
         let rerun = parse_rerun(dto.rerun)?;
         let storage = parse_storage(dto.storage)?;
 
@@ -1466,6 +1467,16 @@ pub enum NanoAgentLaunchParseError {
     OakDeviceConfig(DeviceConfigError),
     UnsupportedInferenceBackend {
         field: &'static str,
+    },
+    InferenceDownscaleDoesNotDivideStereoFrame {
+        downscale_factor: u32,
+        stereo_width_px: u32,
+        stereo_height_px: u32,
+    },
+    InferenceInputDimensionsTooSmall {
+        downscaled_width_px: u32,
+        downscaled_height_px: u32,
+        minimum_axis_px: u32,
     },
     UnsupportedRerunKind,
     InvalidStoragePath {
@@ -2160,6 +2171,38 @@ pub(crate) fn parse_inference(
     })
 }
 
+fn ensure_inference_matches_oak(
+    oak: &NanoOakStreamGraph,
+    inference: &NanoLaunchInference,
+) -> Result<(), NanoAgentLaunchParseError> {
+    let stereo = oak.rectified_stereo();
+    let downscale_factor = inference.downscale_factor();
+    if !stereo.width_px().is_multiple_of(downscale_factor)
+        || !stereo.height_px().is_multiple_of(downscale_factor)
+    {
+        return Err(
+            NanoAgentLaunchParseError::InferenceDownscaleDoesNotDivideStereoFrame {
+                downscale_factor,
+                stereo_width_px: stereo.width_px(),
+                stereo_height_px: stereo.height_px(),
+            },
+        );
+    }
+    let downscaled_width_px = stereo.width_px() / downscale_factor;
+    let downscaled_height_px = stereo.height_px() / downscale_factor;
+    let minimum_axis_px = crate::inference::SUPERPOINT_MINIMUM_INPUT_AXIS_PX;
+    if downscaled_width_px < minimum_axis_px || downscaled_height_px < minimum_axis_px {
+        return Err(
+            NanoAgentLaunchParseError::InferenceInputDimensionsTooSmall {
+                downscaled_width_px,
+                downscaled_height_px,
+                minimum_axis_px,
+            },
+        );
+    }
+    Ok(())
+}
+
 fn parse_inference_backend(
     field: &'static str,
     value: &str,
@@ -2712,7 +2755,7 @@ mod tests {
                 "superpoint_backend": "auto",
                 "lightglue_backend": "auto",
                 "downscale_factor": 1,
-                "maximum_keypoints": 1024
+                "maximum_keypoints": 512
             },
             "rerun": {
                 "kind": "serve_loopback",
@@ -2844,6 +2887,68 @@ mod tests {
         assert_eq!(
             launch.inference().lightglue_backend().runtime(),
             InferenceBackend::CudaCpuHybrid
+        );
+    }
+
+    #[test]
+    fn inference_downscale_must_divide_the_admitted_stereo_frame() {
+        let mut value = valid_value();
+        value["inference"]["downscale_factor"] = json!(6);
+        let result = parse(&value);
+
+        assert!(
+            matches!(
+                &result,
+                Err(
+                    NanoAgentLaunchParseError::InferenceDownscaleDoesNotDivideStereoFrame {
+                        downscale_factor: 6,
+                        stereo_width_px: 640,
+                        stereo_height_px: 400,
+                    }
+                )
+            ),
+            "unexpected parse result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn inference_keypoint_limit_cannot_promise_more_than_the_model_emits() {
+        let mut value = valid_value();
+        value["inference"]["maximum_keypoints"] = json!(513);
+
+        assert!(matches!(
+            parse(&value),
+            Err(NanoAgentLaunchParseError::NumericOutOfRange {
+                field: "inference.maximum_keypoints",
+                value: 513,
+                minimum: 1,
+                maximum: 512,
+            })
+        ));
+    }
+
+    #[test]
+    fn inference_downscale_must_retain_the_model_minimum_dimensions() {
+        let mut value = valid_value();
+        for stream in ["rectified_stereo", "depth"] {
+            value["oak"][stream]["width_px"] = json!(64);
+            value["oak"][stream]["height_px"] = json!(64);
+        }
+        value["inference"]["downscale_factor"] = json!(16);
+        let result = parse(&value);
+
+        assert!(
+            matches!(
+                &result,
+                Err(
+                    NanoAgentLaunchParseError::InferenceInputDimensionsTooSmall {
+                        downscaled_width_px: 4,
+                        downscaled_height_px: 4,
+                        minimum_axis_px: 8,
+                    }
+                )
+            ),
+            "unexpected parse result: {result:?}"
         );
     }
 

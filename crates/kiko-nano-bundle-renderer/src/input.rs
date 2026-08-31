@@ -12,6 +12,7 @@ use kiko_slam::navigation::{
     KIKO_REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS as REVIEWED_NATURAL_HEAD_START_MINIMUM_TICKS,
     KIKO_REVIEWED_NATURAL_HEAD_TARGET_TICKS as REVIEWED_NATURAL_HEAD_TARGET_TICKS,
     KIKO_REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE as REVIEWED_NATURAL_HEAD_TORQUE_LIMIT_PERMILLE,
+    MAX_INFERENCE_KEYPOINTS,
 };
 use robot_protocol::v2::ControllerCapabilities;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1119,7 +1120,7 @@ impl RuntimeEnvelope {
             maximum_keypoints: bounded_nonzero_u32(
                 "runtime.inference.maximum_keypoints",
                 dto.inference.maximum_keypoints,
-                65_535,
+                MAX_INFERENCE_KEYPOINTS,
             )?,
         };
         let rerun = Rerun {

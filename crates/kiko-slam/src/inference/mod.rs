@@ -30,6 +30,9 @@ use crate::env::{EnvError, env_bool, env_string, env_u64, env_usize};
 pub use backend::InferenceBackend;
 pub use eigenplaces::EigenPlaces;
 pub use place::PlaceDescriptorExtractor;
+pub(crate) use superpoint::{
+    SUPERPOINT_MAXIMUM_OUTPUT_KEYPOINTS, SUPERPOINT_MINIMUM_INPUT_AXIS_PX,
+};
 
 /// Generic CLI model directory, resolved from the process working directory.
 ///

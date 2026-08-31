@@ -129,10 +129,10 @@
       "snapshot_every_keyframes": 20
     },
     "inference": {
-      "superpoint_backend": "cuda_cpu_hybrid",
-      "lightglue_backend": "cuda_cpu_hybrid",
-      "downscale_factor": 2,
-      "maximum_keypoints": 512
+      "superpoint_backend": "cpu",
+      "lightglue_backend": "cpu",
+      "downscale_factor": 8,
+      "maximum_keypoints": 128
     },
     "rerun": {
       "decimation": 2,
