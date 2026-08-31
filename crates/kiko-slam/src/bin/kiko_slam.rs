@@ -18274,9 +18274,10 @@ fn run_prepared_live_session(
         if let Some(handle) = face_stage_stats_handle.as_ref() {
             let stats = handle.snapshot();
             eprintln!(
-                "face perception stage stats: final={} results_produced={} head_gaze_disabled_no_policy={} head_gaze_proposed={} head_gaze_withheld={} head_gaze_rejected={} handoff_enqueued={} handoff_replaced_older={} handoff_terminal_pending={} handoff_terminal_fault_latched={} handoff_disconnected={} handoff_channel_poisoned={}",
+                "face perception stage stats: final={} results_produced={} stale_results_dropped={} head_gaze_disabled_no_policy={} head_gaze_proposed={} head_gaze_withheld={} head_gaze_rejected={} handoff_enqueued={} handoff_replaced_older={} handoff_terminal_pending={} handoff_terminal_fault_latched={} handoff_disconnected={} handoff_channel_poisoned={}",
                 face_stage_stats_final.unwrap_or(false),
                 stats.results_produced,
+                stats.stale_results_dropped,
                 stats.head_gaze_disabled_no_policy,
                 stats.head_gaze_proposed,
                 stats.head_gaze_withheld,

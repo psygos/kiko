@@ -61,8 +61,9 @@ use kiko_expression_runtime::{
 };
 #[cfg(feature = "nano-agent")]
 use kiko_expression_runtime::{
-    CharacterPetEpisodeError, CommandedHeadGazeEstimateError, FaceTrackingConfig, HeadGazeResidual,
-    HeadGazeResidualError, HeadRelativeGaze, MAX_FACE_DETECTIONS,
+    CharacterPetEpisodeError, CommandedHeadGazeEstimateError, FaceTrackingConfig,
+    FaceTrackingError, HeadGazeResidual, HeadGazeResidualError, HeadRelativeGaze,
+    MAX_FACE_DETECTIONS,
 };
 use kiko_eye_runtime::{
     ActorExit as EyeActorExit, ActorTermination as EyeActorTermination, ClockError, EyeActorHandle,
@@ -1436,6 +1437,10 @@ impl NanoFaceDiagnosticStatsHandle {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NanoFacePerceptionStageStats {
     pub results_produced: u64,
+    /// Detector results discarded because their source frame expired while
+    /// bounded native perception was running. This is overload evidence, not
+    /// an accessory/device fault.
+    pub stale_results_dropped: u64,
     pub head_gaze_disabled_no_policy: u64,
     pub head_gaze_proposed: u64,
     pub head_gaze_withheld: u64,
@@ -1469,6 +1474,7 @@ impl NanoFacePerceptionStageStatsHandle {
 #[derive(Debug)]
 struct NanoFacePerceptionStageCounters {
     results_produced: AtomicU64,
+    stale_results_dropped: AtomicU64,
     head_gaze_disabled_no_policy: AtomicU64,
     head_gaze_proposed: AtomicU64,
     head_gaze_withheld: AtomicU64,
@@ -1486,6 +1492,7 @@ impl NanoFacePerceptionStageCounters {
     fn new() -> Self {
         Self {
             results_produced: AtomicU64::new(0),
+            stale_results_dropped: AtomicU64::new(0),
             head_gaze_disabled_no_policy: AtomicU64::new(0),
             head_gaze_proposed: AtomicU64::new(0),
             head_gaze_withheld: AtomicU64::new(0),
@@ -1501,6 +1508,10 @@ impl NanoFacePerceptionStageCounters {
 
     fn record_result(&self) {
         saturating_increment(&self.results_produced);
+    }
+
+    fn record_stale_result_drop(&self) {
+        saturating_increment(&self.stale_results_dropped);
     }
 
     fn record_head_gaze(&self, diagnostic: NanoHeadGazeDiagnostic) {
@@ -1540,6 +1551,7 @@ impl NanoFacePerceptionStageCounters {
     fn snapshot(&self) -> NanoFacePerceptionStageStats {
         NanoFacePerceptionStageStats {
             results_produced: self.results_produced.load(Ordering::Relaxed),
+            stale_results_dropped: self.stale_results_dropped.load(Ordering::Relaxed),
             head_gaze_disabled_no_policy: self.head_gaze_disabled_no_policy.load(Ordering::Relaxed),
             head_gaze_proposed: self.head_gaze_proposed.load(Ordering::Relaxed),
             head_gaze_withheld: self.head_gaze_withheld.load(Ordering::Relaxed),
@@ -3800,6 +3812,17 @@ fn run_face_perception_thread(
         };
         let perception_output = match perception.process_parsed(&parsed, &clock) {
             Ok(output) => output,
+            Err(source) if face_perception_result_expired(&source) => {
+                // Latest-frame ingress already bounds queued work. A result
+                // that becomes stale during native detection can no longer
+                // drive expression or gaze, but it does not imply a camera,
+                // detector, clock, or actuator failure. Discard it explicitly
+                // and process the newest available frame. The detector-result
+                // sequence remains consumed, so the next accepted result
+                // truthfully exposes the gap.
+                stage_counters.record_stale_result_drop();
+                continue;
+            }
             Err(source) => {
                 return finish_face_perception_fault(
                     &input,
@@ -3852,6 +3875,14 @@ fn run_face_perception_thread(
             }
         }
     }
+}
+
+#[cfg(feature = "nano-agent")]
+const fn face_perception_result_expired(source: &NanoFacePerceptionError) -> bool {
+    matches!(
+        source,
+        NanoFacePerceptionError::Tracking(FaceTrackingError::StaleFrame { .. })
+    )
 }
 
 #[cfg(feature = "nano-agent")]
@@ -5860,6 +5891,37 @@ mod tests {
     fn health_period(milliseconds: u64) -> NanoAccessoryHealthPeriod {
         NanoAccessoryHealthPeriod::try_from_duration(Duration::from_millis(milliseconds))
             .expect("valid test period")
+    }
+
+    #[cfg(feature = "nano-agent")]
+    #[test]
+    fn only_expired_face_results_are_recoverable_overload() {
+        let stale = NanoFacePerceptionError::Tracking(FaceTrackingError::StaleFrame {
+            deadline_ns: 100,
+            now_ns: 101,
+        });
+        assert!(face_perception_result_expired(&stale));
+        assert!(!face_perception_result_expired(
+            &NanoFacePerceptionError::DetectorResultSequenceExhausted
+        ));
+        assert!(!face_perception_result_expired(
+            &NanoFacePerceptionError::Tracking(FaceTrackingError::FrameFromFuture {
+                observed_at_ns: 101,
+                now_ns: 100,
+            })
+        ));
+    }
+
+    #[cfg(feature = "nano-agent")]
+    #[test]
+    fn stale_face_result_drops_have_disjoint_telemetry() {
+        let counters = NanoFacePerceptionStageCounters::new();
+        counters.record_stale_result_drop();
+        counters.record_result();
+        let stats = counters.snapshot();
+        assert_eq!(stats.stale_results_dropped, 1);
+        assert_eq!(stats.results_produced, 1);
+        assert_eq!(stats.handoff_enqueued, 0);
     }
 
     #[cfg(feature = "nano-agent")]
