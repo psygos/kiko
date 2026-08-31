@@ -26,6 +26,12 @@ pub const HEAD_RETURN_TELEMETRY_SET_MAX_AGE: Duration = HEAD_RETURN_CONTROL_PERI
 /// to a torque-enable write. This is a conservative software freshness
 /// boundary, not a servo thermal-response claim.
 pub const HEAD_PRE_ENABLE_TELEMETRY_MAXIMUM_AGE: Duration = Duration::from_millis(250);
+/// A goal-register write can leave the servo's raw `moving` flag asserted
+/// briefly even when the goal equals the just-observed position. Startup may
+/// re-observe only that bounded condition; unsafe telemetry, position
+/// disagreement, or exhaustion still fails closed before torque enable.
+pub const HEAD_PRE_ENABLE_SETTLE_ATTEMPTS: u8 = 5;
+pub const HEAD_PRE_ENABLE_SETTLE_POLL_PERIOD: Duration = Duration::from_millis(25);
 pub const MAX_HEAD_RETURN_TRAVEL_TICKS: u16 = 512;
 /// Conservative Kiko-specific raw register gates retained from the deployed
 /// legacy natural-head runtime. These values are register units, not

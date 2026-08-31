@@ -20,9 +20,10 @@ use crate::compliant_hold::{
     HeadCompliantHoldController, HeadCompliantTorqueBindingError,
 };
 use crate::config::{
-    ConfigParseError, ConfiguredHeadPoseBounds, HEAD_RETURN_CONTROL_PERIOD,
-    HeadPoseBoundsAdmissionError, HeadPoseWithinConfiguredBounds, HeadReturnPlan,
-    HeadRuntimeConfig, HeadTelemetrySafetyViolation, OperationTimeout, ReturnToTargetConfig,
+    ConfigParseError, ConfiguredHeadPoseBounds, HEAD_PRE_ENABLE_SETTLE_ATTEMPTS,
+    HEAD_PRE_ENABLE_SETTLE_POLL_PERIOD, HEAD_RETURN_CONTROL_PERIOD, HeadPoseBoundsAdmissionError,
+    HeadPoseWithinConfiguredBounds, HeadReturnPlan, HeadRuntimeConfig,
+    HeadTelemetrySafetyViolation, OperationTimeout, ReturnToTargetConfig,
 };
 use crate::energized_temperature::{
     EnergizedTemperatureChannelStatus, EnergizedTemperatureSample, EnergizedTemperatureSupervision,
@@ -1693,6 +1694,7 @@ pub enum HeadRuntimeError {
     PreEnableMoving {
         joint: HeadJoint,
         position: PositionTicks,
+        attempts_used: u8,
         response: Box<ResponseEvidence<FullTelemetry>>,
     },
     PreEnablePositionMismatch {
@@ -5909,48 +5911,55 @@ where
         commands: &mut mpsc::Receiver<HeadCommand>,
         control: &mut ControlState,
     ) -> Result<ResponseEvidence<FullTelemetry>, HeadRuntimeError> {
-        self.check_control(commands, control, RuntimeStage::RefreshBeforeEnable, joint)?;
-        let request = build_full_telemetry_read(joint.servo_id());
-        let response = self
-            .read_telemetry(joint, &request)
-            .await
-            .map_err(|source| HeadRuntimeError::PreEnableTelemetryRead { joint, source })?;
-        let telemetry = response.value();
-        if telemetry.device_status_raw() != 0 {
-            return Err(HeadRuntimeError::PreEnableDeviceStatus {
-                joint,
-                position: telemetry.position(),
-                raw: telemetry.device_status_raw(),
-                response: Box::new(response),
-            });
+        for attempts_used in 1..=HEAD_PRE_ENABLE_SETTLE_ATTEMPTS {
+            self.check_control(commands, control, RuntimeStage::RefreshBeforeEnable, joint)?;
+            let request = build_full_telemetry_read(joint.servo_id());
+            let response = self
+                .read_telemetry(joint, &request)
+                .await
+                .map_err(|source| HeadRuntimeError::PreEnableTelemetryRead { joint, source })?;
+            let telemetry = response.value();
+            if telemetry.device_status_raw() != 0 {
+                return Err(HeadRuntimeError::PreEnableDeviceStatus {
+                    joint,
+                    position: telemetry.position(),
+                    raw: telemetry.device_status_raw(),
+                    response: Box::new(response),
+                });
+            }
+            self.config
+                .telemetry_safety_limits()
+                .admit_pre_torque(telemetry.voltage_raw(), telemetry.temperature_raw())
+                .map_err(|source| HeadRuntimeError::PreEnableTelemetrySafety {
+                    joint,
+                    source,
+                    response: Box::new(response.clone()),
+                })?;
+            let absolute_difference_ticks = target.get().abs_diff(telemetry.position().get());
+            if absolute_difference_ticks > self.config.readback_tolerance().get() {
+                return Err(HeadRuntimeError::PreEnablePositionMismatch {
+                    joint,
+                    target,
+                    actual: telemetry.position(),
+                    absolute_difference_ticks,
+                    tolerance: self.config.readback_tolerance(),
+                    response: Box::new(response),
+                });
+            }
+            if !telemetry.is_moving() {
+                return Ok(response);
+            }
+            if attempts_used == HEAD_PRE_ENABLE_SETTLE_ATTEMPTS {
+                return Err(HeadRuntimeError::PreEnableMoving {
+                    joint,
+                    position: telemetry.position(),
+                    attempts_used,
+                    response: Box::new(response),
+                });
+            }
+            tokio::time::sleep(HEAD_PRE_ENABLE_SETTLE_POLL_PERIOD).await;
         }
-        self.config
-            .telemetry_safety_limits()
-            .admit_pre_torque(telemetry.voltage_raw(), telemetry.temperature_raw())
-            .map_err(|source| HeadRuntimeError::PreEnableTelemetrySafety {
-                joint,
-                source,
-                response: Box::new(response.clone()),
-            })?;
-        if telemetry.is_moving() {
-            return Err(HeadRuntimeError::PreEnableMoving {
-                joint,
-                position: telemetry.position(),
-                response: Box::new(response),
-            });
-        }
-        let absolute_difference_ticks = target.get().abs_diff(telemetry.position().get());
-        if absolute_difference_ticks > self.config.readback_tolerance().get() {
-            return Err(HeadRuntimeError::PreEnablePositionMismatch {
-                joint,
-                target,
-                actual: telemetry.position(),
-                absolute_difference_ticks,
-                tolerance: self.config.readback_tolerance(),
-                response: Box::new(response),
-            });
-        }
-        Ok(response)
+        unreachable!("the nonzero pre-enable settle bound always returns")
     }
 
     /// Write one complete canonical goal set, then prove that the four goal
@@ -9959,6 +9968,53 @@ mod tests {
                 .iter()
                 .all(|write| write[5..=6] == [40, 0])
         );
+    }
+
+    #[tokio::test]
+    async fn pre_enable_moving_flag_may_settle_within_the_bound() {
+        let mut reads = successful_reads();
+        reads[11] = ReadAction::Bytes(telemetry_response_with_moving(HeadJoint::Roll, 2_930, true));
+        reads.insert(
+            12,
+            ReadAction::Bytes(telemetry_response(HeadJoint::Roll, 2_930)),
+        );
+        let (handle, receipt, task, _) = spawn_fake(reads, valid_config(1));
+        let evidence = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("one stale zero-speed moving flag settles before enable");
+        let HeadStartupApplicationEvidence::HostAppliedObservedHold(application) =
+            evidence.application()
+        else {
+            panic!("commissioning startup applies the observed hold");
+        };
+        assert!(!application.pre_enable_telemetry()[3].value().is_moving());
+        handle.shutdown().await.expect("shutdown");
+        task.join().await.expect("actor task");
+    }
+
+    #[tokio::test]
+    async fn persistent_pre_enable_moving_flag_fails_closed() {
+        let mut reads = successful_reads();
+        reads[11] = ReadAction::Bytes(telemetry_response_with_moving(HeadJoint::Roll, 2_930, true));
+        for offset in 1..usize::from(HEAD_PRE_ENABLE_SETTLE_ATTEMPTS) {
+            reads.insert(
+                11 + offset,
+                ReadAction::Bytes(telemetry_response_with_moving(HeadJoint::Roll, 2_930, true)),
+            );
+        }
+        let (error, exit, _) = run_startup_fault(reads, valid_config(1)).await;
+        assert!(matches!(
+            error,
+            HeadRuntimeError::PreEnableMoving {
+                joint: HeadJoint::Roll,
+                position,
+                attempts_used: HEAD_PRE_ENABLE_SETTLE_ATTEMPTS,
+                response,
+            } if position.get() == 2_930 && response.value().is_moving()
+        ));
+        assert!(exit.torque_disable().all_writes_completed());
     }
 
     #[tokio::test]
