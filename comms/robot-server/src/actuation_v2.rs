@@ -1486,6 +1486,7 @@ struct SerialActor<Transport> {
     pending: Option<PendingOperation>,
     cached_stop: Option<CachedStop>,
     last_internal_stop: Option<ForceStop>,
+    startup_begin_after_stop: Option<BeginSession>,
     next_internal_request_id: Option<RequestId>,
     faulted: bool,
     priority_stop: Option<Arc<PriorityStopCoordinator>>,
@@ -1519,6 +1520,7 @@ where
             pending: None,
             cached_stop: None,
             last_internal_stop: None,
+            startup_begin_after_stop: None,
             next_internal_request_id: Some(RequestId::new(0)),
             faulted: false,
             priority_stop: None,
@@ -2338,13 +2340,17 @@ where
         )
         .await?;
         let request_id = self.allocate_internal_request_id()?;
-        self.send_serial(Message::BeginSession(BeginSession {
+        // The STM32 RX queue is deliberately small and fail-closed. Do not
+        // burst ForceStop and BeginSession into it: retain the typed begin
+        // request until the exact startup stop receipt proves that the first
+        // transaction completed. This also prevents a session from starting
+        // after an intervening host stop, priority stop, shutdown, or fault.
+        self.startup_begin_after_stop = Some(BeginSession {
             controller_uid: hello.controller_uid,
             boot_id: hello.boot_id,
             request_id,
             heartbeat_period: self.config.heartbeat_period,
-        }))
-        .await?;
+        });
         Ok(())
     }
 
@@ -2354,7 +2360,9 @@ where
         received_at: Instant,
     ) -> Result<(), ActuationActorError> {
         let exact = self.hello.is_some_and(|hello| {
-            ready.controller_uid == hello.message.controller_uid
+            self.startup_begin_after_stop.is_none()
+                && self.last_internal_stop.is_none()
+                && ready.controller_uid == hello.message.controller_uid
                 && ready.boot_id == hello.message.boot_id
                 && ready.capabilities == hello.message.capabilities
                 && ready.capabilities.classify_session_admission(
@@ -2757,8 +2765,10 @@ where
                     self.heartbeat = None;
                     return Ok(());
                 }
-                if self.internal_stop_result_matches(result) {
-                    self.last_internal_stop = None;
+                if self
+                    .complete_internal_stop_and_maybe_begin(result, false)
+                    .await?
+                {
                     self.pending = Some(PendingOperation::Stop(pending));
                     return Ok(());
                 }
@@ -2781,8 +2791,10 @@ where
                     self.heartbeat = None;
                     return Ok(());
                 }
-                if self.internal_stop_result_matches(result) {
-                    self.last_internal_stop = None;
+                if self
+                    .complete_internal_stop_and_maybe_begin(result, false)
+                    .await?
+                {
                     self.pending = Some(PendingOperation::PriorityStop(pending));
                     return Ok(());
                 }
@@ -2797,11 +2809,44 @@ where
             None => {}
         }
 
-        if self.internal_stop_result_matches(result) {
-            self.last_internal_stop = None;
+        if self
+            .complete_internal_stop_and_maybe_begin(result, true)
+            .await?
+        {
             return Ok(());
         }
         self.protocol_fault(ForceStopReason::SequenceConflict).await
+    }
+
+    async fn complete_internal_stop_and_maybe_begin(
+        &mut self,
+        result: HostStopResult,
+        startup_may_begin: bool,
+    ) -> Result<bool, ActuationActorError> {
+        if !self.internal_stop_result_matches(result) {
+            return Ok(false);
+        }
+        self.last_internal_stop = None;
+        let Some(begin) = self.startup_begin_after_stop.take() else {
+            return Ok(true);
+        };
+        let stop_is_exact = result.result.proves_controller_stop()
+            && result.output_state.is_safe()
+            && result.faults.is_clear();
+        let startup_is_still_authorized = startup_may_begin
+            && self.pending.is_none()
+            && !self.shutdown_in_progress
+            && !self.faulted
+            && self.hello.is_some_and(|hello| {
+                hello.message.controller_uid == begin.controller_uid
+                    && hello.message.boot_id == begin.boot_id
+            });
+        if stop_is_exact && startup_is_still_authorized {
+            self.send_serial(Message::BeginSession(begin)).await?;
+        } else if !stop_is_exact {
+            self.faulted = true;
+        }
+        Ok(true)
     }
 
     async fn handle_framing_fault(
@@ -3218,6 +3263,7 @@ where
         &mut self,
         reason: ForceStopReason,
     ) -> Result<(), ActuationActorError> {
+        self.startup_begin_after_stop = None;
         let (uid, target) =
             self.observed_hello
                 .map_or((self.config.controller_uid, TargetBootId::Any), |hello| {
@@ -3262,6 +3308,7 @@ where
         self.pending = None;
         self.heartbeat = None;
         if clear_session {
+            self.startup_begin_after_stop = None;
             self.hello = None;
             self.ready = None;
             self.invalidate_stop_cache();
@@ -5078,13 +5125,14 @@ mod tests {
                 Message::ForceStop(value) => value,
                 other => panic!("expected startup ForceStop, got {:?}", other.kind()),
             };
+            controller.assert_no_message().await;
+            controller
+                .send(Message::HostStopResult(confirmed_stop(stop, boot_id)))
+                .await;
             assert!(matches!(
                 controller.receive().await,
                 Message::BeginSession(_)
             ));
-            controller
-                .send(Message::HostStopResult(confirmed_stop(stop, boot_id)))
-                .await;
             controller
                 .send(Message::ControllerReady(ready_at(boot_id, ready_uptime)))
                 .await;
@@ -5552,13 +5600,14 @@ mod tests {
         let Message::ForceStop(stop) = controller.receive().await else {
             panic!("aligned Hello must reach the startup stop")
         };
+        controller.assert_no_message().await;
+        controller
+            .send(Message::HostStopResult(confirmed_stop(stop, boot_id)))
+            .await;
         assert!(matches!(
             controller.receive().await,
             Message::BeginSession(_)
         ));
-        controller
-            .send(Message::HostStopResult(confirmed_stop(stop, boot_id)))
-            .await;
         controller
             .send(Message::ControllerReady(ready_at(boot_id, 1_000)))
             .await;
@@ -5574,6 +5623,38 @@ mod tests {
             .send_corrupted(Message::Heartbeat(zero_heartbeat_at(boot_id, 1_002)))
             .await;
         assert!(matches!(controller.receive().await, Message::ForceStop(_)));
+        actor.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_begin_requires_a_confirming_stop_receipt() {
+        let boot_id = boot(7);
+        let (actor_stream, controller_stream) = tokio::io::duplex(4_096);
+        let (_handle, mut startup_ready, actor) = spawn_actor(
+            actor_stream,
+            actor_config(),
+            Arc::new(NoopActuationTelemetry),
+            UartStreamDecoder::new(),
+        );
+        let mut controller = FakeController::new(controller_stream);
+        controller
+            .send(Message::ControllerHello(hello_with(uid(), boot_id)))
+            .await;
+        let Message::ForceStop(stop) = controller.receive().await else {
+            panic!("exact Hello must start with ForceStop")
+        };
+        controller.assert_no_message().await;
+
+        let mut nonconfirming = confirmed_stop(stop, boot_id);
+        nonconfirming.result = StopResultCode::ControllerUnavailable;
+        controller
+            .send(Message::HostStopResult(nonconfirming))
+            .await;
+        controller.assert_no_message().await;
+        assert!(
+            timeout(SHORT_ABSENCE, &mut startup_ready).await.is_err(),
+            "a nonconfirming stop receipt must never reach startup readiness"
+        );
         actor.abort();
     }
 
@@ -7321,7 +7402,14 @@ mod tests {
             HostCommandResultCode::ControllerRestarted
         );
         let stop = harness.controller.receive().await;
-        assert!(matches!(stop, Message::ForceStop(_)));
+        let Message::ForceStop(stop) = stop else {
+            panic!("reboot must start with an exact ForceStop")
+        };
+        harness.controller.assert_no_message().await;
+        harness
+            .controller
+            .send(Message::HostStopResult(confirmed_stop(stop, rebooted)))
+            .await;
         assert!(matches!(
             harness.controller.receive().await,
             Message::BeginSession(_)
