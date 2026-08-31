@@ -9115,6 +9115,14 @@ fn start_wheels_off_qualification_motion_runtime(
         rerun_diagnostics_url,
         fault_injection,
     ) = input.take_for_owner();
+    let console_mode = match &motion_access {
+        WheelsOffMotionAccess::Attended(_) => {
+            kiko_slam::navigation::WheelsOffQualificationConsoleMode::AttendedQualification
+        }
+        WheelsOffMotionAccess::StationaryLab => {
+            kiko_slam::navigation::WheelsOffQualificationConsoleMode::StationaryLab
+        }
+    };
     let boot_id = initial_stop.observed_boot_id().get();
     let stop_request_id = initial_stop.request_id().get();
     let last_applied = match ConsoleAppliedReceipt::from_verified(&initial_zero) {
@@ -9131,7 +9139,7 @@ fn start_wheels_off_qualification_motion_runtime(
     let stop_certainty = ConsoleStopCertainty::from_verified_disarm(&initial_stop);
     let mut initial_base = OperatorConsoleSnapshot::unknown(
         ConsoleSnapshotRevision::parse(1).expect("static qualification revision is nonzero"),
-        ConsoleRuntimeAuthorityKind::WheelsOffQualification,
+        console_mode.authority_kind(),
     );
     initial_base.runtime = Some(AgentRuntimeStateV1::ReadyStopped);
     initial_base.health = initial_health;
@@ -9139,30 +9147,33 @@ fn start_wheels_off_qualification_motion_runtime(
     initial_base.stop_certainty = Some(stop_certainty);
     initial_base.rerun_diagnostics_url = Some(rerun_diagnostics_url);
     let (console, receiver) = kiko_slam::navigation::wheels_off_qualification_console(profile);
-    let telemetry = match kiko_slam::navigation::WheelsOffQualificationTelemetryStore::parse(
-        profile,
-        initial_base,
-        console.snapshot(),
-    ) {
-        Ok(telemetry) => telemetry,
-        Err(source) => {
-            return Err(fail_wheels_off_qualification_before_runtime(
-                coordinator,
-                LiveWheelsOffQualificationMotionStartPrimary::Telemetry(source),
-                boot_id,
-                stop_request_id,
-            ));
-        }
-    };
+    let telemetry =
+        match kiko_slam::navigation::WheelsOffQualificationTelemetryStore::parse_for_mode(
+            console_mode,
+            profile,
+            initial_base,
+            console.snapshot(),
+        ) {
+            Ok(telemetry) => telemetry,
+            Err(source) => {
+                return Err(fail_wheels_off_qualification_before_runtime(
+                    coordinator,
+                    LiveWheelsOffQualificationMotionStartPrimary::Telemetry(source),
+                    boot_id,
+                    stop_request_id,
+                ));
+            }
+        };
     // Bind the loopback UI while the console's motion boundary is still
     // closed. Motion-capable requests fail with `motion_attestation_pending`
     // until the stopped runtime owner and fresh attended attestation are both
     // ready; ordinary Stop and the one-way safety stop remain available.
-    let mut frontend = match kiko_slam::navigation::WheelsOffQualificationFrontend::start(
+    let mut frontend = match kiko_slam::navigation::WheelsOffQualificationFrontend::start_for_mode(
         &frontend_config,
         console.clone(),
         telemetry.clone(),
         profile,
+        console_mode,
     ) {
         Ok(frontend) => frontend,
         Err(source) => {

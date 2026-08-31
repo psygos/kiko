@@ -13,6 +13,7 @@
   const PRODUCTION_CONTROL_PROFILE_KIND = "production_body_frame_si";
   const QUALIFICATION_CONTROL_PROFILE_KIND =
     "wheels_off_raw_timer_pwm_qualification";
+  const STATIONARY_CONTROL_PROFILE_KIND = "stationary_observation_only";
   const QUALIFICATION_INTENT_ENDPOINT =
     "/api/v1/wheels-off-qualification/intents";
   const QUALIFICATION_BANNER =
@@ -20,6 +21,7 @@
   const PRODUCTION_AUTHORITY_KIND = "production_external_interlocks";
   const ATTENDED_TRIAL_AUTHORITY_KIND = "attended_navigation_trial";
   const WHEELS_OFF_AUTHORITY_KIND = "wheels_off_qualification";
+  const STATIONARY_LAB_AUTHORITY_KIND = "stationary_lab";
   // Production publishes every control period and the browser polls every
   // 300 ms. Five unchanged polls are treated as stale observational state.
   const SNAPSHOT_STALE_AFTER_MILLISECONDS = 1500;
@@ -824,6 +826,12 @@
 
   function parsedControlProfile(snapshot) {
     const raw = snapshot.control_profile;
+    if (snapshot.authority_kind === STATIONARY_LAB_AUTHORITY_KIND) {
+      if (raw != null || snapshot.wheels_off_qualification != null) {
+        throw new Error("stationary lab contradicts its observation-only control surface");
+      }
+      return Object.freeze({ kind: STATIONARY_CONTROL_PROFILE_KIND });
+    }
     if ([PRODUCTION_AUTHORITY_KIND, ATTENDED_TRIAL_AUTHORITY_KIND]
       .includes(snapshot.authority_kind)) {
       if (raw != null && raw.kind !== PRODUCTION_CONTROL_PROFILE_KIND) {
@@ -888,10 +896,21 @@
   }
 
   function renderControlProfile(profile) {
+    const stationary = profile.kind === STATIONARY_CONTROL_PROFILE_KIND;
     const qualification = profile.kind === QUALIFICATION_CONTROL_PROFILE_KIND;
     const banner = $("control-profile-banner");
     const domain = $("manual-domain-label");
     const hint = $("manual-control-hint");
+    $("manual-panel").classList.toggle("hidden", stationary);
+    $("mode-panel").classList.toggle("hidden", stationary);
+    if (stationary) {
+      banner.classList.remove("hidden");
+      $("control-profile-title").textContent =
+        "STATIONARY LAB — BASE CONTROL DISABLED";
+      $("control-profile-detail").textContent =
+        "Camera, SLAM, occupancy, expression, and diagnostics remain observational.";
+      return;
+    }
     if (!qualification) {
       banner.classList.add("hidden");
       domain.textContent = "BODY-FRAME SI CONTROL";

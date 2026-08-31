@@ -98,6 +98,22 @@ assert.equal(model.parseConsoleSnapshot(snapshot()).revision, "9");
   assert.equal(parsed.qualification_motion_gate, null);
 }
 
+{
+  const stationary = snapshot();
+  stationary.authority_kind = "stationary_lab";
+  stationary.requested_owner = null;
+  stationary.actual_authority = null;
+  stationary.last_requested_actuation = null;
+  stationary.last_applied.output_state = "disabled";
+  stationary.last_applied.applied_left_timer_pwm_percent = 0;
+  stationary.last_applied.applied_right_timer_pwm_percent = 0;
+  stationary.software_safety_stop_latched = true;
+  stationary.software_safety_signal_state = "completed_fault_latched";
+  const parsed = model.parseConsoleSnapshot(stationary);
+  assert.equal(parsed.authority_kind, "stationary_lab");
+  assert.equal(parsed.qualification_motion_gate, null);
+}
+
 function qualificationSnapshot(motionAuthorityEnabled) {
   const value = snapshot();
   value.authority_kind = "wheels_off_qualification";

@@ -2385,6 +2385,11 @@ mod tests {
         assert!(VIEW_MODEL_JS.contains("function readinessView(snapshot)"));
         assert!(APP_JS.contains("function navigationAuthority()"));
         assert!(APP_JS.contains("ATTENDED_TRIAL_AUTHORITY_KIND"));
+        assert_eq!(INDEX_HTML.matches(r#"id="manual-panel""#).count(), 1);
+        assert!(VIEW_MODEL_JS.contains(r#""stationary_lab""#));
+        assert!(APP_JS.contains("STATIONARY LAB — BASE CONTROL DISABLED"));
+        assert!(APP_JS.contains(r#"$("manual-panel").classList.toggle("hidden", stationary)"#));
+        assert!(APP_JS.contains(r#"$("mode-panel").classList.toggle("hidden", stationary)"#));
         assert!(!APP_JS.contains("attended navigation trial controls are not implemented"));
         assert!(
             !APP_JS.contains("qualificationProfile() == null"),

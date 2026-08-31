@@ -59,6 +59,26 @@ const QUALIFICATION_FRONTEND_HEALTH_SCHEMA_V1: u32 = 1;
 const MIN_DEADMAN_TICK_MS: u64 = 5;
 const MAX_DEADMAN_TICK_MS: u64 = 100;
 
+/// The HTTP owner is shared by the attended electrical qualification and the
+/// stationary integration lab, but their externally visible control surfaces
+/// are intentionally different.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelsOffQualificationConsoleMode {
+    AttendedQualification,
+    StationaryLab,
+}
+
+impl WheelsOffQualificationConsoleMode {
+    pub const fn authority_kind(self) -> super::ConsoleRuntimeAuthorityKind {
+        match self {
+            Self::AttendedQualification => {
+                super::ConsoleRuntimeAuthorityKind::WheelsOffQualification
+            }
+            Self::StationaryLab => super::ConsoleRuntimeAuthorityKind::StationaryLab,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WheelsOffQualificationFrontendConfig {
     bind: OperatorConsoleBind,
@@ -142,6 +162,7 @@ impl std::error::Error for WheelsOffQualificationFrontendConfigError {
 
 #[derive(Debug)]
 struct QualificationTelemetryState {
+    mode: WheelsOffQualificationConsoleMode,
     profile: WheelsOffQualificationControlProfile,
     base: OperatorConsoleSnapshot,
     base_source_revision: ConsoleSnapshotRevision,
@@ -163,7 +184,21 @@ impl WheelsOffQualificationTelemetryStore {
         initial_base: OperatorConsoleSnapshot,
         initial_qualification: WheelsOffQualificationSnapshot,
     ) -> Result<Self, WheelsOffQualificationTelemetryError> {
-        validate_observational_base(&initial_base)?;
+        Self::parse_for_mode(
+            WheelsOffQualificationConsoleMode::AttendedQualification,
+            profile,
+            initial_base,
+            initial_qualification,
+        )
+    }
+
+    pub fn parse_for_mode(
+        mode: WheelsOffQualificationConsoleMode,
+        profile: WheelsOffQualificationControlProfile,
+        initial_base: OperatorConsoleSnapshot,
+        initial_qualification: WheelsOffQualificationSnapshot,
+    ) -> Result<Self, WheelsOffQualificationTelemetryError> {
+        validate_observational_base(&initial_base, mode)?;
         if initial_qualification.schema_version
             != super::WHEELS_OFF_QUALIFICATION_SNAPSHOT_SCHEMA_V2
         {
@@ -178,6 +213,7 @@ impl WheelsOffQualificationTelemetryStore {
         }
         Ok(Self {
             state: Arc::new(Mutex::new(QualificationTelemetryState {
+                mode,
                 profile,
                 base_source_revision: initial_base.revision,
                 base: initial_base,
@@ -222,6 +258,12 @@ impl WheelsOffQualificationTelemetryStore {
         Ok(self.lock_state()?.profile)
     }
 
+    pub fn console_mode(
+        &self,
+    ) -> Result<WheelsOffQualificationConsoleMode, WheelsOffQualificationTelemetryError> {
+        Ok(self.lock_state()?.mode)
+    }
+
     /// Publish navigation/SLAM observations only. Production authority,
     /// manual-envelope, request, and software-latch fields are rejected rather
     /// than silently hidden.
@@ -229,8 +271,8 @@ impl WheelsOffQualificationTelemetryStore {
         &self,
         snapshot: OperatorConsoleSnapshot,
     ) -> Result<(), WheelsOffQualificationTelemetryError> {
-        validate_observational_base(&snapshot)?;
         let mut state = self.lock_state()?;
+        validate_observational_base(&snapshot, state.mode)?;
         if snapshot.revision <= state.base_source_revision {
             return Err(
                 WheelsOffQualificationTelemetryError::BaseRevisionNotIncreasing {
@@ -313,6 +355,12 @@ impl WheelsOffQualificationTelemetryStore {
             ConsoleSnapshotRevision::parse(state.projection_revision.get())
                 .map_err(|_| WheelsOffQualificationTelemetryError::ProjectionRevisionExhausted)?;
         let signal_state = qualification_signal_state(&qualification);
+        let (control_profile, wheels_off_qualification) = match state.mode {
+            WheelsOffQualificationConsoleMode::AttendedQualification => {
+                (Some(state.profile), Some(&qualification))
+            }
+            WheelsOffQualificationConsoleMode::StationaryLab => (None, None),
+        };
         let projection = QualificationSnapshotProjection {
             schema_version: state.base.schema_version,
             authority_kind: state.base.authority_kind,
@@ -336,8 +384,8 @@ impl WheelsOffQualificationTelemetryStore {
             software_safety_signal_state: signal_state,
             physical_emergency_stop_state: state.base.physical_emergency_stop_state,
             rerun_diagnostics_url: &state.base.rerun_diagnostics_url,
-            control_profile: state.profile,
-            wheels_off_qualification: &qualification,
+            control_profile,
+            wheels_off_qualification,
         };
         let serialized = Arc::new(
             serde_json::to_vec(&projection)
@@ -362,13 +410,14 @@ fn bump_projection_revision(
 
 fn validate_observational_base(
     snapshot: &OperatorConsoleSnapshot,
+    mode: WheelsOffQualificationConsoleMode,
 ) -> Result<(), WheelsOffQualificationTelemetryError> {
     if snapshot.schema_version != super::OPERATOR_CONSOLE_SNAPSHOT_SCHEMA_V5 {
         return Err(WheelsOffQualificationTelemetryError::UnsupportedBaseSchema(
             snapshot.schema_version,
         ));
     }
-    if snapshot.authority_kind != super::ConsoleRuntimeAuthorityKind::WheelsOffQualification {
+    if snapshot.authority_kind != mode.authority_kind() {
         return Err(WheelsOffQualificationTelemetryError::ProfileMismatch);
     }
     if snapshot.requested_owner.is_some()
@@ -477,12 +526,15 @@ struct QualificationSnapshotProjection<'a> {
     software_safety_signal_state: ConsoleSafetySignalState,
     physical_emergency_stop_state: ConsolePhysicalEmergencyStopState,
     rerun_diagnostics_url: &'a Option<super::ConsoleRerunDiagnosticsUrl>,
-    control_profile: WheelsOffQualificationControlProfile,
-    wheels_off_qualification: &'a WheelsOffQualificationSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control_profile: Option<WheelsOffQualificationControlProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wheels_off_qualification: Option<&'a WheelsOffQualificationSnapshot>,
 }
 
 #[derive(Debug)]
 struct QualificationHttpContext {
+    mode: WheelsOffQualificationConsoleMode,
     console: WheelsOffQualificationConsoleHandle,
     telemetry: WheelsOffQualificationTelemetryStore,
     profile: WheelsOffQualificationControlProfile,
@@ -692,6 +744,11 @@ async fn handle_qualification_post(
     request: Request<Body>,
     context: &QualificationHttpContext,
 ) -> Response<Body> {
+    if context.mode == WheelsOffQualificationConsoleMode::StationaryLab
+        && path == super::WHEELS_OFF_QUALIFICATION_INTENT_ENDPOINT
+    {
+        return error_response(StatusCode::NOT_FOUND, "not_found");
+    }
     if !matches!(
         path.as_str(),
         "/api/v1/sessions"
@@ -1075,6 +1132,7 @@ impl WheelsOffQualificationHttpServer {
         console: WheelsOffQualificationConsoleHandle,
         telemetry: WheelsOffQualificationTelemetryStore,
         profile: WheelsOffQualificationControlProfile,
+        mode: WheelsOffQualificationConsoleMode,
     ) -> Result<Self, WheelsOffQualificationHttpServerStartError> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1086,6 +1144,7 @@ impl WheelsOffQualificationHttpServer {
                     console,
                     telemetry,
                     profile,
+                    mode,
                     shutdown_rx,
                     ready_tx,
                 )
@@ -1228,6 +1287,7 @@ fn run_qualification_http_server(
     console: WheelsOffQualificationConsoleHandle,
     telemetry: WheelsOffQualificationTelemetryStore,
     profile: WheelsOffQualificationControlProfile,
+    mode: WheelsOffQualificationConsoleMode,
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: mpsc::SyncSender<Result<SocketAddr, String>>,
 ) -> WheelsOffQualificationHttpServerExit {
@@ -1254,6 +1314,7 @@ fn run_qualification_http_server(
     };
     let bound_address = builder.local_addr();
     let context = Arc::new(QualificationHttpContext {
+        mode,
         console: console.clone(),
         telemetry,
         profile,
@@ -1744,11 +1805,28 @@ impl WheelsOffQualificationFrontend {
         telemetry: WheelsOffQualificationTelemetryStore,
         profile: WheelsOffQualificationControlProfile,
     ) -> Result<Self, WheelsOffQualificationFrontendStartError> {
+        Self::start_for_mode(
+            config,
+            console,
+            telemetry,
+            profile,
+            WheelsOffQualificationConsoleMode::AttendedQualification,
+        )
+    }
+
+    pub fn start_for_mode(
+        config: &WheelsOffQualificationFrontendConfig,
+        console: WheelsOffQualificationConsoleHandle,
+        telemetry: WheelsOffQualificationTelemetryStore,
+        profile: WheelsOffQualificationControlProfile,
+        mode: WheelsOffQualificationConsoleMode,
+    ) -> Result<Self, WheelsOffQualificationFrontendStartError> {
         Self::start_with_readiness_probe(
             config,
             console,
             telemetry,
             profile,
+            mode,
             probe_qualification_frontend_readiness,
         )
     }
@@ -1758,6 +1836,7 @@ impl WheelsOffQualificationFrontend {
         console: WheelsOffQualificationConsoleHandle,
         telemetry: WheelsOffQualificationTelemetryStore,
         profile: WheelsOffQualificationControlProfile,
+        mode: WheelsOffQualificationConsoleMode,
         readiness_probe: impl FnOnce(
             SocketAddr,
             OperatorConsoleAccessCapability,
@@ -1772,6 +1851,14 @@ impl WheelsOffQualificationFrontend {
         }
         match telemetry.control_profile() {
             Ok(telemetry_profile) if telemetry_profile == profile => {}
+            Ok(_) => return Err(WheelsOffQualificationFrontendStartError::ProfileMismatch),
+            Err(source) => {
+                console.signal_internal_fail_closed(None);
+                return Err(WheelsOffQualificationFrontendStartError::Telemetry(source));
+            }
+        }
+        match telemetry.console_mode() {
+            Ok(telemetry_mode) if telemetry_mode == mode => {}
             Ok(_) => return Err(WheelsOffQualificationFrontendStartError::ProfileMismatch),
             Err(source) => {
                 console.signal_internal_fail_closed(None);
@@ -1793,6 +1880,7 @@ impl WheelsOffQualificationFrontend {
             console.clone(),
             telemetry,
             profile,
+            mode,
         ) {
             Ok(http) => http,
             Err(source) => {
@@ -2124,6 +2212,7 @@ mod tests {
         .unwrap();
         (
             Arc::new(QualificationHttpContext {
+                mode: WheelsOffQualificationConsoleMode::AttendedQualification,
                 console,
                 telemetry,
                 profile,
@@ -2146,6 +2235,43 @@ mod tests {
         super::super::WheelsOffQualificationIngressReceiver,
     ) {
         test_context_with_motion_authority(true)
+    }
+
+    fn stationary_test_context() -> (
+        Arc<QualificationHttpContext>,
+        super::super::WheelsOffQualificationIngressReceiver,
+    ) {
+        let profile = profile();
+        let (console, receiver) = super::super::wheels_off_qualification_console(profile);
+        console.admit_frontend_readiness().unwrap();
+        let telemetry = WheelsOffQualificationTelemetryStore::parse_for_mode(
+            WheelsOffQualificationConsoleMode::StationaryLab,
+            profile,
+            OperatorConsoleSnapshot::unknown(
+                ConsoleSnapshotRevision::parse(1).unwrap(),
+                super::super::ConsoleRuntimeAuthorityKind::StationaryLab,
+            ),
+            console.snapshot(),
+        )
+        .unwrap();
+        (
+            Arc::new(QualificationHttpContext {
+                mode: WheelsOffQualificationConsoleMode::StationaryLab,
+                console,
+                telemetry,
+                profile,
+                access_capability: OperatorConsoleAccessCapability::parse(ACCESS_BYTES).unwrap(),
+                clock: AgentControlMonotonicOrigin::new(
+                    Instant::now(),
+                    HostMonotonicTimestamp::from_nanos(1_000_000_000),
+                ),
+                bound_port: TEST_PORT,
+                request_permits: Arc::new(Semaphore::new(
+                    MAX_CONCURRENT_QUALIFICATION_HTTP_REQUESTS,
+                )),
+            }),
+            receiver,
+        )
     }
 
     fn api_request(method: Method, path: &str, body: Body) -> Request<Body> {
@@ -2422,6 +2548,36 @@ mod tests {
         );
         assert!(snapshot["requested_owner"].is_null());
         assert!(snapshot["actual_authority"].is_null());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stationary_lab_omits_and_rejects_raw_control_surface() {
+        let (context, mut receiver) = stationary_test_context();
+        let snapshot = handle_qualification_request_inner(
+            api_request(Method::GET, "/api/v1/snapshot", Body::empty()),
+            Arc::clone(&context),
+        )
+        .await;
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let snapshot = response_json(snapshot).await;
+        assert_eq!(snapshot["authority_kind"], "stationary_lab");
+        assert!(snapshot.get("control_profile").is_none());
+        assert!(snapshot.get("wheels_off_qualification").is_none());
+
+        let (session_id, session_capability) =
+            open_session(Arc::clone(&context), ConsoleSourceKind::Operator).await;
+        let intent = handle_qualification_request_inner(
+            authenticated_intent_request(
+                &session_id,
+                &session_capability,
+                1,
+                "{\"kind\":\"begin_manual\"}",
+            ),
+            context,
+        )
+        .await;
+        assert_eq!(intent.status(), StatusCode::NOT_FOUND);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2897,6 +3053,7 @@ mod tests {
             console.clone(),
             telemetry,
             profile,
+            WheelsOffQualificationConsoleMode::AttendedQualification,
             move |_bound_address, access_capability, profile| {
                 expected_capability_tx
                     .send(access_capability.to_hex())

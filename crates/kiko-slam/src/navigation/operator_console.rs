@@ -2697,6 +2697,8 @@ pub enum ConsoleRuntimeAuthorityKind {
     ProductionExternalInterlocks,
     AttendedNavigationTrial,
     WheelsOffQualification,
+    /// Observational bring-up with no nonzero base-control surface.
+    StationaryLab,
 }
 
 /// Immutable latest-only observational state. `None` means unknown, never a

@@ -37,6 +37,7 @@
     "production_external_interlocks",
     "attended_navigation_trial",
     "wheels_off_qualification",
+    "stationary_lab",
   ]);
   const PHYSICAL_STOPS = new Set(["released", "engaged", "unavailable", "faulted"]);
   const STOP_CERTAINTY = new Set([

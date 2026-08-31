@@ -280,6 +280,14 @@ occupancy, MPC shadow diagnostics, and the console without retaining sensor
 payloads or fabricating a persistence claim. Publishable recording remains
 enabled in the attended and production paths only.
 
+The stationary console publishes the distinct `stationary_lab` authority kind.
+It omits the raw-timer qualification profile and qualification-motion evidence,
+does not route the raw-PWM intent endpoint, and hides the manual-drive and
+operating-intent panels. The map, SLAM, subsystem health, controller-zero
+receipt, software safety state, and Rerun link remain observationally visible.
+The attended qualification continues to publish its explicit raw electrical
+profile and endpoint; no missing field is interpreted as production authority.
+
 The first native Jetson observation of this dataset-free path is recorded in
 [`nano-stationary-lab-live-evidence-2026-09-01.md`](nano-stationary-lab-live-evidence-2026-09-01.md).
 
