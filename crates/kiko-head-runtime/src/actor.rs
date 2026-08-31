@@ -21,7 +21,8 @@ use crate::compliant_hold::{
 };
 use crate::config::{
     ConfigParseError, ConfiguredHeadPoseBounds, HEAD_PRE_ENABLE_SETTLE_ATTEMPTS,
-    HEAD_PRE_ENABLE_SETTLE_POLL_PERIOD, HEAD_RETURN_CONTROL_PERIOD, HeadPoseBoundsAdmissionError,
+    HEAD_PRE_ENABLE_SETTLE_POLL_PERIOD, HEAD_READBACK_SETTLE_ATTEMPTS,
+    HEAD_READBACK_SETTLE_POLL_PERIOD, HEAD_RETURN_CONTROL_PERIOD, HeadPoseBoundsAdmissionError,
     HeadPoseWithinConfiguredBounds, HeadReturnPlan, HeadRuntimeConfig,
     HeadTelemetrySafetyViolation, OperationTimeout, ReturnToTargetConfig,
 };
@@ -6752,32 +6753,27 @@ where
         commands: &mut mpsc::Receiver<HeadCommand>,
         control: &mut ControlState,
     ) -> Result<ReadbackEvidence, HeadRuntimeError> {
-        self.check_control(
-            commands,
-            control,
-            RuntimeStage::VerifyFirstStoppedPosition,
-            joint,
-        )?;
         let target = pose.position(joint);
-        let first = self
-            .read_telemetry(joint, request)
-            .await
-            .map_err(|source| HeadRuntimeError::VerificationRead { joint, source })?;
-        let first_target_difference_ticks =
-            self.admit_stopped_readback(joint, VerificationSample::First, target, &first)?;
-
-        self.check_control(
-            commands,
-            control,
-            RuntimeStage::VerifySecondStoppedPosition,
-            joint,
-        )?;
-        let second = self
-            .read_telemetry(joint, request)
-            .await
-            .map_err(|source| HeadRuntimeError::VerificationRead { joint, source })?;
-        let second_target_difference_ticks =
-            self.admit_stopped_readback(joint, VerificationSample::Second, target, &second)?;
+        let (first, first_target_difference_ticks) = self
+            .observe_stopped_readback(
+                joint,
+                VerificationSample::First,
+                target,
+                request,
+                commands,
+                control,
+            )
+            .await?;
+        let (second, second_target_difference_ticks) = self
+            .observe_stopped_readback(
+                joint,
+                VerificationSample::Second,
+                target,
+                request,
+                commands,
+                control,
+            )
+            .await?;
         let stable_difference_ticks = first
             .value()
             .position()
@@ -6802,6 +6798,40 @@ where
             first,
             second,
         })
+    }
+
+    async fn observe_stopped_readback(
+        &mut self,
+        joint: HeadJoint,
+        sample: VerificationSample,
+        target: PositionTicks,
+        request: &kiko_head_protocol::CommandFrame,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<(ResponseEvidence<FullTelemetry>, u16), HeadRuntimeError> {
+        let stage = match sample {
+            VerificationSample::First => RuntimeStage::VerifyFirstStoppedPosition,
+            VerificationSample::Second => RuntimeStage::VerifySecondStoppedPosition,
+        };
+        for attempts_used in 1..=HEAD_READBACK_SETTLE_ATTEMPTS {
+            self.check_control(commands, control, stage, joint)?;
+            let response = self
+                .read_telemetry(joint, request)
+                .await
+                .map_err(|source| HeadRuntimeError::VerificationRead { joint, source })?;
+            match self.admit_stopped_readback(joint, sample, target, &response) {
+                Ok(target_difference_ticks) => {
+                    return Ok((response, target_difference_ticks));
+                }
+                Err(HeadRuntimeError::ReadbackMoving { .. })
+                    if attempts_used < HEAD_READBACK_SETTLE_ATTEMPTS =>
+                {
+                    tokio::time::sleep(HEAD_READBACK_SETTLE_POLL_PERIOD).await;
+                }
+                Err(source) => return Err(source),
+            }
+        }
+        unreachable!("the nonzero readback settle bound always returns")
     }
 
     async fn read_telemetry(
@@ -12125,6 +12155,12 @@ mod tests {
     async fn moving_or_unstable_second_readback_never_claims_hold() {
         let mut moving = successful_reads();
         moving[13] = ReadAction::Bytes(telemetry_response_with_moving(HeadJoint::Bow, 2_127, true));
+        for offset in 1..usize::from(HEAD_READBACK_SETTLE_ATTEMPTS) {
+            moving.insert(
+                13 + offset,
+                ReadAction::Bytes(telemetry_response_with_moving(HeadJoint::Bow, 2_127, true)),
+            );
+        }
         let (error, _, _) = run_startup_fault(moving, valid_config(1)).await;
         assert!(matches!(
             error,
@@ -12147,6 +12183,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn startup_readback_moving_flag_may_settle_within_the_bound() {
+        let positions = [2_127, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        reads[14] = ReadAction::Bytes(telemetry_response_with_moving(
+            HeadJoint::Curl,
+            positions[1],
+            true,
+        ));
+        reads.insert(
+            15,
+            ReadAction::Bytes(telemetry_response(HeadJoint::Curl, positions[1])),
+        );
+        let (handle, receipt, task, _) =
+            spawn_tension_preserving_return_fake(reads, valid_return_config(positions, [1; 4]));
+
+        let evidence = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("one transient startup moving flag settles");
+        let HeadStartupApplicationEvidence::HostAppliedObservedHold(application) =
+            evidence.application()
+        else {
+            panic!("tension-preserving compatibility startup reapplies the observed hold");
+        };
+        assert!(!application.readbacks()[1].first().value().is_moving());
+
+        handle
+            .release_ownership_preserving_hold()
+            .await
+            .expect("hold-preserving release");
+        task.join().await.expect("actor task");
     }
 
     #[tokio::test]

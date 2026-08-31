@@ -32,6 +32,11 @@ pub const HEAD_PRE_ENABLE_TELEMETRY_MAXIMUM_AGE: Duration = Duration::from_milli
 /// disagreement, or exhaustion still fails closed before torque enable.
 pub const HEAD_PRE_ENABLE_SETTLE_ATTEMPTS: u8 = 5;
 pub const HEAD_PRE_ENABLE_SETTLE_POLL_PERIOD: Duration = Duration::from_millis(25);
+/// A goal, torque-limit, or torque-on write can briefly reassert the raw moving
+/// bit. Verification may re-observe only that exact condition; status,
+/// telemetry-safety, and position failures remain immediately fatal.
+pub const HEAD_READBACK_SETTLE_ATTEMPTS: u8 = 5;
+pub const HEAD_READBACK_SETTLE_POLL_PERIOD: Duration = Duration::from_millis(25);
 pub const MAX_HEAD_RETURN_TRAVEL_TICKS: u16 = 512;
 /// Conservative Kiko-specific raw register gates retained from the deployed
 /// legacy natural-head runtime. These values are register units, not
