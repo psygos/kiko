@@ -10,10 +10,12 @@ mod deadline;
 
 pub use actuation_v2::{
     ActuationActorError, ActuationFaultEvidence, ActuationOutputEvidence, ActuationSnapshot,
-    ActuationStartError, ActuationStartupPhase, ActuationTelemetry, NoopActuationTelemetry,
-    ObservedActuationOutput, SerialResynchronizationOutcome, SerialTransmitError,
-    SerialTransmitInterruption, SerialTransmitPhase, ShutdownForceStopOutcome,
-    ShutdownInterruptedTransmitRecovery, UdpServiceError,
+    ActuationStartError, ActuationStartupPhase, ActuationTelemetry, ControllerHelloRejection,
+    ControllerReadyRejection, NoopActuationTelemetry, ObservedActuationOutput,
+    PreSessionHeartbeatRejection, SerialResynchronizationOutcome, SerialTransmitError,
+    SerialTransmitInterruption, SerialTransmitPhase, SessionHeartbeatRejection,
+    ShutdownForceStopOutcome, ShutdownInterruptedTransmitRecovery, StopFaultEvidence,
+    UdpServiceError,
 };
 #[cfg(feature = "qualification-fault-injection")]
 pub use actuation_v2::{

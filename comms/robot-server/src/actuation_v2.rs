@@ -162,19 +162,82 @@ pub enum ActuationStartupPhase {
 /// admitted even after their bounded cleanup stop changes the actor state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActuationFaultEvidence {
-    ControllerHelloRejected(ControllerHello),
-    ControllerReadyRejected(ControllerReady),
-    PreSessionHeartbeatRejected(Heartbeat),
-    SessionHeartbeatRejected(Heartbeat),
-    SessionHeartbeatDidNotProgress(Heartbeat),
-    HeartbeatAuthorityConflict(Heartbeat),
-    ObservationalOdometryIdentityMismatch(ObservationalOdometry),
+    ControllerHelloRejected(ControllerHelloRejection),
+    ControllerReadyRejected(ControllerReadyRejection),
+    PreSessionHeartbeatRejected(PreSessionHeartbeatRejection),
+    SessionHeartbeatRejected(SessionHeartbeatRejection),
+    SessionHeartbeatDidNotProgress,
+    HeartbeatAuthorityConflict,
+    ObservationalOdometryIdentityMismatch,
     UnexpectedControllerMessage(MessageKind),
-    UnexpectedStopResult(HostStopResult),
-    StartupStopNotConfirmed(HostStopResult),
+    UnexpectedStopResult(StopFaultEvidence),
+    StartupStopNotConfirmed(StopFaultEvidence),
     SerialFraming(UartStreamError),
     HeartbeatFreshnessExpired,
     Protocol(ForceStopReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerHelloRejection {
+    ControllerUid,
+    FirmwareAbi,
+    FirmwareBuildId,
+    ActuatorConfigFingerprint,
+    PwmFrequency,
+    WatchdogNominalPeriod,
+    NeutralOutput,
+    PhysicalStopSemantics,
+    MaximumPwm,
+    MotionAuthority,
+    SessionAdmission,
+    OutputState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerReadyRejection {
+    StartupStopPending,
+    ControllerHelloUnavailable,
+    ControllerUid,
+    BootId,
+    Capabilities,
+    SessionAdmission,
+    OutputState,
+    ControllerFaults,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreSessionHeartbeatRejection {
+    ControllerUid,
+    TimerPwm,
+    OutputState,
+    ControllerFaults,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionHeartbeatRejection {
+    ControllerUid,
+    BootId,
+    SessionState,
+    ControllerFaults,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StopFaultEvidence {
+    pub request_id: RequestId,
+    pub result: StopResultCode,
+    pub output_state: OutputState,
+    pub faults: ControllerFaults,
+}
+
+impl From<HostStopResult> for StopFaultEvidence {
+    fn from(result: HostStopResult) -> Self {
+        Self {
+            request_id: result.request_id,
+            result: result.result,
+            output_state: result.output_state,
+            faults: result.faults,
+        }
+    }
 }
 
 /// Current controller-output knowledge exposed to telemetry and UI adapters.
@@ -2332,7 +2395,7 @@ where
                     self.telemetry.observe_odometry(value, received_at);
                 } else {
                     self.last_fault =
-                        Some(ActuationFaultEvidence::ObservationalOdometryIdentityMismatch(value));
+                        Some(ActuationFaultEvidence::ObservationalOdometryIdentityMismatch);
                     self.protocol_fault(ForceStopReason::SessionReset).await?;
                 }
             }
@@ -2366,9 +2429,9 @@ where
         let timed = TimedHello { message: hello };
         self.observed_hello = Some(timed);
 
-        if !self.hello_is_exact(hello) {
+        if let Some(rejection) = self.hello_rejection(hello) {
             self.faulted = true;
-            self.last_fault = Some(ActuationFaultEvidence::ControllerHelloRejected(hello));
+            self.last_fault = Some(ActuationFaultEvidence::ControllerHelloRejected(rejection));
             self.issue_stop_for(
                 hello.controller_uid,
                 TargetBootId::Exact(hello.boot_id),
@@ -2407,21 +2470,8 @@ where
         ready: ControllerReady,
         received_at: Instant,
     ) -> Result<(), ActuationActorError> {
-        let exact = self.hello.is_some_and(|hello| {
-            self.startup_begin_after_stop.is_none()
-                && self.last_internal_stop.is_none()
-                && ready.controller_uid == hello.message.controller_uid
-                && ready.boot_id == hello.message.boot_id
-                && ready.capabilities == hello.message.capabilities
-                && ready.capabilities.classify_session_admission(
-                    self.config.expected_max_abs_pwm_percent,
-                    self.config.expected_physical_stop_semantics,
-                ) == Ok(self.config.expected_session_admission())
-                && ready.output_state.is_safe()
-                && ready.faults.is_clear()
-        });
-        if !exact {
-            self.last_fault = Some(ActuationFaultEvidence::ControllerReadyRejected(ready));
+        if let Some(rejection) = self.ready_rejection(ready) {
+            self.last_fault = Some(ActuationFaultEvidence::ControllerReadyRejected(rejection));
             self.protocol_fault(ForceStopReason::SessionReset).await?;
             return Ok(());
         }
@@ -2448,13 +2498,9 @@ where
         received_at: Instant,
     ) -> Result<(), ActuationActorError> {
         let Some(ready) = self.ready else {
-            if heartbeat.controller_uid != self.config.controller_uid
-                || !heartbeat.timer_pwm.is_zero()
-                || !heartbeat.output_state.is_safe()
-                || !heartbeat.faults.is_clear()
-            {
+            if let Some(rejection) = self.pre_session_heartbeat_rejection(heartbeat) {
                 self.last_fault = Some(ActuationFaultEvidence::PreSessionHeartbeatRejected(
-                    heartbeat,
+                    rejection,
                 ));
                 self.protocol_fault(ForceStopReason::ControllerFault)
                     .await?;
@@ -2464,26 +2510,18 @@ where
         if self.heartbeat_is_provably_delayed(heartbeat, ready) {
             return Ok(());
         }
-        let exact_session = heartbeat.controller_uid == ready.message.controller_uid
-            && heartbeat.boot_id == ready.message.boot_id
-            && self.heartbeat_state_is_exact(heartbeat, ready)
-            && heartbeat.faults.is_clear();
-        if !exact_session {
-            self.last_fault = Some(ActuationFaultEvidence::SessionHeartbeatRejected(heartbeat));
+        if let Some(rejection) = self.session_heartbeat_rejection(heartbeat, ready) {
+            self.last_fault = Some(ActuationFaultEvidence::SessionHeartbeatRejected(rejection));
             self.protocol_fault(ForceStopReason::SessionReset).await?;
             return Ok(());
         }
         if !self.heartbeat_progresses(heartbeat) {
-            self.last_fault = Some(ActuationFaultEvidence::SessionHeartbeatDidNotProgress(
-                heartbeat,
-            ));
+            self.last_fault = Some(ActuationFaultEvidence::SessionHeartbeatDidNotProgress);
             self.protocol_fault(ForceStopReason::SessionReset).await?;
             return Ok(());
         }
         if !self.heartbeat_matches_authority(heartbeat) {
-            self.last_fault = Some(ActuationFaultEvidence::HeartbeatAuthorityConflict(
-                heartbeat,
-            ));
+            self.last_fault = Some(ActuationFaultEvidence::HeartbeatAuthorityConflict);
             self.protocol_fault(ForceStopReason::SequenceConflict)
                 .await?;
             return Ok(());
@@ -2880,7 +2918,7 @@ where
         {
             return Ok(());
         }
-        self.last_fault = Some(ActuationFaultEvidence::UnexpectedStopResult(result));
+        self.last_fault = Some(ActuationFaultEvidence::UnexpectedStopResult(result.into()));
         self.protocol_fault(ForceStopReason::SequenceConflict).await
     }
 
@@ -2911,7 +2949,9 @@ where
             self.send_serial(Message::BeginSession(begin)).await?;
         } else if !stop_is_exact {
             self.faulted = true;
-            self.last_fault = Some(ActuationFaultEvidence::StartupStopNotConfirmed(result));
+            self.last_fault = Some(ActuationFaultEvidence::StartupStopNotConfirmed(
+                result.into(),
+            ));
         }
         Ok(true)
     }
@@ -2947,19 +2987,102 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     fn hello_is_exact(&self, hello: ControllerHello) -> bool {
-        hello.controller_uid == self.config.controller_uid
-            && hello.firmware_abi == self.config.firmware_abi
-            && hello.firmware_build_id == self.config.firmware_build_id
-            && hello.actuator_config_fingerprint == self.config.actuator_config_fingerprint
-            && hello.pwm_frequency == self.config.expected_pwm_frequency
-            && hello.watchdog_nominal_period == self.config.expected_watchdog_nominal_period
-            && hello.neutral_output == self.config.expected_neutral_output
-            && hello.physical_stop_semantics == self.config.expected_physical_stop_semantics
-            && hello.max_abs_pwm_percent == self.config.expected_max_abs_pwm_percent
-            && hello.max_abs_pwm_percent.grants_motion_authority()
-            && hello.session_admission() == Ok(self.config.expected_session_admission())
-            && hello.output_state.is_safe()
+        self.hello_rejection(hello).is_none()
+    }
+
+    fn hello_rejection(&self, hello: ControllerHello) -> Option<ControllerHelloRejection> {
+        if hello.controller_uid != self.config.controller_uid {
+            Some(ControllerHelloRejection::ControllerUid)
+        } else if hello.firmware_abi != self.config.firmware_abi {
+            Some(ControllerHelloRejection::FirmwareAbi)
+        } else if hello.firmware_build_id != self.config.firmware_build_id {
+            Some(ControllerHelloRejection::FirmwareBuildId)
+        } else if hello.actuator_config_fingerprint != self.config.actuator_config_fingerprint {
+            Some(ControllerHelloRejection::ActuatorConfigFingerprint)
+        } else if hello.pwm_frequency != self.config.expected_pwm_frequency {
+            Some(ControllerHelloRejection::PwmFrequency)
+        } else if hello.watchdog_nominal_period != self.config.expected_watchdog_nominal_period {
+            Some(ControllerHelloRejection::WatchdogNominalPeriod)
+        } else if hello.neutral_output != self.config.expected_neutral_output {
+            Some(ControllerHelloRejection::NeutralOutput)
+        } else if hello.physical_stop_semantics != self.config.expected_physical_stop_semantics {
+            Some(ControllerHelloRejection::PhysicalStopSemantics)
+        } else if hello.max_abs_pwm_percent != self.config.expected_max_abs_pwm_percent {
+            Some(ControllerHelloRejection::MaximumPwm)
+        } else if !hello.max_abs_pwm_percent.grants_motion_authority() {
+            Some(ControllerHelloRejection::MotionAuthority)
+        } else if hello.session_admission() != Ok(self.config.expected_session_admission()) {
+            Some(ControllerHelloRejection::SessionAdmission)
+        } else if !hello.output_state.is_safe() {
+            Some(ControllerHelloRejection::OutputState)
+        } else {
+            None
+        }
+    }
+
+    fn ready_rejection(&self, ready: ControllerReady) -> Option<ControllerReadyRejection> {
+        if self.startup_begin_after_stop.is_some() || self.last_internal_stop.is_some() {
+            return Some(ControllerReadyRejection::StartupStopPending);
+        }
+        let Some(hello) = self.hello else {
+            return Some(ControllerReadyRejection::ControllerHelloUnavailable);
+        };
+        if ready.controller_uid != hello.message.controller_uid {
+            Some(ControllerReadyRejection::ControllerUid)
+        } else if ready.boot_id != hello.message.boot_id {
+            Some(ControllerReadyRejection::BootId)
+        } else if ready.capabilities != hello.message.capabilities {
+            Some(ControllerReadyRejection::Capabilities)
+        } else if ready.capabilities.classify_session_admission(
+            self.config.expected_max_abs_pwm_percent,
+            self.config.expected_physical_stop_semantics,
+        ) != Ok(self.config.expected_session_admission())
+        {
+            Some(ControllerReadyRejection::SessionAdmission)
+        } else if !ready.output_state.is_safe() {
+            Some(ControllerReadyRejection::OutputState)
+        } else if !ready.faults.is_clear() {
+            Some(ControllerReadyRejection::ControllerFaults)
+        } else {
+            None
+        }
+    }
+
+    fn pre_session_heartbeat_rejection(
+        &self,
+        heartbeat: Heartbeat,
+    ) -> Option<PreSessionHeartbeatRejection> {
+        if heartbeat.controller_uid != self.config.controller_uid {
+            Some(PreSessionHeartbeatRejection::ControllerUid)
+        } else if !heartbeat.timer_pwm.is_zero() {
+            Some(PreSessionHeartbeatRejection::TimerPwm)
+        } else if !heartbeat.output_state.is_safe() {
+            Some(PreSessionHeartbeatRejection::OutputState)
+        } else if !heartbeat.faults.is_clear() {
+            Some(PreSessionHeartbeatRejection::ControllerFaults)
+        } else {
+            None
+        }
+    }
+
+    fn session_heartbeat_rejection(
+        &self,
+        heartbeat: Heartbeat,
+        ready: ReadySession,
+    ) -> Option<SessionHeartbeatRejection> {
+        if heartbeat.controller_uid != ready.message.controller_uid {
+            Some(SessionHeartbeatRejection::ControllerUid)
+        } else if heartbeat.boot_id != ready.message.boot_id {
+            Some(SessionHeartbeatRejection::BootId)
+        } else if !self.heartbeat_state_is_exact(heartbeat, ready) {
+            Some(SessionHeartbeatRejection::SessionState)
+        } else if !heartbeat.faults.is_clear() {
+            Some(SessionHeartbeatRejection::ControllerFaults)
+        } else {
+            None
+        }
     }
 
     fn heartbeat_authorizes_command(
@@ -7649,7 +7772,9 @@ mod tests {
         assert_eq!(snapshot.startup_phase, ActuationStartupPhase::Faulted);
         assert_eq!(
             snapshot.fault,
-            Some(ActuationFaultEvidence::ControllerHelloRejected(rejected))
+            Some(ActuationFaultEvidence::ControllerHelloRejected(
+                ControllerHelloRejection::FirmwareBuildId
+            ))
         );
         assert_eq!(
             snapshot.observed_boot_id,
