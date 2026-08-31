@@ -2546,6 +2546,7 @@ pub enum ConsoleRequestedInferenceBackend {
     Cpu,
     CoremlGpu,
     Cuda,
+    CudaCpuHybrid,
     #[serde(rename = "tensorrt")]
     TensorRt,
 }
@@ -2556,6 +2557,7 @@ pub enum ConsoleSelectedInferenceBackend {
     Cpu,
     CoremlGpu,
     Cuda,
+    CudaCpuHybrid,
     #[serde(rename = "tensorrt")]
     TensorRt,
 }
@@ -4096,8 +4098,8 @@ mod tests {
         snapshot.slam = Some(ConsoleSlamSnapshot {
             inference: ConsoleInferenceRuntime {
                 superpoint: ConsoleInferenceSelection {
-                    requested: ConsoleRequestedInferenceBackend::Auto,
-                    selected: ConsoleSelectedInferenceBackend::Cuda,
+                    requested: ConsoleRequestedInferenceBackend::CudaCpuHybrid,
+                    selected: ConsoleSelectedInferenceBackend::CudaCpuHybrid,
                 },
                 lightglue: ConsoleInferenceSelection {
                     requested: ConsoleRequestedInferenceBackend::TensorRt,
@@ -4127,7 +4129,10 @@ mod tests {
         assert_eq!(json["slam"]["rate_window"]["span_ns"], u64::MAX.to_string());
         assert_eq!(
             json["slam"]["inference"]["superpoint"],
-            serde_json::json!({"requested": "auto", "selected": "cuda"})
+            serde_json::json!({
+                "requested": "cuda_cpu_hybrid",
+                "selected": "cuda_cpu_hybrid"
+            })
         );
         assert_eq!(
             json["slam"]["inference"]["lightglue"],

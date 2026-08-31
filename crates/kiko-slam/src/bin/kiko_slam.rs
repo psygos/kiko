@@ -918,6 +918,8 @@ enum BackendArg {
     CoremlGpu,
     #[value(name = "cuda")]
     Cuda,
+    #[value(name = "cuda-cpu-hybrid")]
+    CudaCpuHybrid,
     #[value(name = "tensorrt", alias = "trt")]
     TensorRt,
 }
@@ -929,6 +931,7 @@ impl From<BackendArg> for InferenceBackend {
             BackendArg::Cpu => InferenceBackend::Cpu,
             BackendArg::CoremlGpu => InferenceBackend::CoreMLGpu,
             BackendArg::Cuda => InferenceBackend::Cuda,
+            BackendArg::CudaCpuHybrid => InferenceBackend::CudaCpuHybrid,
             BackendArg::TensorRt => InferenceBackend::TensorRT,
         }
     }
@@ -1276,6 +1279,7 @@ enum LiveSelectedInferenceBackend {
     Cpu,
     CoremlGpu,
     Cuda,
+    CudaCpuHybrid,
     TensorRt,
 }
 
@@ -1292,6 +1296,7 @@ impl LiveSelectedInferenceBackend {
             InferenceBackend::Cpu => Ok(Self::Cpu),
             InferenceBackend::CoreMLGpu => Ok(Self::CoremlGpu),
             InferenceBackend::Cuda => Ok(Self::Cuda),
+            InferenceBackend::CudaCpuHybrid => Ok(Self::CudaCpuHybrid),
             InferenceBackend::TensorRT => Ok(Self::TensorRt),
         }
     }
@@ -2299,6 +2304,7 @@ const fn live_inference_backend_name(backend: InferenceBackend) -> &'static str 
         InferenceBackend::Cpu => "cpu",
         InferenceBackend::CoreMLGpu => "coreml_gpu",
         InferenceBackend::Cuda => "cuda",
+        InferenceBackend::CudaCpuHybrid => "cuda_cpu_hybrid",
         InferenceBackend::TensorRT => "tensorrt",
     }
 }
@@ -2311,6 +2317,7 @@ const fn live_selected_inference_backend_name(
         LiveSelectedInferenceBackend::Cpu => "cpu",
         LiveSelectedInferenceBackend::CoremlGpu => "coreml_gpu",
         LiveSelectedInferenceBackend::Cuda => "cuda",
+        LiveSelectedInferenceBackend::CudaCpuHybrid => "cuda_cpu_hybrid",
         LiveSelectedInferenceBackend::TensorRt => "tensorrt",
     }
 }
@@ -7340,6 +7347,7 @@ const fn console_requested_inference_backend(
         InferenceBackend::Cpu => ConsoleRequestedInferenceBackend::Cpu,
         InferenceBackend::CoreMLGpu => ConsoleRequestedInferenceBackend::CoremlGpu,
         InferenceBackend::Cuda => ConsoleRequestedInferenceBackend::Cuda,
+        InferenceBackend::CudaCpuHybrid => ConsoleRequestedInferenceBackend::CudaCpuHybrid,
         InferenceBackend::TensorRT => ConsoleRequestedInferenceBackend::TensorRt,
     }
 }
@@ -7352,6 +7360,9 @@ const fn console_selected_inference_backend(
         LiveSelectedInferenceBackend::Cpu => ConsoleSelectedInferenceBackend::Cpu,
         LiveSelectedInferenceBackend::CoremlGpu => ConsoleSelectedInferenceBackend::CoremlGpu,
         LiveSelectedInferenceBackend::Cuda => ConsoleSelectedInferenceBackend::Cuda,
+        LiveSelectedInferenceBackend::CudaCpuHybrid => {
+            ConsoleSelectedInferenceBackend::CudaCpuHybrid
+        }
         LiveSelectedInferenceBackend::TensorRt => ConsoleSelectedInferenceBackend::TensorRt,
     }
 }

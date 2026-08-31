@@ -555,6 +555,7 @@ pub enum NanoInferenceBackend {
     Auto,
     Cpu,
     Cuda,
+    CudaCpuHybrid,
     TensorRt,
 }
 
@@ -564,6 +565,7 @@ impl NanoInferenceBackend {
             Self::Auto => InferenceBackend::Auto,
             Self::Cpu => InferenceBackend::Cpu,
             Self::Cuda => InferenceBackend::Cuda,
+            Self::CudaCpuHybrid => InferenceBackend::CudaCpuHybrid,
             Self::TensorRt => InferenceBackend::TensorRT,
         }
     }
@@ -2166,6 +2168,7 @@ fn parse_inference_backend(
         "auto" => Ok(NanoInferenceBackend::Auto),
         "cpu" => Ok(NanoInferenceBackend::Cpu),
         "cuda" => Ok(NanoInferenceBackend::Cuda),
+        "cuda_cpu_hybrid" => Ok(NanoInferenceBackend::CudaCpuHybrid),
         "tensorrt" => Ok(NanoInferenceBackend::TensorRt),
         _ => Err(NanoAgentLaunchParseError::UnsupportedInferenceBackend { field }),
     }
@@ -2825,6 +2828,23 @@ mod tests {
             1_073_741_824
         );
         assert_eq!(dataset_limits.terminal_reserve_bytes(), 268_435_456);
+    }
+
+    #[test]
+    fn explicit_cuda_cpu_hybrid_survives_the_launch_parse_boundary() {
+        let mut value = valid_value();
+        value["inference"]["superpoint_backend"] = json!("cuda_cpu_hybrid");
+        value["inference"]["lightglue_backend"] = json!("cuda_cpu_hybrid");
+
+        let launch = parse(&value).expect("explicit hybrid provider plan");
+        assert_eq!(
+            launch.inference().superpoint_backend().runtime(),
+            InferenceBackend::CudaCpuHybrid
+        );
+        assert_eq!(
+            launch.inference().lightglue_backend().runtime(),
+            InferenceBackend::CudaCpuHybrid
+        );
     }
 
     #[test]

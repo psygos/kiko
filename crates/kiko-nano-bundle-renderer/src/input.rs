@@ -314,6 +314,7 @@ pub enum InferenceBackend {
     Auto,
     Cpu,
     Cuda,
+    CudaCpuHybrid,
     #[serde(rename = "tensorrt")]
     TensorRt,
 }
@@ -324,6 +325,7 @@ impl InferenceBackend {
             Self::Auto => "auto",
             Self::Cpu => "cpu",
             Self::Cuda => "cuda",
+            Self::CudaCpuHybrid => "cuda_cpu_hybrid",
             Self::TensorRt => "tensorrt",
         }
     }

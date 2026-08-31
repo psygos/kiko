@@ -12,6 +12,9 @@ pub enum InferenceBackend {
     Cpu,
     CoreMLGpu,
     Cuda,
+    /// CUDA is the primary execution provider and ONNX Runtime may assign
+    /// unsupported graph nodes to the explicitly configured CPU provider.
+    CudaCpuHybrid,
     TensorRT,
 }
 
@@ -33,6 +36,11 @@ impl InferenceBackend {
         }
         if value.eq_ignore_ascii_case("cuda") {
             return Some(Self::Cuda);
+        }
+        if value.eq_ignore_ascii_case("cuda-cpu-hybrid")
+            || value.eq_ignore_ascii_case("cuda_cpu_hybrid")
+        {
+            return Some(Self::CudaCpuHybrid);
         }
         if value.eq_ignore_ascii_case("tensorrt") {
             return Some(Self::TensorRT);
@@ -92,6 +100,14 @@ pub(crate) fn select_backend(
                 return Err(InferenceError::BackendUnavailable { requested });
             }
         }
+        InferenceBackend::CudaCpuHybrid => {
+            if let Some(ep) = cuda_provider()? {
+                providers.push(ep);
+                selected = InferenceBackend::CudaCpuHybrid;
+            } else {
+                return Err(InferenceError::BackendUnavailable { requested });
+            }
+        }
         InferenceBackend::TensorRT => {
             if let Some(ep) = tensorrt_provider()? {
                 providers.push(ep);
@@ -115,7 +131,11 @@ pub(crate) fn select_backend(
         selected = InferenceBackend::Cpu;
     }
 
-    let strict_accelerator = explicit && selected != InferenceBackend::Cpu;
+    let strict_accelerator = explicit
+        && !matches!(
+            selected,
+            InferenceBackend::Cpu | InferenceBackend::CudaCpuHybrid
+        );
     if !strict_accelerator {
         providers.push(CPU::default().with_arena_allocator(use_cpu_arena).build());
     }
@@ -235,6 +255,10 @@ mod tests {
         assert_eq!(
             InferenceBackend::parse("TensorRT"),
             Some(InferenceBackend::TensorRT)
+        );
+        assert_eq!(
+            InferenceBackend::parse("CUDA_CPU_HYBRID"),
+            Some(InferenceBackend::CudaCpuHybrid)
         );
         assert_eq!(InferenceBackend::parse("gpu"), None);
     }

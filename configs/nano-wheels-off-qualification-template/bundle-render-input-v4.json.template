@@ -129,8 +129,8 @@
       "snapshot_every_keyframes": 20
     },
     "inference": {
-      "superpoint_backend": "cpu",
-      "lightglue_backend": "cpu",
+      "superpoint_backend": "cuda_cpu_hybrid",
+      "lightglue_backend": "cuda_cpu_hybrid",
       "downscale_factor": 2,
       "maximum_keypoints": 512
     },
@@ -154,7 +154,7 @@
   },
   "head_policy": {
     "response_timeout_ms": 100,
-    "write_timeout_ms": 100,
+    "write_timeout_ms": 20,
     "arming_freshness_ms": 250,
     "write_attempts": 2,
     "noise_budget_bytes": 32,

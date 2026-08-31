@@ -54,7 +54,7 @@
     "mode": "return_to_natural_and_hold_continuously",
     "device_path": "${HEAD_SERIAL_BY_ID_PATH}",
     "response_timeout_ms": 100,
-    "write_timeout_ms": 100,
+    "write_timeout_ms": 20,
     "arming_freshness_ms": 250,
     "write_attempts": 2,
     "noise_budget_bytes": 32,

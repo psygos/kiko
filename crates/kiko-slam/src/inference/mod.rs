@@ -1016,6 +1016,7 @@ impl AsyncIntraThreadPolicy {
                 InferenceBackend::Auto
                 | InferenceBackend::CoreMLGpu
                 | InferenceBackend::Cuda
+                | InferenceBackend::CudaCpuHybrid
                 | InferenceBackend::TensorRT,
             ) => Ok(AsyncIntraThreadCount(OrtThreadCount(
                 AsyncIntraThreadCount::MINIMUM,
@@ -1081,7 +1082,7 @@ impl SessionSettings {
 fn cpu_provider_may_be_configured(requested_backend: InferenceBackend) -> bool {
     matches!(
         requested_backend,
-        InferenceBackend::Auto | InferenceBackend::Cpu
+        InferenceBackend::Auto | InferenceBackend::Cpu | InferenceBackend::CudaCpuHybrid
     )
 }
 
@@ -1507,6 +1508,9 @@ mod tests {
         assert!(cpu_provider_may_be_configured(InferenceBackend::Cpu));
         assert!(!cpu_provider_may_be_configured(InferenceBackend::CoreMLGpu));
         assert!(!cpu_provider_may_be_configured(InferenceBackend::Cuda));
+        assert!(cpu_provider_may_be_configured(
+            InferenceBackend::CudaCpuHybrid
+        ));
         assert!(!cpu_provider_may_be_configured(InferenceBackend::TensorRT));
     }
 
@@ -1593,6 +1597,7 @@ mod tests {
             InferenceBackend::Auto,
             InferenceBackend::CoreMLGpu,
             InferenceBackend::Cuda,
+            InferenceBackend::CudaCpuHybrid,
             InferenceBackend::TensorRT,
         ] {
             assert_eq!(
