@@ -10,7 +10,7 @@ mod deadline;
 
 pub use actuation_v2::{
     ActuationActorError, ActuationOutputEvidence, ActuationSnapshot, ActuationStartError,
-    ActuationTelemetry, NoopActuationTelemetry, ObservedActuationOutput,
+    ActuationStartupPhase, ActuationTelemetry, NoopActuationTelemetry, ObservedActuationOutput,
     SerialResynchronizationOutcome, SerialTransmitError, SerialTransmitInterruption,
     SerialTransmitPhase, ShutdownForceStopOutcome, ShutdownInterruptedTransmitRecovery,
     UdpServiceError,

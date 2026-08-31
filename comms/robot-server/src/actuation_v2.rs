@@ -136,10 +136,21 @@ fn qualification_partial_uart_record_error(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActuationSnapshot {
     pub status: StatusCode,
+    pub startup_phase: ActuationStartupPhase,
     pub observed_boot_id: TargetBootId,
     pub control_epoch: Option<ControlEpoch>,
     pub output: ActuationOutputEvidence,
     pub last_sequence: Option<V2CommandSequence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActuationStartupPhase {
+    AwaitingHello,
+    AwaitingStartupStopReceipt,
+    AwaitingControllerReady,
+    AwaitingStoppedHeartbeat,
+    ReadyStopped,
+    Faulted,
 }
 
 /// Current controller-output knowledge exposed to telemetry and UI adapters.
@@ -3533,6 +3544,7 @@ where
             });
         ActuationSnapshot {
             status: status.status,
+            startup_phase: self.startup_phase(),
             observed_boot_id: status.observed_boot_id,
             control_epoch: status.control_epoch,
             output,
@@ -3541,6 +3553,22 @@ where
                 .as_ref()
                 .and_then(|owner| owner.cached)
                 .map(|cached| cached.command.sequence),
+        }
+    }
+
+    fn startup_phase(&self) -> ActuationStartupPhase {
+        if self.faulted {
+            ActuationStartupPhase::Faulted
+        } else if self.startup_ready.is_none() {
+            ActuationStartupPhase::ReadyStopped
+        } else if self.hello.is_none() {
+            ActuationStartupPhase::AwaitingHello
+        } else if self.startup_begin_after_stop.is_some() || self.last_internal_stop.is_some() {
+            ActuationStartupPhase::AwaitingStartupStopReceipt
+        } else if self.ready.is_none() {
+            ActuationStartupPhase::AwaitingControllerReady
+        } else {
+            ActuationStartupPhase::AwaitingStoppedHeartbeat
         }
     }
 

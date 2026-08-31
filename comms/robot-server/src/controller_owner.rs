@@ -2,8 +2,8 @@
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
@@ -45,6 +45,45 @@ enum ControllerActorStart {
         candidate: ControllerServerConfigV2,
         fault: OperatorSupervisedCandidateSerialFaultInjection,
     },
+}
+
+struct StartupTelemetry {
+    downstream: Arc<dyn ActuationTelemetry>,
+    latest: Mutex<Option<actuation_v2::ActuationSnapshot>>,
+}
+
+impl StartupTelemetry {
+    fn new(downstream: Arc<dyn ActuationTelemetry>) -> Self {
+        Self {
+            downstream,
+            latest: Mutex::new(None),
+        }
+    }
+
+    fn latest(&self) -> Option<actuation_v2::ActuationSnapshot> {
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl ActuationTelemetry for StartupTelemetry {
+    fn update_actuation(&self, snapshot: actuation_v2::ActuationSnapshot) {
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+        self.downstream.update_actuation(snapshot);
+    }
+
+    fn observe_odometry(
+        &self,
+        odometry: robot_protocol::v2::ObservationalOdometry,
+        received_at: Instant,
+    ) {
+        self.downstream.observe_odometry(odometry, received_at);
+    }
 }
 
 impl ControllerActorStart {
@@ -131,16 +170,21 @@ impl V2ControllerOwner {
         let command_address = socket
             .local_addr()
             .map_err(V2ControllerOwnerStartError::ReadBoundCommandAddress)?;
+        let startup_telemetry = Arc::new(StartupTelemetry::new(telemetry));
         let (actuation, startup_ready, actuation_task) = match actor_start {
             ControllerActorStart::Normal(controller) => {
-                actuation_v2::start_serial_actor(controller, telemetry).await
+                actuation_v2::start_serial_actor(controller, startup_telemetry.clone()).await
             }
             #[cfg(feature = "qualification-fault-injection")]
             ControllerActorStart::CandidateFault {
                 candidate, fault, ..
             } => {
-                actuation_v2::start_candidate_serial_actor_with_fault(candidate, telemetry, fault)
-                    .await
+                actuation_v2::start_candidate_serial_actor_with_fault(
+                    candidate,
+                    startup_telemetry.clone(),
+                    fault,
+                )
+                .await
             }
         }
         .map_err(V2ControllerOwnerStartError::Controller)?;
@@ -158,12 +202,14 @@ impl V2ControllerOwner {
                 })
             }
             Err(_) => {
+                let last_observation = startup_telemetry.latest();
                 let cleanup = match owner.shutdown(shutdown_timeout).await {
                     Ok(()) => V2ControllerOwnerStartCleanup::Confirmed,
                     Err(source) => V2ControllerOwnerStartCleanup::Uncertain(Box::new(source)),
                 };
                 Err(V2ControllerOwnerStartError::ControllerReadyTimedOut {
                     maximum_wait: controller_ready_timeout,
+                    last_observation,
                     cleanup,
                 })
             }
@@ -412,6 +458,7 @@ pub enum V2ControllerOwnerStartError {
     Controller(ActuationStartError),
     ControllerReadyTimedOut {
         maximum_wait: Duration,
+        last_observation: Option<actuation_v2::ActuationSnapshot>,
         cleanup: V2ControllerOwnerStartCleanup,
     },
     ControllerStoppedBeforeReady {
@@ -439,10 +486,11 @@ impl fmt::Display for V2ControllerOwnerStartError {
             }
             Self::ControllerReadyTimedOut {
                 maximum_wait,
+                last_observation,
                 cleanup,
             } => write!(
                 formatter,
-                "exact V2 controller did not reach ready-stopped within {maximum_wait:?}; {cleanup}"
+                "exact V2 controller did not reach ready-stopped within {maximum_wait:?}; last observation {last_observation:?}; {cleanup}"
             ),
             Self::ControllerStoppedBeforeReady { termination } => write!(
                 formatter,
