@@ -274,7 +274,11 @@ sudo /usr/bin/env LD_LIBRARY_PATH=/opt/kiko/qualification/lib \
 
 The state root remains launch-bound even though this entry point is not a
 qualification run: the rendered policy names its absolute map destination.
-Stationary-lab datasets carry no motion or physical-qualification claim.
+The stationary lab does not allocate or publish a replay dataset. Its
+constant-memory ingress sequencer preserves live ordering checks for SLAM,
+occupancy, MPC shadow diagnostics, and the console without retaining sensor
+payloads or fabricating a persistence claim. Publishable recording remains
+enabled in the attended and production paths only.
 
 The mode still owns and supervises the exact STM32 serial endpoint because an
 applied zero/disarm receipt and exclusive ownership are useful integration

@@ -25,11 +25,12 @@ use super::global_planner::{
 use super::goal_input::MapPointGoalSelection;
 use super::ingress::{
     AcceptedDepthIngress, AcceptedGlobalMapIngress, ControlTickIngress, CurrentMapEpochBinding,
-    MapPointGoalIngress, NavigationClockEpoch, NavigationIngressBoundaryError,
-    NavigationIngressEvent, NavigationIngressLog, NavigationIngressRecord,
-    NavigationIngressStreamWriteError, NavigationIngressWriteError, NavigationIngressWriter,
-    NavigationMapEpochCoordinator, NavigationReplayClock, NavigationReplayClockError,
-    RecordedImuReport, RecordedMapEpochId, VisualAttemptIngress, VisualAttemptOutcome,
+    EphemeralNavigationIngress, MapPointGoalIngress, NavigationClockEpoch,
+    NavigationIngressBoundaryError, NavigationIngressEvent, NavigationIngressLog,
+    NavigationIngressRecord, NavigationIngressStreamWriteError, NavigationIngressWriteError,
+    NavigationIngressWriter, NavigationMapEpochCoordinator, NavigationReplayClock,
+    NavigationReplayClockError, RecordedImuReport, RecordedMapEpochId, VisualAttemptIngress,
+    VisualAttemptOutcome,
 };
 use super::local_costmap::{
     DepthFrameKey, LocalCostmap, LocalCostmapClockRegression, LocalCostmapError,
@@ -77,6 +78,17 @@ impl NavigationIngressSink for NavigationIngressLog {
         event: NavigationIngressEvent,
     ) -> Result<NavigationIngressRecord, Self::Error> {
         self.push(event)
+    }
+}
+
+impl NavigationIngressSink for EphemeralNavigationIngress {
+    type Error = NavigationIngressWriteError;
+
+    fn append_event(
+        &mut self,
+        event: NavigationIngressEvent,
+    ) -> Result<NavigationIngressRecord, Self::Error> {
+        self.admit(event)
     }
 }
 

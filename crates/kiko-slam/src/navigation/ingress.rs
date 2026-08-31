@@ -1541,6 +1541,53 @@ impl NavigationIngressLog {
     }
 }
 
+/// Constant-memory ingress sequencer for live diagnostic sessions that must
+/// not claim to produce a replayable navigation dataset.
+///
+/// This owner enforces the same ordering contract and assigns the same
+/// contiguous record identities as the persistent journal, but deliberately
+/// retains no event payload and exposes no finalization or descriptor API.
+/// It is therefore suitable only when the launch mode has already made
+/// persistence structurally unavailable.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EphemeralNavigationIngress {
+    record_count: u64,
+    order_state: NavigationIngressOrderState,
+}
+
+impl EphemeralNavigationIngress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_count(&self) -> u64 {
+        self.record_count
+    }
+
+    /// Validate one event, assign its contiguous process-local sequence, and
+    /// immediately forget its payload. Failure leaves the sequencer unchanged.
+    pub fn admit(
+        &mut self,
+        event: NavigationIngressEvent,
+    ) -> Result<NavigationIngressRecord, NavigationIngressWriteError> {
+        self.order_state
+            .validate(event)
+            .map_err(NavigationIngressWriteError::from_order_violation)?;
+        let raw = self
+            .record_count
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(NavigationIngressWriteError::SequenceExhausted)?;
+        let record = NavigationIngressRecord {
+            sequence: NavigationIngressSequence(raw),
+            event,
+        };
+        self.record_count = raw.get();
+        self.order_state.commit(event);
+        Ok(record)
+    }
+}
+
 fn requested_record_storage_bytes(record_count: usize) -> Option<usize> {
     record_count.checked_mul(std::mem::size_of::<NavigationIngressRecord>())
 }
@@ -3396,6 +3443,51 @@ mod tests {
         assert_eq!(ingress.left_frame_id(), expected_left_frame);
         assert_eq!(ingress.right_frame_id(), expected_right_frame);
         assert_eq!(ingress.outcome(), VisualAttemptOutcome::LocalizationOnly);
+    }
+
+    #[test]
+    fn ephemeral_ingress_sequences_without_retaining_a_bounded_log() {
+        let events = mixed_events();
+        let mut ingress = EphemeralNavigationIngress::new();
+        for (index, event) in events.into_iter().enumerate() {
+            let record = ingress.admit(event).expect("ephemeral admission");
+            assert_eq!(
+                record.sequence().as_u64(),
+                u64::try_from(index + 1).expect("small fixture index")
+            );
+        }
+        assert_eq!(ingress.record_count(), 8);
+    }
+
+    #[test]
+    fn ephemeral_ingress_rejects_invalid_order_without_advancing() {
+        let snapshot = snapshot(4);
+        let mut coordinator = NavigationMapEpochCoordinator::new();
+        let transition = transition(&mut coordinator, &snapshot, 970);
+        let goal = NavigationIngressEvent::PointGoal(
+            MapPointGoalIngress::parse(
+                clock(),
+                host_time(1_000),
+                transition.binding(),
+                point_goal(&snapshot),
+            )
+            .expect("goal ingress"),
+        );
+        let mut ingress = EphemeralNavigationIngress::new();
+
+        assert_eq!(
+            ingress.admit(goal),
+            Err(NavigationIngressWriteError::GoalBeforeMapEpoch)
+        );
+        assert_eq!(ingress.record_count(), 0);
+        assert_eq!(
+            ingress
+                .admit(NavigationIngressEvent::MapEpochStarted(transition.event()))
+                .expect("first map epoch")
+                .sequence()
+                .as_u64(),
+            1
+        );
     }
 
     #[test]

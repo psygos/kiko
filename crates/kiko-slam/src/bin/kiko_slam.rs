@@ -152,13 +152,13 @@ use kiko_slam::navigation::{
 #[cfg(feature = "record")]
 use kiko_slam::navigation::{
     ControlPeriodNs, CoordinatorAdmissionError, CoordinatorTickError, CoordinatorTickOutcome,
-    NAVIGATION_INGRESS_STREAM_FILE, NavigationClockEpoch, NavigationIngressBoundaryError,
-    NavigationIngressCapacity, NavigationIngressCapacityError, NavigationIngressEvent,
-    NavigationIngressReader, NavigationIngressSidecarDescriptor, NavigationIngressStreamReadError,
-    NavigationIngressStreamWriteError, NavigationIngressWriter, NavigationRecordingId,
-    NavigationRecordingIdError, PendingVisualAttemptIngress, RecordedMapEpochId,
-    SafetyDecisionOutcome, ShadowNavigationCoordinator, VisualAdmission, VisualAdmissionError,
-    VisualAttemptOutcome,
+    EphemeralNavigationIngress, NAVIGATION_INGRESS_STREAM_FILE, NavigationClockEpoch,
+    NavigationIngressBoundaryError, NavigationIngressCapacity, NavigationIngressCapacityError,
+    NavigationIngressEvent, NavigationIngressReader, NavigationIngressSidecarDescriptor,
+    NavigationIngressSink, NavigationIngressStreamReadError, NavigationIngressStreamWriteError,
+    NavigationIngressWriter, NavigationRecordingId, NavigationRecordingIdError,
+    PendingVisualAttemptIngress, RecordedMapEpochId, SafetyDecisionOutcome,
+    ShadowNavigationCoordinator, VisualAdmission, VisualAdmissionError, VisualAttemptOutcome,
 };
 #[cfg(all(feature = "nano-agent", unix))]
 use kiko_slam::navigation::{
@@ -883,8 +883,9 @@ struct NanoStationaryLabArgs {
     /// Canonical deployment-relative wheels-off launch document.
     #[arg(long, value_name = "RELATIVE_JSON")]
     launch_config: String,
-    /// Launch-bound persistent state root for lab datasets and diagnostics.
-    /// It must match the absolute map-persistence paths in the rendered policy.
+    /// Launch-bound persistent state root for maps and diagnostics. Stationary
+    /// lab navigation ingress is ephemeral and never publishes a replay dataset.
+    /// This root must match the map-persistence paths in the rendered policy.
     #[arg(long, value_name = "ABSOLUTE_DIRECTORY")]
     state_root: PathBuf,
 }
@@ -4938,6 +4939,44 @@ impl LiveNavigationVizMsg {
     }
 }
 
+/// The navigation owner either writes one publishable dataset journal or
+/// sequences diagnostic events without retaining them. The latter exists only
+/// for the prompt-free, zero-authority stationary lab and cannot yield a
+/// dataset descriptor by construction.
+#[cfg(feature = "record")]
+#[derive(Debug)]
+enum LiveNavigationIngress {
+    Persistent(NavigationIngressWriter<File>),
+    Ephemeral(EphemeralNavigationIngress),
+}
+
+#[cfg(feature = "record")]
+impl NavigationIngressSink for LiveNavigationIngress {
+    type Error = NavigationIngressStreamWriteError;
+
+    fn append_event(
+        &mut self,
+        event: NavigationIngressEvent,
+    ) -> Result<kiko_slam::navigation::NavigationIngressRecord, Self::Error> {
+        match self {
+            Self::Persistent(writer) => writer.append(event),
+            Self::Ephemeral(sequencer) => sequencer
+                .admit(event)
+                .map_err(NavigationIngressStreamWriteError::Write),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+type LiveNavigationCoordinator = ShadowNavigationCoordinator<LiveNavigationIngress>;
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveNavigationPersistence {
+    PublishableDataset,
+    EphemeralDiagnostic,
+}
+
 #[cfg(feature = "record")]
 struct LiveOdometryViz {
     state: Option<String>,
@@ -4946,9 +4985,7 @@ struct LiveOdometryViz {
 }
 
 #[cfg(feature = "record")]
-fn live_odometry_viz(
-    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
-) -> LiveOdometryViz {
+fn live_odometry_viz(coordinator: &LiveNavigationCoordinator) -> LiveOdometryViz {
     let current = coordinator.odometry().current();
     LiveOdometryViz {
         base_to_odom: current.map(|state| {
@@ -4989,7 +5026,7 @@ fn rerun_point2(value: [f64; 2]) -> Option<[f32; 2]> {
 
 #[cfg(feature = "record")]
 fn build_live_navigation_viz_message(
-    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: &LiveNavigationCoordinator,
     tick: HostMonotonicTimestamp,
     tick_sequence: i64,
     outcome: &CoordinatorTickOutcome<NavigationIngressStreamWriteError>,
@@ -5140,7 +5177,7 @@ fn build_live_navigation_viz_message(
     unix
 ))]
 fn build_live_lifecycle_zero_viz_message(
-    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: &LiveNavigationCoordinator,
     tick_sequence: i64,
     applied: &LiveLifecycleZeroApplied<AppliedCommandReceipt>,
 ) -> LiveNavigationVizMsg {
@@ -5183,7 +5220,7 @@ fn build_live_lifecycle_zero_viz_message(
     unix
 ))]
 fn build_live_actuation_fault_viz_message(
-    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: &LiveNavigationCoordinator,
     tick_sequence: i64,
     observed_at: HostMonotonicTimestamp,
     evidence: LiveMotionActuationFaultEvidence,
@@ -5239,7 +5276,7 @@ fn build_live_actuation_fault_viz_message(
     unix
 ))]
 fn build_live_terminal_controller_stop_viz_message(
-    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: &LiveNavigationCoordinator,
     tick_sequence: i64,
     timeline_at_ns: Option<u64>,
     controller_stop_confirmed: bool,
@@ -5359,7 +5396,7 @@ fn publish_live_navigation_viz_message(
 ))]
 fn publish_live_physical_state_viz(
     sender: &mut Option<DropSender<LiveNavigationVizMsg>>,
-    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: &LiveNavigationCoordinator,
     tick_sequence: i64,
     timing: LiveControlTickTiming,
     event: &LivePhysicalStateEvent<
@@ -6479,7 +6516,7 @@ type LiveCoordinatorAdmissionError = CoordinatorAdmissionError<NavigationIngress
     unix
 ))]
 type ProductionLiveMotionOwner =
-    LiveMotionOwner<NavigationIngressWriter<File>, LiveMpcControlDriver, InstantHostClock>;
+    LiveMotionOwner<LiveNavigationIngress, LiveMpcControlDriver, InstantHostClock>;
 
 #[cfg(all(
     feature = "record",
@@ -6487,10 +6524,8 @@ type ProductionLiveMotionOwner =
     feature = "agent-runtime",
     unix
 ))]
-type LiveProductionMotionStartFailure = Box<(
-    ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
-    LiveProductionOwnerStartError,
-)>;
+type LiveProductionMotionStartFailure =
+    Box<(LiveNavigationCoordinator, LiveProductionOwnerStartError)>;
 
 /// Motion ownership selected before the navigation worker starts.
 ///
@@ -6659,6 +6694,16 @@ impl LiveProductionMotionInput {
 enum WheelsOffMotionAccess {
     Attended(AttendedWheelsOffPreflight),
     StationaryLab,
+}
+
+#[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+fn wheels_off_navigation_persistence(
+    motion_access: &WheelsOffMotionAccess,
+) -> LiveNavigationPersistence {
+    match motion_access {
+        WheelsOffMotionAccess::Attended(_) => LiveNavigationPersistence::PublishableDataset,
+        WheelsOffMotionAccess::StationaryLab => LiveNavigationPersistence::EphemeralDiagnostic,
+    }
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
@@ -7770,6 +7815,7 @@ enum LiveNavigationWorkerError {
     JournalVerification {
         source: NavigationIngressStreamReadError,
     },
+    PersistentJournalUnavailable,
 }
 
 #[cfg(feature = "record")]
@@ -8010,6 +8056,9 @@ impl std::fmt::Display for LiveNavigationWorkerError {
             Self::JournalVerification { source } => {
                 write!(formatter, "synchronized navigation journal failed verification: {source}")
             }
+            Self::PersistentJournalUnavailable => formatter.write_str(
+                "a persistence-required navigation owner finalized an ephemeral diagnostic journal",
+            ),
         }
     }
 }
@@ -8035,7 +8084,7 @@ impl std::error::Error for LiveNavigationWorkerError {
             Self::JournalSync { source } | Self::JournalSeek { source } => Some(source),
             Self::JournalCapacity { source } => Some(source),
             Self::JournalVerification { source } => Some(source),
-            Self::JournalRecordCountOutOfRange { .. } => None,
+            Self::JournalRecordCountOutOfRange { .. } | Self::PersistentJournalUnavailable => None,
             #[cfg(feature = "actuation")]
             Self::Actuation { source, .. } => Some(source),
             #[cfg(feature = "actuation")]
@@ -8145,7 +8194,7 @@ fn combine_live_navigation_failures(
 
 #[cfg(feature = "record")]
 struct LiveNavigationWorkerSuccess {
-    descriptor: NavigationIngressSidecarDescriptor,
+    descriptor: Option<NavigationIngressSidecarDescriptor>,
 }
 
 #[cfg(feature = "record")]
@@ -8258,14 +8307,14 @@ struct PendingNanoWarmCheckpoint {
 
 #[cfg(feature = "record")]
 struct LiveCompatibilityNavigationRuntime {
-    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: LiveNavigationCoordinator,
     #[cfg(feature = "actuation")]
     physical_actuation: Option<LiveMpcControlDriver>,
 }
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 struct LiveWheelsOffQualificationMotionRuntime {
-    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: LiveNavigationCoordinator,
     controller: Option<kiko_slam::navigation::WheelsOffQualificationRuntime>,
     frontend: Option<kiko_slam::navigation::WheelsOffQualificationFrontend>,
     attestation_gate: Option<FreshAttendedMotionAttestationGate>,
@@ -8510,10 +8559,19 @@ impl LiveNavigationRuntime {
 
 #[cfg(feature = "record")]
 fn finalize_live_navigation_coordinator(
-    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
-) -> Result<FinalizedLiveNavigationJournal, LiveNavigationWorkerError> {
-    let finalized = coordinator
-        .into_journal()
+    coordinator: LiveNavigationCoordinator,
+) -> Result<Option<FinalizedLiveNavigationJournal>, LiveNavigationWorkerError> {
+    let writer = match coordinator.into_journal() {
+        LiveNavigationIngress::Persistent(writer) => writer,
+        LiveNavigationIngress::Ephemeral(sequencer) => {
+            eprintln!(
+                "ephemeral navigation ingress finalized: sequenced_records={} dataset_published=false",
+                sequencer.record_count(),
+            );
+            return Ok(None);
+        }
+    };
+    let finalized = writer
         .finish_with_descriptor()
         .map_err(|source| LiveNavigationWorkerError::JournalFinalization { source })?;
     let (mut file, descriptor) = finalized.into_parts();
@@ -8551,10 +8609,10 @@ fn finalize_live_navigation_coordinator(
             | NavigationIngressEvent::QualificationAppliedStep(_) => {}
         }
     }
-    Ok(FinalizedLiveNavigationJournal {
+    Ok(Some(FinalizedLiveNavigationJournal {
         descriptor,
         final_map_identity,
-    })
+    }))
 }
 
 #[cfg(all(
@@ -8634,7 +8692,7 @@ fn fail_started_production_owner(
 ))]
 #[allow(clippy::too_many_arguments)]
 fn start_production_motion_runtime(
-    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: LiveNavigationCoordinator,
     coordinator_clock_epoch: NavigationClockEpoch,
     clock_origin: Instant,
     input: LiveAgentMotionStartInput,
@@ -8900,7 +8958,7 @@ fn start_production_motion_runtime(
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 type LiveWheelsOffQualificationMotionStartFailure = Box<(
-    ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    LiveNavigationCoordinator,
     LiveWheelsOffQualificationMotionStartError,
 )>;
 
@@ -9019,7 +9077,7 @@ impl std::error::Error for LiveWheelsOffQualificationMotionStartError {
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 fn fail_wheels_off_qualification_before_runtime(
-    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: LiveNavigationCoordinator,
     primary: LiveWheelsOffQualificationMotionStartPrimary,
     boot_id: u64,
     stop_request_id: u32,
@@ -9038,7 +9096,7 @@ fn fail_wheels_off_qualification_before_runtime(
 
 #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
 fn start_wheels_off_qualification_motion_runtime(
-    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: LiveNavigationCoordinator,
     mut input: LiveWheelsOffQualificationMotionInput,
     actual_runtime_service_interval: Duration,
     process_running: Arc<AtomicBool>,
@@ -9126,7 +9184,7 @@ fn start_wheels_off_qualification_motion_runtime(
             limits.manual_deadman().as_millis(),
         ),
         WheelsOffMotionAccess::StationaryLab => eprintln!(
-            "stationary lab console ready on {}; capability={}; base motion permanently disabled; SLAM/MPC diagnostics are shadow-only",
+            "stationary lab console ready on {}; capability={}; base motion permanently disabled; SLAM/MPC diagnostics are shadow-only; replay dataset capture disabled",
             frontend.bound_address(),
             frontend_config.capability_path().display(),
         ),
@@ -9197,7 +9255,7 @@ fn start_wheels_off_qualification_motion_runtime(
             // remains useful only for exact zero/disarm and health evidence.
             controller.signal_internal_fail_closed(None);
             eprintln!(
-                "stationary lab runtime is live: base nonzero authority is permanently disabled; exact STM32 zero/disarm, OAK SLAM, occupancy, Rerun, accessories, and the loopback console are starting without an attestation dialog"
+                "stationary lab runtime is live: base nonzero authority is permanently disabled; exact STM32 zero/disarm, OAK SLAM, occupancy, Rerun, accessories, and the loopback console are starting without an attestation dialog or replay-dataset recorder"
             );
             FreshAttendedMotionAttestationGate::Closed(
                 FreshAttendedMotionAttestationClosure::StationaryLabMode,
@@ -9335,7 +9393,7 @@ fn observe_production_console_physical_state(
     unix
 ))]
 fn compose_console_map_pose(
-    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: &LiveNavigationCoordinator,
 ) -> Result<Option<ConsolePose2>, LiveProductionConsoleProjectionError> {
     let Some(current) = coordinator.odometry().current() else {
         return Ok(None);
@@ -9464,7 +9522,7 @@ const fn console_current_solver_path_visible(
     unix
 ))]
 fn build_production_console_navigation_snapshot(
-    coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: &LiveNavigationCoordinator,
     observation: &LiveConsoleNavigationObservation,
     localization: Option<AgentLocalizationStateV1>,
     tick_timing: LiveControlTickTiming,
@@ -10806,7 +10864,7 @@ fn drain_entry_snapshot<T, E>(
 #[cfg(feature = "record")]
 #[allow(clippy::too_many_arguments)]
 fn run_live_navigation_worker(
-    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: LiveNavigationCoordinator,
     control_period: ControlPeriodNs,
     coordinator_clock_epoch: NavigationClockEpoch,
     clock_origin: Instant,
@@ -11468,7 +11526,7 @@ fn run_live_navigation_worker(
                                 let record = qualification
                                     .coordinator
                                     .journal_mut()
-                                    .append(kiko_slam::navigation::NavigationIngressEvent::QualificationAppliedStep(
+                                    .append_event(kiko_slam::navigation::NavigationIngressEvent::QualificationAppliedStep(
                                         ingress,
                                     ))
                                     .map_err(|source| {
@@ -11705,7 +11763,7 @@ fn run_live_navigation_worker(
             {
                 let (descriptor, finalized_map_identity) =
                     match finalize_live_navigation_coordinator(coordinator) {
-                        Ok(finalized) => (
+                        Ok(Some(finalized)) => (
                             Some(finalized.descriptor),
                             finalized.final_map_identity.map(|identity| {
                                 NanoFinalizedJournalMapIdentity::new(
@@ -11714,6 +11772,10 @@ fn run_live_navigation_worker(
                                 )
                             }),
                         ),
+                        Ok(None) => {
+                            failures.push(LiveNavigationWorkerError::PersistentJournalUnavailable);
+                            (None, None)
+                        }
                         Err(source) => {
                             failures.push(source);
                             (None, None)
@@ -12048,7 +12110,7 @@ fn run_live_navigation_worker(
 
     let descriptor = match coordinator {
         Some(coordinator) => match finalize_live_navigation_coordinator(coordinator) {
-            Ok(finalized) => Some(finalized.into_descriptor()),
+            Ok(finalized) => finalized.map(FinalizedLiveNavigationJournal::into_descriptor),
             Err(source) => {
                 failures.push(source);
                 None
@@ -12057,9 +12119,7 @@ fn run_live_navigation_worker(
         None => prefinalized_descriptor,
     };
     combine_live_navigation_failures(failures)?;
-    Ok(LiveNavigationWorkerSuccess {
-        descriptor: descriptor.expect("a failure-free finalization returns a descriptor"),
-    })
+    Ok(LiveNavigationWorkerSuccess { descriptor })
 }
 
 #[cfg(feature = "record")]
@@ -12927,11 +12987,11 @@ fn drain_depth_batch(rx: &DropReceiver<DepthImage>) -> Vec<DepthImage> {
 
 #[cfg(feature = "record")]
 struct ActiveLiveNavigation {
-    coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
+    coordinator: LiveNavigationCoordinator,
     control_period: ControlPeriodNs,
-    dataset_directory: PathBuf,
-    dataset_writer: PairedDatasetWriter,
-    dataset_handle: DatasetWriterHandle,
+    dataset_directory: Option<PathBuf>,
+    dataset_writer: Option<PairedDatasetWriter>,
+    dataset_handle: Option<DatasetWriterHandle>,
     #[cfg(feature = "actuation")]
     actuation: Option<NavigationActuationConfigV1>,
 }
@@ -12981,6 +13041,7 @@ fn fail_navigation_setup_after_dataset<T>(
 #[allow(clippy::too_many_arguments)]
 fn activate_live_navigation(
     runtime: PreparedLiveNavigationRuntime,
+    persistence: LiveNavigationPersistence,
     mono_config: &MonoConfig,
     depth_config: Option<&DepthConfig>,
     imu_config: Option<&ImuConfig>,
@@ -13007,99 +13068,113 @@ fn activate_live_navigation(
         #[cfg(feature = "actuation")]
         actuation,
     } = runtime.into_parts();
-    let meta = build_meta(mono_config, depth_config, imu_config, oak_provenance);
-    let dataset_directory = dataset_path.clone();
-    let imu_metadata = ImuStreamMetadata::new(
-        device_session,
-        ImuExtrinsicProvenance::uncalibrated_unknown(),
-    );
-    let writer_config = DatasetWriterConfig {
-        backpressure: Backpressure::Block,
-        ..DatasetWriterConfig::default()
-    };
-    #[cfg(unix)]
-    let (dataset_writer, dataset_handle) = match dataset_storage_limits {
-        Some(storage_limits) => DatasetWriter::create_paired_with_imu_config_and_storage_limits(
-            &dataset_path,
-            &meta,
-            calibration,
-            pairing_window,
-            imu_metadata,
-            writer_config,
-            storage_limits,
-        )?,
-        None => DatasetWriter::create_paired_with_imu_config(
-            &dataset_path,
-            &meta,
-            calibration,
-            pairing_window,
-            imu_metadata,
-            writer_config,
-        )?,
-    };
-    #[cfg(not(unix))]
-    let (dataset_writer, dataset_handle) = DatasetWriter::create_paired_with_imu_config(
-        &dataset_path,
-        &meta,
-        calibration,
-        pairing_window,
-        imu_metadata,
-        writer_config,
-    )?;
-    let journal_path = dataset_path.join(NAVIGATION_INGRESS_STREAM_FILE);
-    #[cfg(unix)]
-    let quota_bound_journal = match dataset_writer.storage_quota() {
-        Some(_) => match dataset_writer.create_quota_bound_navigation_ingress_file() {
-            Ok((file, quota)) => Some((file, quota)),
-            Err(source) => {
-                return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
-            }
-        },
-        None => None,
-    };
-    #[cfg(unix)]
-    let journal_file_result = match quota_bound_journal.as_ref() {
-        Some((file, _)) => file.try_clone(),
-        None => OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&journal_path),
-    };
-    #[cfg(not(unix))]
-    let journal_file_result = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&journal_path);
-    let journal_file = match journal_file_result {
-        Ok(file) => file,
-        Err(source) => {
-            return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
-        }
-    };
-    let recording_id = match generate_navigation_recording_id() {
-        Ok(recording_id) => recording_id,
-        Err(source) => {
-            return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
-        }
-    };
-    #[cfg(unix)]
-    let journal_result = match quota_bound_journal {
-        Some((_original_file, quota)) => NavigationIngressWriter::new_with_dataset_storage_quota(
-            journal_file,
-            recording_id,
-            ingress_capacity,
-            quota,
+    let (journal, dataset_directory, dataset_writer, dataset_handle) = match persistence {
+        LiveNavigationPersistence::EphemeralDiagnostic => (
+            LiveNavigationIngress::Ephemeral(EphemeralNavigationIngress::new()),
+            None,
+            None,
+            None,
         ),
-        None => NavigationIngressWriter::new(journal_file, recording_id, ingress_capacity),
-    };
-    #[cfg(not(unix))]
-    let journal_result = NavigationIngressWriter::new(journal_file, recording_id, ingress_capacity);
-    let journal = match journal_result {
-        Ok(journal) => journal,
-        Err(source) => {
-            return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
+        LiveNavigationPersistence::PublishableDataset => {
+            let meta = build_meta(mono_config, depth_config, imu_config, oak_provenance);
+            let imu_metadata = ImuStreamMetadata::new(
+                device_session,
+                ImuExtrinsicProvenance::uncalibrated_unknown(),
+            );
+            let writer_config = DatasetWriterConfig {
+                backpressure: Backpressure::Block,
+                ..DatasetWriterConfig::default()
+            };
+            #[cfg(unix)]
+            let (writer, handle) = match dataset_storage_limits {
+                Some(storage_limits) => {
+                    DatasetWriter::create_paired_with_imu_config_and_storage_limits(
+                        &dataset_path,
+                        &meta,
+                        calibration,
+                        pairing_window,
+                        imu_metadata,
+                        writer_config,
+                        storage_limits,
+                    )?
+                }
+                None => DatasetWriter::create_paired_with_imu_config(
+                    &dataset_path,
+                    &meta,
+                    calibration,
+                    pairing_window,
+                    imu_metadata,
+                    writer_config,
+                )?,
+            };
+            #[cfg(not(unix))]
+            let (writer, handle) = DatasetWriter::create_paired_with_imu_config(
+                &dataset_path,
+                &meta,
+                calibration,
+                pairing_window,
+                imu_metadata,
+                writer_config,
+            )?;
+            let journal_path = dataset_path.join(NAVIGATION_INGRESS_STREAM_FILE);
+            #[cfg(unix)]
+            let quota_bound_journal = match writer.storage_quota() {
+                Some(_) => match writer.create_quota_bound_navigation_ingress_file() {
+                    Ok((file, quota)) => Some((file, quota)),
+                    Err(source) => {
+                        return fail_navigation_setup_after_dataset(writer, handle, source);
+                    }
+                },
+                None => None,
+            };
+            #[cfg(unix)]
+            let journal_file_result = match quota_bound_journal.as_ref() {
+                Some((file, _)) => file.try_clone(),
+                None => OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&journal_path),
+            };
+            #[cfg(not(unix))]
+            let journal_file_result = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&journal_path);
+            let journal_file = match journal_file_result {
+                Ok(file) => file,
+                Err(source) => return fail_navigation_setup_after_dataset(writer, handle, source),
+            };
+            let recording_id = match generate_navigation_recording_id() {
+                Ok(recording_id) => recording_id,
+                Err(source) => return fail_navigation_setup_after_dataset(writer, handle, source),
+            };
+            #[cfg(unix)]
+            let journal_result = match quota_bound_journal {
+                Some((_original_file, quota)) => {
+                    NavigationIngressWriter::new_with_dataset_storage_quota(
+                        journal_file,
+                        recording_id,
+                        ingress_capacity,
+                        quota,
+                    )
+                }
+                None => NavigationIngressWriter::new(journal_file, recording_id, ingress_capacity),
+            };
+            #[cfg(not(unix))]
+            let journal_result =
+                NavigationIngressWriter::new(journal_file, recording_id, ingress_capacity);
+            let persistent_journal = match journal_result {
+                Ok(journal) => journal,
+                Err(source) => return fail_navigation_setup_after_dataset(writer, handle, source),
+            };
+            (
+                LiveNavigationIngress::Persistent(persistent_journal),
+                Some(dataset_path),
+                Some(writer),
+                Some(handle),
+            )
         }
     };
     let coordinator = match goal {
@@ -13253,6 +13328,7 @@ struct PreparedLiveSession {
     calibration: Calibration,
     rectified_left_intrinsics: OakIntrinsics,
     prepared_navigation_runtime: Option<PreparedLiveNavigationRuntime>,
+    navigation_persistence: LiveNavigationPersistence,
     inference: InferenceConfig,
     tracker_initialization: PreparedTrackerInitialization,
     pair_queue_depth: usize,
@@ -15430,6 +15506,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
         device,
     ) = resources.into_parts();
     debug_assert_eq!(limits, candidate_limits);
+    let navigation_persistence = wheels_off_navigation_persistence(&motion_access);
 
     Ok(PreparedLiveSession {
         device,
@@ -15449,6 +15526,7 @@ fn prepare_nano_wheels_off_qualification_live_session(
         calibration: software.calibration,
         rectified_left_intrinsics: software.rectified_left_intrinsics,
         prepared_navigation_runtime: Some(software.navigation),
+        navigation_persistence,
         inference: software.inference,
         tracker_initialization: PreparedTrackerInitialization::CanonicalNano,
         pair_queue_depth: software.queue_size,
@@ -15711,6 +15789,7 @@ fn prepare_nano_attended_navigation_trial_live_session(
             calibration: software.calibration,
             rectified_left_intrinsics: software.rectified_left_intrinsics,
             prepared_navigation_runtime: Some(software.navigation),
+            navigation_persistence: LiveNavigationPersistence::PublishableDataset,
             inference: software.inference,
             tracker_initialization: PreparedTrackerInitialization::CanonicalNano,
             pair_queue_depth: software.queue_size,
@@ -15822,6 +15901,7 @@ fn prepare_nano_live_session(
         calibration: software.calibration,
         rectified_left_intrinsics: software.rectified_left_intrinsics,
         prepared_navigation_runtime: Some(software.navigation),
+        navigation_persistence: LiveNavigationPersistence::PublishableDataset,
         inference: software.inference,
         tracker_initialization: PreparedTrackerInitialization::CanonicalNano,
         pair_queue_depth: software.queue_size,
@@ -15897,7 +15977,7 @@ fn run_nano_wheels_off_qualification(
 fn run_nano_stationary_lab(args: NanoStationaryLabArgs) -> Result<(), Box<dyn std::error::Error>> {
     let running = install_live_shutdown_handler()?;
     eprintln!(
-        "stationary lab selected: no physical-attestation dialog will run; base nonzero authority and qualification fault injection are structurally unavailable"
+        "stationary lab selected: no physical-attestation dialog will run; base nonzero authority, qualification fault injection, and replay-dataset publication are structurally unavailable"
     );
     run_nano_wheels_off_runtime(
         args.deployment_root,
@@ -16345,6 +16425,7 @@ fn prepare_compatibility_live_session(
         calibration,
         rectified_left_intrinsics,
         prepared_navigation_runtime,
+        navigation_persistence: LiveNavigationPersistence::PublishableDataset,
         inference,
         tracker_initialization: PreparedTrackerInitialization::Environment,
         pair_queue_depth,
@@ -16405,6 +16486,7 @@ fn run_prepared_live_session(
         calibration,
         rectified_left_intrinsics,
         mut prepared_navigation_runtime,
+        navigation_persistence,
         inference,
         tracker_initialization,
         pair_queue_depth,
@@ -16688,14 +16770,16 @@ fn run_prepared_live_session(
         }
 
         let mut depth_ring = DepthRingBuffer::try_new(depth_ring_capacity.get())?;
-        // Dataset creation is intentionally the final fallible setup boundary.
-        // From this point every exit path consumes its handle through either
-        // bound finalization or abort_without_manifest.
+        // Publishable dataset creation is intentionally the final fallible
+        // setup boundary. The stationary diagnostic path allocates no dataset
+        // owner; every persistent exit still consumes its handle through bound
+        // finalization or abort_without_manifest.
         let active_navigation = prepared_navigation_runtime
             .take()
             .map(|runtime| {
                 activate_live_navigation(
                     runtime,
+                    navigation_persistence,
                     &mono_config,
                     depth_config.as_ref(),
                     imu_config.as_ref(),
@@ -16748,9 +16832,9 @@ fn run_prepared_live_session(
             Some(active) => (
                 Some(active.coordinator),
                 Some(active.control_period),
-                Some(active.dataset_directory),
-                Some(active.dataset_writer),
-                Some(active.dataset_handle),
+                active.dataset_directory,
+                active.dataset_writer,
+                active.dataset_handle,
             ),
             None => (None, None, None, None, None),
         };
@@ -18009,7 +18093,7 @@ fn run_prepared_live_session(
         if navigation_stop_precedes_accessory_release && let Some(handle) = navigation_handle.take()
         {
             match handle.join() {
-                Ok(Ok(success)) => navigation_descriptor = Some(success.descriptor),
+                Ok(Ok(success)) => navigation_descriptor = success.descriptor,
                 Ok(Err(error)) => live_failures.push(LiveWorkerFailure::Navigation(error)),
                 Err(payload) => live_failures.push(LiveWorkerFailure::NavigationPanic {
                     detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
@@ -18188,7 +18272,7 @@ fn run_prepared_live_session(
 
         if let Some(handle) = navigation_handle {
             match handle.join() {
-                Ok(Ok(success)) => navigation_descriptor = Some(success.descriptor),
+                Ok(Ok(success)) => navigation_descriptor = success.descriptor,
                 Ok(Err(error)) => live_failures.push(LiveWorkerFailure::Navigation(error)),
                 Err(payload) => live_failures.push(LiveWorkerFailure::NavigationPanic {
                     detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
@@ -18669,14 +18753,16 @@ mod tests {
         FreshAttendedMotionAttestationInput, FreshAttendedMotionAttestationWorker,
         FreshAttendedMotionAttestationWorkerError, FreshAttendedMotionAttestationWorkerPoll,
         FreshAttendedMotionAttestationWorkerShutdown, InitialMotorPowerDisconnectedClaim,
-        MAX_QUALIFICATION_ATTESTATION_LINE_BYTES, QUALIFICATION_ATTESTATION_CHALLENGE_BYTES,
-        WheelsOffAttestationChallengeSource, WheelsOffQualificationAndMotorPowerDisconnectError,
+        LiveNavigationPersistence, MAX_QUALIFICATION_ATTESTATION_LINE_BYTES,
+        QUALIFICATION_ATTESTATION_CHALLENGE_BYTES, WheelsOffAttestationChallengeSource,
+        WheelsOffMotionAccess, WheelsOffQualificationAndMotorPowerDisconnectError,
         WheelsOffQualificationAttestationReadinessBlocker,
         classify_wheels_off_qualification_attestation_readiness,
         finish_attended_wheels_off_qualification, fresh_motion_attestation_must_cancel,
         lower_hex_qualification_challenge, prompt_fresh_attended_motion_phrase,
         read_attended_wheels_off_preflight, read_bounded_tty_line,
         read_fresh_attended_motion_attestation, read_post_run_motor_power_disconnected,
+        wheels_off_navigation_persistence,
     };
     use super::{
         BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, LiveDecisionVizKind,
@@ -21495,6 +21581,23 @@ mod tests {
                 "stationary lab override {forbidden} must not exist"
             );
         }
+    }
+
+    #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
+    #[test]
+    fn stationary_lab_alone_selects_non_publishable_navigation_ingress() {
+        assert_eq!(
+            wheels_off_navigation_persistence(&WheelsOffMotionAccess::StationaryLab),
+            LiveNavigationPersistence::EphemeralDiagnostic
+        );
+        assert_eq!(
+            wheels_off_navigation_persistence(&WheelsOffMotionAccess::Attended(
+                AttendedWheelsOffPreflight {
+                    motor_power_disconnected: InitialMotorPowerDisconnectedClaim,
+                }
+            )),
+            LiveNavigationPersistence::PublishableDataset
+        );
     }
 
     #[cfg(all(feature = "nano-wheels-off-qualification", unix))]
