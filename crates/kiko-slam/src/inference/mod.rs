@@ -30,9 +30,11 @@ use crate::env::{EnvError, env_bool, env_string, env_u64, env_usize};
 pub use backend::InferenceBackend;
 pub use eigenplaces::EigenPlaces;
 pub use place::PlaceDescriptorExtractor;
-pub(crate) use superpoint::{
-    SUPERPOINT_MAXIMUM_OUTPUT_KEYPOINTS, SUPERPOINT_MINIMUM_INPUT_AXIS_PX,
-};
+
+/// Maximum keypoint axis of the tracked `sp.onnx` graph's sorted TopK output.
+pub const SUPERPOINT_MAXIMUM_OUTPUT_KEYPOINTS: u32 = 512;
+/// Minimum executable input axis for the tracked graph's three stride-2 pools.
+pub const SUPERPOINT_MINIMUM_INPUT_AXIS_PX: u32 = 8;
 
 /// Generic CLI model directory, resolved from the process working directory.
 ///

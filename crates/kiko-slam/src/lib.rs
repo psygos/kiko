@@ -6,7 +6,8 @@ use std::sync::Arc;
 pub use inference::pin_ort_runtime_from_path;
 pub use inference::{
     EigenPlaces, InferenceBackend, InferenceError, LightGlue, OrtRuntimePinError,
-    OrtRuntimePinOperation, PinnedOrtRuntime, PlaceDescriptorExtractor, SuperPoint,
+    OrtRuntimePinOperation, PinnedOrtRuntime, PlaceDescriptorExtractor,
+    SUPERPOINT_MAXIMUM_OUTPUT_KEYPOINTS, SUPERPOINT_MINIMUM_INPUT_AXIS_PX, SuperPoint,
     WORKSPACE_MODEL_DIRECTORY, WatchdogConfigError, pin_ort_runtime_from_memory,
 };
 mod channel;

@@ -1,5 +1,6 @@
 use super::{
-    InferenceBackend, InferenceError, ManagedSession, PinnedOrtRuntime, build_session,
+    InferenceBackend, InferenceError, ManagedSession, PinnedOrtRuntime,
+    SUPERPOINT_MAXIMUM_OUTPUT_KEYPOINTS, SUPERPOINT_MINIMUM_INPUT_AXIS_PX, build_session,
     build_session_from_memory,
 };
 use crate::{Descriptor, Detections, DownscaleFactor, Frame, FrameDimensions, Keypoint};
@@ -9,10 +10,6 @@ use std::path::Path;
 
 use crate::DESCRIPTOR_DIM;
 
-// Fixed by the tracked sp.onnx graph: three stride-2 pools, radius-4 NMS,
-// strict score thresholding, and sorted TopK capped at 512.
-pub(crate) const SUPERPOINT_MAXIMUM_OUTPUT_KEYPOINTS: u32 = 512;
-pub(crate) const SUPERPOINT_MINIMUM_INPUT_AXIS_PX: u32 = 8;
 const MAX_OUTPUT_KEYPOINTS: usize = SUPERPOINT_MAXIMUM_OUTPUT_KEYPOINTS as usize;
 const MODEL_STRIDE: u32 = SUPERPOINT_MINIMUM_INPUT_AXIS_PX;
 const EXCLUDED_BORDER: u32 = 4;
