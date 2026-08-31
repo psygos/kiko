@@ -280,6 +280,9 @@ occupancy, MPC shadow diagnostics, and the console without retaining sensor
 payloads or fabricating a persistence claim. Publishable recording remains
 enabled in the attended and production paths only.
 
+The first native Jetson observation of this dataset-free path is recorded in
+[`nano-stationary-lab-live-evidence-2026-09-01.md`](nano-stationary-lab-live-evidence-2026-09-01.md).
+
 The mode still owns and supervises the exact STM32 serial endpoint because an
 applied zero/disarm receipt and exclusive ownership are useful integration
 evidence. It does not reconnect motor power, issue a nonzero command, run a
