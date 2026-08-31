@@ -83,3 +83,99 @@ This run does not establish occupancy output, physical head-gaze behavior,
 grounded wheel signs, PWM-to-velocity calibration, the drive plant, MPC
 tracking, click-to-goal navigation, or recovery behavior. Those remain explicit
 acceptance work; no claim is inferred from the stationary observation.
+
+## Stationary console and accessory-lifecycle refresh
+
+The later `a02c26bec85336f35f42565cf1c64cd9e344c6a7` candidate supersedes
+the console presentation described above. Its stationary mode has a distinct
+`stationary_lab` authority identity, omits the qualification/control-profile
+projection, does not render manual or mode controls, and returns HTTP 404 for
+the raw qualification-intent route before request-body parsing. The shared
+binary and bundle kind retain their qualification names because the same
+reviewed artifact also contains the explicitly attended lane; those internal
+names do not grant the stationary entry point another authority.
+
+Two intermediate candidates were rejected rather than relabelled successful:
+
+- `8a0b7418c260c99f72cf2267f2873f58d39182d3` removed the stationary
+  controls, but later telemetry ticks incorrectly projected the shared
+  `wheels_off_qualification` identity. The runtime rejected that contradiction
+  with a typed `ProfileMismatch` fault.
+- `83386e3b9144385210f38de046715666bf1f2634` retained stationary identity
+  on later ticks. Live use then exposed an independent cancellation defect: a
+  health or frame select branch could drop an already-submitted KEP2 reply
+  receiver. The eye actor correctly failed closed with
+  `ActorStoppedBeforeReporting`. A separate startup attempt also failed closed
+  when bow telemetry had only 116 ms of freshness remaining against the
+  configured 200 ms worst-case write budget.
+
+Commit `a02c26b` makes the accessory loop select observation-only triggers and
+runs every head/eye transaction to a typed completion after selection. Its
+regression fixture deliberately combines a 20 ms eye acknowledgement with a
+1 ms health cadence. The acknowledgement completes before the overdue health
+transaction; the old cancellation structure cannot satisfy that test.
+
+### Refreshed candidate identity
+
+- Source archive SHA-256:
+  `2a1721a8663c5d1a1fb3322e8c11ac408e9e9404123ec4a0f83ebd2deefc7f37`
+- Native Linux aarch64 executable size: `31,359,480` bytes
+- Native executable SHA-256:
+  `dfce412a696a5455caecb361a4b4188012d4c583d81c0cf8a02f74bf57bb27fb`
+- Bundle renderer SHA-256:
+  `b436597feba9c8804c62023d494f0776f28544d44ada392e8e220977e0bd5aca`
+- Render-input SHA-256:
+  `4aaf722c21d87e8eed19d4b8beca26592bcb19f7fd81dc10d3f7da124afdd776`
+- Render-evidence SHA-256:
+  `456e10a7c7df352d8ac6032311cfd602a1be4ea707cf1c3a5e129288e141719b`
+- Launch-record SHA-256:
+  `b8976b3e0c8b127e80f73bc5f460b4273955b1cc7f016e7d798a52d3881fee1a`
+
+The archive hash matched before extraction. The commit was built natively from
+a clean extraction with the locked graph and a deterministic source-path
+remap. Renderer `check` and `stage` both succeeded. The installed immutable
+root matched the staged tree under `diff -qr`; the rejected `83386e3` install
+was retained as a separate rollback directory.
+
+Host evidence for the lifecycle change is 1,475 `nano-agent` library tests and
+109 exact `nano-wheels-off-qualification` binary tests passing, plus strict
+Clippy, rustfmt, and `git diff --check`. The 64 focused accessory-worker tests
+are included in the library count.
+
+### Refreshed live result
+
+The foreground stationary runtime reached `ready_stopped`. Two authenticated
+snapshots advanced from revision 399 to 1,094 while SLAM advanced from 10 to 28
+successful pairs with zero recoverable and zero fatal failures in that window.
+Both snapshots reported:
+
+- `authority_kind: stationary_lab`, with requested owner and actual authority
+  absent;
+- no `control_profile` or `wheels_off_qualification` member;
+- STM32, head, eyes, and OAK ready;
+- requested and applied left/right PWM exactly zero, controller output
+  disabled, controller faults zero, and the software safety stop latched; and
+- map, pose, path, goal, and MPC prediction absent.
+
+An authenticated POST to
+`/api/v1/wheels-off-qualification/intents` returned HTTP 404 with
+`{"error":"not_found"}`. The delivered application contains the explicit
+`STATIONARY LAB — BASE CONTROL DISABLED` banner. After OAK pipeline boot,
+`lsusb -t` placed the camera at 5,000 Mbit/s beneath the 10,000 Mbit/s Tegra
+hub. The unbooted device had initially appeared on the USB 2 tree; that was not
+used as a false USB3 claim.
+
+At 5 minutes 3 seconds, PID 110291 remained live and the state root was still
+exactly `8,135,808,633` bytes: delta zero from the pre-launch measurement. The
+snapshot had reached revision 6,169 with 156 started pairs, 155 successful
+pairs, zero recoverable failures, and zero fatal failures. STM32, head, and eyes
+remained ready. The final point-in-time OAK and SLAM health fields were
+degraded, although paired frames continued and the OAK remained enumerated at
+5,000 Mbit/s; this is not presented as continuous OAK readiness or a real-time
+SLAM result.
+
+The refreshed run remains deliberately honest about missing motion evidence:
+SLAM health is degraded by measured CPU inference latency, and a stationary
+camera cannot create a useful map or current localization. This deployment
+does not establish wheel signs, plant calibration, MPC tracking, or
+click-to-goal navigation.
